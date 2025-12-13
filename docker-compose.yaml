@@ -1,32 +1,42 @@
+# File: docker-compose.yml
 version: '3.8'
 
 services:
-  cache-service:
-    # Nếu bạn muốn tự build tại chỗ khi deploy:
-    # build: . 
-    # Hoặc nếu dùng Image đã đẩy lên DockerHub từ GitHub Actions:
-    image: autocookies/pomai_server:cache-service
-    container_name: pomai-cache # Đặt tên cố định để dễ debug
+  cache:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pomai-cache
     restart: unless-stopped
-
-    # Cấu hình biến môi trường
+    ports:
+      - "8080:8080"
     environment:
       - PORT=8080
-      - JWT_ACCESS_SECRET=${JWT_ACCESS_SECRET} # Lấy từ file .env trên server
-      - CACHE_SHARDS=64
-      - PER_TENANT_CAPACITY_BYTES=52428800 # 50MB
+      - CACHE_SHARDS=32
+      - PER_TENANT_CAPACITY_BYTES=104857600 # 100MB per user
       - GRACEFUL_SHUTDOWN_SEC=10
-
-    # Kết nối vào mạng chung
+      - CLEANUP_INTERVAL_SEC=60
+      - TZ=Asia/Ho_Chi_Minh
+    volumes:
+      - cache-data:/data
     networks:
-      - pomai-net
+      - cache-network
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-    deploy:
-      resources:
-        limits:
-          memory: 512M
+volumes:
+  cache-data:
+    driver: local
 
-# QUAN TRỌNG: Khai báo mạng này là EXTERNAL (đã được tạo từ trước)
 networks:
-  pomai-net:
-    external: true
+  cache-network:
+    driver: bridge

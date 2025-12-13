@@ -1,0 +1,35 @@
+# File: .dockerignore
+. git
+.github
+*. md
+. gitignore
+.env
+.env.*
+
+# Build artifacts
+*. exe
+*.exe~
+*.dll
+*.so
+*.dylib
+cache-server
+
+# Test files
+*_test.go
+testdata/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+temp/
+*. log

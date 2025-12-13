@@ -2,10 +2,12 @@ package cache
 
 import (
 	"container/list"
+	"context"
 	"encoding/gob"
 	"errors"
 	"hash/fnv"
 	"io"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -550,4 +552,85 @@ func (s *Store) Stats() Stats {
 		ShardCount: int(s.shardCount),
 		FreqBoost:  atomic.LoadInt64(&s.freqBoost),
 	}
+}
+
+func (s *Store) StartCleanup(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.cleanupExpired()
+			}
+		}
+	}()
+}
+
+func (s *Store) cleanupExpired() {
+	now := time.Now().UnixNano()
+	cleaned := 0
+
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		toDelete := []string{}
+
+		for key, elem := range sh.items {
+			ent := elem.Value.(*entry)
+			if ent.expireAt != 0 && now > ent.expireAt {
+				toDelete = append(toDelete, key)
+			}
+		}
+
+		for _, key := range toDelete {
+			if elem, ok := sh.items[key]; ok {
+				ent := elem.Value.(*entry)
+				delete(sh.items, key)
+				sh.ll.Remove(elem)
+				sh.bytes -= int64(ent.size)
+				atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
+				cleaned++
+			}
+		}
+
+		sh.mu.Unlock()
+	}
+
+	if cleaned > 0 {
+		log.Printf("[CLEANUP] Removed %d expired keys across all users", cleaned)
+	}
+}
+
+func (s *Store) CleanupExpired() int {
+	now := time.Now().UnixNano()
+	cleaned := 0
+
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		toDelete := []string{}
+
+		for key, elem := range sh.items {
+			ent := elem.Value.(*entry)
+			if ent.expireAt != 0 && now > ent.expireAt {
+				toDelete = append(toDelete, key)
+			}
+		}
+
+		for _, key := range toDelete {
+			if elem, ok := sh.items[key]; ok {
+				ent := elem.Value.(*entry)
+				delete(sh.items, key)
+				sh.ll.Remove(elem)
+				sh.bytes -= int64(ent.size)
+				atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
+				cleaned++
+			}
+		}
+
+		sh.mu.Unlock()
+	}
+
+	return cleaned
 }
