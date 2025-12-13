@@ -1,3 +1,4 @@
+// File: internal/cache/store.go
 package cache
 
 import (
@@ -15,26 +16,26 @@ import (
 )
 
 func init() {
-	// Seed the global PRNG once per process.
 	rand.Seed(time.Now().UnixNano())
 }
 
-// snapshotItem is used for persistence encoding.
 type snapshotItem struct {
 	Key        string
 	Value      []byte
 	ExpireAt   int64
 	LastAccess int64
 	Accesses   uint64
+	CreatedAt  int64
 }
 
 type entry struct {
 	key        string
 	value      []byte
 	size       int
-	expireAt   int64 // unix nano, 0 means no expiry
-	lastAccess int64 // unix nano, used for approximate LRU sampling
+	expireAt   int64
+	lastAccess int64
 	accesses   uint64
+	createdAt  int64
 }
 
 type shard struct {
@@ -49,26 +50,30 @@ type Store struct {
 	shardCount    uint32
 	capacityBytes int64
 
-	// total bytes across all shards (atomic)
 	totalBytesAtomic int64
-
-	// freqBoost used to combine frequency into priority (nanoseconds multiplier)
-	// priority = lastAccess + freqBoost * accesses
-	freqBoost int64
+	freqBoost        int64
 
 	hits      uint64
 	misses    uint64
 	evictions uint64
+
+	adaptiveTTL *AdaptiveTTL // ✅ Adaptive TTL engine
+	bloom       *BloomFilter // ✅ Bloom filter for fast negative lookups
+	bloomStats  BloomStats   // ✅ Bloom filter statistics
 }
 
-// NewStore creates a sharded in-memory store with default settings.
-// shardCount must be > 0. If <=0 default 256 is used.
-// capacityBytes == 0 means "no capacity limit".
+// ✅ Bloom filter statistics
+type BloomStats struct {
+	Hits              uint64 // Bloom said "maybe" and key was found
+	Misses            uint64 // Bloom said "maybe" but key not found (false positive)
+	Avoided           uint64 // Bloom said "no" - avoided shard lock
+	FalsePositiveRate float64
+}
+
 func NewStore(shardCount int) *Store {
 	return NewStoreWithOptions(shardCount, 0)
 }
 
-// NewStoreWithOptions creates a sharded store with specified shard count and capacity in bytes.
 func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
 	if shardCount <= 0 {
 		shardCount = 256
@@ -78,8 +83,7 @@ func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
 		shards:        make([]*shard, shardCount),
 		shardCount:    uint32(shardCount),
 		capacityBytes: capacityBytes,
-		// default freqBoost: 1 millisecond per access (in nanoseconds)
-		freqBoost: 1_000_000,
+		freqBoost:     1_000_000,
 	}
 	for i := 0; i < shardCount; i++ {
 		s.shards[i] = &shard{
@@ -90,8 +94,66 @@ func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
 	return s
 }
 
-// SetFreqBoost sets the boost multiplier (in nanoseconds) applied per access when computing priority.
-// Larger values make frequency matter more (i.e., frequently accessed keys are less likely to be evicted).
+// ✅ EnableBloomFilter enables bloom filter for fast negative lookups
+// size: number of bits (e.g., 10_000_000 for ~1.2MB memory)
+// k: number of hash functions (3-5 is typical, 4 is optimal for ~1% false positive rate)
+func (s *Store) EnableBloomFilter(size uint64, k uint64) {
+	s.bloom = NewBloomFilter(size, k)
+	log.Printf("[BLOOM FILTER] Enabled:  size=%d bits (~%. 2fMB), k=%d hash functions",
+		size, float64(size)/8/1024/1024, k)
+
+	// Populate bloom filter with existing keys
+	populated := 0
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+		for key := range sh.items {
+			s.bloom.Add(key)
+			populated++
+		}
+		sh.mu.RUnlock()
+	}
+
+	if populated > 0 {
+		log.Printf("[BLOOM FILTER] Populated with %d existing keys", populated)
+	}
+}
+
+// ✅ DisableBloomFilter disables bloom filter
+func (s *Store) DisableBloomFilter() {
+	s.bloom = nil
+	log.Println("[BLOOM FILTER] Disabled")
+}
+
+// ✅ GetBloomStats returns bloom filter statistics
+func (s *Store) GetBloomStats() BloomStats {
+	hits := atomic.LoadUint64(&s.bloomStats.Hits)
+	misses := atomic.LoadUint64(&s.bloomStats.Misses)
+	avoided := atomic.LoadUint64(&s.bloomStats.Avoided)
+
+	stats := BloomStats{
+		Hits:    hits,
+		Misses:  misses,
+		Avoided: avoided,
+	}
+
+	// Calculate false positive rate
+	if hits+misses > 0 {
+		stats.FalsePositiveRate = float64(misses) / float64(hits+misses) * 100
+	}
+
+	return stats
+}
+
+func (s *Store) EnableAdaptiveTTL(minTTL, maxTTL time.Duration) {
+	s.adaptiveTTL = NewAdaptiveTTL(minTTL, maxTTL)
+	log.Printf("[ADAPTIVE TTL] Enabled: min=%v, max=%v", minTTL, maxTTL)
+}
+
+func (s *Store) DisableAdaptiveTTL() {
+	s.adaptiveTTL = nil
+	log.Println("[ADAPTIVE TTL] Disabled")
+}
+
 func (s *Store) SetFreqBoost(nanoseconds int64) {
 	atomic.StoreInt64(&s.freqBoost, nanoseconds)
 }
@@ -103,17 +165,12 @@ func (s *Store) getShard(key string) *shard {
 	return s.shards[int(idx)]
 }
 
-// hashToShardIndex computes the shard index for a key.
-// (helper to use in Put when calling evictIfNeeded)
 func (s *Store) hashToShardIndex(key string) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 	return int(h.Sum32() % s.shardCount)
 }
 
-// Put stores a key with value and optional ttl. ttl <= 0 means no expiration.
-// A copy of value is stored. If capacityBytes is set, Put will trigger eviction
-// loops until the store is under capacity.
 func (s *Store) Put(key string, value []byte, ttl time.Duration) {
 	if key == "" {
 		return
@@ -121,32 +178,44 @@ func (s *Store) Put(key string, value []byte, ttl time.Duration) {
 	vcopy := make([]byte, len(value))
 	copy(vcopy, value)
 
-	var expireAt int64
-	if ttl > 0 {
-		expireAt = time.Now().Add(ttl).UnixNano()
-	}
 	now := time.Now().UnixNano()
+	var expireAt int64
 
 	sh := s.getShard(key)
 	sh.mu.Lock()
-	// update existing
+
 	if elem, ok := sh.items[key]; ok {
 		ent := elem.Value.(*entry)
-		// adjust bytes
 		oldSize := ent.size
+
+		if s.adaptiveTTL != nil && ttl > 0 {
+			age := time.Since(time.Unix(0, ent.createdAt))
+			accesses := atomic.LoadUint64(&ent.accesses)
+			adaptiveTTL := s.adaptiveTTL.ComputeTTL(accesses, age)
+			expireAt = time.Now().Add(adaptiveTTL).UnixNano()
+		} else if ttl > 0 {
+			expireAt = time.Now().Add(ttl).UnixNano()
+		}
+
 		ent.value = vcopy
 		ent.size = len(vcopy)
 		ent.expireAt = expireAt
 		ent.lastAccess = now
 		atomic.AddUint64(&ent.accesses, 1)
 		sh.bytes += int64(ent.size - oldSize)
-		// move to front as most recently used (per-shard ordering for sampling)
 		sh.ll.MoveToFront(elem)
-		// update global total
 		atomic.AddInt64(&s.totalBytesAtomic, int64(ent.size-oldSize))
 		sh.mu.Unlock()
 	} else {
-		// insert new
+		if ttl > 0 {
+			if s.adaptiveTTL != nil {
+				adaptiveTTL := s.adaptiveTTL.ComputeTTL(0, 0)
+				expireAt = time.Now().Add(adaptiveTTL).UnixNano()
+			} else {
+				expireAt = time.Now().Add(ttl).UnixNano()
+			}
+		}
+
 		ent := &entry{
 			key:        key,
 			value:      vcopy,
@@ -154,64 +223,121 @@ func (s *Store) Put(key string, value []byte, ttl time.Duration) {
 			expireAt:   expireAt,
 			lastAccess: now,
 			accesses:   1,
+			createdAt:  now,
 		}
 		elem := sh.ll.PushFront(ent)
 		sh.items[key] = elem
 		sh.bytes += int64(ent.size)
 		atomic.AddInt64(&s.totalBytesAtomic, int64(ent.size))
+
+		// ✅ Add to bloom filter
+		if s.bloom != nil {
+			s.bloom.Add(key)
+		}
+
 		sh.mu.Unlock()
 	}
 
-	// Evict if we have a capacity set
 	if s.capacityBytes > 0 {
 		s.evictIfNeeded(s.hashToShardIndex(key))
 	}
 }
 
-// Get returns a copy of the value and true if found and not expired.
-// If key expired or not present returns (nil, false).
+func (s *Store) PutAdaptive(key string, value []byte, baseTTL time.Duration) {
+	s.Put(key, value, baseTTL)
+}
+
+func (s *Store) RefreshTTL(key string) bool {
+	if key == "" || s.adaptiveTTL == nil {
+		return false
+	}
+
+	sh := s.getShard(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+
+	elem, ok := sh.items[key]
+	if !ok {
+		return false
+	}
+
+	ent := elem.Value.(*entry)
+	if ent.expireAt == 0 {
+		return false
+	}
+
+	age := time.Since(time.Unix(0, ent.createdAt))
+	accesses := atomic.LoadUint64(&ent.accesses)
+	newTTL := s.adaptiveTTL.ComputeTTL(accesses, age)
+	ent.expireAt = time.Now().Add(newTTL).UnixNano()
+
+	return true
+}
+
 func (s *Store) Get(key string) ([]byte, bool) {
 	if key == "" {
 		atomic.AddUint64(&s.misses, 1)
 		return nil, false
 	}
+
+	// ✅ Fast path: Check bloom filter first
+	if s.bloom != nil {
+		if !s.bloom.MayContain(key) {
+			// Definitely not present - avoid shard lock!
+			atomic.AddUint64(&s.misses, 1)
+			atomic.AddUint64(&s.bloomStats.Avoided, 1)
+			return nil, false
+		}
+		// Bloom says "maybe" - need to check actual store
+	}
+
 	sh := s.getShard(key)
 
-	// Fast path: read lock to check presence/expiry
 	sh.mu.RLock()
 	elem, ok := sh.items[key]
 	if !ok {
 		sh.mu.RUnlock()
 		atomic.AddUint64(&s.misses, 1)
+
+		// ✅ Bloom filter said "maybe" but key not found (false positive)
+		if s.bloom != nil {
+			atomic.AddUint64(&s.bloomStats.Misses, 1)
+		}
+
 		return nil, false
 	}
+
+	// ✅ Bloom filter was correct (true positive)
+	if s.bloom != nil {
+		atomic.AddUint64(&s.bloomStats.Hits, 1)
+	}
+
 	ent := elem.Value.(*entry)
 	now := time.Now().UnixNano()
 	if ent.expireAt != 0 && now > ent.expireAt {
-		// expired -> upgrade to write lock to remove
 		sh.mu.RUnlock()
 
 		sh.mu.Lock()
-		// re-check
 		elem2, ok2 := sh.items[key]
 		if !ok2 {
-			// removed by someone else
 			sh.mu.Unlock()
 			atomic.AddUint64(&s.misses, 1)
 			return nil, false
 		}
 		ent2 := elem2.Value.(*entry)
 		if ent2.expireAt != 0 && time.Now().UnixNano() > ent2.expireAt {
-			// still expired -> remove
 			delete(sh.items, key)
 			sh.ll.Remove(elem2)
 			sh.bytes -= int64(ent2.size)
 			atomic.AddInt64(&s.totalBytesAtomic, -int64(ent2.size))
+
+			// Note: We don't remove from bloom filter (it's append-only)
+			// False positives will eventually be fixed by bloom filter rebuild
+
 			sh.mu.Unlock()
 			atomic.AddUint64(&s.misses, 1)
 			return nil, false
 		}
-		// not expired anymore -> move to front, update lastAccess and return
 		ent2.lastAccess = time.Now().UnixNano()
 		atomic.AddUint64(&ent2.accesses, 1)
 		sh.ll.MoveToFront(elem2)
@@ -222,23 +348,17 @@ func (s *Store) Get(key string) ([]byte, bool) {
 		return out, true
 	}
 
-	// not expired: we want to bump lastAccess and move to front (update recency).
-	// release read lock and acquire write lock to move element safely.
 	sh.mu.RUnlock()
 
 	sh.mu.Lock()
-	// re-get to avoid races
 	elem2, ok2 := sh.items[key]
 	if !ok2 {
-		// disappeared
 		sh.mu.Unlock()
 		atomic.AddUint64(&s.misses, 1)
 		return nil, false
 	}
 	ent2 := elem2.Value.(*entry)
-	// if expired between locks, handle similarly
 	if ent2.expireAt != 0 && time.Now().UnixNano() > ent2.expireAt {
-		// remove
 		delete(sh.items, key)
 		sh.ll.Remove(elem2)
 		sh.bytes -= int64(ent2.size)
@@ -247,10 +367,17 @@ func (s *Store) Get(key string) ([]byte, bool) {
 		atomic.AddUint64(&s.misses, 1)
 		return nil, false
 	}
-	// update lastAccess and move to front
 	ent2.lastAccess = time.Now().UnixNano()
 	atomic.AddUint64(&ent2.accesses, 1)
 	sh.ll.MoveToFront(elem2)
+
+	if s.adaptiveTTL != nil && ent2.expireAt != 0 {
+		age := time.Since(time.Unix(0, ent2.createdAt))
+		accesses := atomic.LoadUint64(&ent2.accesses)
+		newTTL := s.adaptiveTTL.ComputeTTL(accesses, age)
+		ent2.expireAt = time.Now().Add(newTTL).UnixNano()
+	}
+
 	out := make([]byte, len(ent2.value))
 	copy(out, ent2.value)
 	sh.mu.Unlock()
@@ -258,7 +385,6 @@ func (s *Store) Get(key string) ([]byte, bool) {
 	return out, true
 }
 
-// Delete removes a key if present.
 func (s *Store) Delete(key string) {
 	if key == "" {
 		return
@@ -272,15 +398,56 @@ func (s *Store) Delete(key string) {
 		sh.ll.Remove(elem)
 		sh.bytes -= int64(ent.size)
 		atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
+
+		// Note:  Bloom filter is append-only, we don't remove keys
+		// This creates false positives but they're harmless
 	}
 }
 
-// TTLRemaining returns remaining TTL and true if key exists and has expiration.
-// If key not found returns (0, false). If key exists without expiration returns (0, true).
+// ✅ RebuildBloomFilter rebuilds bloom filter from scratch
+// Call this periodically to reduce false positive rate after many deletions
+func (s *Store) RebuildBloomFilter() int {
+	if s.bloom == nil {
+		return 0
+	}
+
+	// Get bloom filter config
+	oldSize := s.bloom.size
+	oldK := s.bloom.k
+
+	// Create new bloom filter
+	s.bloom = NewBloomFilter(oldSize, oldK)
+
+	// Repopulate with current keys
+	count := 0
+	for _, sh := range s.shards {
+		sh.mu.RLock()
+		for key := range sh.items {
+			s.bloom.Add(key)
+			count++
+		}
+		sh.mu.RUnlock()
+	}
+
+	// Reset bloom stats
+	atomic.StoreUint64(&s.bloomStats.Hits, 0)
+	atomic.StoreUint64(&s.bloomStats.Misses, 0)
+	atomic.StoreUint64(&s.bloomStats.Avoided, 0)
+
+	log.Printf("[BLOOM FILTER] Rebuilt with %d keys", count)
+	return count
+}
+
 func (s *Store) TTLRemaining(key string) (time.Duration, bool) {
 	if key == "" {
 		return 0, false
 	}
+
+	// ✅ Bloom filter check
+	if s.bloom != nil && !s.bloom.MayContain(key) {
+		return 0, false
+	}
+
 	sh := s.getShard(key)
 	sh.mu.RLock()
 	elem, ok := sh.items[key]
@@ -296,7 +463,6 @@ func (s *Store) TTLRemaining(key string) (time.Duration, bool) {
 	remain := time.Until(time.Unix(0, ent.expireAt))
 	if remain <= 0 {
 		sh.mu.RUnlock()
-		// eager remove
 		sh.mu.Lock()
 		if elem2, ok2 := sh.items[key]; ok2 {
 			ent2 := elem2.Value.(*entry)
@@ -314,7 +480,6 @@ func (s *Store) TTLRemaining(key string) (time.Duration, bool) {
 	return remain, true
 }
 
-// candidate represents a sampled eviction candidate.
 type candidate struct {
 	shardIdx int
 	key      string
@@ -322,14 +487,10 @@ type candidate struct {
 	size     int
 }
 
-// evictIfNeeded will evict entries while total bytes exceed capacity.
-// It uses sampling across shards to pick approximate-LRU/LFU hybrid candidates.
-// startShard is used as a hint to start sampling from a shard first.
 func (s *Store) evictIfNeeded(startShard int) {
 	if s.capacityBytes <= 0 {
 		return
 	}
-	// quick check
 	if atomic.LoadInt64(&s.totalBytesAtomic) <= s.capacityBytes {
 		return
 	}
@@ -340,25 +501,20 @@ func (s *Store) evictIfNeeded(startShard int) {
 		start = 0
 	}
 
-	// sampling parameters (tunable)
-	const sampleShardLimit = 16 // number of shards to sample per eviction round
-	const perShardSamples = 2   // elements sampled per shard
-	const maxCandidates = 128   // cap candidates to avoid huge allocations
+	const sampleShardLimit = 16
+	const perShardSamples = 2
+	const maxCandidates = 128
 
 	for atomic.LoadInt64(&s.totalBytesAtomic) > s.capacityBytes {
-		// collect candidates
 		cands := make([]candidate, 0, 32)
-		// pick a set of shards to sample
 		for i := 0; i < sampleShardLimit && i < shardCount; i++ {
 			idx := (start + rand.Intn(shardCount)) % shardCount
 			sh := s.shards[idx]
-			// read-lock shard and sample up to perShardSamples elements from back (LRU side)
 			sh.mu.RLock()
 			elem := sh.ll.Back()
 			count := 0
 			for elem != nil && count < perShardSamples {
 				ent := elem.Value.(*entry)
-				// compute priority = lastAccess + freqBoost * accesses
 				priority := ent.lastAccess + int64(atomic.LoadUint64(&ent.accesses))*atomic.LoadInt64(&s.freqBoost)
 				cands = append(cands, candidate{
 					shardIdx: idx,
@@ -379,11 +535,9 @@ func (s *Store) evictIfNeeded(startShard int) {
 		}
 
 		if len(cands) == 0 {
-			// nothing to evict
 			break
 		}
 
-		// pick the candidate with smallest priority (old & low-frequency)
 		best := cands[0]
 		for _, c := range cands[1:] {
 			if c.priority < best.priority {
@@ -391,26 +545,21 @@ func (s *Store) evictIfNeeded(startShard int) {
 			}
 		}
 
-		// attempt to evict best candidate: acquire shard write lock and verify still present and priority unchanged
 		sh := s.shards[best.shardIdx]
 		sh.mu.Lock()
 		elem, ok := sh.items[best.key]
 		if !ok {
-			// someone else removed it, continue
 			sh.mu.Unlock()
 			start = (start + 1) % shardCount
 			continue
 		}
 		ent := elem.Value.(*entry)
-		// re-calc priority
 		curPriority := ent.lastAccess + int64(atomic.LoadUint64(&ent.accesses))*atomic.LoadInt64(&s.freqBoost)
 		if curPriority != best.priority {
-			// changed, skip
 			sh.mu.Unlock()
 			start = (start + 1) % shardCount
 			continue
 		}
-		// remove
 		delete(sh.items, best.key)
 		sh.ll.Remove(elem)
 		sh.bytes -= int64(ent.size)
@@ -419,26 +568,20 @@ func (s *Store) evictIfNeeded(startShard int) {
 		atomic.AddUint64(&s.evictions, 1)
 		atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
 
-		// advance start so next round samples different shards
 		start = (start + 1) % shardCount
 	}
 }
 
-// totalBytesSnapshot returns the approximate total bytes (atomic read).
 func (s *Store) totalBytesSnapshot() int64 {
 	return atomic.LoadInt64(&s.totalBytesAtomic)
 }
 
 func (s *Store) totalBytes() int64 {
-	// kept for backward compatibility; reads atomically
 	return s.totalBytesSnapshot()
 }
 
-// SnapshotTo writes a snapshot of the current store into the given writer using gob encoding.
-// Only non-expired keys are written.
 func (s *Store) SnapshotTo(w io.Writer) error {
 	enc := gob.NewEncoder(w)
-	// encode header: version
 	if err := enc.Encode(int(1)); err != nil {
 		return err
 	}
@@ -447,7 +590,6 @@ func (s *Store) SnapshotTo(w io.Writer) error {
 		sh.mu.RLock()
 		for _, elem := range sh.items {
 			ent := elem.Value.(*entry)
-			// skip expired
 			if ent.expireAt != 0 && time.Now().UnixNano() > ent.expireAt {
 				continue
 			}
@@ -457,6 +599,7 @@ func (s *Store) SnapshotTo(w io.Writer) error {
 				ExpireAt:   ent.expireAt,
 				LastAccess: ent.lastAccess,
 				Accesses:   atomic.LoadUint64(&ent.accesses),
+				CreatedAt:  ent.createdAt,
 			}
 			if err := enc.Encode(&item); err != nil {
 				sh.mu.RUnlock()
@@ -468,8 +611,6 @@ func (s *Store) SnapshotTo(w io.Writer) error {
 	return nil
 }
 
-// RestoreFrom reads a snapshot encoded by SnapshotTo and restores entries into the store.
-// Existing entries may be overwritten by snapshot values.
 func (s *Store) RestoreFrom(r io.Reader) error {
 	dec := gob.NewDecoder(r)
 	var version int
@@ -488,15 +629,12 @@ func (s *Store) RestoreFrom(r io.Reader) error {
 			}
 			return err
 		}
-		// skip expired items
 		if item.ExpireAt != 0 && time.Now().UnixNano() > item.ExpireAt {
 			continue
 		}
 
-		// insert directly into shard to preserve lastAccess and accesses
 		sh := s.getShard(item.Key)
 		sh.mu.Lock()
-		// if exists, subtract old size and remove
 		if elem, ok := sh.items[item.Key]; ok {
 			old := elem.Value.(*entry)
 			delete(sh.items, item.Key)
@@ -511,28 +649,39 @@ func (s *Store) RestoreFrom(r io.Reader) error {
 			expireAt:   item.ExpireAt,
 			lastAccess: item.LastAccess,
 			accesses:   item.Accesses,
+			createdAt:  item.CreatedAt,
 		}
 		elem := sh.ll.PushFront(ent)
 		sh.items[item.Key] = elem
 		sh.bytes += int64(ent.size)
 		atomic.AddInt64(&s.totalBytesAtomic, int64(ent.size))
+
+		// ✅ Add restored keys to bloom filter
+		if s.bloom != nil {
+			s.bloom.Add(item.Key)
+		}
+
 		sh.mu.Unlock()
 	}
 }
 
-// Stats holds basic store metrics.
 type Stats struct {
-	Hits       uint64
-	Misses     uint64
-	Items      int64
-	Bytes      int64
-	Capacity   int64
-	Evictions  uint64
-	ShardCount int
-	FreqBoost  int64
+	Hits           uint64
+	Misses         uint64
+	Items          int64
+	Bytes          int64
+	Capacity       int64
+	Evictions      uint64
+	ShardCount     int
+	FreqBoost      int64
+	AdaptiveTTL    bool
+	AdaptiveMinTTL string
+	AdaptiveMaxTTL string
+	BloomEnabled   bool    // ✅ Bloom filter status
+	BloomFPRate    float64 // ✅ False positive rate
+	BloomAvoided   uint64  // ✅ Lookups avoided by bloom
 }
 
-// Stats returns aggregated statistics.
 func (s *Store) Stats() Stats {
 	var totalItems int64
 	var totalBytes int64
@@ -542,16 +691,32 @@ func (s *Store) Stats() Stats {
 		totalBytes += sh.bytes
 		sh.mu.RUnlock()
 	}
-	return Stats{
-		Hits:       atomic.LoadUint64(&s.hits),
-		Misses:     atomic.LoadUint64(&s.misses),
-		Items:      totalItems,
-		Bytes:      totalBytes,
-		Capacity:   s.capacityBytes,
-		Evictions:  atomic.LoadUint64(&s.evictions),
-		ShardCount: int(s.shardCount),
-		FreqBoost:  atomic.LoadInt64(&s.freqBoost),
+
+	stats := Stats{
+		Hits:         atomic.LoadUint64(&s.hits),
+		Misses:       atomic.LoadUint64(&s.misses),
+		Items:        totalItems,
+		Bytes:        totalBytes,
+		Capacity:     s.capacityBytes,
+		Evictions:    atomic.LoadUint64(&s.evictions),
+		ShardCount:   int(s.shardCount),
+		FreqBoost:    atomic.LoadInt64(&s.freqBoost),
+		AdaptiveTTL:  s.adaptiveTTL != nil,
+		BloomEnabled: s.bloom != nil,
 	}
+
+	if s.adaptiveTTL != nil {
+		stats.AdaptiveMinTTL = s.adaptiveTTL.minTTL.String()
+		stats.AdaptiveMaxTTL = s.adaptiveTTL.maxTTL.String()
+	}
+
+	if s.bloom != nil {
+		bloomStats := s.GetBloomStats()
+		stats.BloomFPRate = bloomStats.FalsePositiveRate
+		stats.BloomAvoided = bloomStats.Avoided
+	}
+
+	return stats
 }
 
 func (s *Store) StartCleanup(ctx context.Context, interval time.Duration) {
@@ -600,6 +765,11 @@ func (s *Store) cleanupExpired() {
 
 	if cleaned > 0 {
 		log.Printf("[CLEANUP] Removed %d expired keys across all users", cleaned)
+
+		// ✅ Rebuild bloom filter after cleanup if many keys were removed
+		if s.bloom != nil && cleaned > 1000 {
+			s.RebuildBloomFilter()
+		}
 	}
 }
 

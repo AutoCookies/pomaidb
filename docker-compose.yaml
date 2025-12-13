@@ -6,10 +6,6 @@ networks:
     external: true
 
 services:
-  # ============================================================
-  # CACHE SERVICE (Pull từ GitHub Container Registry)
-  # ============================================================
-
   cache-service:
     image: ghcr.io/autocookies/the_pomegranate/pomai-cache:latest
     container_name: pomai-cache
@@ -19,31 +15,61 @@ services:
     ports:
       - "8080:8080" # Expose ra ngoài để Nginx Proxy Manager có thể trỏ vào
     environment:
-      - NODE_ENV=production
+      # Server config
       - PORT=8080
+      - GRACEFUL_SHUTDOWN_SEC=10
+
+      # Cache config
       - CACHE_SHARDS=32
       - PER_TENANT_CAPACITY_BYTES=104857600 # 100MB per user
-      - GRACEFUL_SHUTDOWN_SEC=10
       - CLEANUP_INTERVAL_SEC=60
+
+      # Adaptive TTL
+      - ENABLE_ADAPTIVE_TTL=true
+      - ADAPTIVE_MIN_TTL=1m
+      - ADAPTIVE_MAX_TTL=1h
+
+      # Bloom Filter
+      - ENABLE_BLOOM_FILTER=true
+      - BLOOM_SIZE=10000000 # 10M bits (~1.2MB)
+      - BLOOM_K=4
+
+      # Persistence
+      - PERSISTENCE_TYPE=file
+      - DATA_DIR=/data
+      - SNAPSHOT_INTERVAL=10m
+
+      # Write-Behind
+      - ENABLE_WRITE_BEHIND=true
+      - WRITE_BUFFER_SIZE=1000
+      - FLUSH_INTERVAL=5s
+
+      # Timezone
       - TZ=Asia/Ho_Chi_Minh
+
     volumes:
       - cache-data:/data
+
     healthcheck:
       test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
     deploy:
       resources:
         limits:
-          memory: 256M # Tương tự Nginx Proxy Manager
+          cpus: '0.5'
+          memory: 256M
         reservations:
+          cpus: '0.25'
           memory: 128M
 
 volumes:
