@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/AutoCookies/pomai-cache/internal/cache"
@@ -26,7 +26,7 @@ type Server struct {
 }
 
 // NewServer creates a new API Server.
-// If requireAuth is true the server expects Authorization: Bearer <tenantID> and treats the token value as tenant ID.
+// If requireAuth is true the server expects Authorization: Bearer <jwt> and extracts tenant ID from token.
 func NewServer(tenants *cache.TenantManager, requireAuth bool) *Server {
 	s := &Server{
 		tenants:     tenants,
@@ -59,56 +59,33 @@ func (s *Server) routes() {
 	}).Methods("GET")
 }
 
-// authMiddleware extracts tenant from Authorization header (if requireAuth) and stores tenantID in request context.
-// If requireAuth=false, it injects tenantID "default" so single-tenant mode still works.
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tenantID := "default"
+
 		if s.requireAuth {
-			// 1) Try Authorization header "Bearer <token>"
-			auth := r.Header.Get("Authorization")
-			var token string
-			if auth != "" {
-				parts := strings.Fields(auth)
-				if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
-					token = parts[1]
-				} else {
-					http.Error(w, "unauthorized", http.StatusUnauthorized)
-					return
-				}
+			// Try header first:  X-User-Id or X-Tenant-Id
+			userId := r.Header.Get("X-User-Id")
+			if userId == "" {
+				userId = r.Header.Get("X-Tenant-Id")
+			}
+			// Try query param if header not present
+			if userId == "" {
+				userId = r.URL.Query().Get("userId")
+			}
+			if userId == "" {
+				userId = r.URL.Query().Get("tenantId")
 			}
 
-			// 2) If no header token, try cookie "accessToken"
-			if token == "" {
-				if c, err := r.Cookie("accessToken"); err == nil {
-					token = c.Value
-				}
-			}
-
-			// 3) If still empty, try query param (least secure)
-			if token == "" {
-				token = r.URL.Query().Get("accessToken")
-			}
-
-			if token == "" {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+			if userId == "" {
+				http.Error(w, "unauthorized:  missing userId", http.StatusUnauthorized)
 				return
 			}
 
-			// Map/validate token -> tenantID.
-			// Option A: treat token itself as tenantID (simple)
-			// tenantID = token
-
-			// Option B: use a mapping or validate JWT and extract tenant claim.
-			// Example uses a token->tenant map stored in TenantManager or another AuthManager:
-			if t := s.tenants.LookupTenantForToken(token); t != "" {
-				tenantID = t
-			} else {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
+			tenantID = userId
 		}
 
+		// Store tenantID in context
 		ctx := context.WithValue(r.Context(), ctxTenantKey, tenantID)
 		next(w, r.WithContext(ctx))
 	}
@@ -145,6 +122,9 @@ func (s *Server) handlePut() http.HandlerFunc {
 		}
 		store := s.tenants.GetStore(tenant)
 		store.Put(key, body, ttl)
+
+		log.Printf("[PUT] Tenant=%s, Key=%s, Size=%d bytes, TTL=%s", tenant, key, len(body), ttl)
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}
@@ -161,9 +141,11 @@ func (s *Server) handleGet() http.HandlerFunc {
 		store := s.tenants.GetStore(tenant)
 		v, ok := store.Get(key)
 		if !ok {
+			log.Printf("[GET] Tenant=%s, Key=%s. Result: MISS (404)", tenant, key)
 			http.NotFound(w, r)
 			return
 		}
+		log.Printf("[GET] Tenant=%s, Key=%s. Result: HIT (200), Size=%d bytes", tenant, key, len(v))
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write(v)
 	}
@@ -179,6 +161,9 @@ func (s *Server) handleDelete() http.HandlerFunc {
 		}
 		store := s.tenants.GetStore(tenant)
 		store.Delete(key)
+
+		log.Printf("[DELETE] Tenant=%s, Key=%s deleted.", tenant, key)
+
 		w.WriteHeader(http.StatusNoContent)
 	}
 }

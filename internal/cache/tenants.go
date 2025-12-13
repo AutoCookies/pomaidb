@@ -76,10 +76,3 @@ func (tm *TenantManager) StatsAll() map[string]Stats {
 	}
 	return out
 }
-
-func (tm *TenantManager) LookupTenantForToken(token string) string {
-	// Example: assume token == tenantID for now:
-	return token
-	// Or if you have a map:
-	// tm.mu.RLock(); defer tm.mu.RUnlock(); return tokenMap[token]
-}
