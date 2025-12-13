@@ -1,21 +1,14 @@
-# File: Dockerfile
+# File: Dockerfile - SIMPLEST VERSION
 FROM golang:1.21-alpine AS builder
-
-# Install build dependencies
-RUN apk add --no-cache git ca-certificates tzdata
 
 WORKDIR /app
 
-# Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download
-
-# Copy source code
+# Copy all source
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build \
-    -a -installsuffix cgo \
+# Download deps and build in one step
+RUN go mod download && \
+    CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -o cache-server \
     ./cmd/cache-server
@@ -23,23 +16,17 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # Final stage
 FROM alpine:latest
 
-# Install runtime dependencies
-RUN apk --no-cache add ca-certificates tzdata wget
+RUN apk --no-cache add wget ca-certificates
 
-WORKDIR /root/
+WORKDIR /app
 
-# Copy binary from builder
 COPY --from=builder /app/cache-server .
 
-# Create data directory for cache storage
 RUN mkdir -p /data
 
-# Expose port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=3s \
+    CMD wget -q --spider http://localhost:8080/health || exit 1
 
-# Run the application
 CMD ["./cache-server"]
