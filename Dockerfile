@@ -1,17 +1,17 @@
-# File: Dockerfile - SIMPLEST VERSION
+# File: Dockerfile
 FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
 # Copy all source
-COPY . .
+COPY . . 
 
-# Download deps and build in one step
+# Download deps and build
 RUN go mod download && \
     CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -o cache-server \
-    ./cmd/cache-server
+    ./cmd/server/main.go
 
 # Final stage
 FROM alpine:latest
