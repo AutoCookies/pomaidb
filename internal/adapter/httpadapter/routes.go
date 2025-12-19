@@ -32,7 +32,20 @@ func (s *Server) setupRoutes() {
 	// --- API_KEY ROUTES ---
 	apiKeys := s.router.PathPrefix("/api-key").Subrouter()
 
+	// Create / Generate
 	apiKeys.HandleFunc("/generate", s.authMiddleware(s.apiKeyHandler.HandleGenerate)).Methods("POST")
+	apiKeys.HandleFunc("/create", s.authMiddleware(s.apiKeyHandler.HandleGenerate)).Methods("POST")
+
+	// List keys
+	apiKeys.HandleFunc("/list", s.authMiddleware(s.apiKeyHandler.HandleList)).Methods("GET")
+
+	// Delete (soft-delete / deactivate)
+	apiKeys.HandleFunc("/delete", s.authMiddleware(s.apiKeyHandler.HandleDelete)).Methods("DELETE")
+
+	// Rotate
+	apiKeys.HandleFunc("/rotate", s.authMiddleware(s.apiKeyHandler.HandleRotate)).Methods("POST")
+
+	// Validate
 	apiKeys.HandleFunc("/validate", s.authMiddleware(s.apiKeyHandler.HandleValidate)).Methods("GET")
 
 	// --- CACHE ROUTES (Protected) ---

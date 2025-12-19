@@ -95,7 +95,7 @@ export function SigninForm() {
                                 <div className="flex items-center justify-between">
                                     <FormLabel className="text-xs uppercase text-muted-foreground font-semibold tracking-wider">Password</FormLabel>
                                     <Link
-                                        href="/auth/forgot-password"
+                                        href="/forgot-password"
                                         className="text-xs text-pomai-gold hover:text-pomai-red transition-colors hover:underline"
                                     >
                                         Forgot password?

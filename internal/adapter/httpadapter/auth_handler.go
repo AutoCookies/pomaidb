@@ -22,26 +22,37 @@ func NewAuthHandler(service *services.AuthService) *AuthHandler {
 // --- COOKIE HELPERS ---
 
 func setAuthCookies(w http.ResponseWriter, accessToken, refreshToken string) {
-	isProd := os.Getenv("ENV") == "production" // Hoặc check config
+	isProd := os.Getenv("ENV") == "production"
+	// Nếu bạn chạy frontend và backend trên origins khác trong dev,
+	// modern browsers yêu cầu SameSite=None và Secure=true => cần HTTPS.
+	// Thay vào đó, ở dev ta dùng SameSite=Lax và Secure=false (nếu bạn proxy requests)
+	sameSite := http.SameSiteNoneMode
+	secure := isProd
+
+	if !isProd {
+		// DEV: nếu bạn không chạy HTTPS, set SameSite Lax để cookie không bị browser từ chối.
+		// Lưu ý: nếu frontend gọi API cross-site (different origin) thì Lax có thể không gửi cookie cho XHR POST.
+		sameSite = http.SameSiteLaxMode
+		secure = false
+	}
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     "accessToken",
 		Value:    accessToken,
 		HttpOnly: true,
-		Secure:   isProd, // True in production
+		Secure:   secure,
 		Path:     "/",
-		MaxAge:   15 * 60, // 15 mins
-		SameSite: http.SameSiteNoneMode,
+		MaxAge:   15 * 60,
+		SameSite: sameSite,
 	})
-
 	http.SetCookie(w, &http.Cookie{
 		Name:     "refreshToken",
 		Value:    refreshToken,
 		HttpOnly: true,
-		Secure:   isProd,
+		Secure:   secure,
 		Path:     "/",
-		MaxAge:   7 * 24 * 60 * 60, // 7 days
-		SameSite: http.SameSiteNoneMode,
+		MaxAge:   7 * 24 * 60 * 60,
+		SameSite: sameSite,
 	})
 }
 

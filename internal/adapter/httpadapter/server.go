@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/AutoCookies/pomai-cache/internal/core/ports"
-	"github.com/AutoCookies/pomai-cache/internal/core/services"
 	"github.com/AutoCookies/pomai-cache/internal/engine"
 	"github.com/gorilla/mux"
 )
@@ -25,7 +24,7 @@ func NewServer(
 	authHandler *AuthHandler,
 	tokenMaker ports.TokenMaker,
 	requireAuth bool,
-	apiKeyService services.APIKeyService, // Phụ thuộc API_KEY Service
+	apiKeyService ports.APIKeyService, // Sửa thành ports.APIKeyService (interface)
 ) *Server {
 	apiKeyHandler := NewAPIKeyHandler(apiKeyService) // Khởi tạo APIKeyHandler
 
@@ -37,6 +36,7 @@ func NewServer(
 		router:        mux.NewRouter(),
 		apiKeyHandler: apiKeyHandler,
 	}
+
 	s.setupRoutes()
 	return s
 }

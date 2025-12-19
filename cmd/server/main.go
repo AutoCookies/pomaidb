@@ -20,6 +20,7 @@ import (
 
 	// Import Firebase
 	firebase_setup "github.com/AutoCookies/pomai-cache/internal/adapter/firebase"
+	"github.com/AutoCookies/pomai-cache/internal/adapter/postgresql"
 
 	// Import Auth Adapters (Đảm bảo bạn đã tạo các package này từ các bước trước)
 	"github.com/AutoCookies/pomai-cache/internal/adapter/email"
@@ -89,6 +90,9 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	postgresql.InitializePostgreSQL() // Đảm bảo sử dụng Singleton để khởi tạo một lần
+	postgresPool := postgresql.GetPostgresPool()
 
 	// ============================================================
 	// 2. Initialize Infrastructure (Firebase)
@@ -193,8 +197,12 @@ func main() {
 	// ============================================================
 	requireAuth := os.Getenv("REQUIRE_AUTH") == "true"
 
-	// [QUAN TRỌNG] Truyền authHandler vào NewServer
-	srv := httpadapter.NewServer(tenants, authHandler, tokenMaker, requireAuth)
+	// Khởi tạo APIKeyRepo và APIKeyService
+	apiKeyRepo := persistence.NewAPIKeyRepo(postgresPool)  // Tạo repo APIKey
+	apiKeyService := services.NewAPIKeyService(apiKeyRepo) // Dùng APIKeyRepo trong service
+
+	// Truyền thêm apiKeyService vào NewServer
+	srv := httpadapter.NewServer(tenants, authHandler, tokenMaker, requireAuth, apiKeyService)
 
 	handlerWithCors := httpadapter.CorsMiddleware(srv.Router())
 

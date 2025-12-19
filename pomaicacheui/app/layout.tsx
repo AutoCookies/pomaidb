@@ -1,5 +1,6 @@
 import "./globals.css";
 import Providers from "./provider";
+import "remixicon/fonts/remixicon.css";
 
 export const metadata = {
   title: "Pomai Cache UI",

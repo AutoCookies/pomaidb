@@ -1,5 +1,3 @@
-import { ENVARS } from "@/lib/envars";
-
 export const AUTH_ENDPOINTS = {
     SIGNIN: "/auth/signin",
     SIGNUP: "/auth/signup",
