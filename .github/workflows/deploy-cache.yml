@@ -43,5 +43,5 @@ jobs:
           push: true
           # Tự động gắn tag: latest và hash của commit
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/pomai-cache:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/pomai-cache:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/pomai_server:pomai-cache
+            ${{ secrets.DOCKERHUB_USERNAME }}/pomai_server:pomai-cache-${{ github.sha }}

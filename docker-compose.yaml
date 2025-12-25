@@ -4,7 +4,7 @@ services:
   # 1. Ứng dụng Pomai Cache
   server:
     build: .
-    container_name: pomai_server
+    image: autocookies/pomai_server:pomai-cache
     restart: always
     ports:
       - "8080:8080"
