@@ -49,27 +49,35 @@ func (s *Server) Router() http.Handler {
 	return enableCORS(s.router)
 }
 
-// enableCORS là Middleware cho phép truy cập từ mọi nguồn (Allow All)
-// Phục vụ cho SDK public và Web App (Vercel)
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1. Cho phép tất cả các domain (Client nào cũng gọi được)
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// 1. Lấy Origin từ request của người dùng
+		origin := r.Header.Get("Origin")
 
-		// 2. Cho phép đầy đủ các phương thức HTTP
+		// 2. Dynamic Reflection: Set lại đúng cái Origin đó vào Header trả về
+		// Điều này giúp vượt qua lỗi "Wildcard * not allowed with credentials"
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+		} else {
+			// Nếu không có Origin (ví dụ gọi từ SDK/Postman), thì để *
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+
+		// 3. [QUAN TRỌNG] Cho phép gửi kèm Credentials (Cookies, Auth Headers)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+
+		// 4. Các Methods cho phép
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
 
-		// 3. Cho phép các Header quan trọng (Authorization, X-API-Key dùng để xác thực)
+		// 5. Các Headers cho phép
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With")
 
-		// 4. Xử lý Preflight Request (OPTIONS)
-		// Trình duyệt luôn gửi request này trước khi gửi POST/PUT để "hỏi đường"
+		// 6. Xử lý Preflight (OPTIONS)
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// Nếu không phải OPTIONS, chuyển tiếp cho Router xử lý logic chính
 		next.ServeHTTP(w, r)
 	})
 }
