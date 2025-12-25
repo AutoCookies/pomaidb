@@ -153,3 +153,44 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(out)
 }
+
+// handleIncr handles atomic increment/decrement
+// Route: POST /v1/cache/{key}/incr?delta=1
+func (s *Server) handleIncr(w http.ResponseWriter, r *http.Request) {
+	tenant := tenantFromContext(r.Context())
+	vars := mux.Vars(r)
+	key := vars["key"]
+
+	if key == "" {
+		http.Error(w, "missing key", http.StatusBadRequest)
+		return
+	}
+
+	// Lấy delta từ query param (mặc định là 1)
+	deltaStr := r.URL.Query().Get("delta")
+	var delta int64 = 1
+	if deltaStr != "" {
+		d, err := strconv.ParseInt(deltaStr, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid delta", http.StatusBadRequest)
+			return
+		}
+		delta = d
+	}
+
+	store := s.tenants.GetStore(tenant)
+
+	// Gọi xuống Engine (Hàm Incr bạn vừa thêm vào store.go)
+	newVal, err := store.Incr(key, delta)
+	if err != nil {
+		// Trả về lỗi nếu value cũ không phải là số integer
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Trả về giá trị mới dạng JSON
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]int64{
+		"value": newVal,
+	})
+}

@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
+	"fmt" // [SỬA] Thêm import
 	"hash/fnv"
 	"io"
 	"math/rand"
+	"strconv" // [SỬA] Thêm import
 	"sync"
 	"sync/atomic"
 	"time"
@@ -233,6 +235,97 @@ func (s *Store) Put(key string, value []byte, ttl time.Duration) {
 	if s.capacityBytes > 0 {
 		s.evictIfNeeded(s.hashToShardIndex(key))
 	}
+}
+
+// [SỬA] Incr tăng/giảm giá trị atomic cho key
+func (s *Store) Incr(key string, delta int64) (int64, error) {
+	if key == "" {
+		return 0, errors.New("missing key")
+	}
+
+	now := time.Now().UnixNano()
+	sh := s.getShard(key)
+	sh.mu.Lock()
+
+	var currentVal int64 = 0
+	var expireAt int64 = 0
+	var exists bool = false
+
+	// 1. Kiểm tra entry cũ
+	if elem, ok := sh.items[key]; ok {
+		ent := elem.Value.(*entry)
+		// Check expired
+		if ent.expireAt != 0 && now > ent.expireAt {
+			// Expired: treat as not exist
+			delete(sh.items, key)
+			sh.ll.Remove(elem)
+			sh.bytes -= int64(ent.size)
+			atomic.AddInt64(&s.totalBytesAtomic, -int64(ent.size))
+			exists = false
+		} else {
+			exists = true
+			expireAt = ent.expireAt
+			// Parse existing value
+			valStr := string(ent.value)
+			val, err := strconv.ParseInt(valStr, 10, 64)
+			if err != nil {
+				sh.mu.Unlock()
+				return 0, fmt.Errorf("value is not an integer")
+			}
+			currentVal = val
+
+			// Update LRU info
+			ent.lastAccess = now
+			atomic.AddUint64(&ent.accesses, 1)
+			sh.ll.MoveToFront(elem)
+		}
+	}
+
+	// 2. Tính toán giá trị mới
+	newVal := currentVal + delta
+	newValBytes := []byte(strconv.FormatInt(newVal, 10))
+	newSize := len(newValBytes)
+
+	// 3. Cập nhật Store
+	if exists {
+		elem := sh.items[key]
+		ent := elem.Value.(*entry)
+		oldSize := ent.size
+
+		ent.value = newValBytes
+		ent.size = newSize
+		// ent.expireAt giữ nguyên
+		sh.bytes += int64(newSize - oldSize)
+		atomic.AddInt64(&s.totalBytesAtomic, int64(newSize-oldSize))
+	} else {
+		// Tạo mới
+		ent := &entry{
+			key:        key,
+			value:      newValBytes,
+			size:       newSize,
+			expireAt:   expireAt, // 0 (permanent) nếu mới tạo
+			lastAccess: now,
+			accesses:   1,
+			createdAt:  now,
+		}
+		elem := sh.ll.PushFront(ent)
+		sh.items[key] = elem
+		sh.bytes += int64(newSize)
+		atomic.AddInt64(&s.totalBytesAtomic, int64(newSize))
+
+		if s.bloom != nil {
+			s.bloom.Add(key)
+		}
+	}
+
+	sh.mu.Unlock()
+
+	// 4. Eviction check (ngoài lock)
+	if s.capacityBytes > 0 {
+		s.evictIfNeeded(s.hashToShardIndex(key))
+	}
+
+	return newVal, nil
 }
 
 func (s *Store) PutAdaptive(key string, value []byte, baseTTL time.Duration) {

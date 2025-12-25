@@ -15,7 +15,8 @@ type Server struct {
 	tokenMaker    ports.TokenMaker
 	requireAuth   bool
 	router        *mux.Router
-	apiKeyHandler *APIKeyHandler // Thêm API_KEY Handler
+	apiKeyHandler *APIKeyHandler
+	apiKeyService ports.APIKeyService // expose service for middleware use
 }
 
 // NewServer creates a new API Server instance
@@ -24,7 +25,7 @@ func NewServer(
 	authHandler *AuthHandler,
 	tokenMaker ports.TokenMaker,
 	requireAuth bool,
-	apiKeyService ports.APIKeyService, // Sửa thành ports.APIKeyService (interface)
+	apiKeyService ports.APIKeyService,
 ) *Server {
 	apiKeyHandler := NewAPIKeyHandler(apiKeyService) // Khởi tạo APIKeyHandler
 
@@ -35,6 +36,7 @@ func NewServer(
 		requireAuth:   requireAuth,
 		router:        mux.NewRouter(),
 		apiKeyHandler: apiKeyHandler,
+		apiKeyService: apiKeyService,
 	}
 
 	s.setupRoutes()

@@ -1,45 +1,52 @@
 "use client";
 
 import React, { useCallback, useEffect, useState } from "react";
-import keyService, { Key as RawKey } from "@/services/keyService";
+import keyService, { KeyPublic, CreateRotateResp } from "@/services/keyService";
 import { formatDbTimestamp } from "@/utils/dateUtils";
 import "remixicon/fonts/remixicon.css";
 
-type Key = RawKey & {
-    secret?: string | null;
+type ListKey = KeyPublic & {
+    // frontend won't persist secret in list
+    secret?: never;
+    name?: string;
+    description?: string;
 };
 
 export default function ApiKeyPage() {
-    const [keys, setKeys] = useState<Key[]>([]);
+    const [keys, setKeys] = useState<ListKey[]>([]);
     const [loading, setLoading] = useState(false);
     const [opLoading, setOpLoading] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
 
-    // Create & Validate States
+    // Create states
     const [showCreate, setShowCreate] = useState(false);
     const [createName, setCreateName] = useState("");
     const [createDescription, setCreateDescription] = useState("");
     const [createdSecret, setCreatedSecret] = useState<string | null>(null);
+    const [createdKeyId, setCreatedKeyId] = useState<string | null>(null);
 
+    // Validate
     const [validateInput, setValidateInput] = useState("");
-    const [validateResult, setValidateResult] = useState<{ valid: boolean, msg: string } | null>(null);
-
-    // Reveal map
-    const [revealed, setRevealed] = useState<Record<string, boolean>>({});
+    const [validateResult, setValidateResult] = useState<{ valid: boolean; msg: string } | null>(null);
 
     const fetchKeys = useCallback(async () => {
         setLoading(true);
+        setError(null);
         try {
             const res = await keyService.listKeys();
-            const respKeys: Key[] = (res.keys || []).map((k: any) => ({
-                id: k.id ?? k.ID ?? k.keyId,
-                name: k.name ?? k.label ?? "Untitled",
-                description: k.description ?? k.desc ?? "",
-                createdAt: k.createdAt ?? k.created_at ?? k.created,
-                updatedAt: k.updatedAt ?? k.updated_at ?? k.updated,
-                secret: k.secret ?? k.key ?? undefined,
+            const raw = (res?.keys ?? []) as any[];
+            const mapped: ListKey[] = raw.map((k) => ({
+                id: k.id ?? k.ID ?? k.keyId ?? "",
+                tenantId: k.tenant_id ?? k.tenantId ?? undefined,
+                createdAt: k.created_at ?? k.createdAt ?? k.created ?? undefined,
+                updatedAt: k.updated_at ?? k.updatedAt ?? k.updated ?? undefined,
+                expiresAt: k.expires_at ?? k.expiresAt ?? undefined,
+                isActive: typeof k.is_active !== "undefined" ? Boolean(k.is_active) : typeof k.isActive !== "undefined" ? Boolean(k.isActive) : undefined,
+                secretShown: typeof k.secret_shown !== "undefined" ? Boolean(k.secret_shown) : typeof k.secretShown !== "undefined" ? Boolean(k.secretShown) : undefined,
+                name: k.name ?? k.label ?? undefined,
+                description: k.description ?? k.desc ?? undefined,
             }));
-            setKeys(respKeys);
+            setKeys(mapped);
         } catch (err: any) {
             setError(err?.message || "Failed to load keys");
         } finally {
@@ -47,38 +54,50 @@ export default function ApiKeyPage() {
         }
     }, []);
 
-    useEffect(() => { fetchKeys(); }, [fetchKeys]);
+    useEffect(() => {
+        fetchKeys();
+    }, [fetchKeys]);
 
-    const handleCreate = async (e: React.FormEvent) => {
-        e.preventDefault();
+    const handleCreate = async (e?: React.FormEvent) => {
+        e?.preventDefault();
         if (!createName.trim()) return;
         setOpLoading("create");
+        setError(null);
         setCreatedSecret(null);
+        setCreatedKeyId(null);
+
         try {
-            const res = await keyService.createKey({
+            const res = (await keyService.createKey({
                 name: createName.trim(),
                 description: createDescription.trim() || undefined,
-            });
+            })) as CreateRotateResp;
 
-            // Ép kiểu any để tránh lỗi TS khi truy cập các field không có trong type (fallback)
-            const resAny = res as any;
-            const newKeyRaw: any = res.key || resAny;
+            // Normalize secret and key id (createKey returns normalized shape)
+            const keyId = res.key_id ?? (res.key && res.key.id) ?? undefined;
+            const secret = res.secret ?? (res.key && (res.key.secret ?? (res.key as any).key)) ?? undefined;
 
-            const normalized: Key = {
-                id: newKeyRaw.id ?? newKeyRaw.ID,
-                name: newKeyRaw.name ?? createName,
-                description: newKeyRaw.description ?? createDescription,
+            // Add new item to list (metadata only)
+            const newItem: ListKey = {
+                id: keyId ?? `temp-${Date.now()}`,
+                name: createName.trim(),
+                description: createDescription.trim() || undefined,
                 createdAt: new Date().toISOString(),
-                // Fix: Thêm check newKeyRaw.key (theo keyService) và resAny.secret
-                secret: resAny.secret ?? newKeyRaw.key ?? newKeyRaw.secret ?? null,
+                // do not store secret in list
             };
-            setKeys((prev) => [normalized, ...prev]);
+            setKeys((prev) => [newItem, ...prev]);
 
-            // Show result
-            if (normalized.secret) {
-                setCreatedSecret(normalized.secret);
-                setRevealed(s => ({ ...s, [normalized.id]: true }));
+            if (secret) {
+                setCreatedSecret(secret);
+                setCreatedKeyId(keyId ?? null);
+                // try to copy automatically, ignore errors
+                try {
+                    await navigator.clipboard.writeText(secret);
+                } catch {
+                    // ignore
+                }
             }
+
+            // reset create form
             setShowCreate(false);
             setCreateName("");
             setCreateDescription("");
@@ -92,68 +111,77 @@ export default function ApiKeyPage() {
     const handleRotate = async (keyId: string) => {
         if (!confirm("Rotate this key? The old secret will stop working immediately.")) return;
         setOpLoading(keyId);
+        setError(null);
         try {
-            const res = await keyService.rotateKey({ keyId });
-            const resAny = res as any; // Ép kiểu để TS không bắt lỗi
+            const res = (await keyService.rotateKey({ keyId })) as CreateRotateResp;
+            const secret = res.secret ?? (res.key && (res.key.secret ?? (res.key as any).key)) ?? undefined;
 
-            // Fix: Ưu tiên lấy từ .key (theo định nghĩa service) hoặc fallback sang .secret
-            const newSecret = resAny.secret ?? res.key?.key ?? resAny.key?.secret;
+            // update updatedAt
+            setKeys((prev) => prev.map((k) => (k.id === keyId ? { ...k, updatedAt: new Date().toISOString() } : k)));
 
-            setKeys(prev => prev.map(k => k.id === keyId ? {
-                ...k,
-                secret: newSecret,
-                updatedAt: new Date().toISOString()
-            } : k));
-
-            if (newSecret) {
-                setRevealed(s => ({ ...s, [keyId]: true }));
-                await navigator.clipboard.writeText(newSecret);
-                alert("New secret copied to clipboard!");
+            if (secret) {
+                setCreatedSecret(secret);
+                setCreatedKeyId(keyId);
+                try {
+                    await navigator.clipboard.writeText(secret);
+                } catch {
+                    // ignore
+                }
+                // notify user
+                alert("New secret generated — it is shown once in the banner. Please copy it now.");
             }
         } catch (err: any) {
-            alert(err?.message || "Failed to rotate");
+            alert(err?.message || "Failed to rotate key");
         } finally {
             setOpLoading(null);
         }
     };
 
     const handleDelete = async (keyId: string) => {
-        if (!confirm("Delete this key permanently?")) return;
+        if (!confirm("Delete this key? This will deactivate it.")) return;
         setOpLoading(keyId);
+        setError(null);
         try {
             await keyService.deleteKey(keyId);
-            setKeys(prev => prev.filter(k => k.id !== keyId));
+            setKeys((prev) => prev.filter((k) => k.id !== keyId));
         } catch (err: any) {
-            alert(err?.message || "Failed to delete");
+            alert(err?.message || "Failed to delete key");
         } finally {
             setOpLoading(null);
         }
     };
 
     const handleCopy = (text: string) => {
-        navigator.clipboard.writeText(text).then(() => {
-            // Optional: Toast notification here
+        navigator.clipboard.writeText(text).catch(() => {
+            // ignore
         });
     };
 
-    const handleValidate = async (e: React.FormEvent) => {
-        e.preventDefault();
+    const handleValidate = async (e?: React.FormEvent) => {
+        e?.preventDefault();
         if (!validateInput.trim()) return;
         setOpLoading("validate");
+        setValidateResult(null);
         try {
-            const res = await keyService.validateKey({ key: validateInput.trim() });
-            const valid = (res as any).valid ?? (res as any).is_valid ?? false;
+            const res = await keyService.validateKey({ key: validateInput.trim() }); const valid = !!res.valid;
             setValidateResult({ valid, msg: valid ? "Valid API Key" : "Invalid API Key" });
         } catch (err: any) {
-            setValidateResult({ valid: false, msg: err?.message || "Validation Error" });
+            setValidateResult({ valid: false, msg: err?.message || "Validation error" });
         } finally {
             setOpLoading(null);
         }
     };
 
+    const acknowledgeSecret = () => {
+        // user confirmed they copied the one-time secret; hide banner
+        setCreatedSecret(null);
+        setCreatedKeyId(null);
+        // optional: call ack endpoint if implemented
+        // if (createdKeyId) keyService.ackSecretShown({ keyId: createdKeyId }).catch(()=>{/*ignore*/});
+    };
+
     return (
         <div className="max-w-5xl mx-auto py-8 px-4">
-            {/* Header */}
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
                 <div>
                     <h1 className="text-2xl font-bold text-gray-900 dark:text-white">API Keys</h1>
@@ -167,82 +195,77 @@ export default function ApiKeyPage() {
                 </button>
             </div>
 
-            {error && <div className="mb-6 p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100">{error}</div>}
+            {error && (
+                <div className="mb-6 p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100">{error}</div>
+            )}
 
-            {/* Created Success Alert */}
+            {/* One-time secret banner */}
             {createdSecret && (
                 <div className="mb-6 p-4 bg-green-50 dark:bg-green-900/20 border border-green-100 dark:border-green-800 rounded-lg">
                     <div className="flex items-center justify-between mb-2">
-                        <span className="text-sm font-bold text-green-800 dark:text-green-300">Key Created Successfully</span>
-                        <button onClick={() => handleCopy(createdSecret)} className="text-xs bg-white dark:bg-black px-2 py-1 rounded border shadow-sm hover:bg-gray-50">Copy Secret</button>
+                        <span className="text-sm font-bold text-green-800 dark:text-green-300">Your API Key (shown once)</span>
+                        <div className="flex items-center gap-2">
+                            <button
+                                onClick={() => handleCopy(createdSecret)}
+                                className="text-xs bg-white dark:bg-black px-2 py-1 rounded border shadow-sm hover:bg-gray-50"
+                            >
+                                Copy
+                            </button>
+                            <button onClick={acknowledgeSecret} className="text-xs px-2 py-1 rounded border shadow-sm hover:bg-gray-50">
+                                I copied it
+                            </button>
+                        </div>
                     </div>
                     <div className="font-mono text-xs text-green-900 dark:text-green-100 break-all bg-white/50 dark:bg-black/20 p-2 rounded">
                         {createdSecret}
                     </div>
-                    <p className="text-xs text-green-700 mt-2">Make sure to copy this now. You won't be able to see it again.</p>
+                    <p className="text-xs text-green-700 mt-2">This secret is shown only once. Store it securely — it will not be visible again.</p>
                 </div>
             )}
 
-            {/* Key List Table */}
+            {/* List */}
             <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-xl shadow-sm overflow-hidden">
                 <div className="overflow-x-auto">
                     <table className="w-full text-left text-sm">
                         <thead className="bg-gray-50 dark:bg-gray-800/50 border-b border-gray-100 dark:border-gray-800 text-gray-500 font-medium">
                             <tr>
                                 <th className="px-6 py-4 w-[35%]">Name & Identity</th>
-                                <th className="px-6 py-4 w-[40%]">Secret Key</th>
+                                <th className="px-6 py-4 w-[40%]">Secret</th>
                                 <th className="px-6 py-4 w-[15%]">Created</th>
                                 <th className="px-6 py-4 w-[10%] text-right">Actions</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
                             {loading ? (
-                                <tr><td colSpan={4} className="px-6 py-8 text-center text-gray-500">Loading...</td></tr>
+                                <tr>
+                                    <td colSpan={4} className="px-6 py-8 text-center text-gray-500">
+                                        Loading...
+                                    </td>
+                                </tr>
                             ) : keys.length === 0 ? (
-                                <tr><td colSpan={4} className="px-6 py-8 text-center text-gray-500">No keys found.</td></tr>
+                                <tr>
+                                    <td colSpan={4} className="px-6 py-8 text-center text-gray-500">
+                                        No keys found.
+                                    </td>
+                                </tr>
                             ) : (
                                 keys.map((k) => (
                                     <tr key={k.id} className="group hover:bg-gray-50/50 dark:hover:bg-gray-800/30 transition-colors">
                                         <td className="px-6 py-4 align-top">
-                                            <div className="font-semibold text-gray-900 dark:text-white">{k.name}</div>
-                                            {k.description && <div className="text-xs text-gray-500 truncate max-w-[200px]" title={k.description}>{k.description}</div>}
+                                            <div className="font-semibold text-gray-900 dark:text-white">{k.name ?? k.id}</div>
+                                            {k.description && (
+                                                <div className="text-xs text-gray-500 truncate max-w-[200px]" title={k.description}>
+                                                    {k.description}
+                                                </div>
+                                            )}
                                             <div className="mt-1 font-mono text-[10px] text-gray-400 select-all">ID: {k.id}</div>
                                         </td>
 
                                         <td className="px-6 py-4 align-middle">
-                                            {k.secret ? (
-                                                <div className="flex items-center gap-2 max-w-md">
-                                                    <div className="relative flex-1">
-                                                        <input
-                                                            readOnly
-                                                            type={revealed[k.id] ? "text" : "password"}
-                                                            value={k.secret}
-                                                            className="w-full bg-gray-50 dark:bg-gray-800 border-none rounded px-3 py-1.5 text-xs font-mono text-gray-600 dark:text-gray-300 focus:ring-0 cursor-default"
-                                                        />
-                                                    </div>
-                                                    <button
-                                                        onClick={() => setRevealed(s => ({ ...s, [k.id]: !s[k.id] }))}
-                                                        className="p-1.5 text-gray-400 hover:text-gray-600 transition-colors"
-                                                        title={revealed[k.id] ? "Hide" : "Show"}
-                                                    >
-                                                        <i className={revealed[k.id] ? "ri-eye-off-line" : "ri-eye-line"} />
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleCopy(k.secret!)}
-                                                        className="p-1.5 text-gray-400 hover:text-blue-600 transition-colors"
-                                                        title="Copy Secret"
-                                                    >
-                                                        <i className="ri-file-copy-line" />
-                                                    </button>
-                                                </div>
-                                            ) : (
-                                                <span className="text-xs text-gray-400 italic">Secret hidden (Rotate to regenerate)</span>
-                                            )}
+                                            <span className="text-xs text-gray-400 italic">Secret hidden (Rotate to regenerate)</span>
                                         </td>
 
-                                        <td className="px-6 py-4 align-middle text-gray-500 text-xs">
-                                            {formatDbTimestamp(k.createdAt, k.createdAt)}
-                                        </td>
+                                        <td className="px-6 py-4 align-middle text-gray-500 text-xs">{formatDbTimestamp(k.createdAt, k.createdAt)}</td>
 
                                         <td className="px-6 py-4 align-middle text-right">
                                             <div className="flex items-center justify-end gap-1">
@@ -252,7 +275,7 @@ export default function ApiKeyPage() {
                                                     className="p-2 rounded text-gray-400 hover:text-amber-600 hover:bg-amber-50 transition-all"
                                                     title="Rotate Key"
                                                 >
-                                                    <i className={`ri-refresh-line ${opLoading === k.id ? 'animate-spin text-amber-600' : ''}`} />
+                                                    <i className={`ri-refresh-line ${opLoading === k.id ? "animate-spin text-amber-600" : ""}`} />
                                                 </button>
                                                 <button
                                                     onClick={() => handleDelete(k.id)}
@@ -272,7 +295,7 @@ export default function ApiKeyPage() {
                 </div>
             </div>
 
-            {/* Compact Validate Section */}
+            {/* Validate */}
             <div className="mt-8 max-w-2xl">
                 <details className="group text-sm text-gray-500">
                     <summary className="cursor-pointer hover:text-gray-700 font-medium select-none list-none flex items-center gap-2">
@@ -283,7 +306,10 @@ export default function ApiKeyPage() {
                         <form onSubmit={handleValidate} className="flex gap-2 items-center">
                             <input
                                 value={validateInput}
-                                onChange={(e) => { setValidateInput(e.target.value); setValidateResult(null); }}
+                                onChange={(e) => {
+                                    setValidateInput(e.target.value);
+                                    setValidateResult(null);
+                                }}
                                 className="flex-1 px-3 py-2 rounded border border-gray-200 dark:border-gray-800 bg-transparent text-sm"
                                 placeholder="Paste key to check validity..."
                             />
@@ -292,7 +318,7 @@ export default function ApiKeyPage() {
                             </button>
                         </form>
                         {validateResult && (
-                            <div className={`mt-2 text-xs font-medium ${validateResult.valid ? 'text-green-600' : 'text-red-600'}`}>
+                            <div className={`mt-2 text-xs font-medium ${validateResult.valid ? "text-green-600" : "text-red-600"}`}>
                                 {validateResult.valid ? <i className="ri-checkbox-circle-fill mr-1" /> : <i className="ri-close-circle-fill mr-1" />}
                                 {validateResult.msg}
                             </div>
@@ -301,7 +327,7 @@ export default function ApiKeyPage() {
                 </details>
             </div>
 
-            {/* Create Modal */}
+            {/* Create modal */}
             {showCreate && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
                     <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setShowCreate(false)} />
@@ -310,14 +336,27 @@ export default function ApiKeyPage() {
                         <form onSubmit={handleCreate} className="space-y-4">
                             <div>
                                 <label className="block text-xs font-medium text-gray-700 mb-1">Name</label>
-                                <input autoFocus value={createName} onChange={e => setCreateName(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm focus:ring-2 focus:ring-black focus:border-transparent outline-none" placeholder="e.g. Production Service" />
+                                <input
+                                    autoFocus
+                                    value={createName}
+                                    onChange={(e) => setCreateName(e.target.value)}
+                                    className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm focus:ring-2 focus:ring-black focus:border-transparent outline-none"
+                                    placeholder="e.g. Production Service"
+                                />
                             </div>
                             <div>
                                 <label className="block text-xs font-medium text-gray-700 mb-1">Description</label>
-                                <textarea value={createDescription} onChange={e => setCreateDescription(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm focus:ring-2 focus:ring-black outline-none h-20 resize-none" placeholder="Optional description..." />
+                                <textarea
+                                    value={createDescription}
+                                    onChange={(e) => setCreateDescription(e.target.value)}
+                                    className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-700 text-sm focus:ring-2 focus:ring-black outline-none h-20 resize-none"
+                                    placeholder="Optional description..."
+                                />
                             </div>
                             <div className="flex justify-end gap-2 mt-6">
-                                <button type="button" onClick={() => setShowCreate(false)} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">Cancel</button>
+                                <button type="button" onClick={() => setShowCreate(false)} className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded-lg">
+                                    Cancel
+                                </button>
                                 <button type="submit" disabled={!createName.trim() || opLoading === "create"} className="px-4 py-2 text-sm bg-black text-white rounded-lg hover:bg-gray-800 disabled:opacity-50">
                                     {opLoading === "create" ? "Creating..." : "Create Key"}
                                 </button>

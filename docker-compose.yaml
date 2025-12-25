@@ -1,77 +1,52 @@
 version: '3.8'
 
-networks:
-  pomai-net:
-    driver: bridge
-    external: true
-
 services:
-  cache-service:
-    image: ghcr.io/autocookies/the_pomegranate/pomai-cache:latest
-    container_name: pomai-cache
-    restart: unless-stopped
-    networks:
-      - pomai-net
+  # 1. Ứng dụng Pomai Cache
+  server:
+    build: .
+    container_name: pomai_server
+    restart: always
     ports:
-      - "8080:8080" # Expose ra ngoài để Nginx Proxy Manager có thể trỏ vào
+      - "8080:8080"
+    env_file:
+      - .env
     environment:
-      # Server config
-      - PORT=8080
-      - GRACEFUL_SHUTDOWN_SEC=10
-
-      # Cache config
-      - CACHE_SHARDS=32
-      - PER_TENANT_CAPACITY_BYTES=104857600 # 100MB per user
-      - CLEANUP_INTERVAL_SEC=60
-
-      # Adaptive TTL
-      - ENABLE_ADAPTIVE_TTL=true
-      - ADAPTIVE_MIN_TTL=1m
-      - ADAPTIVE_MAX_TTL=1h
-
-      # Bloom Filter
-      - ENABLE_BLOOM_FILTER=true
-      - BLOOM_SIZE=10000000 # 10M bits (~1.2MB)
-      - BLOOM_K=4
-
-      # Persistence
-      - PERSISTENCE_TYPE=file
-      - DATA_DIR=/data
-      - SNAPSHOT_INTERVAL=10m
-
-      # Write-Behind
-      - ENABLE_WRITE_BEHIND=true
-      - WRITE_BUFFER_SIZE=1000
-      - FLUSH_INTERVAL=5s
-
-      # Timezone
-      - TZ=Asia/Ho_Chi_Minh
-
+      # Ghi đè cấu hình để chạy trong môi trường Docker
+      - ENV=production
+      # [QUAN TRỌNG] Đổi localhost thành tên service 'postgres'
+      - POSTGRESQL_HOST=postgres://pomaicache_admin:Quanlatui777****@postgres:5432/pomaicache?sslmode=disable
+      # Trỏ đường dẫn lưu cache vào volume trong container
+      - DATA_DIR=/data/cache
+      # Config public url cho SDK discovery (nếu deploy thật hãy đổi thành domain thật)
+      - PUBLIC_URL=http://localhost:8080
     volumes:
-      - cache-data:/data
+      # Mount thư mục persist cache ra ngoài máy thật để không mất dữ liệu khi restart
+      - ./pomai_data:/data/cache
+    depends_on:
+      - postgres
 
+  # 2. Database PostgreSQL
+  postgres:
+    image: postgres:15-alpine
+    container_name: pomai_postgres
+    restart: always
+    environment:
+      # Lấy thông tin khớp với file .env của bạn
+      POSTGRES_USER: pomaicache_admin
+      POSTGRES_PASSWORD: Quanlatui777****
+      POSTGRES_DB: pomaicache
+    ports:
+      - "5432:5432"
+    volumes:
+      # Lưu dữ liệu DB bền vững
+      - postgres_data:/var/lib/postgresql/data
+      # Tự động chạy script tạo bảng khi khởi động lần đầu
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health" ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 256M
-        reservations:
-          cpus: '0.25'
-          memory: 128M
+      test: [ "CMD-SHELL", "pg_isready -U pomaicache_admin -d pomaicache" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
-  cache-data:
-    driver: local
+  postgres_data:

@@ -46,13 +46,17 @@ func (s *Server) setupRoutes() {
 	apiKeys.HandleFunc("/rotate", s.authMiddleware(s.apiKeyHandler.HandleRotate)).Methods("POST")
 
 	// Validate
-	apiKeys.HandleFunc("/validate", s.authMiddleware(s.apiKeyHandler.HandleValidate)).Methods("GET")
+	apiKeys.HandleFunc("/validate", s.apiKeyHandler.HandleValidate).Methods("GET")
+
+	// Discover Server URL by API Key
+	apiKeys.HandleFunc("/discover", s.apiKeyHandler.HandleDiscover).Methods("GET", "POST")
 
 	// --- CACHE ROUTES (Protected) ---
 	api.HandleFunc("/cache/{key}", s.authMiddleware(s.handlePut)).Methods("PUT")
 	api.HandleFunc("/cache/{key}", s.authMiddleware(s.handleGet)).Methods("GET")
 	api.HandleFunc("/cache/{key}", s.authMiddleware(s.handleDelete)).Methods("DELETE")
 	api.HandleFunc("/cache/{key}", s.authMiddleware(s.handleHead)).Methods("HEAD")
+	api.HandleFunc("/cache/{key}/incr", s.authMiddleware(s.handleIncr)).Methods("POST")
 
 	// Stats
 	api.HandleFunc("/stats", s.authMiddleware(s.handleStats)).Methods("GET")
@@ -60,50 +64,71 @@ func (s *Server) setupRoutes() {
 	s.router.HandleFunc("/health", s.handleHealth).Methods("GET")
 }
 
-// Middleware: authMiddleware xác thực JWT Token
+// Middleware: authMiddleware xác thực JWT Token hoặc API Key
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Dev mode: bypass auth and set default tenant/user
 		if !s.requireAuth {
-			// Nếu tắt auth mode (dev), cho qua với default user
 			ctx := context.WithValue(r.Context(), ctxTenantKey, "default")
 			ctx = context.WithValue(ctx, ctxUserIDKey, "default")
 			next(w, r.WithContext(ctx))
 			return
 		}
 
-		// 1. Lấy token từ Header hoặc Cookie
-		tokenString := ""
-
-		// 1a. Check Authorization Header (Bearer <token>)
-		authHeader := r.Header.Get("Authorization")
-		if len(authHeader) > 7 && strings.ToUpper(authHeader[:7]) == "BEARER " {
-			tokenString = authHeader[7:]
-		}
-
-		// 1b. Fallback: Check Cookie (nếu header không có)
-		if tokenString == "" {
-			cookie, err := r.Cookie("accessToken")
-			if err == nil {
-				tokenString = cookie.Value
+		// 1) Try API Key first
+		apiKeyHeader := ""
+		// header X-API-Key
+		if v := r.Header.Get("X-API-Key"); v != "" {
+			apiKeyHeader = strings.TrimSpace(v)
+		} else {
+			// Authorization: ApiKey <key>
+			auth := r.Header.Get("Authorization")
+			if len(auth) > 7 && strings.HasPrefix(strings.ToLower(auth), "apikey ") {
+				apiKeyHeader = strings.TrimSpace(auth[7:])
 			}
 		}
 
-		// 2. Nếu không tìm thấy token -> 401
+		if apiKeyHeader != "" {
+			// Validate API Key using APIKeyService
+			if s.apiKeyService != nil {
+				ok, tenantID, err := s.apiKeyService.ValidateAPIKey(apiKeyHeader)
+				if err == nil && ok {
+					// inject tenant and user (userID = tenantID by convention for API key)
+					ctx := context.WithValue(r.Context(), ctxTenantKey, tenantID)
+					ctx = context.WithValue(ctx, ctxUserIDKey, tenantID)
+					next(w, r.WithContext(ctx))
+					return
+				}
+				// invalid API key
+				http.Error(w, "unauthorized: invalid api key", http.StatusUnauthorized)
+				return
+			}
+			// if service not available, fall through to JWT (or reject)
+		}
+
+		// 2) Fallback: JWT (Bearer in Authorization header or accessToken cookie)
+		tokenString := ""
+		authHeader := r.Header.Get("Authorization")
+		if len(authHeader) >= 7 && strings.HasPrefix(strings.ToUpper(authHeader), "BEARER ") {
+			tokenString = authHeader[7:]
+		}
+		if tokenString == "" {
+			if c, err := r.Cookie("accessToken"); err == nil {
+				tokenString = c.Value
+			}
+		}
+
 		if tokenString == "" {
 			http.Error(w, "unauthorized: missing token", http.StatusUnauthorized)
 			return
 		}
 
-		// 3. Verify Token
 		payload, err := s.tokenMaker.VerifyToken(tokenString)
 		if err != nil {
 			http.Error(w, "unauthorized: invalid token", http.StatusUnauthorized)
 			return
 		}
 
-		// 4. Token ngon -> Nhét UserID vào Context
-		// ctxUserIDKey ("userID") để HandleMe dùng
-		// ctxTenantKey ("tenantID") để Cache Engine dùng (Logic: mỗi user là 1 tenant)
 		ctx := context.WithValue(r.Context(), ctxUserIDKey, payload.UserID)
 		ctx = context.WithValue(ctx, ctxTenantKey, payload.UserID)
 
