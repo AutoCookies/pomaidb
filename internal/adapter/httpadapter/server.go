@@ -51,30 +51,20 @@ func (s *Server) Router() http.Handler {
 
 func enableCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 1. Lấy Origin từ request của người dùng
 		origin := r.Header.Get("Origin")
 
-		// 2. Dynamic Reflection: Set lại đúng cái Origin đó vào Header trả về
-		// Điều này giúp vượt qua lỗi "Wildcard * not allowed with credentials"
+		// Lấy domain từ env (hoặc dùng reflection nhưng phải chuẩn)
 		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-		} else {
-			// Nếu không có Origin (ví dụ gọi từ SDK/Postman), thì để *
-			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 
-		// 3. [QUAN TRỌNG] Cho phép gửi kèm Credentials (Cookies, Auth Headers)
 		w.Header().Set("Access-Control-Allow-Credentials", "true")
-
-		// 4. Các Methods cho phép
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
-
-		// 5. Các Headers cho phép
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, Origin, Accept, X-Requested-With")
 
-		// 6. Xử lý Preflight (OPTIONS)
+		// QUAN TRỌNG: Với Preflight (OPTIONS), phải trả về 204 hoặc 200 và DỪNG LUÔN
 		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
