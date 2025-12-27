@@ -204,11 +204,9 @@ func main() {
 	// Truyền thêm apiKeyService vào NewServer
 	srv := httpadapter.NewServer(tenants, authHandler, tokenMaker, requireAuth, apiKeyService)
 
-	handlerWithCors := httpadapter.CorsMiddleware(srv.Router())
-
 	httpSrv := &http.Server{
 		Addr:         *addrFlag,
-		Handler:      handlerWithCors,
+		Handler:      srv.Router(),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
