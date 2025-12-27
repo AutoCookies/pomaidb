@@ -33,7 +33,7 @@ const PomaiCacheLanding = () => {
           <div className="hidden md:flex items-center gap-8 text-sm font-medium text-slate-600">
             <a href="#features" className="hover:text-[#4B8B8B] transition-colors">Features</a>
             <a href="#performance" className="hover:text-[#4B8B8B] transition-colors">Benchmarks</a>
-            <a href="#docs" className="hover:text-[#4B8B8B] transition-colors">Documentation</a>
+            <a href="/documents" className="hover:text-[#4B8B8B] transition-colors">Documentation</a>
           </div>
           <div className="flex items-center gap-4">
             <Link href="/signin" className="hidden md:block text-sm font-bold text-slate-700 hover:text-[#4B8B8B]">Sign In</Link>

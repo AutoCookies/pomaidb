@@ -13,5 +13,10 @@ export const MENU_LIST = [
         label: "Manage Keys",
         href: "/keys",
         icon: "ri-key-line",
+    },
+    {
+        label: "Documents",
+        href: "/documents",
+        icon: "ri-file-line",
     }
 ];
