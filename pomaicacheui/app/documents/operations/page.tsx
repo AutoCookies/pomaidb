@@ -42,24 +42,6 @@ const remaining = await client.ttl('user:101'); // -2 = missing, -1 = no TTL set
 console.log('TTL remaining:', remaining);
 `;
 
-const curlExamples = `# PUT (store)
-curl -X PUT "https://<base_url>/cache/greeting?ttl=60" \\
-  -H "X-API-Key: YOUR_API_KEY" --data "hello"
-
-# GET
-curl -H "X-API-Key: YOUR_API_KEY" "https://<base_url>/cache/greeting"
-
-# DELETE
-curl -X DELETE -H "X-API-Key: YOUR_API_KEY" "https://<base_url>/cache/greeting"
-
-# INCR
-curl -X POST -H "X-API-Key: YOUR_API_KEY" "https://<base_url>/cache/page:views:home/incr?delta=1"
-
-# HEAD (TTL)
-curl -I -H "X-API-Key: YOUR_API_KEY" "https://<base_url>/cache/user:101"
-# Look for header: X-Cache-TTL-Remaining
-`;
-
 export default function OperationsPage() {
     return (
         <div className="max-w-4xl mx-auto py-12 px-6">
@@ -171,18 +153,6 @@ export default function OperationsPage() {
                         <li>Keep API keys secret and rotate them if compromised.</li>
                     </ul>
                 </div>
-
-                {/* Curl / HTTP */}
-                <div className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm">
-                    <h2 className="text-xl font-semibold mb-3">Direct HTTP examples (curl)</h2>
-                    <p className="text-sm text-gray-600 dark:text-gray-300">
-                        If you call the HTTP API directly, include your API key in <code>X-API-Key</code> (and/or Authorization). Below are curl examples for common operations.
-                    </p>
-                    <pre className="mt-3 bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm overflow-x-auto">
-                        <code>{curlExamples}</code>
-                    </pre>
-                </div>
-
                 <div className="text-sm text-gray-500 dark:text-gray-400">
                     <p>
                         Need these broken down into separate pages (one file per operation) or want runnable playground examples? I can split each section into its own route/page with interactive code samples.

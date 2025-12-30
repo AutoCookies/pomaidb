@@ -2,124 +2,155 @@
 
 import React from "react";
 
-const nodeExample = `// Node.js (server)
+const nodeExample = `// Node.js (Server)
 import { PomaiClient } from '@autocookie/pomai-cache';
 
+// The SDK automatically handles server discovery using your API Key
 const client = new PomaiClient(process.env.POMAI_CACHE_KEY || 'YOUR_API_KEY');
 
 async function run() {
-  // Store a string with TTL 60s
+  // Store a string with a 60-second TTL
   await client.set('greeting', 'Hello Pomai!', { ttl: 60 });
 
-  // Retrieve it
+  // Retrieve the value
   const val = await client.get('greeting');
-  console.log('greeting =', val);
+  console.log('Value:', val);
 }
 
 run().catch(console.error);`;
 
-const browserExample = `// Browser (bundler / Deno / Workers)
-import { PomaiClient } from '@autocookie/pomai-cache';
+const goExample = `// Go (Golang)
+import (
+    "context"
+    "fmt"
+    "github.com/AutoCookies/pomai-sdk"
+)
 
-// Initialize with only your API key
-const client = new PomaiClient('YOUR_API_KEY');
+func main() {
+    ctx := context.Background()
+    
+    // Initialize the client with your API key
+    client, _ := sdk.New("YOUR_API_KEY")
 
-await client.set('session:user:1', { id: 1, name: 'Alice' }, { ttl: 300 });
-const user = await client.getJSON('session:user:1');
-console.log(user);`;
+    // Store a JSON object
+    user := User{ID: 101, Name: "AutoCookies"}
+    client.SetJSON(ctx, "user:101", user, 300)
 
-const curlExample = `# 1) (Optional) Discover base_url if you don't have it
-curl -s -H "X-API-Key: YOUR_API_KEY" "https://discovery.example.com/api-key/discover"
-
-# Response example:
-# { "base_url": "https://pomaicache-api.example.com/v1" }
-
-# 2) PUT value (once you know base_url)
-curl -X PUT "https://pomaicache-api.example.com/v1/cache/greeting?ttl=60" \\
-  -H "X-API-Key: YOUR_API_KEY" \\
-  --data "Hello via curl"
-
-# 3) GET value
-curl -H "X-API-Key: YOUR_API_KEY" "https://pomaicache-api.example.com/v1/cache/greeting"
-`;
+    // Atomic increment
+    newCount, _ := client.Incr(ctx, "page_views", 1)
+    fmt.Printf("Total Views: %d\\n", newCount)
+}`;
 
 export default function QuickstartPage() {
     return (
         <div className="max-w-4xl mx-auto py-12 px-6">
-            <header className="mb-8">
-                <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Quickstart — Connect to Pomai Cache</h1>
-                <p className="mt-3 text-gray-600 dark:text-gray-300">
-                    You only need your API key to use Pomai Cache. If your environment requires a discovery URL, provide it via config or the POMAI_DISCOVERY_URL environment variable; otherwise the SDK will use the default local discovery URL.
+            <header className="mb-12 border-b border-gray-200 dark:border-gray-700 pb-8">
+                <h1 className="text-4xl font-extrabold text-gray-900 dark:text-white tracking-tight">
+                    Quickstart Guide
+                </h1>
+                <p className="mt-4 text-lg text-gray-600 dark:text-gray-300">
+                    Connect to Pomai Cache in minutes. Our SDKs handle the complex routing and discovery logic for you automatically.
                 </p>
             </header>
 
-            <section className="space-y-6">
-                <div className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm">
-                    <h2 className="text-xl font-semibold mb-3">1. Install</h2>
-                    <p className="text-sm text-gray-600 dark:text-gray-300">
-                        Install the JS/TS package (example package name: <code>@autocookie/pomai-cache</code>).
-                    </p>
-                    <pre className="mt-3 bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm overflow-x-auto">
-                        <code>npm install @autocookie/pomai-cache</code>
-                    </pre>
-                </div>
+            <div className="grid grid-cols-1 gap-12">
+                {/* Step 1: Install */}
+                <section>
+                    <h2 className="text-2xl font-bold mb-4 flex items-center">
+                        <span className="bg-indigo-600 text-white rounded-full w-8 h-8 flex items-center justify-center mr-3 text-sm font-mono">1</span>
+                        Install SDK
+                    </h2>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-4">
+                        <div className="p-5 bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm">
+                            <h3 className="font-bold text-sm uppercase tracking-wider text-gray-500 mb-3">JavaScript / TypeScript</h3>
+                            <pre className="bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm font-mono text-indigo-600 dark:text-indigo-400">
+                                <code>npm install @autocookie/pomai-cache</code>
+                            </pre>
+                        </div>
+                        <div className="p-5 bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 shadow-sm">
+                            <h3 className="font-bold text-sm uppercase tracking-wider text-gray-500 mb-3">Go (Golang)</h3>
+                            <pre className="bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm font-mono text-teal-600 dark:text-teal-400">
+                                <code>go get github.com/AutoCookies/pomai-sdk</code>
+                            </pre>
+                        </div>
+                    </div>
+                </section>
 
-                <div className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm">
-                    <h2 className="text-xl font-semibold mb-3">2. Configure your API key</h2>
-                    <p className="text-sm text-gray-600 dark:text-gray-300">
-                        Store your API key in an environment variable (or provide it directly when initializing the SDK in a secure environment).
+                {/* Step 2: API Key */}
+                <section>
+                    <h2 className="text-2xl font-bold mb-4 flex items-center">
+                        <span className="bg-indigo-600 text-white rounded-full w-8 h-8 flex items-center justify-center mr-3 text-sm font-mono">2</span>
+                        Configure API Key
+                    </h2>
+                    <p className="text-gray-600 dark:text-gray-300 mb-4">
+                        We recommend storing your API key in an environment variable for security.
                     </p>
-                    <pre className="mt-3 bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm overflow-x-auto">
-                        <code>POMAI_CACHE_KEY=your_full_api_key_here</code>
-                    </pre>
-                </div>
+                    <div className="relative group">
+                        <pre className="bg-gray-100 dark:bg-gray-900 p-4 rounded-lg text-sm font-mono border dark:border-gray-700">
+                            <code>POMAI_CACHE_KEY=your_key_id.your_secret_key</code>
+                        </pre>
+                    </div>
+                </section>
 
-                <div className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm">
-                    <h2 className="text-xl font-semibold mb-3">3. Quick example — Node.js</h2>
-                    <p className="text-sm text-gray-600 dark:text-gray-300">
-                        Initialize the client with your API key. If you need to override discovery behavior, pass <code>{`{ discoveryUrl: 'https://...' }`}</code> in the constructor or set <code>POMAI_DISCOVERY_URL</code>.
-                    </p>
-                    <pre className="mt-3 bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm overflow-x-auto">
-                        <code>{nodeExample}</code>
-                    </pre>
-                </div>
+                {/* Step 3: Implementation */}
+                <section className="space-y-10">
+                    <h2 className="text-2xl font-bold mb-4 flex items-center">
+                        <span className="bg-indigo-600 text-white rounded-full w-8 h-8 flex items-center justify-center mr-3 text-sm font-mono">3</span>
+                        Usage Examples
+                    </h2>
 
-                <div className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm">
-                    <h2 className="text-xl font-semibold mb-3">4. Example — Browser / Edge environments</h2>
-                    <p className="text-sm text-gray-600 dark:text-gray-300">
-                        The same SDK works in browsers, Workers, Deno, and other JS runtimes. Initialize with your API key.
-                    </p>
-                    <pre className="mt-3 bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm overflow-x-auto">
-                        <code>{browserExample}</code>
-                    </pre>
-                </div>
+                    {/* Node.js Block */}
+                    <div className="space-y-3">
+                        <div className="flex justify-between items-center">
+                            <h3 className="text-lg font-semibold text-indigo-500 tracking-wide"># Node.js & TypeScript</h3>
+                        </div>
+                        <div className="rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700">
+                            <pre className="bg-gray-50 dark:bg-gray-900 p-5 text-sm leading-relaxed overflow-x-auto">
+                                <code>{nodeExample}</code>
+                            </pre>
+                        </div>
+                    </div>
 
-                <div className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm">
-                    <h2 className="text-xl font-semibold mb-3">5. Example — curl (HTTP)</h2>
-                    <p className="text-sm text-gray-600 dark:text-gray-300">
-                        To call the HTTP API directly, you can optionally query the discovery endpoint to obtain the base_url, then perform PUT/GET requests.
-                    </p>
-                    <pre className="mt-3 bg-gray-100 dark:bg-gray-900 p-3 rounded text-sm overflow-x-auto">
-                        <code>{curlExample}</code>
-                    </pre>
-                </div>
+                    {/* Go Block */}
+                    <div className="space-y-3">
+                        <div className="flex justify-between items-center">
+                            <h3 className="text-lg font-semibold text-teal-500 tracking-wide"># Go (Golang)</h3>
+                        </div>
+                        <div className="rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700">
+                            <pre className="bg-gray-50 dark:bg-gray-900 p-5 text-sm leading-relaxed overflow-x-auto">
+                                <code>{goExample}</code>
+                            </pre>
+                        </div>
+                    </div>
+                </section>
 
-                <div className="p-6 bg-white dark:bg-gray-800 rounded-lg shadow-sm text-sm text-gray-600 dark:text-gray-300">
-                    <h3 className="font-semibold mb-2">Important notes</h3>
-                    <ul className="list-disc list-inside space-y-1">
-                        <li>You only need to provide your API key to initialize the SDK in most setups.</li>
-                        <li>If your deployment requires a specific discovery URL, set the <code>POMAI_DISCOVERY_URL</code> environment variable or pass <code>discoveryUrl</code> in the client config.</li>
-                        <li>The SDK can cache a discovered base_url in localStorage (when available) to reduce repeated discovery calls.</li>
-                        <li>Keep your API key secret — do not commit it to public repositories. Use environment variables or a secret manager.</li>
+                {/* Security and Best Practices */}
+                <section className="p-8 bg-indigo-50 dark:bg-indigo-900/20 rounded-2xl border border-indigo-100 dark:border-indigo-900/30">
+                    <h3 className="text-indigo-800 dark:text-indigo-300 font-bold text-lg mb-4 flex items-center">
+                        Security Best Practices
+                    </h3>
+                    <ul className="space-y-3 text-indigo-900/80 dark:text-indigo-200/80">
+                        <li className="flex items-start">
+                            <span className="mr-2">•</span>
+                            <span><strong>Zero-Config:</strong> You only need the API Key. The SDK automatically resolves the correct server nodes for your tenant.</span>
+                        </li>
+                        <li className="flex items-start">
+                            <span className="mr-2">•</span>
+                            <span><strong>Server-Side Only:</strong> Never expose your secret key in client-side code that is visible to users. Use environment variables or secret managers.</span>
+                        </li>
+                        <li className="flex items-start">
+                            <span className="mr-2">•</span>
+                            <span><strong>Automatic Optimization:</strong> The SDK caches server locations in <code>localStorage</code> (Browser) or <code>TempDir</code> (Go) to minimize discovery overhead.</span>
+                        </li>
                     </ul>
-                </div>
+                </section>
+            </div>
 
-                <div className="text-sm text-gray-500 dark:text-gray-400">
-                    <p>
-                        Want examples for Go or more advanced patterns (TTL management, counters)? I can add a "Next steps" section using your provided main.go sample.
-                    </p>
-                </div>
-            </section>
+            <footer className="mt-20 pt-10 border-t border-gray-200 dark:border-gray-700 text-center text-gray-500 dark:text-gray-400 text-sm">
+                <p>
+                    Need help? View the <a href="#" className="text-indigo-600 dark:text-indigo-400 font-medium hover:underline">Full Documentation</a> or <a href="#" className="text-indigo-600 dark:text-indigo-400 font-medium hover:underline">Contact Support</a>.
+                </p>
+            </footer>
         </div>
     );
 }
