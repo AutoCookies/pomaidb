@@ -3,7 +3,7 @@
 .github
 *. md
 .gitignore
-. env*
+.env*
 
 # Build artifacts
 cache-server
