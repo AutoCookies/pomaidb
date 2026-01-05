@@ -2,12 +2,13 @@
 package replication
 
 import (
+	"encoding/gob"
 	"errors"
 	"net"
 	"sync"
 	"time"
 
-	"encoding/gob"
+	"github.com/AutoCookies/pomai-cache/internal/engine/core"
 )
 
 // Errors
@@ -156,16 +157,10 @@ type ReplicationStats struct {
 	DownPeers        int
 }
 
-// StoreInterface defines required store methods
-type StoreInterface interface {
-	Put(key string, value []byte, ttl time.Duration) error
-	Delete(key string)
-	Incr(key string, delta int64) (int64, error)
-}
-
 // TenantManagerInterface defines tenant operations
+// FIX: Trả về *core.Store cụ thể để khớp với implementation của tenants.Manager
 type TenantManagerInterface interface {
-	GetStore(tenantID string) StoreInterface
+	GetStore(tenantID string) *core.Store
 }
 
 // AckMessage represents acknowledgment from peer

@@ -1,36 +1,36 @@
-// File: internal/engine/ttl/manager.go
 package ttl
 
 import (
+	"context"
 	"time"
 )
 
-// Manager handles TTL operations
 type Manager struct {
-	store StoreInterface
+	store   StoreInterface
+	cleaner *PPPCleaner
 }
 
-// NewManager creates TTL manager
 func NewManager(store StoreInterface) *Manager {
-	return &Manager{store: store}
+	m := &Manager{
+		store: store,
+	}
+
+	m.cleaner = NewPPPCleaner(m, store)
+	return m
 }
 
-// TTLRemaining checks remaining TTL for a key
+func (m *Manager) Start(ctx context.Context) {
+	m.cleaner.Start(ctx)
+}
+
 func (m *Manager) TTLRemaining(key string) (time.Duration, bool) {
 	if key == "" {
 		return 0, false
 	}
 
-	// Fast-path:  Check bloom filter
-	bloom := m.store.GetBloomFilter()
-	if bloom != nil && !bloom.MayContain(key) {
-		return 0, false
-	}
-
 	shard := m.store.GetShard(key)
-
-	// Quick check with read lock
 	shard.RLock()
+
 	items := shard.GetItems()
 	elem, ok := items[key]
 	if !ok {
@@ -44,74 +44,40 @@ func (m *Manager) TTLRemaining(key string) (time.Duration, bool) {
 		return 0, false
 	}
 
-	// No TTL (permanent)
-	if entry.ExpireAt() == 0 {
+	exp := entry.ExpireAt()
+	if exp == 0 {
 		shard.RUnlock()
 		return 0, true
 	}
 
-	remain := time.Until(time.Unix(0, entry.ExpireAt()))
-	shard.RUnlock()
-
-	// Lazy delete if expired
-	if remain <= 0 {
-		m.DeleteExpired(key)
+	now := time.Now().UnixNano()
+	if now > exp {
+		shard.RUnlock()
+		go m.deleteAsync(key)
 		return 0, false
 	}
 
-	return remain, true
+	shard.RUnlock()
+	return time.Duration(exp - now), true
 }
 
-// DeleteExpired deletes key if expired (with double-check locking)
-func (m *Manager) DeleteExpired(key string) bool {
+func (m *Manager) deleteAsync(key string) {
 	shard := m.store.GetShard(key)
 	shard.Lock()
 	defer shard.Unlock()
 
-	// Double-check:  verify key still exists and is expired
-	items := shard.GetItems()
-	elem, ok := items[key]
-	if !ok {
-		return false
+	if size, ok := shard.DeleteItem(key); ok {
+		shard.AddBytes(-int64(size))
+		m.store.AddTotalBytes(-int64(size))
+		if mc := m.store.GetGlobalMemCtrl(); mc != nil {
+			mc.Release(int64(size))
+		}
 	}
-
-	entry := extractEntry(elem)
-	if entry == nil {
-		return false
-	}
-
-	if entry.ExpireAt() == 0 {
-		return false // No expiration
-	}
-
-	if time.Now().UnixNano() <= entry.ExpireAt() {
-		return false // Not expired yet
-	}
-
-	// Delete
-	size, deleted := shard.DeleteItem(key)
-	if !deleted {
-		return false
-	}
-
-	// Update metrics
-	shard.AddBytes(-int64(size))
-	m.store.AddTotalBytes(-int64(size))
-
-	// Release memory
-	if memCtrl := m.store.GetGlobalMemCtrl(); memCtrl != nil {
-		memCtrl.Release(int64(size))
-	}
-
-	return true
 }
 
-// Helper:   Extract entry from interface
 func extractEntry(elem interface{}) EntryInterface {
 	if entry, ok := elem.(EntryInterface); ok {
 		return entry
 	}
-	// Handle container/list. Element wrapping
-	// This assumes elem might be *list.Element containing EntryInterface
 	return nil
 }

@@ -1,4 +1,3 @@
-// File: internal/transport/tcp/protocol.go
 package tcp
 
 import (
@@ -9,16 +8,11 @@ import (
 	"sync"
 )
 
-// ============================================================================
-// PROTOCOL CONSTANTS
-// ============================================================================
-
 const (
 	MagicByte = 'P'
 	Version   = 1
 )
 
-// Opcodes
 const (
 	OpSet    = 1
 	OpGet    = 2
@@ -52,9 +46,28 @@ const (
 	OpZRank  = 53
 	OpZRange = 54
 	OpZCard  = 55
+
+	OpHSet    = 60
+	OpHGet    = 61
+	OpHDel    = 62
+	OpHExists = 63
+	OpHGetAll = 64
+	OpHIncrBy = 65
+
+	OpPICAppend = 70
+	OpPICGet    = 71
+
+	OpMatrixSet  = 80
+	OpMatrixGet  = 81
+	OpMatrixAdd  = 82
+	OpMatrixMult = 83
+
+	OpClusterNodes = 90
+
+	OpPLGAddEdge = 100
+	OpPLGExtract = 101
 )
 
-// Status codes
 const (
 	StatusOK             = 0
 	StatusKeyNotFound    = 1
@@ -65,10 +78,6 @@ const (
 )
 
 const HeaderSize = 8
-
-// ============================================================================
-// BUFFER POOLS
-// ============================================================================
 
 var (
 	smallBufferPool = sync.Pool{
@@ -91,18 +100,12 @@ var (
 	}
 )
 
-// ============================================================================
-// PACKET STRUCTURE
-// ============================================================================
-
-// Packet represents a protocol packet
 type Packet struct {
 	Opcode uint8
 	Key    string
 	Value  []byte
 }
 
-// String returns string representation of opcode
 func (p *Packet) OpcodeString() string {
 	switch p.Opcode {
 	case OpSet:
@@ -121,16 +124,27 @@ func (p *Packet) OpcodeString() string {
 		return "EXISTS"
 	case OpStats:
 		return "STATS"
+	case OpHSet:
+		return "HSET"
+	case OpHGet:
+		return "HGET"
+	case OpHDel:
+		return "HDEL"
+	case OpHExists:
+		return "HEXISTS"
+	case OpHGetAll:
+		return "HGETALL"
+	case OpHIncrBy:
+		return "HINCRBY"
+	case OpPLGAddEdge:
+		return "PLG_ADD"
+	case OpPLGExtract:
+		return "PLG_EXTRACT"
 	default:
 		return "UNKNOWN"
 	}
 }
 
-// ============================================================================
-// BUFFERED CONNECTION
-// ============================================================================
-
-// BufferedConn wraps a connection with buffered I/O
 type BufferedConn struct {
 	conn   net.Conn
 	reader *bufio.Reader
@@ -139,7 +153,6 @@ type BufferedConn struct {
 	rmu    sync.Mutex
 }
 
-// NewBufferedConn creates a new buffered connection
 func NewBufferedConn(conn net.Conn) *BufferedConn {
 	return &BufferedConn{
 		conn:   conn,
@@ -148,7 +161,6 @@ func NewBufferedConn(conn net.Conn) *BufferedConn {
 	}
 }
 
-// WritePacket writes a packet to the connection
 func (bc *BufferedConn) WritePacket(op uint8, key string, value []byte) error {
 	bc.wmu.Lock()
 	defer bc.wmu.Unlock()
@@ -187,7 +199,6 @@ func (bc *BufferedConn) WritePacket(op uint8, key string, value []byte) error {
 	return bc.writer.Flush()
 }
 
-// ReadPacket reads a packet from the connection
 func (bc *BufferedConn) ReadPacket() (Packet, error) {
 	bc.rmu.Lock()
 	defer bc.rmu.Unlock()
@@ -239,16 +250,10 @@ func (bc *BufferedConn) ReadPacket() (Packet, error) {
 	}, nil
 }
 
-// Close closes the connection
 func (bc *BufferedConn) Close() error {
 	return bc.conn.Close()
 }
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-// getBuffer gets a buffer from the pool
 func getBuffer(size int) *[]byte {
 	if size <= 4096 {
 		return smallBufferPool.Get().(*[]byte)
@@ -256,7 +261,6 @@ func getBuffer(size int) *[]byte {
 	return largeBufferPool.Get().(*[]byte)
 }
 
-// putBuffer returns a buffer to the pool
 func putBuffer(buf *[]byte) {
 	if cap(*buf) <= 4096 {
 		smallBufferPool.Put(buf)
@@ -265,7 +269,6 @@ func putBuffer(buf *[]byte) {
 	}
 }
 
-// parseHeaderFast parses header bytes
 func parseHeaderFast(header []byte) (op uint8, keyLen uint16, valLen uint32) {
 	op = header[1]
 	keyLen = uint16(header[2])<<8 | uint16(header[3])
@@ -273,7 +276,6 @@ func parseHeaderFast(header []byte) (op uint8, keyLen uint16, valLen uint32) {
 	return
 }
 
-// writeHeaderFast writes header bytes
 func writeHeaderFast(buf []byte, op uint8, keyLen uint16, valLen uint32) {
 	buf[0] = MagicByte
 	buf[1] = op
@@ -285,11 +287,6 @@ func writeHeaderFast(buf []byte, op uint8, keyLen uint16, valLen uint32) {
 	buf[7] = byte(valLen)
 }
 
-// ============================================================================
-// STANDALONE FUNCTIONS
-// ============================================================================
-
-// WritePacket writes a packet to a writer
 func WritePacket(w io.Writer, op uint8, key string, value []byte) error {
 	keyLen := len(key)
 	valLen := len(value)
@@ -321,7 +318,6 @@ func WritePacket(w io.Writer, op uint8, key string, value []byte) error {
 	return err
 }
 
-// ReadPacket reads a packet from a reader
 func ReadPacket(r io.Reader) (Packet, error) {
 	headerPtr := headerPool.Get().(*[]byte)
 	header := *headerPtr
@@ -370,24 +366,17 @@ func ReadPacket(r io.Reader) (Packet, error) {
 	}, nil
 }
 
-// ============================================================================
-// PACKET BUFFER (REUSABLE)
-// ============================================================================
-
-// PacketBuffer provides reusable buffers for packet I/O
 type PacketBuffer struct {
 	headerBuf [HeaderSize]byte
 	bodyBuf   []byte
 }
 
-// NewPacketBuffer creates a new packet buffer
 func NewPacketBuffer() *PacketBuffer {
 	return &PacketBuffer{
 		bodyBuf: make([]byte, 4096),
 	}
 }
 
-// ReadPacket reads a packet using the buffer
 func (pb *PacketBuffer) ReadPacket(r io.Reader) (Packet, error) {
 	if _, err := io.ReadFull(r, pb.headerBuf[:]); err != nil {
 		return Packet{}, err
@@ -421,7 +410,6 @@ func (pb *PacketBuffer) ReadPacket(r io.Reader) (Packet, error) {
 	}, nil
 }
 
-// WritePacket writes a packet using the buffer
 func (pb *PacketBuffer) WritePacket(w io.Writer, op uint8, key string, value []byte) error {
 	keyLen := len(key)
 	valLen := len(value)

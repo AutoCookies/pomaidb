@@ -2,6 +2,7 @@
 package common
 
 import (
+	"errors"
 	"time"
 )
 
@@ -60,3 +61,11 @@ func (t OpType) String() string {
 		return "UNKNOWN"
 	}
 }
+
+var (
+	ErrEmptyKey            = errors.New("empty key")
+	ErrInsufficientStorage = errors.New("insufficient storage")
+	ErrValueNotInteger     = errors.New("value is not an integer")
+	ErrKeyNotFound         = errors.New("key not found")
+	ErrCorruptData         = errors.New("corrupted chunk data")
+)

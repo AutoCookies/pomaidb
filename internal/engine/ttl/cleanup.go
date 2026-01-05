@@ -1,179 +1,297 @@
-// File: internal/engine/ttl/cleanup.go
 package ttl
 
 import (
 	"context"
-	"log"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/AutoCookies/pomai-cache/packages/ds/bloom"
 )
 
-type Cleaner struct {
-	manager          *Manager
-	store            StoreInterface
-	cleanupInterval  time.Duration
-	rebuildThreshold int
-	logger           *log.Logger
+const (
+	defaultInterval = 100 * time.Millisecond
+	clusterSize     = 16
+	maxTimeBudget   = 10 * time.Millisecond
+	sampleBatch     = 5
+	predictBias     = 10 * time.Second
+)
+
+var (
+	clusterPool = sync.Pool{
+		New: func() interface{} { return make([]string, 0, clusterSize) },
+	}
+	visitedPool = sync.Pool{
+		New: func() interface{} { return make(map[string]struct{}, clusterSize) },
+	}
+)
+
+type PPPCleaner struct {
+	manager  *Manager
+	store    StoreInterface
+	interval time.Duration
+	running  atomic.Bool
 }
 
-func NewCleaner(manager *Manager, store StoreInterface) *Cleaner {
-	return &Cleaner{
-		manager:          manager,
-		store:            store,
-		cleanupInterval:  time.Minute,
-		rebuildThreshold: 1000,
+func NewPPPCleaner(manager *Manager, store StoreInterface) *PPPCleaner {
+	return &PPPCleaner{
+		manager:  manager,
+		store:    store,
+		interval: defaultInterval,
 	}
 }
 
-func (c *Cleaner) SetInterval(interval time.Duration) {
-	c.cleanupInterval = interval
+func (c *PPPCleaner) Start(ctx context.Context) {
+	if !c.running.CompareAndSwap(false, true) {
+		return
+	}
+	go c.loop(ctx)
 }
 
-func (c *Cleaner) SetRebuildThreshold(threshold int) {
-	c.rebuildThreshold = threshold
+func (c *PPPCleaner) loop(ctx context.Context) {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			c.running.Store(false)
+			return
+		case <-ticker.C:
+			c.predictivePeel()
+		}
+	}
 }
 
-func (c *Cleaner) Start(ctx context.Context) {
-	ticker := time.NewTicker(c.cleanupInterval)
+func (c *PPPCleaner) predictivePeel() {
+	shards := c.store.GetShards()
+	start := time.Now()
+	now := start.UnixNano()
 
-	go func() {
-		defer ticker.Stop()
+	for _, shard := range shards {
+		if time.Since(start) > maxTimeBudget {
+			break
+		}
 
-		for {
-			select {
-			case <-ctx.Done():
-				c.logInfo("Cleanup worker stopped")
-				return
+		seed := c.sampleSmartSeed(shard, now)
+		if seed == "" {
+			continue
+		}
 
-			case <-ticker.C:
-				cleaned := c.CleanupExpired()
-				if cleaned > 0 {
-					c.logInfo("Cleaned %d expired keys", cleaned)
+		cluster, expiredCandidates := c.expandCluster(shard, seed, now)
+
+		if len(expiredCandidates) > 0 {
+			c.deleteBatch(shard, expiredCandidates)
+		} else {
+			// proactive predictive prune
+			items := shard.GetItems()
+			avgPred := c.avgClusterPredict(cluster, items)
+			if avgPred > 0 && avgPred < now+int64(predictBias) {
+				cands := make([]string, 0, len(cluster))
+				for _, k := range cluster {
+					if elem, ok := items[k]; ok {
+						if entry := extractEntry(elem); entry != nil {
+							if entry.PredictNext() < now+int64(predictBias) {
+								cands = append(cands, k)
+							}
+						}
+					}
+				}
+				if len(cands) > 0 {
+					c.deleteBatch(shard, cands)
 				}
 			}
 		}
-	}()
+
+		c.recycleBuffers(cluster, nil)
+	}
 }
 
-func (c *Cleaner) CleanupExpired() int {
-	now := time.Now().UnixNano()
-	cleaned := int64(0)
+func (c *PPPCleaner) sampleSmartSeed(shard ShardInterface, now int64) string {
+	shard.RLock()
+	defer shard.RUnlock()
 
-	shards := c.store.GetShards()
-
-	for _, shard := range shards {
-		count := c.cleanupShard(shard, now)
-		atomic.AddInt64(&cleaned, int64(count))
+	items := shard.GetItems()
+	if len(items) == 0 {
+		return ""
 	}
 
-	totalCleaned := int(atomic.LoadInt64(&cleaned))
-
-	if totalCleaned > c.rebuildThreshold {
-		c.logInfo("Triggering incremental bloom rebuild after %d deletions", totalCleaned)
-		go c.IncrementalBloomRebuild()
+	keys := make([]string, 0, sampleBatch*2)
+	count := 0
+	for k := range items {
+		keys = append(keys, k)
+		count++
+		if count >= sampleBatch*2 {
+			break
+		}
+	}
+	if len(keys) == 0 {
+		return ""
 	}
 
-	return totalCleaned
+	n := len(keys)
+	workers := runtime.NumCPU()
+	if workers > n {
+		workers = n
+	}
+	chunk := (n + workers - 1) / workers
+	preds := make([]int64, n)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		i0 := w * chunk
+		i1 := i0 + chunk
+		if i1 > n {
+			i1 = n
+		}
+		go func(a, b int) {
+			for i := a; i < b; i++ {
+				elem := items[keys[i]]
+				entry := extractEntry(elem)
+				if entry == nil {
+					preds[i] = 1<<63 - 1
+				} else {
+					if exp := entry.ExpireAt(); exp > 0 && now > exp {
+						preds[i] = now - 1
+					} else {
+						preds[i] = entry.PredictNext()
+					}
+				}
+			}
+			wg.Done()
+		}(i0, i1)
+	}
+	wg.Wait()
+
+	bestIdx := -1
+	minPred := int64(1<<63 - 1)
+	for i := 0; i < n && (i < sampleBatch); i++ {
+		// select top sampleBatch minima across preds
+		// naive selection: scan all and pick smallest unseen
+		for j := 0; j < n; j++ {
+			if preds[j] < minPred {
+				minPred = preds[j]
+				bestIdx = j
+			}
+		}
+	}
+	if bestIdx >= 0 && bestIdx < len(keys) {
+		return keys[bestIdx]
+	}
+	// fallback: random-ish first
+	return keys[0]
 }
 
-func (c *Cleaner) cleanupShard(shard ShardInterface, now int64) int {
-	shard.Lock()
-	defer shard.Unlock()
+func (c *PPPCleaner) expandCluster(shard ShardInterface, seedKey string, now int64) ([]string, []string) {
+	shard.RLock()
+	defer shard.RUnlock()
 
-	toDelete := make([]string, 0)
 	items := shard.GetItems()
 
-	for key, elem := range items {
+	cluster := clusterPool.Get().([]string)[:0]
+	visited := visitedPool.Get().(map[string]struct{})
+
+	for k := range visited {
+		delete(visited, k)
+	}
+
+	queue := make([]string, 0, clusterSize)
+	queue = append(queue, seedKey)
+	visited[seedKey] = struct{}{}
+	cluster = append(cluster, seedKey)
+
+	expiredCandidates := make([]string, 0, clusterSize)
+
+	for len(queue) > 0 && len(cluster) < clusterSize {
+		curr := queue[0]
+		queue = queue[1:]
+
+		elem, ok := items[curr]
+		if !ok {
+			continue
+		}
 		entry := extractEntry(elem)
 		if entry == nil {
 			continue
 		}
 
-		expireAt := entry.ExpireAt()
-		if expireAt != 0 && now > expireAt {
-			toDelete = append(toDelete, key)
+		if exp := entry.ExpireAt(); exp > 0 && now > exp {
+			expiredCandidates = append(expiredCandidates, curr)
+		}
+
+		if entry.PredictNext() > now+int64(predictBias) {
+			continue
+		}
+
+		hints := entry.GetHints()
+		for _, h := range hints {
+			if _, seen := visited[h]; !seen {
+				visited[h] = struct{}{}
+				if len(cluster) < clusterSize {
+					cluster = append(cluster, h)
+					queue = append(queue, h)
+				}
+			}
 		}
 	}
 
-	totalSize := 0
-	for _, key := range toDelete {
+	visitedPool.Put(visited)
+
+	return cluster, expiredCandidates
+}
+
+func (c *PPPCleaner) deleteBatch(shard ShardInterface, keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+
+	shard.Lock()
+	defer shard.Unlock()
+
+	freed := int64(0)
+	for _, key := range keys {
 		size, ok := shard.DeleteItem(key)
 		if ok {
-			totalSize += size
+			freed += int64(size)
 		}
 	}
 
-	if totalSize > 0 {
-		shard.AddBytes(-int64(totalSize))
-		c.store.AddTotalBytes(-int64(totalSize))
-
-		if memCtrl := c.store.GetGlobalMemCtrl(); memCtrl != nil {
-			memCtrl.Release(int64(totalSize))
+	if freed > 0 {
+		shard.AddBytes(-freed)
+		c.store.AddTotalBytes(-freed)
+		if mc := c.store.GetGlobalMemCtrl(); mc != nil {
+			mc.Release(freed)
 		}
 	}
-
-	return len(toDelete)
 }
 
-func (c *Cleaner) IncrementalBloomRebuild() {
-	bloomFilter := c.store.GetBloomFilter()
-	if bloomFilter == nil {
-		return
+func (c *PPPCleaner) recycleBuffers(cluster []string, visited map[string]struct{}) {
+	if cluster != nil {
+		clusterPool.Put(cluster)
 	}
-
-	c.logInfo("Starting incremental bloom rebuild")
-
-	totalItems := int64(0)
-	shards := c.store.GetShards()
-
-	for _, shard := range shards {
-		totalItems += int64(shard.GetItemCount())
+	if visited != nil {
+		visitedPool.Put(visited)
 	}
-
-	if totalItems == 0 {
-		c.logInfo("No items - clearing bloom filter")
-		bloomFilter.Clear()
-		return
-	}
-
-	newBloom := bloom.NewOptimal(uint64(totalItems), 0.01)
-
-	keysAdded := 0
-	for _, shard := range shards {
-		added := c.rebuildShardBloom(shard, newBloom)
-		keysAdded += added
-	}
-
-	c.store.SetBloomFilter(newBloom)
-
-	c.logInfo("Incremental bloom rebuild complete:  %d keys", keysAdded)
 }
 
-func (c *Cleaner) rebuildShardBloom(shard ShardInterface, bloomFilter *bloom.BloomFilter) int {
-	shard.RLock()
-	defer shard.RUnlock()
-
-	items := shard.GetItems()
-	added := 0
-
-	for key := range items {
-		bloomFilter.Add(key)
-		added++
-
-		if added%1000 == 0 {
-			time.Sleep(time.Microsecond)
+func (c *PPPCleaner) avgClusterPredict(cluster []string, items map[string]interface{}) int64 {
+	n := len(cluster)
+	if n == 0 {
+		return 0
+	}
+	preds := make([]float32, 0, n)
+	for _, k := range cluster {
+		if elem, ok := items[k]; ok {
+			if e := extractEntry(elem); e != nil {
+				preds = append(preds, float32(e.PredictNext()))
+			} else {
+				preds = append(preds, float32(1<<31-1))
+			}
+		} else {
+			preds = append(preds, float32(1<<31-1))
 		}
 	}
-
-	return added
-}
-
-func (c *Cleaner) logInfo(format string, args ...interface{}) {
-	if c.logger != nil {
-		c.logger.Printf("[TTL-CLEANUP] "+format, args...)
-	} else {
-		log.Printf("[TTL-CLEANUP] "+format, args...)
-	}
+	workers := runtime.NumCPU()
+	total := parallelSumFloat32(preds, workers)
+	avg := int64(total / float64(len(preds)))
+	return avg
 }

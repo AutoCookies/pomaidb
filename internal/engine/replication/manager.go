@@ -1,22 +1,61 @@
-// File: internal/engine/replication/manager.go
 package replication
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// Manager handles replication coordination
+const (
+	gossipInterval  = 1 * time.Second
+	failTimeout     = 15 * time.Second
+	maxGossipPacket = 1024
+	burstProb       = 0.1
+)
+
+type NodeState int
+
+const (
+	NodeStateAlive NodeState = iota
+	NodeStateSuspect
+	NodeStateDead
+)
+
+type NodeInfo struct {
+	ID        string    `json:"id"`
+	TCPAddr   string    `json:"tcp"`
+	UDPAddr   string    `json:"udp"`
+	State     NodeState `json:"-"`
+	LastSeen  int64     `json:"-"`
+	ShardMask uint32    `json:"mask"`
+}
+
+type GossipMessage struct {
+	SenderID string     `json:"sid"`
+	Sender   NodeInfo   `json:"sinfo"`
+	Members  []NodeInfo `json:"mem"`
+}
+
 type Manager struct {
-	nodeID       string
-	mode         ReplicationMode
-	tenants      TenantManagerInterface
-	peers        map[string]*Peer
-	peersMu      sync.RWMutex
+	nodeID  string
+	mode    ReplicationMode
+	tenants TenantManagerInterface
+
+	peers     map[string]*Peer
+	peersList []string
+	peersMu   sync.RWMutex
+
+	clusterNodes map[string]*NodeInfo
+	clusterMu    sync.RWMutex
+	udpConn      *net.UDPConn
+	gossipPort   string
+
 	isLeader     atomic.Bool
 	opLog        *OpLog
 	ctx          context.Context
@@ -29,10 +68,17 @@ type Manager struct {
 		FailedReplicas   atomic.Uint64
 		AverageLatencyMs atomic.Int64
 		CurrentLag       atomic.Int64
+		BurstOps         atomic.Uint64
 	}
 }
 
-// NewManager creates replication manager
+type PomaiAgent struct {
+	shardID   int
+	state     string
+	neighbors []string
+	mu        sync.RWMutex
+}
+
 func NewManager(nodeID string, mode ReplicationMode, tenants TenantManagerInterface) *Manager {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -41,6 +87,8 @@ func NewManager(nodeID string, mode ReplicationMode, tenants TenantManagerInterf
 		mode:         mode,
 		tenants:      tenants,
 		peers:        make(map[string]*Peer),
+		peersList:    make([]string, 0),
+		clusterNodes: make(map[string]*NodeInfo),
 		opLog:        NewOpLog(100000),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -50,16 +98,363 @@ func NewManager(nodeID string, mode ReplicationMode, tenants TenantManagerInterf
 
 	rm.isLeader.Store(true)
 
-	// Start background workers
 	go rm.healthCheckLoop()
 	go rm.metricsLoop()
 
-	log.Printf("[REPLICATION] Manager started:  node=%s, mode=%s", nodeID, mode)
-
+	log.Printf("[REPLICATION] Manager started: node=%s, mode=%s", nodeID, mode)
 	return rm
 }
 
-// Replicate replicates operation to peers
+func (rm *Manager) StartAgents(shardCount int) {
+	for i := 0; i < shardCount; i++ {
+		agent := &PomaiAgent{shardID: i, state: "exploring"}
+		go agent.run(rm)
+	}
+	log.Printf("[PMAC] Started %d Pomai Agents", shardCount)
+}
+
+func (a *PomaiAgent) run(m *Manager) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			a.explore(m)
+			a.cluster(m)
+			a.optimize(m)
+		}
+	}
+}
+
+func (a *PomaiAgent) explore(m *Manager) {
+	m.peersMu.RLock()
+	defer m.peersMu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.neighbors = make([]string, 0)
+	for id, peer := range m.peers {
+		if peer.GetLag() < 50 && peer.GetStatus() == PeerHealthy {
+			a.neighbors = append(a.neighbors, id)
+		}
+	}
+}
+
+func (a *PomaiAgent) cluster(m *Manager) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.neighbors) >= 2 {
+		a.state = "optimizing"
+	} else {
+		a.state = "exploring"
+	}
+}
+
+func (a *PomaiAgent) optimize(m *Manager) {
+	a.mu.RLock()
+	state := a.state
+	a.mu.RUnlock()
+
+	if state == "optimizing" {
+		// Optimization logic
+	}
+}
+
+func (rm *Manager) BurstReplicate(tenantID, key string, value []byte, ttl time.Duration) {
+	if rand.Float64() > burstProb {
+		return
+	}
+
+	targets := rm.getRandomPeers(2)
+	if len(targets) == 0 {
+		return
+	}
+
+	op := ReplicaOp{
+		Type:      OpTypeSet,
+		Key:       key,
+		Value:     value,
+		TTL:       ttl,
+		TenantID:  tenantID,
+		Timestamp: time.Now().UnixNano(),
+	}
+
+	rm.stats.BurstOps.Add(1)
+
+	for _, peer := range targets {
+		go func(p *Peer) {
+			_ = rm.sendOpToPeer(p, op)
+		}(peer)
+	}
+}
+
+func (rm *Manager) getRandomPeers(count int) []*Peer {
+	rm.peersMu.RLock()
+	defer rm.peersMu.RUnlock()
+
+	n := len(rm.peersList)
+	if n == 0 {
+		return nil
+	}
+
+	result := make([]*Peer, 0, count)
+	limit := count
+	if n < limit {
+		limit = n
+	}
+
+	indices := rand.Perm(n)
+	for i := 0; i < limit; i++ {
+		id := rm.peersList[indices[i]]
+		if peer, ok := rm.peers[id]; ok && peer.GetStatus() == PeerHealthy {
+			result = append(result, peer)
+		}
+	}
+	return result
+}
+
+func (rm *Manager) EnableGossip(tcpPort, udpPort string, seeds []string) error {
+	rm.gossipPort = udpPort
+
+	addr, err := net.ResolveUDPAddr("udp", ":"+udpPort)
+	if err != nil {
+		return err
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return err
+	}
+	rm.udpConn = conn
+
+	myIP := getOutboundIP()
+
+	me := &NodeInfo{
+		ID:       rm.nodeID,
+		TCPAddr:  fmt.Sprintf("%s:%s", myIP, tcpPort),
+		UDPAddr:  fmt.Sprintf("%s:%s", myIP, udpPort),
+		State:    NodeStateAlive,
+		LastSeen: time.Now().Unix(),
+	}
+	rm.clusterMu.Lock()
+	rm.clusterNodes[rm.nodeID] = me
+	rm.clusterMu.Unlock()
+
+	go rm.gossipListenLoop()
+	go rm.gossipBroadcastLoop()
+	go rm.gossipFailureLoop()
+
+	for _, seed := range seeds {
+		if seed != "" {
+			go rm.PingDirect(seed)
+		}
+	}
+
+	log.Printf("[CLUSTER] Gossip enabled on %s (Seeds: %d)", udpPort, len(seeds))
+	return nil
+}
+
+func (rm *Manager) Stop() {
+	rm.Shutdown()
+	rm.StopGossip()
+}
+
+func (rm *Manager) StopGossip() {
+	if rm.udpConn != nil {
+		rm.udpConn.Close()
+	}
+}
+
+func (rm *Manager) gossipListenLoop() {
+	buf := make([]byte, maxGossipPacket)
+	for {
+		select {
+		case <-rm.ctx.Done():
+			return
+		default:
+			if rm.udpConn == nil {
+				return
+			}
+			rm.udpConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, _, err := rm.udpConn.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			rm.handleGossipPacket(buf[:n])
+		}
+	}
+}
+
+func (rm *Manager) handleGossipPacket(data []byte) {
+	var msg GossipMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return
+	}
+
+	rm.clusterMu.Lock()
+	defer rm.clusterMu.Unlock()
+
+	rm.mergeNodeState(msg.Sender)
+	for _, node := range msg.Members {
+		rm.mergeNodeState(node)
+	}
+}
+
+func (rm *Manager) mergeNodeState(node NodeInfo) {
+	if node.ID == rm.nodeID {
+		return
+	}
+
+	existing, exists := rm.clusterNodes[node.ID]
+
+	if !exists {
+		log.Printf("[CLUSTER] Discovery: Node %s at %s", node.ID, node.TCPAddr)
+		newNode := node
+		newNode.State = NodeStateAlive
+		newNode.LastSeen = time.Now().Unix()
+		rm.clusterNodes[node.ID] = &newNode
+		go rm.AddPeer(node.ID, node.TCPAddr)
+	} else {
+		existing.LastSeen = time.Now().Unix()
+		if existing.State != NodeStateAlive {
+			log.Printf("[CLUSTER] Node %s recovered", node.ID)
+			existing.State = NodeStateAlive
+		}
+		if existing.TCPAddr != node.TCPAddr {
+			existing.TCPAddr = node.TCPAddr
+		}
+	}
+}
+
+func (rm *Manager) broadcastGossip() {
+	rm.clusterMu.RLock()
+	nodes := make([]NodeInfo, 0, len(rm.clusterNodes))
+	targets := make([]string, 0)
+
+	me := *rm.clusterNodes[rm.nodeID]
+
+	for _, n := range rm.clusterNodes {
+		if n.State == NodeStateAlive && n.ID != rm.nodeID {
+			nodes = append(nodes, *n)
+			targets = append(targets, n.UDPAddr)
+		}
+	}
+	rm.clusterMu.RUnlock()
+
+	subsetSize := 3
+	if len(nodes) > subsetSize {
+		rand.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+		nodes = nodes[:subsetSize]
+	}
+
+	msg := GossipMessage{
+		SenderID: rm.nodeID,
+		Sender:   me,
+		Members:  nodes,
+	}
+	data, _ := json.Marshal(msg)
+
+	k := 3
+	if len(targets) > 0 {
+		rand.Shuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
+		if len(targets) < k {
+			k = len(targets)
+		}
+
+		for i := 0; i < k; i++ {
+			rm.sendUDP(targets[i], data)
+		}
+	}
+}
+
+func (rm *Manager) gossipBroadcastLoop() {
+	ticker := time.NewTicker(gossipInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rm.ctx.Done():
+			return
+		case <-ticker.C:
+			rm.broadcastGossip()
+		}
+	}
+}
+
+func (rm *Manager) gossipFailureLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rm.ctx.Done():
+			return
+		case <-ticker.C:
+			rm.reapDeadNodes()
+		}
+	}
+}
+
+func (rm *Manager) reapDeadNodes() {
+	rm.clusterMu.Lock()
+	defer rm.clusterMu.Unlock()
+
+	now := time.Now().Unix()
+	timeout := int64(failTimeout.Seconds())
+
+	for id, node := range rm.clusterNodes {
+		if id == rm.nodeID {
+			continue
+		}
+
+		if now-node.LastSeen > timeout {
+			if node.State == NodeStateAlive {
+				log.Printf("[CLUSTER] ⚠️ Node %s detected DEAD (timeout)", id)
+				node.State = NodeStateDead
+				go rm.RemovePeer(id)
+			}
+		}
+	}
+}
+
+func (rm *Manager) PingDirect(addr string) {
+	rm.clusterMu.RLock()
+	me, ok := rm.clusterNodes[rm.nodeID]
+	rm.clusterMu.RUnlock()
+	if !ok {
+		return
+	}
+
+	msg := GossipMessage{
+		SenderID: rm.nodeID,
+		Sender:   *me,
+	}
+	data, _ := json.Marshal(msg)
+	rm.sendUDP(addr, data)
+}
+
+func (rm *Manager) sendUDP(addr string, data []byte) {
+	if rm.udpConn == nil {
+		return
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return
+	}
+	rm.udpConn.WriteToUDP(data, udpAddr)
+}
+
+func getOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "127.0.0.1"
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
 func (rm *Manager) Replicate(op ReplicaOp) error {
 	if !rm.isLeader.Load() {
 		return ErrNotLeader
@@ -75,31 +470,24 @@ func (rm *Manager) Replicate(op ReplicaOp) error {
 	case ModeAsync:
 		go rm.replicateAsync(op)
 		return nil
-
 	case ModeSync:
 		return rm.replicateSync(op)
-
 	case ModeSemiSync:
 		return rm.replicateSemiSync(op)
-
 	default:
 		return fmt.Errorf("unknown replication mode: %d", rm.mode)
 	}
 }
 
-// replicateAsync sends operation to all peers without waiting
 func (rm *Manager) replicateAsync(op ReplicaOp) {
 	peers := rm.getHealthyPeers()
-
 	for _, peer := range peers {
 		go rm.sendOpToPeer(peer, op)
 	}
 }
 
-// replicateSync waits for all peers to acknowledge
 func (rm *Manager) replicateSync(op ReplicaOp) error {
 	peers := rm.getHealthyPeers()
-
 	if len(peers) == 0 {
 		return ErrNoHealthyPeers
 	}
@@ -122,21 +510,17 @@ func (rm *Manager) replicateSync(op ReplicaOp) error {
 		rm.stats.ReplicatedOps.Add(1)
 		return nil
 	}
-
 	rm.stats.FailedReplicas.Add(1)
-	return fmt.Errorf("sync replication failed: %d/%d peers succeeded", successCount, len(peers))
+	return fmt.Errorf("sync failed: %d/%d success", successCount, len(peers))
 }
 
-// replicateSemiSync waits for quorum
 func (rm *Manager) replicateSemiSync(op ReplicaOp) error {
 	peers := rm.getHealthyPeers()
-
 	if len(peers) == 0 {
 		return ErrNoHealthyPeers
 	}
 
 	quorum := rm.calculateQuorum(len(peers))
-
 	errCh := make(chan error, len(peers))
 	for _, peer := range peers {
 		go func(p *Peer) {
@@ -154,7 +538,6 @@ func (rm *Manager) replicateSemiSync(op ReplicaOp) error {
 				successCount++
 				if successCount >= quorum {
 					rm.stats.ReplicatedOps.Add(1)
-					// Drain remaining responses
 					go func() {
 						for j := i + 1; j < len(peers); j++ {
 							<-errCh
@@ -169,20 +552,17 @@ func (rm *Manager) replicateSemiSync(op ReplicaOp) error {
 				return nil
 			}
 			rm.stats.FailedReplicas.Add(1)
-			return fmt.Errorf("semi-sync timeout:  %d/%d quorum not met", successCount, quorum)
+			return fmt.Errorf("semi-sync timeout")
 		}
 	}
-
 	if successCount >= quorum {
 		rm.stats.ReplicatedOps.Add(1)
 		return nil
 	}
-
 	rm.stats.FailedReplicas.Add(1)
-	return fmt.Errorf("semi-sync failed: %d/%d quorum not met", successCount, quorum)
+	return fmt.Errorf("semi-sync failed")
 }
 
-// calculateQuorum computes required quorum size
 func (rm *Manager) calculateQuorum(peerCount int) int {
 	if rm.writeQuorum > 0 {
 		return rm.writeQuorum
@@ -190,11 +570,9 @@ func (rm *Manager) calculateQuorum(peerCount int) int {
 	return (peerCount / 2) + 1
 }
 
-// getHealthyPeers returns list of healthy peers
 func (rm *Manager) getHealthyPeers() []*Peer {
 	rm.peersMu.RLock()
 	defer rm.peersMu.RUnlock()
-
 	peers := make([]*Peer, 0, len(rm.peers))
 	for _, peer := range rm.peers {
 		if peer.GetStatus() == PeerHealthy {
@@ -204,123 +582,53 @@ func (rm *Manager) getHealthyPeers() []*Peer {
 	return peers
 }
 
-// AddPeer adds replication peer
 func (rm *Manager) AddPeer(peerID, addr string) error {
-	return rm.addPeerInternal(peerID, addr, false)
-}
+	rm.peersMu.RLock()
+	_, exists := rm.peers[peerID]
+	rm.peersMu.RUnlock()
+	if exists {
+		return nil
+	}
 
-// addPeerInternal adds peer (internal, supports mock)
-func (rm *Manager) addPeerInternal(peerID, addr string, isMock bool) error {
 	conn, err := connectToPeer(addr, 5*time.Second)
 	if err != nil {
-		return fmt.Errorf("failed to connect to peer %s: %w", peerID, err)
+		return fmt.Errorf("connect failed: %w", err)
 	}
 
-	peer := newPeer(peerID, addr, conn, isMock)
-
+	peer := newPeer(peerID, addr, conn, false)
 	rm.peersMu.Lock()
 	rm.peers[peerID] = peer
+	rm.peersList = append(rm.peersList, peerID)
 	rm.peersMu.Unlock()
 
-	if !isMock {
-		go rm.handlePeer(peer)
-	}
-
-	log.Printf("[REPLICATION] Peer added: %s (%s)", peerID, addr)
+	go rm.handlePeer(peer)
+	log.Printf("[REPLICATION] Peer added: %s", peerID)
 	return nil
 }
 
-// RemovePeer removes peer
 func (rm *Manager) RemovePeer(peerID string) {
 	rm.peersMu.Lock()
+	defer rm.peersMu.Unlock()
+
 	peer, ok := rm.peers[peerID]
 	if ok {
 		peer.conn.Close()
 		delete(rm.peers, peerID)
-	}
-	rm.peersMu.Unlock()
 
-	log.Printf("[REPLICATION] Peer removed: %s", peerID)
-}
-
-// SyncFromPeer syncs operations from leader
-func (rm *Manager) SyncFromPeer(peerID string, fromSeq uint64) error {
-	rm.peersMu.RLock()
-	peer, ok := rm.peers[peerID]
-	rm.peersMu.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("peer not found: %s", peerID)
-	}
-
-	ops := rm.opLog.GetSince(fromSeq)
-
-	for _, op := range ops {
-		if err := rm.sendOpToPeer(peer, op); err != nil {
-			return fmt.Errorf("sync failed at seqNum %d: %w", op.SeqNum, err)
+		for i, id := range rm.peersList {
+			if id == peerID {
+				lastIdx := len(rm.peersList) - 1
+				rm.peersList[i] = rm.peersList[lastIdx]
+				rm.peersList = rm.peersList[:lastIdx]
+				break
+			}
 		}
 	}
-
-	log.Printf("[REPLICATION] Synced %d ops to peer %s", len(ops), peerID)
-	return nil
 }
 
-// SetMode changes replication mode
-func (rm *Manager) SetMode(mode ReplicationMode) {
-	rm.mode = mode
-	log.Printf("[REPLICATION] Mode changed to:  %s", mode)
-}
-
-// SetWriteQuorum sets write quorum
-func (rm *Manager) SetWriteQuorum(quorum int) {
-	rm.writeQuorum = quorum
-	log.Printf("[REPLICATION] Write quorum set to: %d", quorum)
-}
-
-// SetLeader sets leader status
-func (rm *Manager) SetLeader(isLeader bool) {
-	rm.isLeader.Store(isLeader)
-	log.Printf("[REPLICATION] Leader status:  %v", isLeader)
-}
-
-// GetStats returns replication statistics
-func (rm *Manager) GetStats() ReplicationStats {
-	rm.peersMu.RLock()
-	activeCount := len(rm.peers)
-	healthyCount := 0
-	degradedCount := 0
-	downCount := 0
-
-	for _, peer := range rm.peers {
-		switch peer.GetStatus() {
-		case PeerHealthy:
-			healthyCount++
-		case PeerDegraded:
-			degradedCount++
-		case PeerDown:
-			downCount++
-		}
-	}
-	rm.peersMu.RUnlock()
-
-	return ReplicationStats{
-		TotalOps:         rm.stats.TotalOps.Load(),
-		ReplicatedOps:    rm.stats.ReplicatedOps.Load(),
-		FailedReplicas:   rm.stats.FailedReplicas.Load(),
-		AverageLatencyMs: rm.stats.AverageLatencyMs.Load(),
-		CurrentLag:       rm.stats.CurrentLag.Load(),
-		ActivePeers:      activeCount,
-		HealthyPeers:     healthyCount,
-		DegradedPeers:    degradedCount,
-		DownPeers:        downCount,
-	}
-}
-
-// Shutdown gracefully stops replication
 func (rm *Manager) Shutdown() {
 	log.Println("[REPLICATION] Shutting down...")
 	rm.cancel()
-
 	rm.peersMu.Lock()
 	for _, peer := range rm.peers {
 		peer.conn.Close()
@@ -328,12 +636,9 @@ func (rm *Manager) Shutdown() {
 	rm.peersMu.Unlock()
 }
 
-// Background loops
-
 func (rm *Manager) healthCheckLoop() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-rm.ctx.Done():
@@ -347,7 +652,6 @@ func (rm *Manager) healthCheckLoop() {
 func (rm *Manager) metricsLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-rm.ctx.Done():
@@ -360,7 +664,30 @@ func (rm *Manager) metricsLoop() {
 
 func (rm *Manager) logMetrics() {
 	stats := rm.GetStats()
-	log.Printf("[REPLICATION] Stats: TotalOps=%d, Replicated=%d, Failed=%d, AvgLatency=%dms, Peers=%d/%d/%d",
-		stats.TotalOps, stats.ReplicatedOps, stats.FailedReplicas, stats.AverageLatencyMs,
-		stats.HealthyPeers, stats.DegradedPeers, stats.DownPeers)
+	rm.clusterMu.RLock()
+	nodeCount := len(rm.clusterNodes)
+	rm.clusterMu.RUnlock()
+	log.Printf("[REPLICATION] Nodes: %d | Ops: %d | Bursts: %d | Healthy: %d",
+		nodeCount, stats.TotalOps, rm.stats.BurstOps.Load(), stats.HealthyPeers)
+}
+
+func (rm *Manager) GetStats() ReplicationStats {
+	rm.peersMu.RLock()
+	active := len(rm.peers)
+	healthy := 0
+	for _, p := range rm.peers {
+		if p.GetStatus() == PeerHealthy {
+			healthy++
+		}
+	}
+	rm.peersMu.RUnlock()
+
+	return ReplicationStats{
+		TotalOps:       rm.stats.TotalOps.Load(),
+		ReplicatedOps:  rm.stats.ReplicatedOps.Load(),
+		FailedReplicas: rm.stats.FailedReplicas.Load(),
+		ActivePeers:    active,
+		HealthyPeers:   healthy,
+		CurrentLag:     rm.stats.CurrentLag.Load(),
+	}
 }

@@ -1,4 +1,3 @@
-// File: internal/engine/ttl/types.go
 package ttl
 
 type StoreInterface interface {
@@ -27,9 +26,9 @@ type EntryInterface interface {
 	Size() int
 	ExpireAt() int64
 	IsExpired() bool
-	LastAccess() int64
-	Accesses() uint64
-	CreatedAt() int64
+	GetHints() []string
+
+	PredictNext() int64
 }
 
 type BloomFilterInterface interface {

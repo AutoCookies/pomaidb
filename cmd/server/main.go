@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -11,6 +12,8 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,556 +26,497 @@ import (
 	tcpAdapter "github.com/AutoCookies/pomai-cache/internal/adapter/tcp"
 	"github.com/AutoCookies/pomai-cache/internal/core/ports"
 	"github.com/AutoCookies/pomai-cache/internal/engine/core"
+	"github.com/AutoCookies/pomai-cache/internal/engine/replication"
 	"github.com/AutoCookies/pomai-cache/internal/engine/tenants"
 )
 
 const (
-	Version     = "1.4.0-ai-stream"
-	ServiceName = "Pomai Cache (Enterprise Edition)"
+	AppName = "POMAI CACHE"
+	Version = "1.8.1-stable"
+	Build   = "Enterprise"
+
+	ColorReset  = "\033[0m"
+	ColorCyan   = "\033[36m"
+	ColorGreen  = "\033[32m"
+	ColorYellow = "\033[33m"
+	ColorRed    = "\033[31m"
+	ColorBold   = "\033[1m"
 )
 
 type Config struct {
-	HTTPPort string
-	TCPPort  string
-
-	CacheShards   int
-	CapacityBytes int64
-
-	MaxVectorCount int64
-	VectorDim      int
-
-	EnableCDC bool
-	CDCStream string
-
-	PersistenceType string
-	DataDir         string
-	WriteBufferSize int
-	FlushInterval   time.Duration
-
+	HTTPPort         string
+	TCPPort          string
+	ClusterMode      bool
+	NodeID           string
+	GossipPort       string
+	Seeds            string
+	MaxConnections   int
+	CacheShards      int
+	CapacityBytes    int64
+	PersistenceType  string
+	DataDir          string
+	WriteBufferSize  int
+	FlushInterval    time.Duration
 	HTTPReadTimeout  time.Duration
 	HTTPWriteTimeout time.Duration
 	HTTPIdleTimeout  time.Duration
 	ShutdownTimeout  time.Duration
-
-	EnableCORS    bool
-	EnableMetrics bool
-	EnableDebug   bool
-
-	GCPercent       int
-	MaxProcs        int
-	MemoryLimit     int64
-	EnableProfiling bool
+	EnableCORS       bool
+	EnableMetrics    bool
+	EnableDebug      bool
+	GCPercent        int
+	MaxProcs         int
+	MemoryLimit      int64
 }
 
 func init() {
-	applyRuntimeTuning()
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	debug.SetGCPercent(-1)
+	debug.SetMemoryLimit(math.MaxInt64)
 }
 
 func main() {
 	_ = godotenv.Load()
 
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("Configuration error: %v", err)
+	cfg := parseFlags()
+
+	if cfg.MemoryLimit == 0 {
+		core.ApplySystemAdaptive()
 	}
 
-	applyConfigTuning(cfg)
+	tuneRuntime(cfg)
+	printHeader(cfg)
 
-	printBanner(cfg)
+	printStatus("CORE", "Initializing Tenant Manager...")
+	tm := tenants.NewManager(cfg.CacheShards, cfg.CapacityBytes)
 
-	log.Println("Initializing components...")
+	printStatus("STORAGE", "Initializing Persistence Layer...")
+	pers, persImpl := initPersistence(cfg, tm)
+	defer closePersistence(pers)
 
-	storeConfig := &core.StoreConfig{
-		ShardCount:    cfg.CacheShards,
-		CapacityBytes: cfg.CapacityBytes,
-	}
-
-	log.Printf("Creating tenant manager (shards=%d, capacity=%s, ai_ready=%v)...",
-		cfg.CacheShards, formatBytes(cfg.CapacityBytes), cfg.MaxVectorCount > 0)
-
-	tm := tenants.NewManager(storeConfig.ShardCount, storeConfig.CapacityBytes)
-
-	pers, persImpl := setupPersistence(cfg, tm)
-	defer closePersistence(pers, persImpl, tm)
-
-	wb := setupWriteBehind(cfg, pers)
+	wb := initWriteBehind(cfg, pers)
 	defer closeWriteBehind(wb)
 
-	httpSrv, tcpSrv := startServers(cfg, tm)
-
-	waitForReady(cfg.HTTPPort)
-
-	log.Println("")
-	log.Println("========================================")
-	log.Println("Pomai Cache is READY for High Performance!")
-	log.Println("========================================")
-	log.Println("")
-
-	if cfg.EnableProfiling {
-		log.Printf("Profiling:   http://localhost:%s/debug/pprof/", cfg.HTTPPort)
+	printStatus("CLUSTER", "Configuring Replication Topology...")
+	rm := initCluster(cfg, tm)
+	if rm != nil {
+		defer rm.Stop()
 	}
 
-	gracefulShutdown(cfg, httpSrv, tcpSrv, wb, pers, persImpl, tm)
+	printStatus("NETWORK", "Binding Service Ports...")
+	httpSrv, tcpSrv := initServers(cfg, tm, rm)
+	startServers(httpSrv, tcpSrv, cfg.HTTPPort, cfg.TCPPort)
+
+	waitForHealth(cfg.HTTPPort)
+	printReady(cfg)
+
+	shutdown(cfg, httpSrv, tcpSrv, wb, persImpl, tm)
 }
 
-func applyRuntimeTuning() {
-	numCPU := runtime.NumCPU()
-	runtime.GOMAXPROCS(numCPU)
-	debug.SetGCPercent(-1)
-	debug.SetMemoryLimit(math.MaxInt64)
+func parseFlags() *Config {
+	defaultHTTPPort := "8080"
+	defaultTCPPort := "7600"
+	defaultGossipPort := "7946"
+	defaultNodeID := fmt.Sprintf("node-%d", time.Now().Unix())
+	defaultCacheShards := 2048
+	defaultCapacityBytes := int64(0)
+	defaultPersistence := "none"
+	defaultDataDir := "./data"
+	defaultWriteBufferSize := 1000
+	defaultFlushInterval := 5 * time.Second
+	defaultShutdownTimeout := 30 * time.Second
+	defaultHTTPReadTimeout := 10 * time.Second
+	defaultHTTPWriteTimeout := 10 * time.Second
+	defaultHTTPIdleTimeout := 60 * time.Second
+
+	httpPort := flag.String("http-port", defaultHTTPPort, "HTTP port")
+	tcpPort := flag.String("tcp-port", defaultTCPPort, "TCP port")
+	clusterMode := flag.Bool("cluster", false, "Enable cluster mode (gossip)")
+	nodeID := flag.String("node-id", defaultNodeID, "Node ID")
+	gossipPort := flag.String("gossip-port", defaultGossipPort, "Gossip port")
+	seeds := flag.String("seeds", "", "Comma-separated cluster seed nodes (host:port)")
+	maxConns := flag.Int("max-conns", 10000, "Max TCP connections")
+	cacheShards := flag.Int("cache-shards", defaultCacheShards, "Number of cache shards")
+	capacity := flag.String("capacity-bytes", "", "Per-tenant capacity (e.g. 10GB, 512MB). Empty = unlimited")
+	persistence := flag.String("persistence", defaultPersistence, "Persistence type: none|file|wal")
+	dataDir := flag.String("data-dir", defaultDataDir, "Data directory for persistence")
+	writeBuf := flag.Int("write-buffer", defaultWriteBufferSize, "Write-behind buffer size")
+	flushInt := flag.String("flush-interval", defaultFlushInterval.String(), "Write-behind flush interval (e.g. 5s)")
+	httpReadTO := flag.String("http-read-timeout", defaultHTTPReadTimeout.String(), "HTTP read timeout")
+	httpWriteTO := flag.String("http-write-timeout", defaultHTTPWriteTimeout.String(), "HTTP write timeout")
+	httpIdleTO := flag.String("http-idle-timeout", defaultHTTPIdleTimeout.String(), "HTTP idle timeout")
+	shutdownTO := flag.String("shutdown-timeout", defaultShutdownTimeout.String(), "Shutdown timeout")
+	enableCORS := flag.Bool("enable-cors", false, "Enable CORS")
+	enableMetrics := flag.Bool("enable-metrics", true, "Enable metrics endpoint")
+	enableDebug := flag.Bool("debug", false, "Enable debug mode")
+	gcPercent := flag.Int("gogc", -1, "GOGC percent (-1 leaves as-is)")
+	maxProcs := flag.Int("gomaxprocs", 0, "GOMAXPROCS override (0 = leave as-is)")
+	memLimit := flag.String("mem-limit", "", "Memory limit (e.g. 8GB). Empty = no limit")
+
+	flag.Parse()
+
+	capBytes := defaultCapacityBytes
+	if *capacity != "" {
+		if v, err := parseBytes(*capacity); err == nil {
+			capBytes = v
+		} else {
+			log.Printf("[WARN] invalid capacity-bytes: %v", err)
+		}
+	}
+
+	flushDur := defaultFlushInterval
+	if d, err := time.ParseDuration(*flushInt); err == nil {
+		flushDur = d
+	} else {
+		log.Printf("[WARN] invalid flush-interval: %v", err)
+	}
+
+	httpReadDur := defaultHTTPReadTimeout
+	if d, err := time.ParseDuration(*httpReadTO); err == nil {
+		httpReadDur = d
+	} else {
+		log.Printf("[WARN] invalid http-read-timeout: %v", err)
+	}
+
+	httpWriteDur := defaultHTTPWriteTimeout
+	if d, err := time.ParseDuration(*httpWriteTO); err == nil {
+		httpWriteDur = d
+	} else {
+		log.Printf("[WARN] invalid http-write-timeout: %v", err)
+	}
+
+	httpIdleDur := defaultHTTPIdleTimeout
+	if d, err := time.ParseDuration(*httpIdleTO); err == nil {
+		httpIdleDur = d
+	} else {
+		log.Printf("[WARN] invalid http-idle-timeout: %v", err)
+	}
+
+	shutdownDur := defaultShutdownTimeout
+	if d, err := time.ParseDuration(*shutdownTO); err == nil {
+		shutdownDur = d
+	} else {
+		log.Printf("[WARN] invalid shutdown-timeout: %v", err)
+	}
+
+	memLimitBytes := int64(0)
+	if *memLimit != "" {
+		if v, err := parseBytes(*memLimit); err == nil {
+			memLimitBytes = v
+		} else {
+			log.Printf("[WARN] invalid mem-limit: %v", err)
+		}
+	}
+
+	return &Config{
+		HTTPPort:         *httpPort,
+		TCPPort:          *tcpPort,
+		ClusterMode:      *clusterMode,
+		NodeID:           *nodeID,
+		GossipPort:       *gossipPort,
+		Seeds:            *seeds,
+		MaxConnections:   *maxConns,
+		CacheShards:      *cacheShards,
+		CapacityBytes:    capBytes,
+		PersistenceType:  *persistence,
+		DataDir:          *dataDir,
+		WriteBufferSize:  *writeBuf,
+		FlushInterval:    flushDur,
+		HTTPReadTimeout:  httpReadDur,
+		HTTPWriteTimeout: httpWriteDur,
+		HTTPIdleTimeout:  httpIdleDur,
+		ShutdownTimeout:  shutdownDur,
+		EnableCORS:       *enableCORS,
+		EnableMetrics:    *enableMetrics,
+		EnableDebug:      *enableDebug,
+		GCPercent:        *gcPercent,
+		MaxProcs:         *maxProcs,
+		MemoryLimit:      memLimitBytes,
+	}
 }
 
-func applyConfigTuning(cfg *Config) {
+func parseBytes(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, nil
+	}
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(s, "GB"):
+		mult = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "GB")
+	case strings.HasSuffix(s, "MB"):
+		mult = 1024 * 1024
+		s = strings.TrimSuffix(s, "MB")
+	case strings.HasSuffix(s, "KB"):
+		mult = 1024
+		s = strings.TrimSuffix(s, "KB")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+	i, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return 0, err
+	}
+	return int64(i * float64(mult)), nil
+}
+
+func tuneRuntime(cfg *Config) {
 	if cfg.MaxProcs > 0 {
 		runtime.GOMAXPROCS(cfg.MaxProcs)
-		log.Printf("GOMAXPROCS set to %d", cfg.MaxProcs)
 	}
-
-	if cfg.GCPercent >= -1 {
-		old := debug.SetGCPercent(cfg.GCPercent)
-		log.Printf("GC percent changed from %d to %d", old, cfg.GCPercent)
+	if cfg.GCPercent > -2 {
+		debug.SetGCPercent(cfg.GCPercent)
 	}
-
 	if cfg.MemoryLimit > 0 {
 		debug.SetMemoryLimit(cfg.MemoryLimit)
-		log.Printf("Memory limit set to %s", formatBytes(cfg.MemoryLimit))
-	}
-
-	if cfg.EnableDebug {
-		runtime.SetBlockProfileRate(1)
-		runtime.SetMutexProfileFraction(1)
-		log.Println("Block and mutex profiling enabled")
 	}
 }
 
-func loadConfig() (*Config, error) {
-	cfg := &Config{
-		HTTPPort: getenv("PORT", "8080"),
-		TCPPort:  getenv("TCP_PORT", "7600"),
+func printHeader(cfg *Config) {
+	fmt.Print("\033[H\033[2J")
+	fmt.Println(ColorCyan + `
+  ____  ____  __  __    _    ___    ____    _    ____ _   _ _____ 
+ |  _ \|  _ \|  \/  |  / \  |_ _|  / ___|  / \  / ___| | | | ____|
+ | |_) | | | | |\/| | / _ \  | |  | |     / _ \| |   | |_| |  _|
+ |  __/| |_| | |  | |/ ___ \ | |  | |___ / ___ \ |___|  _  | |___
+ |_|   \____/|_|  |_/_/   \_\___|  \____/_/   \_\____|_| |_|_____|
+` + ColorReset)
+	fmt.Printf(" %s%s %s%s\n", ColorBold, AppName, Version, ColorReset)
+	fmt.Printf(" %s%s%s\n\n", ColorYellow, Build, ColorReset)
 
-		CacheShards:   getenvInt("CACHE_SHARDS", 2048),
-		CapacityBytes: int64(getenvInt("PER_TENANT_CAPACITY_BYTES", 0)),
-
-		MaxVectorCount: int64(getenvInt("MAX_VECTOR_COUNT", 500000)),
-		EnableCDC:      getenvBool("ENABLE_CDC", false),
-		CDCStream:      getenv("CDC_STREAM_NAME", "__cdc_log__"),
-
-		PersistenceType: getenv("PERSISTENCE_TYPE", "none"),
-		DataDir:         getenv("DATA_DIR", "./data"),
-		WriteBufferSize: getenvInt("WRITE_BUFFER_SIZE", 1000),
-		FlushInterval:   getenvDuration("FLUSH_INTERVAL", 5*time.Second),
-
-		HTTPReadTimeout:  getenvDuration("HTTP_READ_TIMEOUT", 30*time.Second),
-		HTTPWriteTimeout: getenvDuration("HTTP_WRITE_TIMEOUT", 30*time.Second),
-		HTTPIdleTimeout:  getenvDuration("HTTP_IDLE_TIMEOUT", 120*time.Second),
-		ShutdownTimeout:  getenvDuration("SHUTDOWN_TIMEOUT", 30*time.Second),
-
-		EnableCORS:    getenvBool("ENABLE_CORS", false),
-		EnableMetrics: getenvBool("ENABLE_METRICS", false),
-		EnableDebug:   getenvBool("ENABLE_DEBUG", false),
-
-		GCPercent:       getenvInt("GOGC", -1),
-		MaxProcs:        getenvInt("GOMAXPROCS", 0),
-		MemoryLimit:     int64(getenvInt("GOMEMLIMIT", 0)),
-		EnableProfiling: getenvBool("ENABLE_PROFILING", false),
-	}
-
-	if err := validateConfig(cfg); err != nil {
-		return nil, err
-	}
-
-	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create data dir: %w", err)
-	}
-
-	return cfg, nil
-}
-
-func validateConfig(cfg *Config) error {
-	if cfg.CacheShards < 1 || cfg.CacheShards > 8192 {
-		return fmt.Errorf("CACHE_SHARDS must be 1-8192, got %d", cfg.CacheShards)
-	}
-	if cfg.CapacityBytes < 0 {
-		return fmt.Errorf("capacity cannot be negative")
-	}
-	if cfg.MaxVectorCount < 0 {
-		return fmt.Errorf("MAX_VECTOR_COUNT cannot be negative")
-	}
-	return nil
-}
-
-func printBanner(cfg *Config) {
-	banner := `
-==================================================
-   POMAI CACHE v%s
-==================================================
-  Unified Multi-Model In-Memory Database
-  (KV + Graph + Vector + TimeSeries + Stream)
-==================================================
-
-System Resources:
-  Go Version:      %s
-  CPU Cores:       %d
-  GOMAXPROCS:      %d
-  OS/Arch:         %s/%s
-  Memory Limit:    %s
-
-Modules Status:
-  Key-Value:       Enabled (Shards: %d, Cap: %s)
-  Vector AI:       Enabled (Max: %d vectors)
-  TimeStream:      Enabled (CDC: %v)
-  Graph DB:        Enabled
-  Bitmap:          Enabled
-
-Networking:
-  HTTP API:        :%s
-  TCP (Gnet):      :%s
-
-Persistence:
-  Type:            %s
-  Data Dir:        %s
-
-Observability:
-  Stats:           http://localhost:%s/v1/stats
-  Profiling:       %v
-
-==================================================
-`
-
-	capacityStr := "Unlimited"
-	if cfg.CapacityBytes > 0 {
-		capacityStr = formatBytes(cfg.CapacityBytes)
-	}
-
-	memLimitStr := "Unlimited"
+	fmt.Println(ColorBold + " SYSTEM RESOURCES" + ColorReset)
+	fmt.Printf(" %-15s %d Cores\n", "CPU", runtime.GOMAXPROCS(0))
 	if cfg.MemoryLimit > 0 {
-		memLimitStr = formatBytes(cfg.MemoryLimit)
+		fmt.Printf(" %-15s %s\n", "Memory Limit", formatBytes(cfg.MemoryLimit))
+	} else {
+		fmt.Printf(" %-15s %s\n", "Memory Limit", "Unlimited")
 	}
-
-	fmt.Printf(banner,
-		Version,
-		runtime.Version(),
-		runtime.NumCPU(),
-		runtime.GOMAXPROCS(0),
-		runtime.GOOS,
-		runtime.GOARCH,
-		memLimitStr,
-		cfg.CacheShards,
-		capacityStr,
-		cfg.MaxVectorCount,
-		cfg.EnableCDC,
-		cfg.HTTPPort,
-		cfg.TCPPort,
-		cfg.PersistenceType,
-		cfg.DataDir,
-		cfg.HTTPPort,
-		cfg.EnableProfiling,
-	)
+	fmt.Printf(" %-15s %s\n", "OS/Arch", runtime.GOOS+"/"+runtime.GOARCH)
+	fmt.Println()
 }
 
-func setupPersistence(cfg *Config, tm *tenants.Manager) (ports.Persister, interface{}) {
-	var pers ports.Persister
-	var persImpl interface{}
+func printStatus(module, msg string) {
+	fmt.Printf(" [%s", ColorCyan)
+	fmt.Printf("%-8s", module)
+	fmt.Printf("%s] %s\n", ColorReset, msg)
+}
 
-	log.Printf("Setting up persistence (type=%s)...", cfg.PersistenceType)
+func printReady(cfg *Config) {
+	fmt.Println()
+	fmt.Println(ColorBold + " SYSTEM READY" + ColorReset)
+	fmt.Printf(" %-15s %s%s%s\n", "HTTP API", ColorGreen, "http://localhost:"+cfg.HTTPPort, ColorReset)
+	fmt.Printf(" %-15s %s%s%s\n", "TCP Protocol", ColorGreen, "tcp://localhost:"+cfg.TCPPort, ColorReset)
 
+	mode := "Standalone"
+	if cfg.ClusterMode {
+		mode = fmt.Sprintf("Cluster (Node: %s)", cfg.NodeID)
+	}
+	fmt.Printf(" %-15s %s\n", "Mode", mode)
+	fmt.Printf(" %-15s %s\n", "Persistence", strings.ToUpper(cfg.PersistenceType))
+	fmt.Printf(" %-15s %s\n", "Capacity", formatBytes(cfg.CapacityBytes))
+	fmt.Println()
+}
+
+func initPersistence(cfg *Config, tm *tenants.Manager) (ports.Persister, interface{}) {
 	switch cfg.PersistenceType {
 	case "file":
-		fp, err := file.NewFilePersister(cfg.DataDir)
+		p, err := file.NewFilePersister(cfg.DataDir)
 		if err != nil {
-			log.Fatalf("Failed to create file persister: %v", err)
+			log.Fatalf("FS Init Failed: %v", err)
 		}
-		log.Println("File persistence initialized")
-		pers = fp
-		persImpl = fp
-
+		return p, p
 	case "wal":
-		walPath := fmt.Sprintf("%s/wal.log", cfg.DataDir)
-		wp, err := wal.NewWALPersister(walPath)
+		p, err := wal.NewWALPersister(cfg.DataDir + "/wal.log")
 		if err != nil {
-			log.Fatalf("Failed to create WAL persister:  %v", err)
+			log.Fatalf("WAL Init Failed: %v", err)
 		}
-
-		log.Println("Restoring from WAL...")
-		defaultStore := tm.GetStore("default")
-
-		if err := wp.RestoreFrom(defaultStore); err != nil {
-			log.Printf("WAL restore warning: %v", err)
-		} else {
-			stats := defaultStore.Stats()
-			log.Printf("WAL restored: %d items, %s",
-				stats.Items, formatBytes(stats.Bytes))
-		}
-
-		pers = wp
-		persImpl = wp
-
-	case "none":
-		log.Println("No persistence (in-memory only)")
-		np := persistence.NewNoOpPersister()
-		pers = np
-		persImpl = np
-
+		_ = p.RestoreFrom(tm.GetStore("default"))
+		return p, p
 	default:
-		log.Printf("Unknown persistence type '%s', using none", cfg.PersistenceType)
-		np := persistence.NewNoOpPersister()
-		pers = np
-		persImpl = np
+		p := persistence.NewNoOpPersister()
+		return p, p
 	}
-
-	return pers, persImpl
 }
 
-func setupWriteBehind(cfg *Config, pers ports.Persister) *persistence.WriteBehindBuffer {
+func initWriteBehind(cfg *Config, p ports.Persister) *persistence.WriteBehindBuffer {
 	if cfg.PersistenceType == "none" {
-		log.Println("Write-behind buffer skipped")
 		return nil
 	}
-
-	log.Printf("Setting up write-behind buffer (size=%d, interval=%v)...",
-		cfg.WriteBufferSize, cfg.FlushInterval)
-
-	wb := persistence.NewWriteBehindBuffer(cfg.WriteBufferSize, cfg.FlushInterval, pers)
-
-	ctx := context.Background()
-	wb.Start(ctx)
-
-	log.Println("Write-behind buffer started")
+	wb := persistence.NewWriteBehindBuffer(cfg.WriteBufferSize, cfg.FlushInterval, p)
+	wb.Start(context.Background())
 	return wb
 }
 
-func startServers(cfg *Config, tm *tenants.Manager) (*httpAdapter.Server, *tcpAdapter.PomaiServer) {
-	log.Printf("Starting HTTP server on :%s...", cfg.HTTPPort)
-
-	httpConfig := httpAdapter.DefaultServerConfig()
-	httpConfig.Port, _ = strconv.Atoi(cfg.HTTPPort)
-	httpConfig.ReadTimeout = cfg.HTTPReadTimeout
-	httpConfig.WriteTimeout = cfg.HTTPWriteTimeout
-	httpConfig.IdleTimeout = cfg.HTTPIdleTimeout
-	httpConfig.EnableCORS = cfg.EnableCORS
-	httpConfig.EnableMetrics = cfg.EnableMetrics
-	httpConfig.EnableDebug = cfg.EnableDebug
-
-	httpSrv := httpAdapter.NewServerWithConfig(tm, httpConfig)
-
-	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
-		}
-	}()
-
-	log.Printf("HTTP server started on :%s", cfg.HTTPPort)
-
-	log.Printf("Starting Gnet TCP server on :%s...", cfg.TCPPort)
-
-	tcpSrv := tcpAdapter.NewPomaiServer(tm)
-
-	go func() {
-		addr := ":" + cfg.TCPPort
-		if err := tcpSrv.ListenAndServe(addr); err != nil {
-			log.Fatalf("TCP server error: %v", err)
-		}
-	}()
-
-	log.Println("Gnet TCP server started")
-
-	return httpSrv, tcpSrv
+func closeWriteBehind(wb *persistence.WriteBehindBuffer) {
+	if wb != nil {
+		wb.Close()
+	}
 }
 
-func waitForReady(port string) {
-	log.Println("Waiting for services...")
+func initCluster(cfg *Config, tm *tenants.Manager) *replication.Manager {
+	if !cfg.ClusterMode {
+		return nil
+	}
+	rm := replication.NewManager(cfg.NodeID, replication.ModeAsync, tm)
+	seeds := strings.Split(cfg.Seeds, ",")
+	if err := rm.EnableGossip(cfg.TCPPort, cfg.GossipPort, seeds); err != nil {
+		log.Fatalf("Gossip Init Failed: %v", err)
+	}
+	return rm
+}
 
-	maxRetries := 50
-	retryDelay := 100 * time.Millisecond
+func initServers(cfg *Config, tm *tenants.Manager, rm *replication.Manager) (*httpAdapter.Server, *tcpAdapter.PomaiServer) {
+	hCfg := httpAdapter.DefaultServerConfig()
+	hCfg.Port, _ = strconv.Atoi(cfg.HTTPPort)
+	hCfg.ReadTimeout = cfg.HTTPReadTimeout
+	hCfg.WriteTimeout = cfg.HTTPWriteTimeout
+	hCfg.IdleTimeout = cfg.HTTPIdleTimeout
+	hCfg.EnableCORS = cfg.EnableCORS
+	hCfg.EnableMetrics = cfg.EnableMetrics
+	hCfg.EnableDebug = cfg.EnableDebug
 
-	for i := 0; i < maxRetries; i++ {
-		resp, err := http.Get("http://localhost:" + port + "/health")
+	return httpAdapter.NewServerWithConfig(tm, hCfg), tcpAdapter.NewPomaiServer(tm, rm, cfg.MaxConnections)
+}
+
+func startServers(httpSrv *httpAdapter.Server, tcpSrv *tcpAdapter.PomaiServer, hPort, tPort string) {
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP Start Failed: %v", err)
+		}
+	}()
+	go func() {
+		if err := tcpSrv.ListenAndServe(":" + tPort); err != nil {
+			log.Fatalf("TCP Start Failed: %v", err)
+		}
+	}()
+}
+
+func waitForHealth(port string) {
+	url := "http://localhost:" + port + "/health"
+	for i := 0; i < 50; i++ {
+		resp, err := http.Get(url)
 		if err == nil && resp.StatusCode == 200 {
 			resp.Body.Close()
-			log.Println("Services ready")
 			return
 		}
 		if resp != nil {
 			resp.Body.Close()
 		}
-		time.Sleep(retryDelay)
+		time.Sleep(100 * time.Millisecond)
 	}
-
-	log.Println("Health check timeout")
 }
 
-func gracefulShutdown(cfg *Config, httpSrv *httpAdapter.Server, tcpSrv *tcpAdapter.PomaiServer,
-	wb *persistence.WriteBehindBuffer, pers ports.Persister,
-	persImpl interface{}, tm *tenants.Manager) {
+func shutdown(cfg *Config, hSrv *httpAdapter.Server, tSrv *tcpAdapter.PomaiServer, wb *persistence.WriteBehindBuffer, pImpl interface{}, tm *tenants.Manager) {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	fmt.Println(ColorRed + "\n SHUTDOWN SEQUENCE INITIATED" + ColorReset)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
 
-	sig := <-sigCh
-	log.Printf("\nSignal received: %v", sig)
-	log.Println("Starting graceful shutdown...")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	defer shutdownCancel()
-
-	log.Println("Stopping HTTP server...")
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("HTTP shutdown error: %v", err)
-	} else {
-		log.Println("HTTP server stopped")
-	}
-
-	log.Println("Stopping TCP server...")
-	if err := tcpSrv.Shutdown(cfg.ShutdownTimeout); err != nil {
-		log.Printf("TCP shutdown error: %v", err)
-	} else {
-		log.Println("TCP server stopped")
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); hSrv.Shutdown(ctx) }()
+	go func() { defer wg.Done(); tSrv.Shutdown(cfg.ShutdownTimeout) }()
+	wg.Wait()
 
 	if wb != nil {
-		log.Println("Flushing write-behind buffer...")
-		closeWriteBehind(wb)
+		wb.Close()
 	}
 
-	if sp, ok := persImpl.(ports.Snapshotter); ok {
-		log.Println("Creating snapshots...")
-		createSnapshots(sp, tm)
-	}
-
-	log.Println("Closing persistence...")
-	closePersistence(pers, persImpl, tm)
-
-	printFinalStats(tm)
-
-	log.Println("\nShutdown complete. Goodbye!")
-}
-
-func closeWriteBehind(wb *persistence.WriteBehindBuffer) {
-	if wb == nil {
-		return
-	}
-
-	if err := wb.Close(); err != nil {
-		log.Printf("Write-behind close error: %v", err)
-	} else {
-		log.Println("Write-behind buffer flushed")
-	}
-}
-
-func createSnapshots(sp ports.Snapshotter, tm *tenants.Manager) {
-	tenantIDs := tm.ListTenants()
-	log.Printf("Creating snapshots for %d tenant(s)...", len(tenantIDs))
-
-	successCount := 0
-	totalItems := int64(0)
-	totalBytes := int64(0)
-
-	for _, id := range tenantIDs {
-		store := tm.GetStore(id)
-		if store == nil {
-			continue
-		}
-
-		stats := store.Stats()
-		totalItems += stats.Items
-		totalBytes += stats.Bytes
-
-		if err := sp.Snapshot(store); err != nil {
-			log.Printf("Snapshot error for tenant '%s': %v", id, err)
-		} else {
-			successCount++
+	if sp, ok := pImpl.(ports.Snapshotter); ok {
+		printStatus("STORAGE", "Creating Final Snapshot...")
+		for _, id := range tm.ListTenants() {
+			if s := tm.GetStore(id); s != nil {
+				sp.Snapshot(s)
+			}
 		}
 	}
 
-	log.Printf("Snapshots created: %d/%d (items: %d, size: %s)",
-		successCount, len(tenantIDs), totalItems, formatBytes(totalBytes))
+	fmt.Println(ColorGreen + " SYSTEM HALTED SAFELY" + ColorReset)
 }
 
-func closePersistence(pers ports.Persister, persImpl interface{}, tm *tenants.Manager) {
-	if pers == nil {
-		return
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-
-	if err := pers.Close(); err != nil {
-		log.Printf("Persistence close error: %v", err)
-	} else {
-		log.Println("Persistence closed")
-	}
+	return def
 }
 
-func printFinalStats(tm *tenants.Manager) {
-	log.Println("\nFinal Statistics:")
-
-	tenantIDs := tm.ListTenants()
-	for _, id := range tenantIDs {
-		store := tm.GetStore(id)
-		if store == nil {
-			continue
-		}
-
-		stats := store.Stats()
-		log.Printf("  Tenant '%s': %d items, %s",
-			id, stats.Items, formatBytes(stats.Bytes))
-	}
-
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	log.Printf("  Memory: Alloc=%s, TotalAlloc=%s, Sys=%s, NumGC=%d",
-		formatBytes(int64(m.Alloc)),
-		formatBytes(int64(m.TotalAlloc)),
-		formatBytes(int64(m.Sys)),
-		m.NumGC)
-}
-
-func getenv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-func getenvInt(key string, defaultValue int) int {
-	if value := os.Getenv(key); value != "" {
-		if intValue, err := strconv.Atoi(value); err == nil {
-			return intValue
+func getEnvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			return i
 		}
 	}
-	return defaultValue
+	return def
 }
 
-func getenvBool(key string, defaultValue bool) bool {
-	if value := os.Getenv(key); value != "" {
-		if boolValue, err := strconv.ParseBool(value); err == nil {
-			return boolValue
+func getEnvBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
-	return defaultValue
+	return def
 }
 
-func getenvDuration(key string, defaultValue time.Duration) time.Duration {
-	if value := os.Getenv(key); value != "" {
-		if duration, err := time.ParseDuration(value); err == nil {
-			return duration
+func getEnvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
 		}
 	}
-	return defaultValue
+	return def
 }
 
-func formatBytes(bytes int64) string {
-	if bytes == 0 {
-		return "0 B"
+func getEnvBytes(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	v = strings.ToUpper(strings.TrimSpace(v))
+
+	multiplier := int64(1)
+	if strings.HasSuffix(v, "GB") {
+		multiplier = 1024 * 1024 * 1024
+		v = strings.TrimSuffix(v, "GB")
+	} else if strings.HasSuffix(v, "MB") {
+		multiplier = 1024 * 1024
+		v = strings.TrimSuffix(v, "MB")
+	} else if strings.HasSuffix(v, "KB") {
+		multiplier = 1024
+		v = strings.TrimSuffix(v, "KB")
+	} else if strings.HasSuffix(v, "B") {
+		v = strings.TrimSuffix(v, "B")
 	}
 
+	if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return i * multiplier
+	}
+	return def
+}
+
+func formatBytes(b int64) string {
+	if b <= 0 {
+		return "Unlimited"
+	}
 	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
 	}
-
 	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
+	for n := b / unit; n >= unit; n /= unit {
 		div *= unit
 		exp++
 	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
 
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+func closePersistence(pers ports.Persister) {
+	if pers != nil {
+		pers.Close()
+	}
 }

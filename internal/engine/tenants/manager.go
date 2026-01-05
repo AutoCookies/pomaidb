@@ -1,4 +1,3 @@
-// File: internal/engine/tenants/manager.go
 package tenants
 
 import (
@@ -8,95 +7,96 @@ import (
 	"github.com/AutoCookies/pomai-cache/internal/engine/core"
 )
 
-// Manager manages per-tenant stores
+type tenant struct {
+	store *core.Store
+	sem   chan struct{}
+}
+
 type Manager struct {
 	mu                sync.RWMutex
-	stores            map[string]*core.Store
-	slots             map[string]chan struct{}
+	tenants           map[string]*tenant
 	shardCount        int
 	perTenantCapacity int64
 	maxConcurrent     int
 }
 
-// StoreInterface defines store operations
-type StoreInterface interface {
-	// Add methods as needed
-}
+type StoreInterface interface{}
 
-// StoreFactory creates stores
-type StoreFactory func(shardCount int, capacityBytes int64) StoreInterface
-
-// NewManager creates tenant manager
 func NewManager(shardCount int, perTenantCapacity int64) *Manager {
 	return NewManagerWithLimit(shardCount, perTenantCapacity, 100)
 }
 
-// NewManagerWithLimit creates manager with concurrency limit
 func NewManagerWithLimit(shardCount int, perTenantCapacity int64, maxConcurrent int) *Manager {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 100
 	}
-
 	return &Manager{
-		stores:            make(map[string]*core.Store),
-		slots:             make(map[string]chan struct{}),
+		tenants:           make(map[string]*tenant),
 		shardCount:        shardCount,
 		perTenantCapacity: perTenantCapacity,
 		maxConcurrent:     maxConcurrent,
 	}
 }
 
-// GetStore returns store for tenant (creates if needed)
 func (tm *Manager) GetStore(tenantID string) *core.Store {
 	tm.mu.RLock()
-	store, ok := tm.stores[tenantID]
+	t, ok := tm.tenants[tenantID]
 	tm.mu.RUnlock()
 
 	if ok {
-		return store
+		return t.store
 	}
 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if store, ok = tm.stores[tenantID]; ok {
-		return store
+	if t, ok = tm.tenants[tenantID]; ok {
+		return t.store
 	}
 
-	store = core.NewStoreWithOptions(tm.shardCount, tm.perTenantCapacity)
+	store := core.NewStoreWithOptions(tm.shardCount, tm.perTenantCapacity)
 	store.SetTenantID(tenantID)
-	tm.stores[tenantID] = store
+
+	t = &tenant{
+		store: store,
+		sem:   make(chan struct{}, tm.maxConcurrent),
+	}
+	tm.tenants[tenantID] = t
 
 	return store
 }
 
-// AcquireTenant acquires slot for tenant
 func (tm *Manager) AcquireTenant(tenantID string, timeout time.Duration) bool {
-	tm.mu.Lock()
-	ch, ok := tm.slots[tenantID]
+	tm.mu.RLock()
+	t, ok := tm.tenants[tenantID]
+	tm.mu.RUnlock()
+
 	if !ok {
-		ch = make(chan struct{}, tm.maxConcurrent)
-		tm.slots[tenantID] = ch
+		tm.GetStore(tenantID)
+		tm.mu.RLock()
+		t, ok = tm.tenants[tenantID]
+		tm.mu.RUnlock()
+		if !ok {
+			return false
+		}
 	}
-	tm.mu.Unlock()
 
 	if timeout <= 0 {
-		ch <- struct{}{}
+		t.sem <- struct{}{}
 		return true
 	}
 
 	select {
-	case ch <- struct{}{}:
+	case t.sem <- struct{}{}:
 		return true
 	case <-time.After(timeout):
 		return false
 	}
 }
 
-// ReleaseTenant releases tenant slot
 func (tm *Manager) ReleaseTenant(tenantID string) {
 	tm.mu.RLock()
-	ch, ok := tm.slots[tenantID]
+	t, ok := tm.tenants[tenantID]
 	tm.mu.RUnlock()
 
 	if !ok {
@@ -104,34 +104,30 @@ func (tm *Manager) ReleaseTenant(tenantID string) {
 	}
 
 	select {
-	case <-ch:
+	case <-t.sem:
 	default:
 	}
 }
 
-// ListTenants returns all tenant IDs
 func (tm *Manager) ListTenants() []string {
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
-	tenants := make([]string, 0, len(tm.stores))
-	for id := range tm.stores {
-		tenants = append(tenants, id)
+	ids := make([]string, 0, len(tm.tenants))
+	for id := range tm.tenants {
+		ids = append(ids, id)
 	}
-	return tenants
+	return ids
 }
 
-// RemoveTenant removes tenant store
 func (tm *Manager) RemoveTenant(tenantID string) bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	_, ok := tm.stores[tenantID]
-	if !ok {
+	if _, ok := tm.tenants[tenantID]; !ok {
 		return false
 	}
 
-	delete(tm.stores, tenantID)
-	delete(tm.slots, tenantID)
+	delete(tm.tenants, tenantID)
 	return true
 }

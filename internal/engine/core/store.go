@@ -1,9 +1,9 @@
-// File: internal/engine/core/store.go
 package core
 
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +11,7 @@ import (
 	"hash/fnv"
 	"io"
 	"log"
+	"math"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -19,11 +20,15 @@ import (
 	"github.com/golang/snappy"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/AutoCookies/pomai-cache/internal/engine/core/common"
+	"github.com/AutoCookies/pomai-cache/internal/engine/core/data_types"
+	"github.com/AutoCookies/pomai-cache/internal/engine/core/sharding"
+	"github.com/AutoCookies/pomai-cache/internal/engine/core/storage"
 	"github.com/AutoCookies/pomai-cache/internal/engine/eviction"
 	"github.com/AutoCookies/pomai-cache/packages/ds/bloom"
-	"github.com/AutoCookies/pomai-cache/packages/ds/graph"
 	"github.com/AutoCookies/pomai-cache/packages/ds/sketch"
 	"github.com/AutoCookies/pomai-cache/packages/ds/skiplist"
+	"github.com/AutoCookies/pomai-cache/packages/ds/timestream"
 )
 
 var (
@@ -31,9 +36,17 @@ var (
 	ErrInsufficientStorage = errors.New("insufficient storage")
 	ErrValueNotInteger     = errors.New("value is not an integer")
 	ErrKeyNotFound         = errors.New("key not found")
+	ErrCorruptData         = errors.New("corrupted chunk data")
 )
 
-var GlobalMemCtrl MemoryController
+var GlobalMemCtrl common.MemoryController
+
+const (
+	chunkHeaderMagic   = "\xff\xfeCHNK"
+	chunkSizeThreshold = 1024
+	fixedChunkSize     = 4096
+	pgusMagicByte      = 0x02
+)
 
 var hashPool = sync.Pool{
 	New: func() any {
@@ -42,9 +55,10 @@ var hashPool = sync.Pool{
 }
 
 type Store struct {
-	config *StoreConfig
+	config     *common.StoreConfig
+	chunkStore *data_types.ChunkStore
 
-	shards     []*Shard
+	shards     []*sharding.Shard
 	shardCount uint32
 	shardMask  uint32
 
@@ -62,28 +76,46 @@ type Store struct {
 	evictionCancel  context.CancelFunc
 	freqSketch      *sketch.Sketch
 
-	vectorStore *VectorStore
-	graphStore  *GraphStore
-	timeStream  *TimeStreamStore
-	bitmapStore *BitmapStore
+	vectorStore *data_types.VectorStore
+	graphStore  *data_types.GraphStore
+	timeStream  *data_types.TimeStreamStore
+	bitmapStore *data_types.BitmapStore
 	cdcEnabled  atomic.Bool
 	cdcStream   string
+	hashStore   *data_types.HashStore
+
+	plgStore *data_types.PLGStore
+	pgus     *storage.PGUS
+
+	vectorSearchEMA    float64
+	vectorSearchEMAMu  sync.Mutex
+	vectorSearchAlpha  float64
+	vectorSearchTarget time.Duration
+	adaptiveEfEnabled  bool
+	picStore           *data_types.PICStore
+	pmcStore           *data_types.PMCStore
+
+	_      [56]byte // CPU Caching Padding make the hot fields to be on separate cache lines
+	hits   atomic.Uint64
+	_      [56]byte
+	misses atomic.Uint64
+	_      [56]byte
 }
 
 func NewStore(shardCount int) *Store {
-	config := DefaultStoreConfig()
+	config := common.DefaultStoreConfig()
 	config.ShardCount = shardCount
 	return NewStoreWithConfig(config)
 }
 
 func NewStoreWithOptions(shardCount int, capacityBytes int64) *Store {
-	config := DefaultStoreConfig()
+	config := common.DefaultStoreConfig()
 	config.ShardCount = shardCount
 	config.CapacityBytes = capacityBytes
 	return NewStoreWithConfig(config)
 }
 
-func NewStoreWithConfig(config *StoreConfig) *Store {
+func NewStoreWithConfig(config *common.StoreConfig) *Store {
 	if config.ShardCount <= 0 {
 		config.ShardCount = 256
 	}
@@ -92,33 +124,61 @@ func NewStoreWithConfig(config *StoreConfig) *Store {
 	config.ShardCount = shardCount
 
 	ctx, cancel := context.WithCancel(context.Background())
+	dataDir := "./data"
 
 	s := &Store{
 		config:          config,
-		shards:          make([]*Shard, shardCount),
+		shards:          make([]*sharding.Shard, shardCount),
 		shardCount:      uint32(shardCount),
 		shardMask:       uint32(shardCount - 1),
+		chunkStore:      data_types.NewChunkStore(),
 		zsets:           make(map[string]*skiplist.Skiplist),
 		evictionMetrics: &eviction.EvictionMetrics{},
 		evictionCtx:     ctx,
 		evictionCancel:  cancel,
-		vectorStore:     NewVectorStore(),
-		graphStore:      NewGraphStore(),
-		timeStream:      NewTimeStreamStore(),
-		bitmapStore:     NewBitmapStore(),
+		vectorStore:     data_types.NewVectorStore(),
+		graphStore:      data_types.NewGraphStore(),
+		timeStream:      data_types.NewTimeStreamStore(),
+		bitmapStore:     data_types.NewBitmapStore(),
 		cdcStream:       "__cdc_log__",
+		hashStore:       data_types.NewHashStore(),
+		picStore:        data_types.NewPICStore(),
+		pmcStore:        data_types.NewPMCStore(),
+		plgStore:        data_types.NewPLGStore(),
+		pgus:            storage.NewPGUS(dataDir + "/pomai_virtual.dat"),
 	}
 
 	s.cdcEnabled.Store(false)
 	s.freqSketch = sketch.New(1<<16, 4)
 
 	for i := 0; i < shardCount; i++ {
-		s.shards[i] = NewLockFreeShardAdapter()
+		s.shards[i] = sharding.NewLockFreeShardAdapter()
 	}
 
 	s.evictionManager = eviction.NewManager(s)
 
+	s.vectorSearchEMA = 0
+	s.vectorSearchAlpha = 0.12
+	s.vectorSearchTarget = 50 * time.Millisecond
+	s.adaptiveEfEnabled = true
+
 	return s
+}
+
+func (s *Store) PLGAddEdge(node1, node2 string, weight float64) {
+	if s.evictionManager != nil {
+		now := time.Now().UnixNano()
+		s.evictionManager.RecordAccess(node1, now)
+		s.evictionManager.RecordAccess(node2, now)
+	}
+	s.plgStore.AddEdge(node1, node2, weight)
+}
+
+func (s *Store) PLGExtractCluster(startNode string, minDensity float64) []string {
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(startNode, time.Now().UnixNano())
+	}
+	return s.plgStore.ExtractCluster(startNode, minDensity)
 }
 
 func (s *Store) SetBit(key string, offset uint64, value int) (int, error) {
@@ -134,22 +194,23 @@ func (s *Store) BitCount(key string, start, end int64) (int64, error) {
 }
 
 func (s *Store) StreamAppend(stream string, id string, val float64, metadata map[string]interface{}) error {
-	return s.timeStream.Append(stream, &Event{
+	return s.timeStream.Append(stream, &timestream.Event{
 		ID:        id,
 		Value:     val,
 		Metadata:  metadata,
 		Timestamp: time.Now().UnixNano(),
-		Type:      "generic", // Hoặc lấy từ metadata
+		Type:      "generic",
 	})
 }
 
-// StreamQuery trả về raw events trong khoảng thời gian
-func (s *Store) StreamRange(stream string, start, end int64) ([]*Event, error) {
-	// Filter nil nghĩa là lấy tất cả
+func (s *Store) StreamAppendBatch(stream string, events []*timestream.Event) error {
+	return s.timeStream.AppendBatch(stream, events)
+}
+
+func (s *Store) StreamRange(stream string, start, end int64) ([]*timestream.Event, error) {
 	return s.timeStream.Range(stream, start, end, nil)
 }
 
-// StreamWindow trả về dữ liệu đã tổng hợp (Aggregated)
 func (s *Store) StreamWindow(stream string, windowStr string, aggType string) (map[int64]float64, error) {
 	dur, err := time.ParseDuration(windowStr)
 	if err != nil {
@@ -158,15 +219,13 @@ func (s *Store) StreamWindow(stream string, windowStr string, aggType string) (m
 	return s.timeStream.Window(stream, dur, aggType)
 }
 
-// StreamAnomaly phát hiện bất thường
-func (s *Store) StreamDetectAnomaly(stream string, threshold float64) ([]*Event, error) {
+func (s *Store) StreamDetectAnomaly(stream string, threshold float64) ([]*timestream.Event, error) {
 	if threshold <= 0 {
-		threshold = 2.5 // Default Z-Score threshold (99% confidence)
+		threshold = 2.5
 	}
 	return s.timeStream.DetectAnomaly(stream, threshold)
 }
 
-// StreamForecast dự báo giá trị
 func (s *Store) StreamForecast(stream string, horizonStr string) (float64, error) {
 	dur, err := time.ParseDuration(horizonStr)
 	if err != nil {
@@ -175,8 +234,7 @@ func (s *Store) StreamForecast(stream string, horizonStr string) (float64, error
 	return s.timeStream.Forecast(stream, dur)
 }
 
-// StreamPattern tìm chuỗi sự kiện A -> B -> C
-func (s *Store) StreamDetectPattern(stream string, types []string, withinStr string) ([][]*Event, error) {
+func (s *Store) StreamDetectPattern(stream string, types []string, withinStr string) ([][]*timestream.Event, error) {
 	dur, err := time.ParseDuration(withinStr)
 	if err != nil {
 		return nil, err
@@ -184,49 +242,134 @@ func (s *Store) StreamDetectPattern(stream string, types []string, withinStr str
 	return s.timeStream.DetectPattern(stream, types, dur)
 }
 
+func (s *Store) ReadGroup(stream, group string, count int) ([]*timestream.Event, error) {
+	return s.timeStream.ReadGroup(stream, group, count)
+}
+
+func graphNodeKey(graphName, nodeID string) string {
+	return "g:n:" + graphName + ":" + nodeID
+}
+
+func graphEdgeKey(graphName, from, to string) string {
+	return "g:e:" + graphName + ":" + from + ":" + to
+}
+
 func (s *Store) CreateGraph(name string) error {
 	return s.graphStore.CreateGraph(name)
 }
 
 func (s *Store) AddGraphNode(graphName, nodeID string, properties map[string]interface{}) error {
-	return s.graphStore.AddNode(graphName, nodeID, properties)
+	// 1. Đăng ký ID vào Graph Engine (Để sau này map được String <-> Int)
+	// Hàm này trong graph_store cần expose ra, hoặc ta gọi AddEdge ảo.
+	// Tuy nhiên, cách tốt nhất là cập nhật graph_store để có hàm EnsureNode.
+	// Tạm thời ta dùng trick: AddEdge(nodeID, nodeID, 0) nếu graph_store chưa hỗ trợ AddNode riêng,
+	// nhưng tốt nhất hãy thêm hàm AddNode vào graph_store (xem bên dưới).
+	if err := s.graphStore.AddNode(graphName, nodeID); err != nil {
+		return err
+	}
+
+	// 2. Lưu Properties vào KV Store (Cache dữ liệu)
+	if len(properties) > 0 {
+		propBytes, err := json.Marshal(properties)
+		if err != nil {
+			return err
+		}
+		// Lưu key dạng: g:n:mygraph:user1
+		return s.Put(graphNodeKey(graphName, nodeID), propBytes, 0)
+	}
+	return nil
 }
 
-func (s *Store) AddGraphEdge(graphName, from, to, edgeType string, weight float64, props map[string]interface{}) error {
-	return s.graphStore.AddEdge(graphName, from, to, edgeType, weight, props)
+func (s *Store) AddGraphEdge(graphName, from, to string, weight float64, props map[string]interface{}) error {
+	if s.evictionManager != nil {
+		now := time.Now().UnixNano()
+		s.evictionManager.RecordAccess(from, now)
+		s.evictionManager.RecordAccess(to, now)
+	}
+
+	if err := s.graphStore.AddEdge(graphName, from, to, weight); err != nil {
+		return err
+	}
+
+	if len(props) > 0 {
+		propBytes, err := json.Marshal(props)
+		if err != nil {
+			return err
+		}
+		return s.Put(graphEdgeKey(graphName, from, to), propBytes, 0)
+	}
+	return nil
 }
 
-func (s *Store) GraphShortestPath(graphName, from, to string, maxDepth int) (*graph.PathResult, error) {
+func (s *Store) GraphGetNode(graphName, nodeID string) (map[string]interface{}, error) {
+	val, ok := s.Get(graphNodeKey(graphName, nodeID))
+	if !ok {
+		// Node có thể tồn tại trong Topology nhưng không có props
+		// Check Topology
+		if !s.graphStore.NodeExists(graphName, nodeID) {
+			return nil, ErrKeyNotFound
+		}
+		return map[string]interface{}{"id": nodeID}, nil
+	}
+
+	var props map[string]interface{}
+	if err := json.Unmarshal(val, &props); err != nil {
+		return nil, err
+	}
+	props["id"] = nodeID
+	return props, nil
+}
+
+func (s *Store) GraphNeighbors(graphName, nodeID string, depth int) ([]map[string]interface{}, error) {
+	// 1. Dùng Graph Engine để lấy IDs (Siêu nhanh)
+	// Cần thêm hàm GetNeighbors vào graph_store (dựa trên BFS hoặc CSR Slice)
+	neighborIDs, err := s.graphStore.GetNeighbors(graphName, nodeID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. Hydrate dữ liệu (Lấy thịt đắp vào xương)
+	results := make([]map[string]interface{}, 0, len(neighborIDs))
+	for _, id := range neighborIDs {
+		// Pipeline Get (nếu tối ưu kỹ hơn thì dùng MGet)
+		nodeProps, _ := s.GraphGetNode(graphName, id)
+		if nodeProps == nil {
+			nodeProps = map[string]interface{}{"id": id}
+		}
+		results = append(results, nodeProps)
+	}
+	return results, nil
+}
+
+func (s *Store) GraphShortestPath(graphName, from, to string, maxDepth int) ([]string, error) {
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(from, time.Now().UnixNano())
+	}
 	return s.graphStore.ShortestPath(graphName, from, to, maxDepth)
 }
 
-func (s *Store) GraphNeighbors(graphName, nodeID string, depth int, edgeType string) ([]string, error) {
-	return s.graphStore.GetNeighbors(graphName, nodeID, depth, edgeType)
-}
-
 func (s *Store) GraphPageRank(graphName string, iterations int) (map[string]float64, error) {
-	return s.graphStore.PageRank(graphName, iterations, 0.85)
-}
-
-func (s *Store) GraphCommunities(graphName, algorithm string) (map[string]int, error) {
-	return s.graphStore.DetectCommunities(graphName, algorithm)
-}
-
-func (s *Store) GraphSubgraph(graphName string, nodeIDs []string) (*graph.Graph, error) {
-	return s.graphStore.GetSubgraph(graphName, nodeIDs)
+	return s.graphStore.PageRank(graphName, iterations)
 }
 
 func (s *Store) ListGraphs() []string {
 	return s.graphStore.ListGraphs()
 }
 
-func (s *Store) GraphStats(name string) (*GraphStats, error) {
-	return s.graphStore.GraphStats(name)
-}
-
 func (s *Store) PutWithEmbedding(key string, value []byte, embedding []float32, ttl time.Duration) error {
 	if key == "" {
 		return ErrEmptyKey
+	}
+
+	var norm float64
+	for _, v := range embedding {
+		norm += float64(v) * float64(v)
+	}
+	if norm > 0 {
+		norm = math.Sqrt(norm)
+		for i := range embedding {
+			embedding[i] = float32(float64(embedding[i]) / norm)
+		}
 	}
 
 	if err := s.Put(key, value, ttl); err != nil {
@@ -235,7 +378,9 @@ func (s *Store) PutWithEmbedding(key string, value []byte, embedding []float32, 
 
 	defaultIndex := "default_embeddings"
 	if !s.vectorStore.HasIndex(defaultIndex) {
-		s.vectorStore.CreateIndex(defaultIndex, len(embedding), "cosine")
+		if err := s.vectorStore.CreateIndex(defaultIndex, len(embedding), "cosine"); err != nil {
+			return fmt.Errorf("create vector index failed: %w", err)
+		}
 	}
 
 	metadata := map[string]interface{}{
@@ -250,79 +395,140 @@ func (s *Store) PutWithEmbedding(key string, value []byte, embedding []float32, 
 	return nil
 }
 
-func (s *Store) GetSemantic(query []float32, minSimilarity float32) ([]byte, bool) {
-	defaultIndex := "default_embeddings"
-
-	results, err := s.vectorStore.Search(defaultIndex, query, 1)
-	if err != nil || len(results) == 0 {
-		return nil, false
+func (s *Store) SearchVector(indexName string, query []float32, k int) ([]data_types.VectorSearchResult, error) {
+	if s.vectorStore == nil {
+		return nil, fmt.Errorf("vector store not initialized")
+	}
+	if len(query) == 0 {
+		return nil, fmt.Errorf("empty query")
 	}
 
-	bestMatch := results[0]
-	maxDistance := 1.0 - minSimilarity
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		start := time.Now()
+		results, err := s.vectorStore.Search(indexName, query, k)
+		elapsed := time.Since(start)
 
-	if bestMatch.Distance > maxDistance {
-		return nil, false
-	}
+		s.updateVectorSearchEMA(elapsed)
 
-	return s.Get(bestMatch.ID)
-}
-
-func (s *Store) SemanticSearch(query []float32, k int) ([]SemanticResult, error) {
-	defaultIndex := "default_embeddings"
-
-	vectorResults, err := s.vectorStore.Search(defaultIndex, query, k)
-	if err != nil {
-		return nil, err
-	}
-
-	results := make([]SemanticResult, 0, len(vectorResults))
-	for _, vr := range vectorResults {
-		value, exists := s.Get(vr.ID)
-		if !exists {
-			continue
+		if err == nil {
+			if s.adaptiveEfEnabled {
+				s.maybeReduceEfOnLatency()
+			}
+			return results, nil
 		}
 
-		results = append(results, SemanticResult{
-			Key:      vr.ID,
-			Value:    value,
-			Distance: vr.Distance,
-			Metadata: vr.Metadata,
-		})
+		lastErr = err
+		time.Sleep(time.Duration(attempt*10) * time.Millisecond)
 	}
 
-	return results, nil
+	return nil, fmt.Errorf("vector search failed after retries: %w", lastErr)
 }
 
-func (s *Store) SemanticGet(query []float32, k int) ([]string, []float32, error) {
+func (s *Store) SetAdaptiveEfEnabled(enabled bool) {
+	s.adaptiveEfEnabled = enabled
+}
+
+func (s *Store) updateVectorSearchEMA(d time.Duration) {
+	s.vectorSearchEMAMu.Lock()
+	defer s.vectorSearchEMAMu.Unlock()
+	ms := float64(d.Milliseconds())
+	if s.vectorSearchEMA == 0 {
+		s.vectorSearchEMA = ms
+	} else {
+		a := s.vectorSearchAlpha
+		s.vectorSearchEMA = a*ms + (1.0-a)*s.vectorSearchEMA
+	}
+}
+
+func (s *Store) maybeReduceEfOnLatency() {
+	s.vectorSearchEMAMu.Lock()
+	emaMs := s.vectorSearchEMA
+	s.vectorSearchEMAMu.Unlock()
+
+	if emaMs == 0 {
+		return
+	}
+
+	if time.Duration(emaMs)*time.Millisecond > s.vectorSearchTarget {
+		stats, err := s.vectorStore.IndexStats("default_embeddings")
+		if err != nil {
+			return
+		}
+		currentEf := parseEfFromStats(stats)
+		if currentEf <= 1 {
+			return
+		}
+		newEf := int(math.Max(1, math.Floor(float64(currentEf)*0.8)))
+		s.vectorStore.SetGlobalEfSearch(newEf)
+		log.Printf("[TUNER] Reduced ef from %d to %d due to high vector EMA=%.2fms", currentEf, newEf, emaMs)
+	}
+}
+
+func parseEfFromStats(stats map[string]interface{}) int {
+	if stats == nil {
+		return 0
+	}
+	keys := []string{"ef", "ef_search", "global_ef", "efSearch"}
+	for _, k := range keys {
+		if v, ok := stats[k]; ok {
+			switch t := v.(type) {
+			case int:
+				return t
+			case int32:
+				return int(t)
+			case int64:
+				return int(t)
+			case float64:
+				return int(t)
+			case string:
+				if parsed, err := strconv.Atoi(t); err == nil {
+					return parsed
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func (s *Store) PutWithEmbeddingFast(key string, value []byte, embedding []float32, ttl time.Duration) error {
+	if key == "" {
+		return ErrEmptyKey
+	}
+
+	var norm float64
+	for _, v := range embedding {
+		norm += float64(v) * float64(v)
+	}
+	if norm > 0 {
+		norm = math.Sqrt(norm)
+		for i := range embedding {
+			embedding[i] = float32(float64(embedding[i]) / norm)
+		}
+	}
+
+	if err := s.PutFast(key, value, ttl); err != nil {
+		return err
+	}
+
 	defaultIndex := "default_embeddings"
-
-	vectorResults, err := s.vectorStore.Search(defaultIndex, query, k)
-	if err != nil {
-		return nil, nil, err
+	if !s.vectorStore.HasIndex(defaultIndex) {
+		if err := s.vectorStore.CreateIndex(defaultIndex, len(embedding), "cosine"); err != nil {
+			return fmt.Errorf("create vector index failed: %w", err)
+		}
 	}
 
-	keys := make([]string, len(vectorResults))
-	distances := make([]float32, len(vectorResults))
-
-	for i, vr := range vectorResults {
-		keys[i] = vr.ID
-		distances[i] = vr.Distance
+	metadata := map[string]interface{}{
+		"key":        key,
+		"created_at": time.Now().Unix(),
 	}
 
-	return keys, distances, nil
-}
+	if err := s.vectorStore.Insert(defaultIndex, key, embedding, metadata); err != nil {
+		return fmt.Errorf("vector insert failed: %w", err)
+	}
 
-func (s *Store) CreateVectorIndex(name string, dimension int, distanceType string) error {
-	return s.vectorStore.CreateIndex(name, dimension, distanceType)
-}
-
-func (s *Store) InsertVector(indexName, id string, vector []float32, metadata map[string]interface{}) error {
-	return s.vectorStore.Insert(indexName, id, vector, metadata)
-}
-
-func (s *Store) SearchVector(indexName string, query []float32, k int) ([]VectorSearchResult, error) {
-	return s.vectorStore.Search(indexName, query, k)
+	return nil
 }
 
 func (s *Store) DeleteVector(indexName, id string) error {
@@ -360,7 +566,7 @@ func (s *Store) Shutdown() {
 	}
 }
 
-func (s *Store) getShardFast(key string) *Shard {
+func (s *Store) getShardFast(key string) *sharding.Shard {
 	h := hashPool.Get().(hash.Hash32)
 	h.Reset()
 	h.Write([]byte(key))
@@ -369,7 +575,7 @@ func (s *Store) getShardFast(key string) *Shard {
 	return s.shards[idx]
 }
 
-func (s *Store) getShard(key string) *Shard {
+func (s *Store) getShard(key string) *sharding.Shard {
 	return s.getShardFast(key)
 }
 
@@ -382,61 +588,104 @@ func (s *Store) hashToShardIndex(key string) int {
 	return idx
 }
 
-func (s *Store) GetShards() []*Shard {
+func (s *Store) GetShards() []*sharding.Shard {
 	return s.shards
 }
 
-func (s *Store) Get(key string) ([]byte, bool) {
-	if key == "" {
-		return nil, false
-	}
-
-	if s.bloom != nil {
-		if !s.bloom.MayContain(key) {
-			return nil, false
-		}
-	}
-
-	shard := s.getShardFast(key)
-	entry, ok := shard.Get(key)
-
-	if !ok {
-		return nil, false
-	}
-
-	if s.freqSketch != nil {
-		s.freqSketch.Increment(key)
-	}
-
-	return entry.Value(), true
+func (s *Store) isChunked(val []byte) bool {
+	return len(val) >= len(chunkHeaderMagic) && string(val[:len(chunkHeaderMagic)]) == chunkHeaderMagic
 }
 
-func (s *Store) GetFast(key string) ([]byte, bool) {
-	if key == "" {
+func (s *Store) resolveChunks(val []byte) ([]byte, bool) {
+	if len(val) < len(chunkHeaderMagic)+8 {
 		return nil, false
 	}
 
-	if s.bloom != nil {
-		if !s.bloom.MayContain(key) {
+	reader := bytes.NewReader(val[len(chunkHeaderMagic):])
+
+	var origSize uint32
+	var numChunks uint32
+
+	if err := binary.Read(reader, binary.LittleEndian, &origSize); err != nil {
+		return nil, false
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &numChunks); err != nil {
+		return nil, false
+	}
+
+	out := make([]byte, 0, origSize)
+	chunkIDBuf := make([]byte, 8)
+
+	for i := uint32(0); i < numChunks; i++ {
+		if _, err := io.ReadFull(reader, chunkIDBuf); err != nil {
 			return nil, false
 		}
+		id := data_types.ChunkID(string(chunkIDBuf))
+		chunkData, ok := s.chunkStore.GetChunk(id)
+		if !ok {
+			return nil, false
+		}
+		out = append(out, chunkData...)
 	}
 
-	shard := s.getShardFast(key)
-	entry, ok := shard.Get(key)
-
-	if !ok {
+	if uint32(len(out)) != origSize {
 		return nil, false
 	}
 
-	return entry.Value(), true
+	return out, true
 }
 
-func (s *Store) Put(key string, value []byte, ttl time.Duration) error {
-	if key == "" {
-		return ErrEmptyKey
+func (s *Store) cleanupChunks(val []byte) {
+	if len(val) < len(chunkHeaderMagic)+8 {
+		return
 	}
-	entry := NewEntry(key, value, ttl)
+
+	reader := bytes.NewReader(val[len(chunkHeaderMagic)+4:])
+	var numChunks uint32
+	if err := binary.Read(reader, binary.LittleEndian, &numChunks); err != nil {
+		return
+	}
+
+	ids := make([]data_types.ChunkID, 0, numChunks)
+	chunkIDBuf := make([]byte, 8)
+
+	for i := uint32(0); i < numChunks; i++ {
+		if _, err := io.ReadFull(reader, chunkIDBuf); err != nil {
+			break
+		}
+		ids = append(ids, data_types.ChunkID(string(chunkIDBuf)))
+	}
+
+	go s.chunkStore.DecRefBatch(ids)
+}
+
+func (s *Store) putChunked(key string, value []byte, ttl time.Duration) error {
+	numChunks := (len(value) + fixedChunkSize - 1) / fixedChunkSize
+	chunks := make([][]byte, 0, numChunks)
+
+	for i := 0; i < len(value); i += fixedChunkSize {
+		end := i + fixedChunkSize
+		if end > len(value) {
+			end = len(value)
+		}
+		chunks = append(chunks, value[i:end])
+	}
+
+	ids, err := s.chunkStore.PutBatch(chunks)
+	if err != nil {
+		return err
+	}
+
+	buf := bytes.NewBuffer(make([]byte, 0, len(chunkHeaderMagic)+8+(len(ids)*8)))
+	buf.WriteString(chunkHeaderMagic)
+	binary.Write(buf, binary.LittleEndian, uint32(len(value)))
+	binary.Write(buf, binary.LittleEndian, uint32(len(ids)))
+
+	for _, id := range ids {
+		buf.WriteString(string(id))
+	}
+
+	entry := common.NewEntry(key, buf.Bytes(), ttl)
 	shard := s.getShardFast(key)
 	_, deltaBytes := shard.Set(entry)
 	atomic.AddInt64(&s.totalBytesAtomic, deltaBytes)
@@ -452,21 +701,130 @@ func (s *Store) Put(key string, value []byte, ttl time.Duration) error {
 	return nil
 }
 
+func (s *Store) Get(key string) ([]byte, bool) {
+	if key == "" {
+		return nil, false
+	}
+	if s.bloom != nil && !s.bloom.MayContain(key) {
+		s.misses.Add(1) // Miss
+		return nil, false
+	}
+	shard := s.getShardFast(key)
+	entry, ok := shard.Get(key)
+	if !ok {
+		s.misses.Add(1) // Miss
+		return nil, false
+	}
+	s.hits.Add(1) // Hit
+	s.recordAccess(key)
+
+	// ... logic xử lý chunk/pgus giữ nguyên ...
+	val := entry.Value()
+	if len(val) > 0 && val[0] == pgusMagicByte {
+		return s.resolvePGUS(val)
+	}
+	if s.isChunked(val) {
+		return s.resolveChunks(val)
+	}
+	return val, true
+}
+
+func (s *Store) GetFast(key string) ([]byte, bool) {
+	if key == "" {
+		return nil, false
+	}
+
+	if s.bloom != nil && !s.bloom.MayContain(key) {
+		return nil, false
+	}
+
+	shard := s.getShardFast(key)
+	entry, ok := shard.Get(key)
+	if !ok {
+		s.misses.Add(1)
+		return nil, false
+	}
+
+	s.hits.Add(1)
+
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(key, time.Now().UnixNano())
+	}
+
+	val := entry.Value()
+	if s.isChunked(val) {
+		return s.resolveChunks(val)
+	}
+
+	return val, true
+}
+
+func (s *Store) Put(key string, value []byte, ttl time.Duration) error {
+	if key == "" {
+		return ErrEmptyKey
+	}
+
+	if len(value) >= chunkSizeThreshold {
+		return s.putPGUS(key, value, ttl)
+	}
+
+	if s.config.CapacityBytes > 0 &&
+		atomic.LoadInt64(&s.totalBytesAtomic) >= s.config.CapacityBytes {
+		return ErrInsufficientStorage
+	}
+
+	// Lưu Inline (Raw)
+	entry := common.NewEntry(key, value, ttl)
+	shard := s.getShardFast(key)
+	_, deltaBytes := shard.Set(entry)
+	atomic.AddInt64(&s.totalBytesAtomic, deltaBytes)
+
+	s.postWriteOps(key, value)
+
+	return nil
+}
+
+func (s *Store) putPGUS(key string, value []byte, ttl time.Duration) error {
+
+	granuleIDs := s.pgus.Write(value)
+
+	metaLen := 1 + 4 + (len(granuleIDs) * 8)
+	metaBuf := make([]byte, metaLen)
+
+	metaBuf[0] = pgusMagicByte
+	binary.BigEndian.PutUint32(metaBuf[1:5], uint32(len(granuleIDs)))
+
+	for i, id := range granuleIDs {
+		offset := 5 + (i * 8)
+		binary.BigEndian.PutUint64(metaBuf[offset:], uint64(id))
+	}
+
+	entry := common.NewEntry(key, metaBuf, ttl)
+	shard := s.getShardFast(key)
+	_, deltaBytes := shard.Set(entry)
+	atomic.AddInt64(&s.totalBytesAtomic, deltaBytes)
+
+	s.postWriteOps(key, value)
+	return nil
+}
+
 func (s *Store) PutFast(key string, value []byte, ttl time.Duration) error {
 	if key == "" {
 		return ErrEmptyKey
 	}
 
-	entry := NewEntry(key, value, ttl)
+	if len(value) >= chunkSizeThreshold {
+		return s.putChunked(key, value, ttl)
+	}
+
+	entry := common.NewEntry(key, value, ttl)
 	shard := s.getShardFast(key)
 	_, deltaBytes := shard.Set(entry)
-
 	atomic.AddInt64(&s.totalBytesAtomic, deltaBytes)
 
 	if s.bloom != nil {
 		s.bloom.Add(key)
 	}
-
 	if s.freqSketch != nil {
 		s.freqSketch.Increment(key)
 	}
@@ -486,12 +844,26 @@ func (s *Store) Delete(key string) {
 
 	atomic.AddInt64(&s.totalBytesAtomic, -int64(entry.Size()))
 
+	val := entry.Value()
+
+	// [PGUS CLEANUP]
+	if len(val) > 0 && val[0] == pgusMagicByte {
+		metaCopy := make([]byte, len(val))
+		copy(metaCopy, val)
+		go s.cleanupPGUS(metaCopy)
+	} else if s.isChunked(val) {
+		s.cleanupChunks(val)
+	}
+
 	s.trackCDC("DEL", key, nil)
 
 	if GlobalMemCtrl != nil {
 		GlobalMemCtrl.Release(int64(entry.Size()))
 	}
-	s.vectorStore.Delete("default_embeddings", key)
+	// Xóa vector index nếu có
+	if s.vectorStore != nil {
+		_ = s.vectorStore.Delete("default_embeddings", key)
+	}
 }
 
 func (s *Store) Exists(key string) bool {
@@ -499,10 +871,8 @@ func (s *Store) Exists(key string) bool {
 		return false
 	}
 
-	if s.bloom != nil {
-		if !s.bloom.MayContain(key) {
-			return false
-		}
+	if s.bloom != nil && !s.bloom.MayContain(key) {
+		return false
 	}
 
 	shard := s.getShardFast(key)
@@ -512,143 +882,76 @@ func (s *Store) Exists(key string) bool {
 
 func (s *Store) Incr(key string, delta int64) (int64, error) {
 	if key == "" {
-		return 0, ErrEmptyKey
+		return 0, common.ErrEmptyKey
 	}
 
 	shard := s.getShardFast(key)
+	var resultVal int64
 
-	if shard.useLockfree {
-		return s.incrLockFree(shard, key, delta)
-	}
+	mutator := func(oldEntry *common.Entry) (*common.Entry, error) {
+		var currentVal int64 = 0
 
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
+		if oldEntry != nil {
+			raw := oldEntry.Value()
+			var valStr string
 
-	var currentVal int64 = 0
-
-	elem, ok := shard.items[key]
-	if ok {
-		ent := elem.Value.(*Entry)
-		raw := ent.value
-
-		var valStr string
-		if len(raw) > 0 {
-			magic := raw[0]
-			payload := raw[1:]
-			if magic == 1 {
-				decoded, err := snappy.Decode(nil, payload)
-				if err != nil {
-					return 0, fmt.Errorf("corrupted data: %w", err)
+			if s.isChunked(raw) {
+				decoded, ok := s.resolveChunks(raw)
+				if !ok {
+					return nil, common.ErrCorruptData
 				}
 				valStr = string(decoded)
-			} else {
-				valStr = string(payload)
+			} else if len(raw) > 0 {
+				if raw[0] == 1 {
+					decoded, err := snappy.Decode(nil, raw[1:])
+					if err != nil {
+						return nil, fmt.Errorf("corrupted data: %w", err)
+					}
+					valStr = string(decoded)
+				} else {
+					valStr = string(raw[1:])
+				}
+			}
+
+			val, err := strconv.ParseInt(valStr, 10, 64)
+			if err != nil {
+				return nil, common.ErrValueNotInteger
+			}
+			currentVal = val
+
+			if s.isChunked(raw) {
+				s.cleanupChunks(raw)
 			}
 		}
 
-		val, err := strconv.ParseInt(valStr, 10, 64)
-		if err != nil {
-			return 0, ErrValueNotInteger
-		}
-		currentVal = val
+		newVal := currentVal + delta
+		resultVal = newVal
+
+		newValBytes := []byte(strconv.FormatInt(newVal, 10))
+		finalData := make([]byte, len(newValBytes)+1)
+		finalData[0] = 0
+		copy(finalData[1:], newValBytes)
+
+		return common.NewEntry(key, finalData, 0), nil
 	}
 
-	newVal := currentVal + delta
-	newValBytes := []byte(strconv.FormatInt(newVal, 10))
-	finalData := make([]byte, len(newValBytes)+1)
-	finalData[0] = 0
-	copy(finalData[1:], newValBytes)
-
-	newEntry := NewEntry(key, finalData, 0)
-
-	var deltaBytes int64
-	if elem, ok := shard.items[key]; ok {
-		oldEntry := elem.Value.(*Entry)
-		deltaBytes = int64(newEntry.Size() - oldEntry.Size())
-		elem.Value = newEntry
-		shard.ll.MoveToFront(elem)
-	} else {
-		elem := shard.ll.PushFront(newEntry)
-		shard.items[key] = elem
-		deltaBytes = int64(newEntry.Size())
+	err := shard.AtomicMutate(key, mutator)
+	if err != nil {
+		return 0, err
 	}
 
-	shard.bytes.Add(deltaBytes)
-	atomic.AddInt64(&s.totalBytesAtomic, deltaBytes)
-
-	return newVal, nil
-}
-
-func (s *Store) incrLockFree(shard *Shard, key string, delta int64) (int64, error) {
-	entry, ok := shard.lockfree.Get(key)
-
-	var currentVal int64 = 0
-
-	if ok {
-		raw := entry.value
-		var valStr string
-		if len(raw) > 0 {
-			magic := raw[0]
-			payload := raw[1:]
-			if magic == 1 {
-				decoded, err := snappy.Decode(nil, payload)
-				if err != nil {
-					return 0, fmt.Errorf("corrupted data: %w", err)
-				}
-				valStr = string(decoded)
-			} else {
-				valStr = string(payload)
-			}
-		}
-
-		val, err := strconv.ParseInt(valStr, 10, 64)
-		if err != nil {
-			return 0, ErrValueNotInteger
-		}
-		currentVal = val
-	}
-
-	newVal := currentVal + delta
-	newValBytes := []byte(strconv.FormatInt(newVal, 10))
-	finalData := make([]byte, len(newValBytes)+1)
-	finalData[0] = 0
-	copy(finalData[1:], newValBytes)
-
-	newEntry := NewEntry(key, finalData, 0)
-	_, deltaBytes := shard.lockfree.Set(newEntry)
-
-	atomic.AddInt64(&s.totalBytesAtomic, deltaBytes)
-
-	return newVal, nil
-}
-
-func (s *Store) MGet(keys []string) map[string][]byte {
-	if len(keys) == 0 {
-		return nil
-	}
-
-	results := make(map[string][]byte, len(keys))
-
-	for _, key := range keys {
-		if val, ok := s.Get(key); ok {
-			results[key] = val
-		}
-	}
-
-	return results
+	return resultVal, nil
 }
 
 func (s *Store) MSet(items map[string][]byte, ttl time.Duration) error {
 	if len(items) == 0 {
 		return nil
 	}
-
 	for key, val := range items {
 		if err := s.Put(key, val, ttl); err != nil {
 			return fmt.Errorf("mset failed at key %s: %w", key, err)
 		}
 	}
-
 	return nil
 }
 
@@ -656,6 +959,15 @@ func (s *Store) Clear() {
 	for _, shard := range s.shards {
 		shard.Clear()
 	}
+
+	if s.hashStore != nil {
+		s.hashStore.Clear()
+	}
+
+	if s.plgStore != nil {
+		s.plgStore.Clear()
+	}
+
 	atomic.StoreInt64(&s.totalBytesAtomic, 0)
 }
 
@@ -676,7 +988,7 @@ func (s *Store) GetBloomFilter() eviction.BloomFilterInterface {
 	return s.bloom
 }
 
-func (s *Store) GetConfig() *StoreConfig {
+func (s *Store) GetConfig() *common.StoreConfig {
 	return s.config
 }
 
@@ -748,11 +1060,11 @@ func (s *Store) ForceEvictBytes(targetBytes int64) int64 {
 	if s.evictionManager == nil {
 		return 0
 	}
-	return s.evictionManager.ForceEvictBytes(targetBytes)
+	return s.evictionManager.BatchEvict(targetBytes)
 }
 
 type memoryControllerWrapper struct {
-	mc MemoryController
+	mc common.MemoryController
 }
 
 func (w *memoryControllerWrapper) Release(bytes int64) {
@@ -782,11 +1094,11 @@ func (w *memoryControllerWrapper) Capacity() int64 {
 	return 0
 }
 
-func (s *Store) EvictionStats() EvictionMetrics {
-	return EvictionMetrics{}
+func (s *Store) EvictionStats() common.EvictionMetrics {
+	return common.EvictionMetrics{}
 }
 
-func (s *Store) Stats() Stats {
+func (s *Store) Stats() common.Stats {
 	var totalItems int64
 	var totalBytes int64
 
@@ -795,7 +1107,7 @@ func (s *Store) Stats() Stats {
 		totalBytes += shard.Bytes()
 	}
 
-	return Stats{
+	return common.Stats{
 		Items:      totalItems,
 		Bytes:      totalBytes,
 		Capacity:   s.config.CapacityBytes,
@@ -805,11 +1117,17 @@ func (s *Store) Stats() Stats {
 }
 
 func (s *Store) GetHits() uint64 {
-	return 0
+	return s.hits.Load()
 }
 
 func (s *Store) GetMisses() uint64 {
-	return 0
+	return s.misses.Load()
+}
+
+func (s *Store) GetAvgLatency() float64 {
+	s.vectorSearchEMAMu.Lock()
+	defer s.vectorSearchEMAMu.Unlock()
+	return s.vectorSearchEMA
 }
 
 func (s *Store) GetEvictions() uint64 {
@@ -824,9 +1142,16 @@ func (s *Store) Serialize() (io.Reader, error) {
 	for _, shard := range s.shards {
 		items := shard.GetItems()
 		for key, val := range items {
-			if elem, ok := val.(*Entry); ok {
+			if elem, ok := val.(*common.Entry); ok {
 				if !elem.IsExpired() {
-					allEntries[key] = elem.Value()
+					valBytes := elem.Value()
+					if s.isChunked(valBytes) {
+						if resolved, ok := s.resolveChunks(valBytes); ok {
+							allEntries[key] = resolved
+						}
+					} else {
+						allEntries[key] = valBytes
+					}
 				}
 			}
 		}
@@ -834,7 +1159,7 @@ func (s *Store) Serialize() (io.Reader, error) {
 
 	data, err := json.Marshal(allEntries)
 	if err != nil {
-		return nil, fmt.Errorf("failed to serialize:   %w", err)
+		return nil, fmt.Errorf("failed to serialize: %w", err)
 	}
 
 	return bytes.NewReader(data), nil
@@ -895,13 +1220,16 @@ func nextPowerOf2(n int) int {
 
 func (s *Store) EvictExpired() int {
 	totalEvicted := 0
-
 	for i := 0; i < int(s.shardCount); i++ {
 		shard := s.shards[i]
 		expired := shard.EvictExpired()
+		for _, e := range expired {
+			if s.isChunked(e.Value()) {
+				s.cleanupChunks(e.Value())
+			}
+		}
 		totalEvicted += len(expired)
 	}
-
 	return totalEvicted
 }
 
@@ -928,7 +1256,7 @@ func (s *Store) trackCDC(op string, key string, val []byte) {
 		meta["val"] = string(val)
 	}
 
-	go s.timeStream.Append(s.cdcStream, &Event{
+	go s.timeStream.Append(s.cdcStream, &timestream.Event{
 		Type:      "cdc",
 		Value:     numVal,
 		Metadata:  meta,
@@ -936,7 +1264,7 @@ func (s *Store) trackCDC(op string, key string, val []byte) {
 	})
 }
 
-func (s *Store) GetChanges(groupName string, count int) ([]*Event, error) {
+func (s *Store) GetChanges(groupName string, count int) ([]*timestream.Event, error) {
 	return s.timeStream.ReadGroup(s.cdcStream, groupName, count)
 }
 
@@ -952,7 +1280,6 @@ func (s *Store) getOrCreateZSet(key string) *skiplist.Skiplist {
 	s.zmu.Lock()
 	defer s.zmu.Unlock()
 
-	// Double check
 	if zs, ok = s.zsets[key]; ok {
 		return zs
 	}
@@ -1021,4 +1348,170 @@ func (s *Store) ZCard(key string) int {
 		return 0
 	}
 	return zs.Card()
+}
+
+func (s *Store) HSet(key, field string, value []byte) error {
+	return s.hashStore.HSet(key, field, value)
+}
+
+func (s *Store) HGet(key, field string) ([]byte, bool) {
+	return s.hashStore.HGet(key, field)
+}
+
+func (s *Store) HDel(key, field string) bool {
+	return s.hashStore.HDel(key, field)
+}
+
+func (s *Store) HExists(key, field string) bool {
+	return s.hashStore.HExists(key, field)
+}
+
+func (s *Store) HGetAll(key string) map[string][]byte {
+	return s.hashStore.HGetAll(key)
+}
+
+func (s *Store) MGet(keys []string) map[string][]byte {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	results := make(map[string][]byte, len(keys))
+
+	for _, key := range keys {
+		if val, ok := s.Get(key); ok {
+			results[key] = val
+		}
+	}
+
+	return results
+}
+
+func (s *Store) SemanticSearch(query []float32, k int) ([]SemanticResult, error) {
+	if s.vectorStore == nil {
+		return nil, fmt.Errorf("vector store not initialized")
+	}
+	if len(query) == 0 {
+		return nil, fmt.Errorf("empty query")
+	}
+	defaultIndex := "default_embeddings"
+	vectorResults, err := s.vectorStore.Search(defaultIndex, query, k)
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]SemanticResult, 0, len(vectorResults))
+	for _, vr := range vectorResults {
+		var value []byte
+		if s != nil {
+			if v, ok := s.Get(vr.ID); ok {
+				value = v
+			} else {
+				value = nil
+			}
+		}
+		results = append(results, SemanticResult{
+			Key:      vr.ID,
+			Value:    value,
+			Distance: vr.Distance,
+			Metadata: vr.Metadata,
+		})
+	}
+
+	return results, nil
+}
+
+func (s *Store) PICAppend(chainID, prompt string, response []byte, metadata map[string]string) error {
+	if chainID == "" {
+		return ErrEmptyKey
+	}
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(chainID, time.Now().UnixNano())
+	}
+	return s.picStore.Append(chainID, prompt, response, metadata)
+}
+
+func (s *Store) PICGet(chainID string, idx int) (data_types.InferenceChain, error) {
+	if chainID == "" {
+		return data_types.InferenceChain{}, ErrEmptyKey
+	}
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(chainID, time.Now().UnixNano())
+	}
+	return s.picStore.Get(chainID, idx)
+}
+
+func (s *Store) MatrixSet(key string, rows, cols int, data []float32) error {
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(key, time.Now().UnixNano())
+	}
+	return s.pmcStore.Set(key, rows, cols, data)
+}
+
+func (s *Store) MatrixGet(key string) (data_types.Matrix, error) {
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(key, time.Now().UnixNano())
+	}
+	return s.pmcStore.Get(key)
+}
+
+func (s *Store) MatrixAdd(key1, key2 string) (data_types.Matrix, error) {
+	return s.pmcStore.Add(key1, key2)
+}
+
+func (s *Store) MatrixMultiply(key1, key2 string) (data_types.Matrix, error) {
+	return s.pmcStore.Multiply(key1, key2)
+}
+
+func (s *Store) resolvePGUS(meta []byte) ([]byte, bool) {
+	// Validate độ dài tối thiểu (Magic + Count)
+	if len(meta) < 5 {
+		return nil, false
+	}
+
+	count := binary.BigEndian.Uint32(meta[1:5])
+	expectedLen := 5 + int(count)*8
+	if len(meta) != expectedLen {
+		return nil, false
+	}
+
+	// Parse IDs
+	ids := make([]storage.GranuleID, count)
+	for i := 0; i < int(count); i++ {
+		offset := 5 + (i * 8)
+		ids[i] = storage.GranuleID(binary.BigEndian.Uint64(meta[offset:]))
+	}
+
+	return s.pgus.Read(ids), true
+}
+
+func (s *Store) cleanupPGUS(meta []byte) {
+	if len(meta) < 5 {
+		return
+	}
+	count := binary.BigEndian.Uint32(meta[1:5])
+	ids := make([]storage.GranuleID, count)
+	for i := 0; i < int(count); i++ {
+		offset := 5 + (i * 8)
+		ids[i] = storage.GranuleID(binary.BigEndian.Uint64(meta[offset:]))
+	}
+	s.pgus.Dereference(ids)
+}
+
+func (s *Store) recordAccess(key string) {
+	if s.evictionManager != nil {
+		s.evictionManager.RecordAccess(key, time.Now().UnixNano())
+	}
+	if s.freqSketch != nil {
+		s.freqSketch.Increment(key)
+	}
+}
+
+func (s *Store) postWriteOps(key string, value []byte) {
+	s.trackCDC("PUT", key, value)
+	if s.bloom != nil {
+		s.bloom.Add(key)
+	}
+	if s.freqSketch != nil {
+		s.freqSketch.Increment(key)
+	}
 }

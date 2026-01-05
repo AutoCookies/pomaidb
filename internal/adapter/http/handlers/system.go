@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/AutoCookies/pomai-cache/internal/engine/core"
+	"github.com/AutoCookies/pomai-cache/internal/engine/core/common"
 )
 
 // ============================================================================
@@ -244,7 +244,7 @@ func (h *HTTPHandlers) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 // ============================================================================
 
 // convertToTenantStats converts core.Stats to TenantStats
-func convertToTenantStats(stats core.Stats) TenantStats {
+func convertToTenantStats(stats common.Stats) TenantStats {
 	return TenantStats{
 		TenantID:     stats.TenantID,
 		Hits:         stats.Hits,
