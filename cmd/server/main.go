@@ -81,7 +81,9 @@ func main() {
 	cfg := parseFlags()
 
 	if cfg.MemoryLimit == 0 {
-		core.ApplySystemAdaptive()
+		if applied := core.ApplySystemAdaptive(); applied > 0 {
+			cfg.MemoryLimit = applied
+		}
 	}
 
 	tuneRuntime(cfg)

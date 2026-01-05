@@ -6,19 +6,15 @@ import (
 
 type DistanceFunc func(a, b []float32) float32
 
-// CosineSIMD: Phiên bản tối ưu nhất cho AVX2/NEON
 func CosineSIMD(a, b []float32) float32 {
 	if len(a) != len(b) || len(a) == 0 {
-		return 2.0 // Max distance
+		return 2.0
 	}
-
-	// Hint compiler: Eliminate bounds checks
 	_ = a[len(a)-1]
 	_ = b[len(b)-1]
 
 	var dot, sumA, sumB float32
 
-	// Manual Loop Unrolling 8x
 	i := 0
 	for ; i <= len(a)-8; i += 8 {
 		dot += a[i]*b[i] + a[i+1]*b[i+1] + a[i+2]*b[i+2] + a[i+3]*b[i+3] +
@@ -71,7 +67,7 @@ func EuclideanSIMD(a, b []float32) float32 {
 
 func DotProductSIMD(a, b []float32) float32 {
 	if len(a) != len(b) {
-		return float32(math.MinInt32)
+		return 0
 	}
 
 	dim := len(a)
@@ -86,7 +82,7 @@ func DotProductSIMD(a, b []float32) float32 {
 		sum += a[i] * b[i]
 	}
 
-	return -sum
+	return sum
 }
 
 func ManhattanSIMD(a, b []float32) float32 {

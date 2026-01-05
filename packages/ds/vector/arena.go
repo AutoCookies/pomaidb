@@ -1,6 +1,7 @@
 package vector
 
 import (
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 )
@@ -14,7 +15,7 @@ type VectorArena struct {
 	mu      sync.RWMutex
 	chunks  [][]float32
 	nodes   []*NodeData
-	strToID map[string]uint32
+	strToID map[uint64]uint32
 	idToStr []string
 	count   atomic.Uint32
 }
@@ -31,7 +32,7 @@ func NewVectorArena(dim int, initialCap int) *VectorArena {
 		dim:     dim,
 		chunks:  make([][]float32, 0, 16),
 		nodes:   make([]*NodeData, 0, initialCap),
-		strToID: make(map[string]uint32),
+		strToID: make(map[uint64]uint32),
 		idToStr: make([]string, 0, initialCap),
 	}
 }
@@ -51,7 +52,11 @@ func (arena *VectorArena) AllocNode(key string, vec []float32, level int) (uint3
 	arena.mu.Lock()
 	defer arena.mu.Unlock()
 
-	if _, exists := arena.strToID[key]; exists {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	keyHash := h.Sum64()
+
+	if _, exists := arena.strToID[keyHash]; exists {
 		return 0, false
 	}
 
@@ -66,7 +71,7 @@ func (arena *VectorArena) AllocNode(key string, vec []float32, level int) (uint3
 
 	copy(arena.chunks[chunkIdx][offset:], vec)
 
-	arena.strToID[key] = id
+	arena.strToID[keyHash] = id
 	arena.idToStr = append(arena.idToStr, key)
 
 	node := &NodeData{
@@ -128,8 +133,28 @@ func (arena *VectorArena) GetNode(id uint32) *NodeData {
 }
 
 func (arena *VectorArena) GetID(key string) (uint32, bool) {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	keyHash := h.Sum64()
+
 	arena.mu.RLock()
 	defer arena.mu.RUnlock()
-	id, ok := arena.strToID[key]
+	id, ok := arena.strToID[keyHash]
 	return id, ok
+}
+
+func (arena *VectorArena) GetVectors(ids []uint32) [][]float32 {
+	arena.mu.RLock()
+	defer arena.mu.RUnlock()
+
+	vecs := make([][]float32, len(ids))
+	for i, id := range ids {
+		chunkIdx := int(id) / ChunkSize
+		offset := (int(id) % ChunkSize) * arena.dim
+
+		if chunkIdx < len(arena.chunks) {
+			vecs[i] = arena.chunks[chunkIdx][offset : offset+arena.dim]
+		}
+	}
+	return vecs
 }

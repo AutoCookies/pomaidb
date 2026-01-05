@@ -30,8 +30,11 @@ type HNSW struct {
 	distFunc       DistanceFunc
 	visitedPool    *sync.Pool
 	resultPool     *sync.Pool
+	neighborPool   *sync.Pool
+	vecBufPool     *sync.Pool
 	rng            *rand.Rand
 	mu             sync.RWMutex
+	normalized     bool
 }
 
 func NewHNSW(dim, m, efConstruction int, arena *ds.VectorArena) *HNSW {
@@ -51,9 +54,46 @@ func NewHNSW(dim, m, efConstruction int, arena *ds.VectorArena) *HNSW {
 		resultPool: &sync.Pool{
 			New: func() interface{} { return &resultHeap{data: make([]SearchResult, 0, 64)} },
 		},
+		neighborPool: &sync.Pool{
+			New: func() interface{} { return make([]uint32, 0, 256) },
+		},
+		vecBufPool: &sync.Pool{
+			New: func() interface{} { return make([][]float32, 0, 16) },
+		},
 	}
 	h.efSearch.Store(int32(DefaultEfSearch))
 	return h
+}
+
+func (h *HNSW) SetNormalizedVectors(n bool) {
+	h.normalized = n
+	if n {
+		h.distFunc = nil
+	} else {
+		h.distFunc = CosineSIMD
+	}
+}
+
+func (h *HNSW) IsNormalized() bool {
+	return h.normalized
+}
+
+func (h *HNSW) GetEfSearch() int {
+	return int(h.efSearch.Load())
+}
+
+func (h *HNSW) SetEfSearch(ef int) {
+	if ef < 1 {
+		ef = 1
+	}
+	h.efSearch.Store(int32(ef))
+}
+
+func (h *HNSW) Size() int {
+	if h.arena == nil {
+		return 0
+	}
+	return h.arena.Size()
 }
 
 func (h *HNSW) Insert(key string, vec []float32) error {
@@ -214,9 +254,6 @@ func (h *HNSW) searchLayer(query []float32, entryPoint uint32, ef int, level int
 		visited[entryPoint] = true
 	}
 
-	// Reusable buffer for vectors in batch (avoid alloc in loop)
-	batchVecs := make([][]float32, 16)
-
 	for candidates.Len() > 0 {
 		curr := heap.Pop(candidates).(SearchResult)
 		if curr.Distance > results.data[0].Distance {
@@ -230,27 +267,29 @@ func (h *HNSW) searchLayer(query []float32, entryPoint uint32, ef int, level int
 
 		currNode.Mu.RLock()
 		conns := currNode.Connections[level]
-		neighbors := make([]uint32, len(conns))
-		copy(neighbors, conns)
+
+		neighBuf := h.neighborPool.Get().([]uint32)
+		if cap(neighBuf) < len(conns) {
+			neighBuf = make([]uint32, 0, len(conns))
+		} else {
+			neighBuf = neighBuf[:0]
+		}
+		neighBuf = append(neighBuf, conns...)
 		currNode.Mu.RUnlock()
 
-		// 1. Filter valid unvisited neighbors
-		validCount := 0
-		for _, nID := range neighbors {
+		validNeighbors := neighBuf[:0]
+		for _, nID := range neighBuf {
 			if nID >= uint32(len(visited)) {
 				continue
 			}
 			if !visited[nID] {
 				visited[nID] = true
 				if !h.arena.IsDeleted(nID) {
-					neighbors[validCount] = nID
-					validCount++
+					validNeighbors = append(validNeighbors, nID)
 				}
 			}
 		}
-		validNeighbors := neighbors[:validCount]
 
-		// 2. Process in Batches
 		batchSize := 16
 		for i := 0; i < len(validNeighbors); i += batchSize {
 			end := i + batchSize
@@ -258,22 +297,17 @@ func (h *HNSW) searchLayer(query []float32, entryPoint uint32, ef int, level int
 				end = len(validNeighbors)
 			}
 			batch := validNeighbors[i:end]
-
-			// Phase A: Prefetch & Load
+			vecs := h.arena.GetVectors(batch)
 			for j, nID := range batch {
-				vec := h.arena.GetVector(nID)
-				batchVecs[j] = vec
-				if len(vec) > 0 {
-					// Software Prefetch Hint: Touch first byte to load cache line
-					_ = vec[0]
+				vec := vecs[j]
+				var dist float32
+				if h.normalized {
+					dist = 1.0 - DotProductSIMD(query, vec)
+				} else if h.distFunc != nil {
+					dist = h.distFunc(query, vec)
+				} else {
+					dist = CosineSIMD(query, vec)
 				}
-			}
-
-			// Phase B: Compute (SIMD)
-			for j, nID := range batch {
-				vec := batchVecs[j]
-				// Call distFunc directly to avoid re-locking/fetching
-				dist := h.distFunc(query, vec)
 
 				if dist < results.data[0].Distance || results.Len() < ef {
 					neighborRes := SearchResult{ID: nID, Distance: dist}
@@ -285,6 +319,8 @@ func (h *HNSW) searchLayer(query []float32, entryPoint uint32, ef int, level int
 				}
 			}
 		}
+
+		h.neighborPool.Put(neighBuf)
 	}
 
 	finalRes := make([]SearchResult, results.Len())
@@ -296,7 +332,13 @@ func (h *HNSW) searchLayer(query []float32, entryPoint uint32, ef int, level int
 
 func (h *HNSW) dist(v []float32, id uint32) float32 {
 	vec := h.arena.GetVector(id)
-	return h.distFunc(v, vec)
+	if h.normalized {
+		return 1.0 - DotProductSIMD(v, vec)
+	}
+	if h.distFunc != nil {
+		return h.distFunc(v, vec)
+	}
+	return CosineSIMD(v, vec)
 }
 
 func (h *HNSW) getNode(id uint32) *ds.NodeData {
@@ -320,18 +362,6 @@ func (h *HNSW) Delete(key string) bool {
 	}
 	h.arena.MarkDeleted(id)
 	return true
-}
-
-func (h *HNSW) Size() int {
-	return h.arena.Size()
-}
-
-func (h *HNSW) SetEfSearch(ef int) {
-	h.efSearch.Store(int32(ef))
-}
-
-func (h *HNSW) GetEfSearch() int {
-	return int(h.efSearch.Load())
 }
 
 type SearchResult struct {
