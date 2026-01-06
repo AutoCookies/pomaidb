@@ -844,9 +844,9 @@ import (
         "github.com/golang/snappy"
         "golang.org/x/sync/singleflight"
 
-        "github.com/AutoCookies/pomai-cache/packages/ds/bloom"
-        "github.com/AutoCookies/pomai-cache/packages/ds/sketch"
-        "github.com/AutoCookies/pomai-cache/packages/ds/skiplist"
+        "github.com/AutoCookies/pomai-cache/shared/ds/bloom"
+        "github.com/AutoCookies/pomai-cache/shared/ds/sketch"
+        "github.com/AutoCookies/pomai-cache/shared/ds/skiplist"
 )
 
 func init() <span class="cov8" title="1">{
@@ -1930,7 +1930,7 @@ import (
         "sync/atomic"
         "time"
 
-        "github.com/AutoCookies/pomai-cache/packages/ds/skiplist"
+        "github.com/AutoCookies/pomai-cache/shared/ds/skiplist"
 )
 
 // snapshotItem là struct trung gian dùng để encode/decode dữ liệu.
@@ -2457,7 +2457,7 @@ import (
         "sync/atomic"
         "time"
 
-        "github.com/AutoCookies/pomai-cache/packages/ds/bloom"
+        "github.com/AutoCookies/pomai-cache/shared/ds/bloom"
 )
 
 // TTLRemaining kiểm tra thời gian sống còn lại của một key.
@@ -2644,7 +2644,7 @@ func (s *Store) RebuildBloomFilter() <span class="cov0" title="0">{
 		<pre class="file" id="file9" style="display: none">package engine
 
 import (
-        "github.com/AutoCookies/pomai-cache/packages/ds/skiplist"
+        "github.com/AutoCookies/pomai-cache/shared/ds/skiplist"
 )
 
 func (s *Store) ZAdd(key, member string, score float64) <span class="cov8" title="1">{

@@ -341,7 +341,7 @@ WAL corruption or failed restore:
 Code layout:
 - `internal/engine` contains the runtime engines (core, ttl, eviction, replication).
 - `internal/adapter` contains protocol adapters (tcp, http, persistence).
-- `packages` contains data structures and algorithms (vector, ds, al).
+- `shared` contains data structures and algorithms (vector, ds, al).
 - `cmd` contains server and bench tooling.
 
 Testing:

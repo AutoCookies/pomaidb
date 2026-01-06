@@ -11,8 +11,8 @@ import (
 	"github.com/cespare/xxhash/v2"
 
 	"github.com/AutoCookies/pomai-cache/internal/engine/core/metrics"
-	al "github.com/AutoCookies/pomai-cache/packages/al/vector"
-	ds "github.com/AutoCookies/pomai-cache/packages/ds/vector"
+	al "github.com/AutoCookies/pomai-cache/shared/al/vector"
+	ds "github.com/AutoCookies/pomai-cache/shared/ds/vector"
 )
 
 const ShardCount = 64

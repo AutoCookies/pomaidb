@@ -1,7 +1,7 @@
 package data_types
 
 import (
-	"github.com/AutoCookies/pomai-cache/packages/ds/plg"
+	"github.com/AutoCookies/pomai-cache/shared/ds/plg"
 )
 
 type PLGStore struct {

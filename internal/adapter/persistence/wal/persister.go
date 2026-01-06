@@ -2,14 +2,18 @@ package wal
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/AutoCookies/pomai-cache/internal/core/ports"
+	"github.com/AutoCookies/pomai-cache/internal/ppcrc"
 )
 
 type WalTarget interface {
@@ -21,7 +25,6 @@ type WalTarget interface {
 type WALPersister struct {
 	walPath string
 	file    *os.File
-	encoder *gob.Encoder
 	mu      sync.Mutex
 }
 
@@ -45,51 +48,106 @@ func NewWALPersister(walPath string) (*WALPersister, error) {
 	return &WALPersister{
 		walPath: walPath,
 		file:    file,
-		encoder: gob.NewEncoder(file),
 	}, nil
 }
 
 func (w *WALPersister) Persist(key string, value []byte) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	entry := walEntry{
+	// Wrap single persist into batch of 1 for consistent format
+	op := walEntry{
 		Key:   key,
 		Value: value,
 		TTL:   0,
 	}
-
-	if err := w.encoder.Encode(&entry); err != nil {
-		return err
-	}
-
-	return w.file.Sync()
-}
-
-func (w *WALPersister) PersistBatch(ops []ports.WriteOp) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	for _, op := range ops {
+	// Encode to buffer first so we can compute CRC over encoded bytes
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(&op); err != nil {
+		return fmt.Errorf("gob encode failed: %w", err)
+	}
+	data := buf.Bytes()
+	crc := ppcrc.CRC64(0, data)
+
+	// Write: [uint32 len][data][uint64 crc]
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+
+	if _, err := w.file.Write(hdr[:]); err != nil {
+		return err
+	}
+	if _, err := w.file.Write(data); err != nil {
+		return err
+	}
+	var crcBuf [8]byte
+	binary.BigEndian.PutUint64(crcBuf[:], crc)
+	if _, err := w.file.Write(crcBuf[:]); err != nil {
+		return err
+	}
+
+	if err := w.file.Sync(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *WALPersister) PersistBatch(ops []ports.WriteOp) error {
+	if len(ops) == 0 {
+		return nil
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// We'll write entries one by one but keep everything in the file in the length+data+crc format.
+	for _, opIn := range ops {
 		entry := walEntry{
-			Key:   op.Key,
-			Value: op.Value,
-			TTL:   int64(op.TTL),
+			Key:   opIn.Key,
+			Value: opIn.Value,
+			TTL:   int64(opIn.TTL),
 		}
 
-		if err := w.encoder.Encode(&entry); err != nil {
-			return fmt.Errorf("failed to encode entry: %w", err)
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		if err := enc.Encode(&entry); err != nil {
+			return fmt.Errorf("gob encode failed: %w", err)
+		}
+		data := buf.Bytes()
+		crc := ppcrc.CRC64(0, data)
+
+		// length
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+		if _, err := w.file.Write(hdr[:]); err != nil {
+			return err
+		}
+		// data
+		if _, err := w.file.Write(data); err != nil {
+			return err
+		}
+		// crc
+		var crcBuf [8]byte
+		binary.BigEndian.PutUint64(crcBuf[:], crc)
+		if _, err := w.file.Write(crcBuf[:]); err != nil {
+			return err
 		}
 	}
 
-	return w.file.Sync()
+	// Ensure durable
+	if err := w.file.Sync(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (w *WALPersister) Load(key string) ([]byte, error) {
 	return nil, fmt.Errorf("WAL persister does not support Load")
 }
 
-// [SỬA] Thay *engine.Store bằng WalTarget (interface nội bộ)
+// Snapshot saves a snapshot of the target to a snapshot file and truncates WAL.
+// Snapshot will create <walPath>.snapshot (atomic rename) and on success it truncates the WAL.
+// The snapshot file itself keeps the format produced by target.SnapshotTo (no extra trailer here).
 func (w *WALPersister) Snapshot(target WalTarget) error {
 	snapshotPath := w.walPath + ".snapshot"
 	tmpPath := snapshotPath + ".tmp"
@@ -99,7 +157,7 @@ func (w *WALPersister) Snapshot(target WalTarget) error {
 		return err
 	}
 
-	// Gọi qua interface
+	// Gọi qua interface to produce snapshot content (target is responsible for format)
 	if err := target.SnapshotTo(file); err != nil {
 		file.Close()
 		os.Remove(tmpPath)
@@ -123,24 +181,26 @@ func (w *WALPersister) Snapshot(target WalTarget) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.file.Close()
+	if w.file != nil {
+		w.file.Close()
+	}
 
 	if err := os.Truncate(w.walPath, 0); err != nil {
 		return err
 	}
 
-	file, err = os.OpenFile(w.walPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fileHandle, err := os.OpenFile(w.walPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
-
-	w.file = file
-	w.encoder = gob.NewEncoder(file)
+	w.file = fileHandle
 
 	return nil
 }
 
-// [SỬA] Thay *engine.Store bằng WalTarget
+// RestoreFrom restores state from snapshot + WAL.
+// It will first try to restore snapshot (if present) using target.RestoreFrom(snapshotFile).
+// Then it will replay WAL entries; each WAL entry is validated using CRC64. Corrupted entries stop replay.
 func (w *WALPersister) RestoreFrom(target WalTarget) error {
 	// 1. Restore from snapshot first
 	snapshotPath := w.walPath + ".snapshot"
@@ -149,11 +209,11 @@ func (w *WALPersister) RestoreFrom(target WalTarget) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
-
 		if err := target.RestoreFrom(file); err != nil {
+			file.Close()
 			return fmt.Errorf("failed to restore from snapshot: %w", err)
 		}
+		file.Close()
 	}
 
 	// 2. Replay WAL
@@ -166,13 +226,48 @@ func (w *WALPersister) RestoreFrom(target WalTarget) error {
 	}
 	defer file.Close()
 
-	decoder := gob.NewDecoder(bufio.NewReader(file))
+	reader := bufio.NewReader(file)
 	count := 0
 
 	for {
+		// Read length (4 bytes)
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(reader, lenBuf[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				// End of WAL
+				break
+			}
+			return fmt.Errorf("failed to read entry length: %w", err)
+		}
+		entryLen := binary.BigEndian.Uint32(lenBuf[:])
+		if entryLen == 0 {
+			// invalid entry
+			return fmt.Errorf("invalid entry length 0 at pos %d", count)
+		}
+
+		// Read encoded data
+		data := make([]byte, entryLen)
+		if _, err := io.ReadFull(reader, data); err != nil {
+			return fmt.Errorf("failed to read entry data: %w", err)
+		}
+
+		// Read CRC
+		var crcBuf [8]byte
+		if _, err := io.ReadFull(reader, crcBuf[:]); err != nil {
+			return fmt.Errorf("failed to read entry crc: %w", err)
+		}
+		expected := binary.BigEndian.Uint64(crcBuf[:])
+
+		// Verify CRC
+		got := ppcrc.CRC64(0, data)
+		if got != expected {
+			return fmt.Errorf("wal crc mismatch at entry %d: expected %016x got %016x", count, expected, got)
+		}
+
+		// Decode walEntry from data
 		var entry walEntry
-		if err := decoder.Decode(&entry); err != nil {
-			break
+		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&entry); err != nil {
+			return fmt.Errorf("failed to decode wal entry: %w", err)
 		}
 
 		// Replay using interface method Put

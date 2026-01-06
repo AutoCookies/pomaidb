@@ -15,6 +15,8 @@ type StoreConfig struct {
 	EvictionThreshold float64
 	EvictionTarget    float64
 	TenantID          string
+	VectorInitCap     int `json:"vector_init_cap"`
+	BloomCapacity     int `json:"bloom_capacity"`
 }
 
 // DefaultStoreConfig returns default configuration
@@ -26,6 +28,8 @@ func DefaultStoreConfig() *StoreConfig {
 		EvictionThreshold: 0.80,
 		EvictionTarget:    0.70,
 		TenantID:          "default",
+		VectorInitCap:     1_000,
+		BloomCapacity:     100_000,
 	}
 }
 

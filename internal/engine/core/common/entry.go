@@ -1,4 +1,3 @@
-// File: internal/engine/core/entry.go
 package common
 
 import (
@@ -15,6 +14,7 @@ type Entry struct {
 	lastAccess atomic.Int64
 	accesses   atomic.Uint64
 	createdAt  int64
+	slabRef    interface{}
 }
 
 func NewEntry(key string, value []byte, ttl time.Duration) *Entry {
@@ -56,59 +56,15 @@ func (e *Entry) IsExpired() bool {
 	return time.Now().UnixNano() > e.expireAt
 }
 
-func (e *Entry) IsExpiredAt(now int64) bool {
-	if e.expireAt == 0 {
-		return false
-	}
-	return now > e.expireAt
-}
-
-func (e *Entry) Touch() {
-	now := time.Now().UnixNano()
-	e.lastAccess.Store(now)
-	e.accesses.Add(1)
-}
-
-func (e *Entry) TouchFast() uint64 {
-	e.lastAccess.Store(time.Now().UnixNano())
-	return e.accesses.Add(1)
-}
-
-func (e *Entry) TouchNoTime() uint64 {
-	return e.accesses.Add(1)
-}
-
-func (e *Entry) Age() time.Duration {
-	return time.Duration(time.Now().UnixNano() - e.createdAt)
-}
-
-func (e *Entry) AgeNano() int64 {
-	return time.Now().UnixNano() - e.createdAt
-}
-
-func (e *Entry) Accesses() uint64 {
-	return e.accesses.Load()
-}
-
-func (e *Entry) LastAccess() int64 {
-	return e.lastAccess.Load()
-}
-
-func (e *Entry) CreatedAt() int64 {
-	return e.createdAt
-}
-
 func (e *Entry) TTLRemaining() time.Duration {
 	if e.expireAt == 0 {
 		return 0
 	}
-
-	remain := time.Until(time.Unix(0, e.expireAt))
+	remain := e.expireAt - time.Now().UnixNano()
 	if remain < 0 {
 		return 0
 	}
-
-	return remain
+	return time.Duration(remain)
 }
 
 func (e *Entry) TTLRemainingNano() int64 {
@@ -147,6 +103,7 @@ func (e *Entry) Clone() *Entry {
 		size:      e.size,
 		expireAt:  e.expireAt,
 		createdAt: e.createdAt,
+		slabRef:   nil,
 	}
 }
 
@@ -159,30 +116,13 @@ func (e *Entry) Score() int {
 	}
 
 	frequency := float64(accesses) / (float64(age) / float64(time.Second))
-
 	return int(frequency * 1000)
 }
 
-func (e *Entry) LFUScore() int {
-	return int(e.accesses.Load())
+func (e *Entry) SetSlab(slab interface{}) {
+	e.slabRef = slab
 }
 
-func (e *Entry) LRUScore() int64 {
-	return -e.lastAccess.Load()
-}
-
-func (e *Entry) SizeScore() int {
-	return int(e.size)
-}
-
-func (e *Entry) Metadata() map[string]interface{} {
-	return map[string]interface{}{
-		"key":         e.key,
-		"size":        e.size,
-		"accesses":    e.accesses.Load(),
-		"age_ms":      e.AgeNano() / int64(time.Millisecond),
-		"ttl_ms":      e.TTLRemainingNano() / int64(time.Millisecond),
-		"last_access": e.lastAccess.Load(),
-		"created_at":  e.createdAt,
-	}
+func (e *Entry) GetSlab() interface{} {
+	return e.slabRef
 }

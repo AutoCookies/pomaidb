@@ -4,8 +4,9 @@ import (
 	"encoding/binary"
 	"sync"
 
-	"github.com/cespare/xxhash/v2"
 	"github.com/golang/snappy"
+
+	"github.com/AutoCookies/pomai-cache/internal/ppcrc"
 )
 
 // Config parameters
@@ -47,20 +48,15 @@ func NewChunkStore() *ChunkStore {
 	return cs
 }
 
-// hashToShard selects the shard index based on the xxhash of the key
+// getShard selects the shard index based on the crc64 of the key
 func (cs *ChunkStore) getShard(keyHash uint64) *chunkShard {
 	return cs.shards[keyHash&ChunkShardMask]
 }
 
-// computeHash returns 64-bit hash (for sharding) and raw byte string (for map key)
-// We use xxhash for speed. For collision safety in large scale, you might want 128-bit,
-// but for in-memory cache, 64-bit xxhash is usually acceptable performance/risk trade-off.
-// To be safer, we can append length to the key or use 128-bit variant.
-// Here we use xxhash.Sum64 and store key as 8 bytes raw.
+// computeChunkKey returns a 64-bit hash and the raw 8-byte key string.
+// It now uses the pure-Go CRC64 implementation (ppcrc) for hashing.
 func computeChunkKey(data []byte) (uint64, string) {
-	h := xxhash.Sum64(data)
-	// Create a string key from the uint64 hash to save memory (8 bytes vs 40 bytes hex)
-	// Using unsafe or direct conversion would be faster but let's be safe first.
+	h := ppcrc.Sum(data)
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], h)
 	return h, string(b[:])

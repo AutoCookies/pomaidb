@@ -17,7 +17,7 @@ import (
 	"github.com/AutoCookies/pomai-cache/internal/engine/core/data_types"
 	"github.com/AutoCookies/pomai-cache/internal/engine/replication"
 	"github.com/AutoCookies/pomai-cache/internal/engine/tenants"
-	"github.com/AutoCookies/pomai-cache/packages/ds/timestream"
+	"github.com/AutoCookies/pomai-cache/shared/ds/timestream"
 	"github.com/panjf2000/gnet/v2"
 )
 

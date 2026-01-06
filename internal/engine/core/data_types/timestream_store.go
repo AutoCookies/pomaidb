@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	al "github.com/AutoCookies/pomai-cache/packages/al/timestream"
-	ds "github.com/AutoCookies/pomai-cache/packages/ds/timestream"
+	al "github.com/AutoCookies/pomai-cache/shared/al/timestream"
+	ds "github.com/AutoCookies/pomai-cache/shared/ds/timestream"
 )
 
 // TimeStreamStore quản lý nhiều Time Series Streams
@@ -84,7 +84,7 @@ func (ts *TimeStreamStore) Range(streamName string, start, end int64, filterFunc
 	return results, nil
 }
 
-// Các hàm Compute: Gọi xuống packages/al
+// Các hàm Compute: Gọi xuống sharedl
 
 func (ts *TimeStreamStore) Window(streamName string, windowSize time.Duration, aggType string) (map[int64]float64, error) {
 	v, ok := ts.streams.Load(streamName)

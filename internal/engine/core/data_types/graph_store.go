@@ -5,8 +5,8 @@ import (
 	"hash/fnv"
 	"sync"
 
-	al "github.com/AutoCookies/pomai-cache/packages/al/graph"
-	ds "github.com/AutoCookies/pomai-cache/packages/ds/graph"
+	al "github.com/AutoCookies/pomai-cache/shared/al/graph"
+	ds "github.com/AutoCookies/pomai-cache/shared/ds/graph"
 )
 
 const (
@@ -231,7 +231,7 @@ func (gs *GraphStore) GetNeighbors(graphName, nodeID string) ([]string, error) {
 }
 
 // -----------------------------------------------------------------------------
-// COMPUTE DELEGATION (Gọi xuống packages/al)
+// COMPUTE DELEGATION (Gọi xuống shared/al)
 // -----------------------------------------------------------------------------
 
 func (gs *GraphStore) PageRank(graphName string, iterations int) (map[string]float64, error) {

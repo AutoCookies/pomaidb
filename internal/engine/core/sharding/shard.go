@@ -21,17 +21,28 @@ type Shard struct {
 	lockfree    *LockFreeShard
 	useLockfree bool
 
-	syncmap    *SyncMapShard
+	// Placeholder nếu sau này implement syncmap shard
+	// syncmap    *SyncMapShard
 	useSyncMap bool
+}
+
+func NewShard() *Shard {
+	return &Shard{
+		items: make(map[string]*list.Element),
+		ll:    list.New(),
+	}
+}
+
+func NewLockFreeShardAdapter() *Shard {
+	return &Shard{
+		lockfree:    NewLockFreeShard(),
+		useLockfree: true,
+	}
 }
 
 func (s *Shard) AtomicMutate(key string, mutator func(old *common.Entry) (*common.Entry, error)) error {
 	if s.useLockfree {
 		return s.lockfree.AtomicMutate(key, mutator)
-	}
-
-	if s.useSyncMap {
-		return s.syncmap.AtomicMutate(key, mutator)
 	}
 
 	s.mu.Lock()
@@ -50,263 +61,51 @@ func (s *Shard) AtomicMutate(key string, mutator func(old *common.Entry) (*commo
 	}
 
 	if newEntry == nil {
+		// Logic xóa nếu mutator trả về nil
+		if exists {
+			s.deleteElement(elem)
+		}
 		return nil
 	}
 
-	var deltaBytes int64
-	newSize := int64(newEntry.Size())
-
+	// Logic update/insert
 	if exists {
-		deltaBytes = newSize - int64(oldEntry.Size())
 		elem.Value = newEntry
 		s.ll.MoveToFront(elem)
+		// Tính delta size: mới - cũ
+		delta := int64(newEntry.Size()) - int64(oldEntry.Size())
+		s.bytes.Add(delta)
 	} else {
 		elem := s.ll.PushFront(newEntry)
 		s.items[key] = elem
-		deltaBytes = newSize
+		s.bytes.Add(int64(newEntry.Size()))
 	}
 
-	s.bytes.Add(deltaBytes)
 	return nil
 }
 
-func NewShard() *Shard {
-	return NewShardWithCapacity(minCapacity)
-}
-
-func NewShardWithCapacity(capacity int) *Shard {
-	if capacity < minCapacity {
-		capacity = minCapacity
-	}
-
-	return &Shard{
-		items:       make(map[string]*list.Element, capacity),
-		ll:          list.New(),
-		useLockfree: false,
-		useSyncMap:  false,
-	}
-}
-
-func NewLockFreeShardAdapter() *Shard {
-	lfs := NewLockFreeShard(0)
-
-	return &Shard{
-		items:       make(map[string]*list.Element, 1),
-		ll:          list.New(),
-		lockfree:    lfs,
-		useLockfree: true,
-		useSyncMap:  false,
-	}
-}
-
-func NewSyncMapShardAdapter() *Shard {
-	sms := NewSyncMapShard()
-
-	return &Shard{
-		items:       make(map[string]*list.Element, 1),
-		ll:          list.New(),
-		syncmap:     sms,
-		useSyncMap:  true,
-		useLockfree: false,
-	}
-}
-
 func (s *Shard) Get(key string) (*common.Entry, bool) {
-	if s.useSyncMap {
-		entry, ok := s.syncmap.Get(key)
-		if ok {
-			entry.Touch()
-		}
-		return entry, ok
-	}
-
 	if s.useLockfree {
-		entry, ok := s.lockfree.Get(key)
-		return entry, ok
+		return s.lockfree.Get(key)
 	}
 
 	s.mu.RLock()
-	elem := s.items[key]
+	elem, ok := s.items[key]
 	s.mu.RUnlock()
 
-	if elem == nil {
+	if !ok {
 		return nil, false
 	}
 
-	entry := elem.Value.(*common.Entry)
-	if entry.IsExpired() {
-		return nil, false
-	}
-
-	entry.Touch()
-
-	s.mu.Lock()
-	if elem2, ok := s.items[key]; ok && elem2 == elem {
-		s.ll.MoveToFront(elem)
-	}
-	s.mu.Unlock()
-
-	return entry, true
+	// LRU promotion (cần Write Lock nếu muốn chính xác tuyệt đối,
+	// hoặc dùng try-lock để tránh contention cho read-heavy)
+	// Ở đây dùng strategy: Read trước, nếu tồn tại thì promote sau (tùy chọn)
+	// Để đơn giản và an toàn thread, ta không promote trong Get (hoặc dùng LockFreeShard cho perf)
+	return elem.Value.(*common.Entry), true
 }
 
-func (s *Shard) Set(entry *common.Entry) (*common.Entry, int64) {
-	if s.useSyncMap {
-		old, delta := s.syncmap.Set(entry)
-		entry.Touch()
-		return old, delta
-	}
-
-	if s.useLockfree {
-		return s.lockfree.Set(entry)
-	}
-
-	key := entry.Key()
-	newSize := int64(entry.Size())
-
-	s.mu.Lock()
-
-	var oldEntry *common.Entry
-	var deltaBytes int64
-
-	if elem := s.items[key]; elem != nil {
-		oldEntry = elem.Value.(*common.Entry)
-		deltaBytes = newSize - int64(oldEntry.Size())
-		elem.Value = entry
-		s.ll.MoveToFront(elem)
-	} else {
-		elem := s.ll.PushFront(entry)
-		s.items[key] = elem
-		deltaBytes = newSize
-	}
-
-	s.mu.Unlock()
-	s.bytes.Add(deltaBytes)
-
-	entry.Touch()
-
-	return oldEntry, deltaBytes
-}
-
-func (s *Shard) Delete(key string) (*common.Entry, bool) {
-	if s.useSyncMap {
-		return s.syncmap.Delete(key)
-	}
-
-	if s.useLockfree {
-		return s.lockfree.Delete(key)
-	}
-
-	s.mu.Lock()
-
-	elem := s.items[key]
-	if elem == nil {
-		s.mu.Unlock()
-		return nil, false
-	}
-
-	entry := elem.Value.(*common.Entry)
-	entrySize := int64(entry.Size())
-
-	delete(s.items, key)
-	s.ll.Remove(elem)
-
-	s.mu.Unlock()
-	s.bytes.Add(-entrySize)
-
-	return entry, true
-}
-
-func (s *Shard) Len() int {
-	if s.useSyncMap {
-		return s.syncmap.Len()
-	}
-
-	if s.useLockfree {
-		return s.lockfree.Len()
-	}
-
-	s.mu.RLock()
-	length := len(s.items)
-	s.mu.RUnlock()
-	return length
-}
-
-func (s *Shard) Bytes() int64 {
-	if s.useSyncMap {
-		return s.syncmap.Bytes()
-	}
-
-	if s.useLockfree {
-		return s.lockfree.Bytes()
-	}
-
-	return s.bytes.Load()
-}
-
-func (s *Shard) EvictExpired() []*common.Entry {
-	if s.useSyncMap {
-		return s.syncmap.EvictExpired()
-	}
-
-	if s.useLockfree {
-		return s.lockfree.EvictExpired()
-	}
-
-	s.mu.Lock()
-
-	expired := make([]*common.Entry, 0, 64)
-	toDelete := make([]*list.Element, 0, 64)
-	var totalSize int64
-
-	count := 0
-	for elem := s.ll.Back(); elem != nil && count < 100; elem = elem.Prev() {
-		entry := elem.Value.(*common.Entry)
-		if entry.IsExpired() {
-			expired = append(expired, entry)
-			toDelete = append(toDelete, elem)
-			totalSize += int64(entry.Size())
-		}
-		count++
-	}
-
-	for _, elem := range toDelete {
-		entry := elem.Value.(*common.Entry)
-		delete(s.items, entry.Key())
-		s.ll.Remove(elem)
-	}
-
-	s.mu.Unlock()
-
-	if totalSize > 0 {
-		s.bytes.Add(-totalSize)
-	}
-
-	return expired
-}
-
-func (s *Shard) Clear() {
-	if s.useSyncMap {
-		s.syncmap.Clear()
-		return
-	}
-
-	if s.useLockfree {
-		s.lockfree.Clear()
-		return
-	}
-
-	s.mu.Lock()
-	s.items = make(map[string]*list.Element, minCapacity)
-	s.ll = list.New()
-	s.mu.Unlock()
-	s.bytes.Store(0)
-}
-
+// GetAndTouch lấy item và đẩy lên đầu LRU
 func (s *Shard) GetAndTouch(key string) (*common.Entry, bool) {
-	if s.useSyncMap {
-		return s.syncmap.Get(key)
-	}
-
 	if s.useLockfree {
 		return s.lockfree.GetAndTouch(key)
 	}
@@ -314,65 +113,93 @@ func (s *Shard) GetAndTouch(key string) (*common.Entry, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	elem := s.items[key]
-	if elem == nil {
+	elem, ok := s.items[key]
+	if !ok {
 		return nil, false
 	}
-
-	entry := elem.Value.(*common.Entry)
-	if entry.IsExpired() {
-		return nil, false
-	}
-
 	s.ll.MoveToFront(elem)
-	entry.Touch()
+	return elem.Value.(*common.Entry), true
+}
 
+// Set thêm hoặc cập nhật entry. Trả về entry cũ (nếu có) để Free memory.
+func (s *Shard) Set(entry *common.Entry) (*common.Entry, int64) {
+	if s.useLockfree {
+		return s.lockfree.Set(entry)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var oldEntry *common.Entry
+	var delta int64
+
+	if elem, ok := s.items[entry.Key()]; ok {
+		oldEntry = elem.Value.(*common.Entry)
+		elem.Value = entry
+		s.ll.MoveToFront(elem)
+		delta = int64(entry.Size()) - int64(oldEntry.Size())
+	} else {
+		elem := s.ll.PushFront(entry)
+		s.items[entry.Key()] = elem
+		delta = int64(entry.Size())
+	}
+
+	s.bytes.Add(delta)
+	return oldEntry, delta
+}
+
+// DeleteItem xóa item và trả về Entry để caller xử lý Free memory (Arena)
+func (s *Shard) DeleteItem(key string) (*common.Entry, bool) {
+	if s.useLockfree {
+		return s.lockfree.DeleteItem(key)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	elem, ok := s.items[key]
+	if !ok {
+		return nil, false
+	}
+
+	entry := s.deleteElement(elem)
 	return entry, true
 }
 
-func (s *Shard) GetFast(key string) (*common.Entry, bool) {
+// deleteElement internal helper
+func (s *Shard) deleteElement(elem *list.Element) *common.Entry {
+	s.ll.Remove(elem)
+	entry := elem.Value.(*common.Entry)
+	delete(s.items, entry.Key())
+	s.bytes.Add(-int64(entry.Size()))
+	return entry
+}
+
+// Delete wrapper cho tương thích ngược nếu cần
+func (s *Shard) Delete(key string) bool {
+	_, ok := s.DeleteItem(key)
+	return ok
+}
+
+func (s *Shard) Clear() {
 	if s.useLockfree {
-		return s.lockfree.GetFast(key)
+		s.lockfree.Clear()
+		return
 	}
-	return s.Get(key)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.items = make(map[string]*list.Element)
+	s.ll.Init()
+	s.bytes.Store(0)
 }
 
-func (s *Shard) SetFast(entry *common.Entry) (*common.Entry, int64) {
-	if s.useLockfree {
-		return s.lockfree.SetFast(entry)
-	}
-	return s.Set(entry)
-}
-
-func (s *Shard) Lock() {
-	if !s.useLockfree && !s.useSyncMap {
-		s.mu.Lock()
-	}
-}
-
-func (s *Shard) Unlock() {
-	if !s.useLockfree && !s.useSyncMap {
-		s.mu.Unlock()
-	}
-}
-
-func (s *Shard) RLock() {
-	if !s.useLockfree && !s.useSyncMap {
-		s.mu.RLock()
-	}
-}
-
-func (s *Shard) RUnlock() {
-	if !s.useLockfree && !s.useSyncMap {
-		s.mu.RUnlock()
-	}
-}
+func (s *Shard) Lock()    { s.mu.Lock() }
+func (s *Shard) Unlock()  { s.mu.Unlock() }
+func (s *Shard) RLock()   { s.mu.RLock() }
+func (s *Shard) RUnlock() { s.mu.RUnlock() }
 
 func (s *Shard) GetItems() map[string]interface{} {
-	if s.useSyncMap {
-		return s.syncmap.GetItems()
-	}
-
 	if s.useLockfree {
 		return s.lockfree.GetItems()
 	}
@@ -388,49 +215,53 @@ func (s *Shard) GetItems() map[string]interface{} {
 }
 
 func (s *Shard) GetLRUBack() interface{} {
-	if s.useSyncMap {
-		return nil
-	}
-
 	if s.useLockfree {
-		return s.lockfree.GetLRUBack()
+		return nil // LockFree chưa hỗ trợ chuẩn LRU pointer public
 	}
-
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.ll.Back()
 }
 
-func (s *Shard) DeleteItem(key string) (size int, ok bool) {
-	entry, ok := s.Delete(key)
-	if !ok {
-		return 0, false
-	}
-	return entry.Size(), true
-}
-
 func (s *Shard) GetBytes() int64 {
-	return s.Bytes()
+	return s.bytes.Load()
 }
 
-func (s *Shard) AddBytes(delta int64) {
-	if s.useSyncMap {
-		s.syncmap.AddBytes(delta)
-		return
-	}
-
+func (s *Shard) Len() int {
 	if s.useLockfree {
-		s.lockfree.AddBytes(delta)
-		return
+		return s.lockfree.Len()
 	}
 
-	s.bytes.Add(delta)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.items)
 }
 
-func (s *Shard) GetItemCount() int {
-	return s.Len()
+func (s *Shard) Bytes() int64 {
+	if s.useLockfree {
+		return s.lockfree.Bytes()
+	}
+	return s.bytes.Load()
 }
 
-func (s *Shard) Compact() int {
-	return len(s.EvictExpired())
+func (s *Shard) EvictExpired() []*common.Entry {
+	if s.useLockfree {
+		return s.lockfree.EvictExpired()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var expired []*common.Entry
+
+	// Duyệt danh sách items
+	for _, elem := range s.items {
+		entry := elem.Value.(*common.Entry)
+		if entry.IsExpired() {
+			s.deleteElement(elem)
+			expired = append(expired, entry)
+		}
+	}
+
+	return expired
 }

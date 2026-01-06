@@ -5,19 +5,17 @@ import (
 	"hash/fnv"
 	"sync"
 
-	ds "github.com/AutoCookies/pomai-cache/packages/ds/hash"
+	"github.com/AutoCookies/pomai-cache/shared/ds/hashtable"
 )
 
 const (
-	HashShards    = 64
+	HashShards    = 256
 	HashShardMask = HashShards - 1
 )
 
-// HashShard quản lý một phần keyspace
 type HashShard struct {
-	mu sync.RWMutex
-	// Value là interface (FlatHash hoặc MapHash)
-	items map[string]ds.HashObject
+	mu    sync.RWMutex
+	items map[string]hashtable.HashObject
 }
 
 type HashStore struct {
@@ -28,7 +26,7 @@ func NewHashStore() *HashStore {
 	store := &HashStore{}
 	for i := 0; i < HashShards; i++ {
 		store.shards[i] = &HashShard{
-			items: make(map[string]ds.HashObject),
+			items: make(map[string]hashtable.HashObject),
 		}
 	}
 	return store
@@ -51,26 +49,15 @@ func (h *HashStore) HSet(key, field string, value []byte) error {
 
 	obj, exists := shard.items[key]
 	if !exists {
-		// Mặc định khởi tạo là FlatHash (Tiết kiệm RAM)
-		flat := ds.NewFlatHash()
-		flat.Set(field, value)
-		shard.items[key] = flat
-		return nil
+		obj = hashtable.NewPacked()
+		shard.items[key] = obj
 	}
 
-	// Logic Adaptive: Kiểm tra xem có cần Upgrade không
-	if obj.IsFlat() {
-		// Nếu vượt quá ngưỡng -> Biến hình thành MapHash
-		if obj.Len() >= ds.MaxFlatSize {
-			flat := obj.(*ds.FlatHash)
-			newMap := flat.ToMap()
-			newMap.Set(field, value)
-			shard.items[key] = newMap // Replace
-			return nil
-		}
+	newObj, upgraded := obj.Set(field, value)
+	if upgraded {
+		shard.items[key] = newObj
 	}
 
-	obj.Set(field, value)
 	return nil
 }
 
@@ -86,6 +73,19 @@ func (h *HashStore) HGet(key, field string) ([]byte, bool) {
 	return obj.Get(field)
 }
 
+func (h *HashStore) HExists(key, field string) bool {
+	shard := h.getShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	obj, exists := shard.items[key]
+	if !exists {
+		return false
+	}
+	_, found := obj.Get(field)
+	return found
+}
+
 func (h *HashStore) HDel(key, field string) bool {
 	shard := h.getShard(key)
 	shard.mu.Lock()
@@ -96,21 +96,13 @@ func (h *HashStore) HDel(key, field string) bool {
 		return false
 	}
 
-	deleted := obj.Delete(field)
+	deleted, newLen := obj.Delete(field)
 	if deleted {
-		// Clean up nếu rỗng để giải phóng RAM
-		if obj.Len() == 0 {
+		if newLen == 0 {
 			delete(shard.items, key)
 		}
-		// TODO (Optional): Downgrade từ Map về Flat nếu size nhỏ lại?
-		// Thường thì ít khi làm vậy để tránh thrashing, nhưng có thể implement.
 	}
 	return deleted
-}
-
-func (h *HashStore) HExists(key, field string) bool {
-	val, ok := h.HGet(key, field)
-	return ok && val != nil
 }
 
 func (h *HashStore) HGetAll(key string) map[string][]byte {
@@ -128,7 +120,35 @@ func (h *HashStore) HGetAll(key string) map[string][]byte {
 func (h *HashStore) Clear() {
 	for _, shard := range h.shards {
 		shard.mu.Lock()
-		shard.items = make(map[string]ds.HashObject)
+		shard.items = make(map[string]hashtable.HashObject)
 		shard.mu.Unlock()
+	}
+}
+
+func (h *HashStore) Stats() map[string]interface{} {
+	totalKeys := 0
+	packedKeys := 0
+	pphtKeys := 0
+	totalBytes := 0
+
+	for _, s := range h.shards {
+		s.mu.RLock()
+		totalKeys += len(s.items)
+		for _, v := range s.items {
+			if v.IsPacked() {
+				packedKeys++
+			} else {
+				pphtKeys++
+			}
+			totalBytes += v.SizeInBytes()
+		}
+		s.mu.RUnlock()
+	}
+
+	return map[string]interface{}{
+		"hash_total":  totalKeys,
+		"hash_packed": packedKeys,
+		"hash_ppht":   pphtKeys,
+		"hash_bytes":  totalBytes,
 	}
 }

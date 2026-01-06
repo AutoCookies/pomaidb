@@ -25,10 +25,11 @@ import (
 	"github.com/AutoCookies/pomai-cache/internal/engine/core/sharding"
 	"github.com/AutoCookies/pomai-cache/internal/engine/core/storage"
 	"github.com/AutoCookies/pomai-cache/internal/engine/eviction"
-	"github.com/AutoCookies/pomai-cache/packages/ds/bloom"
-	"github.com/AutoCookies/pomai-cache/packages/ds/sketch"
-	"github.com/AutoCookies/pomai-cache/packages/ds/skiplist"
-	"github.com/AutoCookies/pomai-cache/packages/ds/timestream"
+	"github.com/AutoCookies/pomai-cache/shared/ds/arena"
+	"github.com/AutoCookies/pomai-cache/shared/ds/bloom"
+	"github.com/AutoCookies/pomai-cache/shared/ds/sketch"
+	"github.com/AutoCookies/pomai-cache/shared/ds/skiplist"
+	"github.com/AutoCookies/pomai-cache/shared/ds/timestream"
 )
 
 var (
@@ -64,7 +65,7 @@ type Store struct {
 
 	totalBytesAtomic int64
 
-	bloom *bloom.BloomFilter
+	bloom *bloom.SBF
 	g     singleflight.Group
 
 	zsets map[string]*skiplist.Skiplist
@@ -100,6 +101,7 @@ type Store struct {
 	_      [56]byte
 	misses atomic.Uint64
 	_      [56]byte
+	arena  *arena.LuuArena
 }
 
 func NewStore(shardCount int) *Store {
@@ -146,6 +148,7 @@ func NewStoreWithConfig(config *common.StoreConfig) *Store {
 		pmcStore:        data_types.NewPMCStore(),
 		plgStore:        data_types.NewPLGStore(),
 		pgus:            storage.NewPGUS(dataDir + "/pomai_virtual.dat"),
+		arena:           arena.NewLuuArena(),
 	}
 
 	s.cdcEnabled.Store(false)
@@ -705,10 +708,11 @@ func (s *Store) Get(key string) ([]byte, bool) {
 	if key == "" {
 		return nil, false
 	}
-	if s.bloom != nil && !s.bloom.MayContain(key) {
-		s.misses.Add(1) // Miss
+	if s.bloom != nil && !s.bloom.Exists(key) {
+		s.misses.Add(1)
 		return nil, false
 	}
+
 	shard := s.getShardFast(key)
 	entry, ok := shard.Get(key)
 	if !ok {
@@ -734,7 +738,7 @@ func (s *Store) GetFast(key string) ([]byte, bool) {
 		return nil, false
 	}
 
-	if s.bloom != nil && !s.bloom.MayContain(key) {
+	if s.bloom != nil && !s.bloom.Exists(key) {
 		return nil, false
 	}
 
@@ -817,8 +821,32 @@ func (s *Store) PutFast(key string, value []byte, ttl time.Duration) error {
 		return s.putChunked(key, value, ttl)
 	}
 
-	entry := common.NewEntry(key, value, ttl)
+	if len(value) > 4096 {
+		if ptr, err := s.offloadPGUS(value); err == nil {
+			value = ptr
+		}
+	}
+
+	destBuf, slab := s.arena.Alloc(len(value))
+	copy(destBuf, value)
+
+	entry := common.NewEntry(key, destBuf, ttl)
+	if slab != nil {
+		entry.SetSlab(slab)
+	}
+
 	shard := s.getShardFast(key)
+
+	if oldEntry, ok := shard.Get(key); ok {
+		var oldSlabPtr *arena.Slab
+		if ref := oldEntry.GetSlab(); ref != nil {
+			if casted, ok := ref.(*arena.Slab); ok {
+				oldSlabPtr = casted
+			}
+		}
+		s.arena.Free(oldEntry.Value(), oldSlabPtr)
+	}
+
 	_, deltaBytes := shard.Set(entry)
 	atomic.AddInt64(&s.totalBytesAtomic, deltaBytes)
 
@@ -829,49 +857,41 @@ func (s *Store) PutFast(key string, value []byte, ttl time.Duration) error {
 		s.freqSketch.Increment(key)
 	}
 
+	s.postWriteOps(key, value)
+
 	return nil
 }
 
-func (s *Store) Delete(key string) {
-	if key == "" {
-		return
-	}
+func (s *Store) Delete(key string) bool {
 	shard := s.getShardFast(key)
-	entry, ok := shard.Delete(key)
-	if !ok {
-		return
+
+	entry, ok := shard.Get(key)
+	if ok {
+		shard.Delete(key)
+		atomic.AddInt64(&s.totalBytesAtomic, -int64(entry.Size()))
+
+		var slabPtr *arena.Slab
+		if ref := entry.GetSlab(); ref != nil {
+			if casted, ok := ref.(*arena.Slab); ok {
+				slabPtr = casted
+			}
+		}
+
+		s.arena.Free(entry.Value(), slabPtr)
+
+		if len(entry.Value()) >= 5 && string(entry.Value()[:1]) == "P" {
+			s.cleanupPGUS(entry.Value())
+		}
+		return true
 	}
-
-	atomic.AddInt64(&s.totalBytesAtomic, -int64(entry.Size()))
-
-	val := entry.Value()
-
-	// [PGUS CLEANUP]
-	if len(val) > 0 && val[0] == pgusMagicByte {
-		metaCopy := make([]byte, len(val))
-		copy(metaCopy, val)
-		go s.cleanupPGUS(metaCopy)
-	} else if s.isChunked(val) {
-		s.cleanupChunks(val)
-	}
-
-	s.trackCDC("DEL", key, nil)
-
-	if GlobalMemCtrl != nil {
-		GlobalMemCtrl.Release(int64(entry.Size()))
-	}
-	// Xóa vector index nếu có
-	if s.vectorStore != nil {
-		_ = s.vectorStore.Delete("default_embeddings", key)
-	}
+	return false
 }
-
 func (s *Store) Exists(key string) bool {
 	if key == "" {
 		return false
 	}
 
-	if s.bloom != nil && !s.bloom.MayContain(key) {
+	if s.bloom != nil && !s.bloom.Exists(key) {
 		return false
 	}
 
@@ -976,16 +996,6 @@ func (s *Store) SetTenantID(tenantID string) {
 		tenantID = "default"
 	}
 	s.config.TenantID = tenantID
-}
-
-func (s *Store) SetBloomFilter(bf interface{}) {
-	if bloomFilter, ok := bf.(*bloom.BloomFilter); ok {
-		s.bloom = bloomFilter
-	}
-}
-
-func (s *Store) GetBloomFilter() eviction.BloomFilterInterface {
-	return s.bloom
 }
 
 func (s *Store) GetConfig() *common.StoreConfig {
@@ -1462,19 +1472,39 @@ func (s *Store) MatrixMultiply(key1, key2 string) (data_types.Matrix, error) {
 	return s.pmcStore.Multiply(key1, key2)
 }
 
+func (s *Store) offloadPGUS(data []byte) ([]byte, error) {
+	ids := s.pgus.Write(data)
+	if len(ids) == 0 {
+		return nil, errors.New("pgus write failed: no ids returned")
+	}
+
+	buf := new(bytes.Buffer)
+	buf.WriteString("P")
+
+	if err := binary.Write(buf, binary.BigEndian, uint32(len(ids))); err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		if err := binary.Write(buf, binary.BigEndian, uint64(id)); err != nil {
+			return nil, err
+		}
+	}
+
+	return buf.Bytes(), nil
+}
+
 func (s *Store) resolvePGUS(meta []byte) ([]byte, bool) {
-	// Validate độ dài tối thiểu (Magic + Count)
-	if len(meta) < 5 {
+	if len(meta) < 5 || meta[0] != 'P' {
 		return nil, false
 	}
 
 	count := binary.BigEndian.Uint32(meta[1:5])
+
 	expectedLen := 5 + int(count)*8
 	if len(meta) != expectedLen {
 		return nil, false
 	}
 
-	// Parse IDs
 	ids := make([]storage.GranuleID, count)
 	for i := 0; i < int(count); i++ {
 		offset := 5 + (i * 8)
@@ -1485,16 +1515,43 @@ func (s *Store) resolvePGUS(meta []byte) ([]byte, bool) {
 }
 
 func (s *Store) cleanupPGUS(meta []byte) {
-	if len(meta) < 5 {
+	if len(meta) < 5 || meta[0] != 'P' {
 		return
 	}
-	count := binary.BigEndian.Uint32(meta[1:5])
-	ids := make([]storage.GranuleID, count)
-	for i := 0; i < int(count); i++ {
-		offset := 5 + (i * 8)
-		ids[i] = storage.GranuleID(binary.BigEndian.Uint64(meta[offset:]))
+}
+
+// FreeEntry implements eviction.StoreInterface expected by eviction.Manager.
+// It finalizes freeing an evicted entry: returns arena memory, decrefs chunk/pgus and updates total bytes.
+func (s *Store) FreeEntry(entry *common.Entry) {
+	if entry == nil {
+		return
 	}
-	s.pgus.Dereference(ids)
+
+	val := entry.Value()
+
+	// If chunked, decrement chunk refs asynchronously
+	if s.isChunked(val) {
+		s.cleanupChunks(val)
+	}
+
+	// If PGUS metadata ('P' prefix), cleanup PGUS
+	if len(val) > 0 {
+		if val[0] == 'P' || val[0] == pgusMagicByte {
+			s.cleanupPGUS(val)
+		}
+	}
+
+	// Free arena/slab memory if applicable
+	var slabPtr *arena.Slab
+	if ref := entry.GetSlab(); ref != nil {
+		if casted, ok := ref.(*arena.Slab); ok {
+			slabPtr = casted
+		}
+	}
+	s.arena.Free(val, slabPtr)
+
+	// Update total bytes counter
+	atomic.AddInt64(&s.totalBytesAtomic, -int64(entry.Size()))
 }
 
 func (s *Store) recordAccess(key string) {

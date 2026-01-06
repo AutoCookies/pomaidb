@@ -8,9 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AutoCookies/pomai-cache/packages/al/pomegranate"
-	"github.com/AutoCookies/pomai-cache/packages/al/ppe"
-	"github.com/AutoCookies/pomai-cache/packages/al/pqse"
+	"github.com/AutoCookies/pomai-cache/internal/engine/core/common"
+	"github.com/AutoCookies/pomai-cache/shared/al/pomegranate"
+	"github.com/AutoCookies/pomai-cache/shared/al/ppe"
+	"github.com/AutoCookies/pomai-cache/shared/al/pqse"
 )
 
 type StoreInterface interface {
@@ -23,12 +24,12 @@ type StoreInterface interface {
 	GetTenantID() string
 	GetFreqEstimator() FreqEstimator
 	GetGlobalMemCtrl() MemoryController
-	GetBloomFilter() BloomFilterInterface
 	AddEviction()
 	SetGlobalEfSearch(ef int)
 	GetHits() uint64
 	GetMisses() uint64
 	GetAvgLatency() float64
+	FreeEntry(entry *common.Entry)
 }
 
 type ShardInterface interface {
@@ -38,7 +39,8 @@ type ShardInterface interface {
 	RUnlock()
 	GetItems() map[string]interface{}
 	GetLRUBack() interface{}
-	DeleteItem(key string) (size int, ok bool)
+	// [UPDATE] Trả về *common.Entry thay vì size
+	DeleteItem(key string) (*common.Entry, bool)
 	GetBytes() int64
 }
 
@@ -49,15 +51,6 @@ type FreqEstimator interface {
 
 type MemoryController interface {
 	Release(bytes int64)
-}
-
-type BloomFilterInterface interface {
-	Add(key string)
-	Remove(key string)
-	MayContain(key string) bool
-	Clear()
-	Count() uint64
-	FillRatio() float64
 }
 
 var (
@@ -249,10 +242,12 @@ func (m *Manager) runPPE3(targetBytes int64) int64 {
 
 		s := m.store.GetShardByIndex(c.shardIdx)
 		s.Lock()
-		if size, ok := s.DeleteItem(c.key); ok {
+		// [UPDATE] Nhận *common.Entry từ DeleteItem
+		if entry, ok := s.DeleteItem(c.key); ok {
+			size := entry.Size()
 			freed += int64(size)
 			evicted++
-			m.cleanup(c.key, size)
+			m.cleanup(c.key, size, entry)
 		}
 		s.Unlock()
 	}
@@ -300,9 +295,11 @@ func (m *Manager) runPQSE(targetBytes int64) error {
 		if len(victims) > 0 {
 			s.Lock()
 			for _, k := range victims {
-				if size, ok := s.DeleteItem(k); ok {
+				// [UPDATE] Nhận Entry
+				if entry, ok := s.DeleteItem(k); ok {
+					size := entry.Size()
 					freed += int64(size)
-					m.cleanup(k, size)
+					m.cleanup(k, size, entry)
 					if freed >= targetBytes {
 						break
 					}
@@ -318,15 +315,19 @@ func (m *Manager) runPQSE(targetBytes int64) error {
 	return nil
 }
 
-func (m *Manager) cleanup(key string, size int) {
+// [UPDATE] Thêm tham số entry để free
+func (m *Manager) cleanup(key string, size int, entry *common.Entry) {
 	m.store.AddTotalBytes(-int64(size))
 	m.store.AddEviction()
 	if mc := m.store.GetGlobalMemCtrl(); mc != nil {
 		mc.Release(int64(size))
 	}
-	if bf := m.store.GetBloomFilter(); bf != nil {
-		bf.Remove(key)
+
+	// [NEW] Gọi Store để giải phóng bộ nhớ Arena
+	if entry != nil {
+		m.store.FreeEntry(entry)
 	}
+
 	m.predictors.Delete(key)
 	m.membrane.Prune(key)
 }
@@ -338,11 +339,14 @@ func (m *Manager) EvictKey(key string) int {
 	}
 	s.Lock()
 	defer s.Unlock()
-	size, ok := s.DeleteItem(key)
+	// [UPDATE]
+	entry, ok := s.DeleteItem(key)
 	if ok {
-		m.cleanup(key, size)
+		size := entry.Size()
+		m.cleanup(key, size, entry)
+		return size
 	}
-	return size
+	return 0
 }
 
 func (m *Manager) GetMetrics() *EvictionMetrics {
