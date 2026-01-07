@@ -28,3 +28,5 @@ tmp/
 data/
 cpu.prof
 coverage.out
+build
+*.mmap

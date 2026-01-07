@@ -6,6 +6,9 @@
 // candidate set for search and avoids building a very large monolithic index
 // in memory on resource-constrained machines.
 //
+// This version is shard-friendly and thread-safe: readers use shared_lock,
+// writers use unique_lock. Per-shard VectorStore instances should be created
+// and attached to per-shard PomaiMap/PomaiArena.
 
 #include <memory>
 #include <string>
@@ -13,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
+#include <shared_mutex>
 #include <atomic>
 #include <thread>
 #include <chrono>
@@ -39,7 +43,6 @@ namespace pomai::ai
         void attach_map(PomaiMap *map);
 
         // Enable IVF-PQ filter (optional). Must be called after init().
-        // Returns true on success.
         bool enable_ivf(size_t num_clusters = 1024, size_t m_sub = 16, size_t nbits = 8, uint64_t seed = 12345);
 
         // Upsert / remove / search
@@ -76,6 +79,11 @@ namespace pomai::ai
         std::atomic<bool> ppq_demote_running_{false};
         uint64_t ppq_demote_interval_ms_{5000};
         uint64_t ppq_demote_cold_thresh_ms_{5000};
+
+        // Reader-writer lock for concurrency:
+        // - upsert/remove take unique_lock
+        // - search takes shared_lock
+        mutable std::shared_mutex rw_mu_;
 
         // helpers
         std::unique_ptr<char[]> build_seed_buffer(const float *vec) const;

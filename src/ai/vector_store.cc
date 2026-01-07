@@ -5,6 +5,7 @@
 #include <cassert>
 #include <algorithm>
 #include <random>
+#include <future>
 
 using namespace pomai::memory;
 
@@ -16,7 +17,6 @@ namespace pomai::ai
         stop_pppq_demoter();
     }
 
-    // Initialize HNSW (PPHNSW wrapper). Returns false on failure (e.g. memory).
     bool VectorStore::init(size_t dim, size_t max_elements, size_t M, size_t ef_construction, PomaiArena *arena)
     {
         if (dim == 0 || max_elements == 0)
@@ -46,7 +46,6 @@ namespace pomai::ai
 
         //
         // PPPQ: create, train quickly on random samples and attach to PPHNSW.
-        // This provides per-point PQ codes and enables approximate-dist path + demotion.
         //
         try
         {
@@ -67,7 +66,7 @@ namespace pomai::ai
 
             ppq->train(samples.data(), n_train, 10);
 
-            // Attach PPPQ into PPHNSW (PPHNSW will propagate non-owning pointer into PomaiSpace)
+            // Attach PPPQ into PPHNSW
             pphnsw_->setPPPQ(std::move(ppq));
 
             // Start background demoter that periodically calls PPPQ::purgeCold
@@ -87,9 +86,6 @@ namespace pomai::ai
         map_ = map;
     }
 
-    // Enable the optional IVFPQ filter. This can be used to reduce candidate set
-    // for searches on high-dimensional collections (saves memory by avoiding a huge
-    // monolithic HNSW for all vectors).
     bool VectorStore::enable_ivf(size_t num_clusters, size_t m_sub, size_t nbits, uint64_t seed)
     {
         if (dim_ == 0)
@@ -101,7 +97,6 @@ namespace pomai::ai
         return true;
     }
 
-    // Build payload buffer (payload-only; PPHNSW expects raw payload pointer, not PPEHeader)
     std::unique_ptr<char[]> VectorStore::build_seed_buffer(const float *vec) const
     {
         size_t payload_size = dim_ * sizeof(float);
@@ -110,7 +105,6 @@ namespace pomai::ai
         return buf;
     }
 
-    // Store 8-byte label into map as value (little-endian)
     bool VectorStore::store_label_in_map(uint64_t label, const char *key, size_t klen)
     {
         if (!map_)
@@ -126,7 +120,6 @@ namespace pomai::ai
         return true;
     }
 
-    // Read label stored in map for key (0 on not-found)
     uint64_t VectorStore::read_label_from_map(const char *key, size_t klen) const
     {
         if (!map_)
@@ -140,19 +133,18 @@ namespace pomai::ai
         return label;
     }
 
-    // Upsert vector: insert/replace into PPHNSW and optionally register in IVF.
+    // Upsert: exclusive lock
     bool VectorStore::upsert(const char *key, size_t klen, const float *vec)
     {
+        std::unique_lock<std::shared_mutex> write_lock(rw_mu_);
+
         if (!pphnsw_)
             return false;
         if (!key || klen == 0 || !vec)
             return false;
 
-        // NOTE: We now insert quantized payloads to reduce RAM footprint.
-        // Choose quantization bits here (8 or 4). 8-bit is a good default; 4-bit saves more memory but reduces quality.
         const int quant_bits = 8;
 
-        // find existing label from in-memory cache first, then fallback to map
         uint64_t label = 0;
         {
             std::lock_guard<std::mutex> lk(label_map_mu_);
@@ -177,22 +169,18 @@ namespace pomai::ai
         {
             if (label != 0)
             {
-                // update existing using quantized insertion path
                 pphnsw_->addQuantizedPoint(vec, dim_, quant_bits, static_cast<hnswlib::labeltype>(label), /*replace_deleted=*/true);
             }
             else
             {
-                // allocate new label
                 uint64_t new_label = next_label_.fetch_add(1, std::memory_order_relaxed);
                 pphnsw_->addQuantizedPoint(vec, dim_, quant_bits, static_cast<hnswlib::labeltype>(new_label), /*replace_deleted=*/false);
 
-                // persist label in map
                 if (map_)
                 {
                     bool ok = store_label_in_map(new_label, key, klen);
                     if (!ok)
                     {
-                        // cleanup index mark-deleted best-effort
                         try
                         {
                             pphnsw_->markDelete(static_cast<hnswlib::labeltype>(new_label));
@@ -213,7 +201,6 @@ namespace pomai::ai
                 label = new_label;
             }
 
-            // register in IVFPQ (if enabled)
             if (ivf_enabled_ && ivf_)
             {
                 int cl = ivf_->assign_cluster(vec);
@@ -230,9 +217,11 @@ namespace pomai::ai
         }
     }
 
-    // Remove a vector by key
+    // Remove: exclusive lock
     bool VectorStore::remove(const char *key, size_t klen)
     {
+        std::unique_lock<std::shared_mutex> write_lock(rw_mu_);
+
         if (!map_)
             return false;
         if (!key || klen == 0)
@@ -271,96 +260,84 @@ namespace pomai::ai
         return map_erased;
     }
 
-    // Search: if IVFPQ enabled, probe clusters and scan only seeds in probed clusters.
-    // Otherwise fall back to HNSW adaptive search.
+    // Search: shared lock allows concurrent readers
     std::vector<std::pair<std::string, float>> VectorStore::search(const float *query, size_t dim, size_t topk)
     {
+        std::shared_lock<std::shared_mutex> read_lock(rw_mu_);
+
         std::vector<std::pair<std::string, float>> out;
         if (!pphnsw_)
             return out;
         if (!query || dim != dim_ || topk == 0)
             return out;
 
-        // If IVF is enabled, use it to limit candidate set
         if (ivf_enabled_ && ivf_)
         {
-            // choose probe_k heuristically: min( max(16, 1% of clusters), clusters)
             size_t clusters = ivf_->num_clusters();
             size_t probe_k = std::min<size_t>(clusters, std::max<size_t>(16, clusters / 100));
             auto probes = ivf_->probe_clusters(query, probe_k);
             std::unordered_set<int> probe_set(probes.begin(), probes.end());
 
-            // Max-heap for top-k (store squared distances)
             using Item = std::pair<double, const Seed *>;
-            struct Cmp
-            {
-                bool operator()(Item const &a, Item const &b) const { return a.first < b.first; }
-            };
-
+            struct Cmp { bool operator()(Item const &a, Item const &b) const { return a.first < b.first; } };
             std::priority_queue<Item, std::vector<Item>, Cmp> heap;
 
-            // iterate all seeds via map->scan_all but only compute distance for seeds in probed clusters
             map_->scan_all([&](Seed *s)
                            {
-            if (!s) return;
-            if (s->type != Seed::OBJ_VECTOR) return;
+                               if (!s) return;
+                               if (s->type != Seed::OBJ_VECTOR) return;
 
-            uint16_t klen = s->get_klen();
+                               uint16_t klen = s->get_klen();
+                               const char *keyptr = s->payload;
+                               uint64_t label = 0;
+                               label = read_label_from_map(keyptr, klen);
+                               if (label == 0) return;
 
-            // build key string to read stored label (label stored via store_label_in_map)
-            const char *keyptr = s->payload;
-            uint64_t label = 0;
-            // read label from map using key (safe, reuse read function)
-            label = read_label_from_map(keyptr, klen);
-            if (label == 0) return;
+                               int cl = ivf_->get_cluster_for_label(label);
+                               if (cl < 0) return;
+                               if (probe_set.find(cl) == probe_set.end()) return;
 
-            int cl = ivf_->get_cluster_for_label(label);
-            if (cl < 0) return;
-            if (probe_set.find(cl) == probe_set.end()) return;
+                               const char *vec_bytes = nullptr;
+                               uint32_t blen = 0;
+                               if ((s->flags & Seed::FLAG_INDIRECT) == 0)
+                               {
+                                   blen = s->get_vlen();
+                                   if (blen == 0) return;
+                                   vec_bytes = s->payload + klen;
+                               }
+                               else
+                               {
+                                   uint64_t offset = 0;
+                                   std::memcpy(&offset, s->payload + klen, pomai::config::MAP_PTR_BYTES);
+                                   const char *blob_hdr = arena_ ? arena_->blob_ptr_from_offset_for_map(offset) : nullptr;
+                                   if (!blob_hdr) return;
+                                   blen = *reinterpret_cast<const uint32_t *>(blob_hdr);
+                                   if (blen == 0) return;
+                                   vec_bytes = blob_hdr + sizeof(uint32_t);
+                               }
 
-            // resolve vector bytes (inline or indirect)
-            const char *vec_bytes = nullptr;
-            uint32_t blen = 0;
-            if ((s->flags & Seed::FLAG_INDIRECT) == 0)
-            {
-                blen = s->get_vlen();
-                if (blen == 0) return;
-                vec_bytes = s->payload + klen;
-            }
-            else
-            {
-                uint64_t offset = 0;
-                std::memcpy(&offset, s->payload + klen, pomai::config::MAP_PTR_BYTES);
-                const char *blob_hdr = arena_ ? arena_->blob_ptr_from_offset_for_map(offset) : nullptr;
-                if (!blob_hdr) return;
-                blen = *reinterpret_cast<const uint32_t *>(blob_hdr);
-                if (blen == 0) return;
-                vec_bytes = blob_hdr + sizeof(uint32_t);
-            }
+                               if (!vec_bytes) return;
+                               if (blen % sizeof(float) != 0) return;
+                               size_t vec_len = blen / sizeof(float);
+                               if (vec_len != dim_) return;
 
-            if (!vec_bytes) return;
-            if (blen % sizeof(float) != 0) return;
-            size_t vec_len = blen / sizeof(float);
-            if (vec_len != dim_) return;
+                               const float *vec = reinterpret_cast<const float *>(vec_bytes);
+                               double sum = 0.0;
+                               for (size_t i = 0; i < dim_; ++i)
+                               {
+                                   double d = static_cast<double>(query[i]) - static_cast<double>(vec[i]);
+                                   sum += d * d;
+                               }
 
-            const float *vec = reinterpret_cast<const float *>(vec_bytes);
-            // compute squared L2
-            double sum = 0.0;
-            for (size_t i = 0; i < dim_; ++i)
-            {
-                double d = static_cast<double>(query[i]) - static_cast<double>(vec[i]);
-                sum += d * d;
-            }
+                               if (heap.size() < topk)
+                                   heap.emplace(sum, s);
+                               else if (sum < heap.top().first)
+                               {
+                                   heap.pop();
+                                   heap.emplace(sum, s);
+                               }
+                           });
 
-            if (heap.size() < topk)
-                heap.emplace(sum, s);
-            else if (sum < heap.top().first)
-            {
-                heap.pop();
-                heap.emplace(sum, s);
-            } });
-
-            // collect results in nearest-first order
             std::vector<Item> results;
             while (!heap.empty())
             {
@@ -379,7 +356,7 @@ namespace pomai::ai
             return out;
         }
 
-        // Fallback: HNSW adaptive search (return label->key translation)
+        // Fallback: HNSW adaptive search
         try
         {
             auto buf = build_seed_buffer(query);
@@ -404,7 +381,6 @@ namespace pomai::ai
                     key = std::to_string(label);
                 tmp.emplace_back(std::move(key), dist);
             }
-            // pq is max-heap => results currently furthest-first, reverse to nearest-first
             std::reverse(tmp.begin(), tmp.end());
             out = std::move(tmp);
         }
@@ -422,7 +398,6 @@ namespace pomai::ai
         return label_to_key_.size();
     }
 
-    // --- PPPQ demoter control ---
     void VectorStore::start_pppq_demoter()
     {
         if (!pphnsw_)
