@@ -1,0 +1,1 @@
+"upstream original HNSW copy — kept for reference only".
