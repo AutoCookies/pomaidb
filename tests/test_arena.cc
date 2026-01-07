@@ -1,8 +1,8 @@
 #include <iostream>
 #include <cstdint>
 #include <string>
-#include "memory/arena.h"
-#include "core/seed.h"
+#include "src/memory/arena.h"
+#include "src/core/seed.h"
 
 // Minimal test harness (no GTest). Exit codes:
 // 0 = all OK

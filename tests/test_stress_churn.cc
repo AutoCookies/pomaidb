@@ -20,9 +20,9 @@
 #include <chrono>
 #include <cstdlib>
 
-#include "memory/arena.h"
-#include "core/map.h"
-#include "core/metrics.h"
+#include "src/memory/arena.h"
+#include "src/core/map.h"
+#include "src/core/metrics.h"
 
 static uint32_t rand_size(std::mt19937 &rng, uint32_t min_b = 16, uint32_t max_b = 16384)
 {

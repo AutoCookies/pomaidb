@@ -2,8 +2,8 @@
 #include <sstream>
 #include <string>
 #include <cstdint>
-#include "memory/arena.h"
-#include "core/map.h"
+#include "src/memory/arena.h"
+#include "src/core/map.h"
 
 // Simple test that verifies indirect/blob storage path (no GTest).
 // Inserts a key with a value larger than Seed::payload capacity and verifies retrieval.

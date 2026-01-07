@@ -12,8 +12,8 @@
 #include <cstdint>
 #include <cassert>
 
-#include "memory/arena.h"
-#include "core/map.h"
+#include "src/memory/arena.h"
+#include "src/core/map.h"
 
 int main()
 {

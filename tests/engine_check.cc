@@ -5,9 +5,9 @@
 #include <cstddef>
 #include <sstream>
 
-#include "core/map.h"
-#include "memory/arena.h"
-#include "core/metrics.h"
+#include "src/core/map.h"
+#include "src/memory/arena.h"
+#include "src/core/metrics.h"
 
 /*
   Demo program:

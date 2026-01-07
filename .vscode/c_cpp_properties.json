@@ -5,12 +5,13 @@
       "includePath": [
         "${workspaceFolder}",
         "${workspaceFolder}/**",
-        "${workspaceFolder}/memory",
-        "${workspaceFolder}/core",
-        "${workspaceFolder}/ai",
+        "${workspaceFolder}/src/memory",
+        "${workspaceFolder}/src/core",
+        "${workspaceFolder}/src/ai",
+        "${workspaceFolder}/src/ai/hnswlib",
         "${workspaceFolder}/tests",
-        "${workspaceFolder}/facade",
-        "${workspaceFolder}/sharding"
+        "${workspaceFolder}/src/facade",
+        "${workspaceFolder}/src/sharding"
       ],
       "defines": [],
       "compilerPath": "/usr/bin/g++",

@@ -7,9 +7,9 @@
 #include <cstring>
 #include <algorithm> // For std::max
 
-#include "ai/hnswlib/hnswlib.h"
-#include "ai/pomai_hnsw.h"
-#include "ai/ppe.h"
+#include "src/ai/hnswlib/hnswlib.h"
+#include "src/ai/pomai_hnsw.h"
+#include "src/ai/ppe.h"
 
 using namespace pomai::ai;
 using namespace std::chrono;

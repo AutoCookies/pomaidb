@@ -2,8 +2,8 @@
 #include <sstream>
 #include <string>
 #include <cstdint>
-#include "memory/arena.h"
-#include "core/map.h"
+#include "src/memory/arena.h"
+#include "src/core/map.h"
 
 // Helper to compute next power of two >= v
 static uint64_t next_power_of_two(uint64_t v)

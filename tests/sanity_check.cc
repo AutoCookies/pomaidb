@@ -2,8 +2,8 @@
 #include <iomanip>
 #include <cstring>
 #include <cstddef>
-#include "memory/arena.h"
-#include "core/map.h"
+#include "src/memory/arena.h"
+#include "src/core/map.h"
 
 // Updated sanity_check: uses PomaiMap::find_seed(...) to obtain Seed*
 // and uses arena.blob_ptr_from_offset_for_map(...) to resolve blob offsets.
