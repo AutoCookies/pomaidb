@@ -1,0 +1,68 @@
+// core/config.h
+#pragma once
+#include <cstdint>
+#include <string>
+#include <atomic>
+#include <optional>
+
+namespace pomai::config
+{
+
+    // Immutable compile-time constants (kept as constexpr)
+    constexpr size_t SEED_PAYLOAD_BYTES = 48;
+    constexpr size_t SEED_ALIGNMENT = 64;
+
+    // Server compile-time configuration constants (moved here for centralised tuning)
+    // These are constexpr so they can be used in compile-time contexts (array sizes, std::array, etc).
+    constexpr size_t SERVER_MAX_EVENTS = 1024;           // epoll events array size
+    constexpr size_t SERVER_READ_BUFFER = 4096;          // default per-read temporary buffer / initial connection reserve
+    constexpr size_t SERVER_MAX_RESP_PARTS = 16;         // maximum number of RESP array elements we accept
+    constexpr size_t SERVER_MAX_PART_BYTES = 1 << 20;    // 1 MiB max size per RESP bulk-string part (safety)
+    constexpr size_t SERVER_MAX_COMMAND_BYTES = 4 << 20; // 4 MiB max total command frame (safety)
+    constexpr bool SERVER_REQUIRE_RESP_ARRAYS = true;    // require RESP arrays (disable inline commands)
+
+    // PWP (Pomai Wire Protocol) related constants
+    constexpr uint8_t PWP_MAGIC = 0x50;                      // 'P'
+    constexpr size_t PWP_MAX_PACKET_SIZE = 16 * 1024 * 1024; // 16 MiB cap for a single frame
+    constexpr size_t PWP_INBUF_RESERVE = SERVER_READ_BUFFER; // initial inbuf reservation
+    constexpr size_t PWP_OUTBUF_RESERVE = 4096;              // initial outbuf reservation
+    constexpr int PWP_LISTEN_BACKLOG = 1024;                 // listen backlog
+
+    // Seed-related constants (centralised)
+    constexpr uint8_t SEED_OBJ_STRING = 0;
+    constexpr uint8_t SEED_FLAG_INLINE = 0;
+    constexpr uint8_t SEED_FLAG_INDIRECT = 0x1;
+
+    // Map-related compile-time tuning
+    // - MAP_MAX_INLINE_KEY: maximum key bytes stored inline inside Seed.payload (leave room for pointer)
+    // - MAP_PTR_BYTES: size used for storing blob offset (uint64_t)
+    constexpr size_t MAP_MAX_INLINE_KEY = 40;          // keys must be reasonably small to fit inline
+    constexpr size_t MAP_PTR_BYTES = sizeof(uint64_t); // we store blob offsets (uint64_t)
+
+    // Runtime-tunable defaults (can be changed at startup)
+    struct Runtime
+    {
+        // harvest tuning
+        std::uint32_t harvest_sample = 5;
+        std::uint32_t harvest_max_attempts = 20;
+        std::uint32_t initial_entropy = 8;
+        std::uint32_t max_entropy = 1024;
+
+        // arena defaults (MB)
+        std::uint64_t arena_mb_per_shard = 512;
+
+        // server
+        std::uint16_t default_port = 6379;
+
+        // deterministic RNG for tests; empty = random_device
+        std::optional<uint64_t> rng_seed{};
+    };
+
+    // Global runtime config (initialize early in main)
+    extern Runtime runtime;
+
+    // Helpers: init from env / string
+    void init_from_env();                       // read env vars like POMAI_HARVEST_SAMPLE
+    void init_from_args(int argc, char **argv); // optional lightweight arg parser
+
+} // namespace pomai::config

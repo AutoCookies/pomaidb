@@ -1,0 +1,30 @@
+{
+  "configurations": [
+    {
+      "name": "Linux",
+      "includePath": [
+        "${workspaceFolder}",
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/src/memory",
+        "${workspaceFolder}/src/core",
+        "${workspaceFolder}/src/ai",
+        "${workspaceFolder}/src/ai/hnswlib",
+        "${workspaceFolder}/tests",
+        "${workspaceFolder}/src/facade",
+        "${workspaceFolder}/src/sharding"
+      ],
+      "defines": [],
+      "compilerPath": "/usr/bin/g++",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "gcc-x64",
+      "browse": {
+        "path": [
+          "${workspaceFolder}",
+          "${workspaceFolder}/**"
+        ]
+      }
+    }
+  ],
+  "version": 4
+}

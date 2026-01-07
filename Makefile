@@ -1,32 +1,15 @@
-.PHONY: all build test fmt lint docker-build docker-run compose-up compose-down
+# Top-level Makefile - wrapper around build.sh
+.PHONY: all clean lib server
 
-BINARY := pomai-cache
-IMAGE := pomai-cache:local
-PORT ?= 8080
+BUILD_SCRIPT := ./build.sh
 
-all: build
+all: server
 
-build:
-	go build -v -o $(BINARY) ./cmd/server
+lib:
+	$(BUILD_SCRIPT)
 
-test:
-	go test ./... -v
+server: lib
+	@echo "Server built (if src/main.cc or examples/main.cc present) at build/pomai_server"
 
-fmt:
-	go fmt ./...
-
-lint:
-	@# optional: requires golangci-lint in PATH
-	@golangci-lint run || true
-
-docker-build:
-	docker build -t $(IMAGE) .
-
-docker-run:
-	docker run --rm -p $(PORT):8080 -v $(PWD)/data:/data -e PORT=$(PORT) $(IMAGE)
-
-compose-up:
-	docker-compose up --build -d
-
-compose-down:
-	docker-compose down
+clean:
+	$(BUILD_SCRIPT) clean
