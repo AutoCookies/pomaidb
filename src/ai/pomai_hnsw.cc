@@ -733,6 +733,34 @@ namespace pomai::ai
             demote_thread_.join();
     }
 
+    template <typename dist_t>
+    size_t PPHNSW<dist_t>::estimatedMemoryUsageBytes(size_t avg_degree_multiplier) const noexcept
+    {
+        try
+        {
+            size_t cnt = elementCount();
+            size_t seed_size = getSeedSize(); // PPEHeader + payload per element
+            uint64_t payload_bytes = static_cast<uint64_t>(seed_size) * static_cast<uint64_t>(cnt);
+
+            // estimate average degree (neighbors stored): use M_ as base, average degree ~= 2*M
+            size_t avg_degree = std::max<size_t>(1, static_cast<size_t>(this->M_) * avg_degree_multiplier);
+
+            // neighbor list overhead: store neighbors as int/tableint
+            uint64_t neighbor_bytes = static_cast<uint64_t>(cnt) * static_cast<uint64_t>(avg_degree) * static_cast<uint64_t>(sizeof(int));
+
+            // misc overhead: small per-element (locks, annotations, label maps)
+            uint64_t misc_per_elem = 64; // conservative
+            uint64_t misc_bytes = static_cast<uint64_t>(cnt) * misc_per_elem;
+
+            uint64_t total = payload_bytes + neighbor_bytes + misc_bytes;
+            return static_cast<size_t>(total);
+        }
+        catch (...)
+        {
+            return 0;
+        }
+    }
+
     // explicit instantiation for float
     template class PPHNSW<float>;
 

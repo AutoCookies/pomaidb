@@ -9,6 +9,7 @@
 
 #include "src/memory/arena.h"
 #include "src/core/seed.h"
+#include "src/core/config.h"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -150,6 +151,15 @@ namespace pomai::memory
             bytes = 1;
         a.allocate_region(bytes);
         return a;
+    }
+
+    PomaiArena PomaiArena::FromConfig()
+    {
+        // Read runtime arena_mb_per_shard; fall back to 512 if unset or zero.
+        uint64_t mb = pomai::config::runtime.arena_mb_per_shard;
+        if (mb == 0)
+            mb = 512;
+        return FromMB(mb);
     }
 
     bool PomaiArena::allocate_region(uint64_t bytes)
@@ -445,7 +455,9 @@ namespace pomai::memory
 
         int fd = open(fname.c_str(), O_RDONLY);
         if (fd < 0)
+        {
             return nullptr;
+        }
         struct stat st;
         if (fstat(fd, &st) != 0)
         {
@@ -470,7 +482,6 @@ namespace pomai::memory
     // ---------------- Demote / Promote ----------------
     std::string PomaiArena::generate_remote_filename(uint64_t id) const
     {
-        // Build deterministic but unique filename containing pid, time and id.
         std::ostringstream ss;
         pid_t pid = getpid();
         auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -492,11 +503,9 @@ namespace pomai::memory
         if (total == 0)
             return 0;
 
-        // create remote filename
         uint64_t id = next_remote_id_++;
         std::string fname = generate_remote_filename(id);
 
-        // write atomically: write to temp and rename
         std::string tmpname = fname + ".tmp";
         int fd = open(tmpname.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
         if (fd < 0)
@@ -514,7 +523,6 @@ namespace pomai::memory
         }
         fsync(fd);
         close(fd);
-        // atomic rename
         if (rename(tmpname.c_str(), fname.c_str()) != 0)
         {
             std::cerr << "PomaiArena::demote_blob: rename failed: " << strerror(errno) << "\n";
@@ -522,19 +530,16 @@ namespace pomai::memory
             return 0;
         }
 
-        // Return block to freelist
         uint64_t block = block_size_for(total);
         auto &vec = free_lists_[block];
         if (vec.size() < MAX_FREELIST_PER_BUCKET)
             vec.push_back(local_offset);
 
-        // encode remote id
         uint64_t remote_id = blob_region_bytes_ + id;
         remote_map_[remote_id] = fname;
 
         std::cerr << "PomaiArena::demote_blob: demoted offset=" << local_offset << " -> file=" << fname << " remote_id=" << remote_id << " bytes=" << total << "\n";
 
-        // Note: mapping not created now (lazy). Caller should replace stored offset with remote_id.
         return remote_id;
     }
 
@@ -547,11 +552,9 @@ namespace pomai::memory
         if (!base_addr_)
             return 0;
 
-        // create remote filename
         uint64_t id = next_remote_id_++;
         std::string fname = generate_remote_filename(id);
 
-        // write atomically: write to temp and rename
         std::string tmpname = fname + ".tmp";
         int fd = open(tmpname.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
         if (fd < 0)
@@ -615,7 +618,6 @@ namespace pomai::memory
             return UINT64_MAX;
         const std::string &fname = it->second;
 
-        // read file into vector
         int fd = open(fname.c_str(), O_RDONLY);
         if (fd < 0)
             return UINT64_MAX;
@@ -665,7 +667,6 @@ namespace pomai::memory
             blob_next_offset_ = offset + block;
         }
 
-        // If remote was mmapped, unmap and remove mapping
         auto mit = remote_mmaps_.find(remote_id);
         if (mit != remote_mmaps_.end())
         {
@@ -678,7 +679,6 @@ namespace pomai::memory
             remote_mmaps_.erase(mit);
         }
 
-        // remove remote file metadata and unlink file (best-effort)
         unlink(fname.c_str());
         remote_map_.erase(remote_id);
 
@@ -714,7 +714,6 @@ namespace pomai::memory
     void PomaiArena::cleanup()
     {
         std::lock_guard<std::mutex> lk(mu_);
-        // unmap remote mmaps
         for (auto &ent : remote_mmaps_)
         {
             const char *addr = ent.second.first;

@@ -28,10 +28,6 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/src/facade/CMakeLists.txt")
   add_subdirectory(src/facade)
 endif()
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/src/sharding/CMakeLists.txt")
-  add_subdirectory(src/sharding)
-endif()
-
 if(BUILD_APPS AND EXISTS "${CMAKE_SOURCE_DIR}/apps/CMakeLists.txt")
   add_subdirectory(apps)
 endif()

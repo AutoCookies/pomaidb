@@ -125,9 +125,15 @@ namespace pomai::memory
         uint64_t seed_region_size() const noexcept;
 
         // ---------------- Factories for tests / convenience ------------
+
         // Create arena from MB/GB; returns a PomaiArena object (invalid if allocation failed).
         static PomaiArena FromMB(uint64_t mb);
         static PomaiArena FromGB(double gb);
+
+        // Create arena sized according to runtime configuration (POMAI_ARENA_MB).
+        // Reads pomai::config::runtime.arena_mb_per_shard and returns an arena sized to that value
+        // (or a sensible default if it is zero).
+        static PomaiArena FromConfig();
 
     private:
         // Internal helpers

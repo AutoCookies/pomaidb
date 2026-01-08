@@ -1,5 +1,14 @@
 #pragma once
 // facade/server.h - Pomai Wire Protocol (PWP) v1 implementation (enhanced)
+//
+// This version integrates the shard-based PPSM index directly into the server.
+// On first VSET the server lazily constructs a ShardManager and a PPSM instance
+// (per-shard HNSW workers). VSET enqueues inserts into PPSM; VSEARCH fans out
+// to shards via PPSM::search and returns merged results.
+//
+// Note: VectorStore is not used here when PPSM is active. We keep the rest of
+// the server code unchanged (epoll loop, request parsing/serialization).
+
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/uio.h> // writev
@@ -18,12 +27,15 @@
 #include <cstring>
 #include <atomic>
 #include <algorithm>
+#include <sstream> // <-- added for memoryUsage serialization
+#include <thread>
 
 #include "src/core/map.h"
 #include "src/core/metrics.h"
 #include "src/core/config.h"
 #include "src/core/seed.h"
-#include "src/ai/vector_store.h"
+#include "src/core/pps_manager.h"
+#include "src/core/shard_manager.h"
 
 struct alignas(16) PomaiHeader
 {
@@ -42,7 +54,8 @@ enum OpCode : uint8_t
     OP_DEL = 3,
     OP_PING = 99,
     OP_VSET = 10,
-    OP_VSEARCH = 11
+    OP_VSEARCH = 11,
+    OP_VMEM = 12 // new: request memory usage from PPSM (returns CSV payload,index_overhead,total)
 };
 enum StatusCode : uint16_t
 {
@@ -59,9 +72,10 @@ private:
     int epoll_fd{-1};
     int event_fd{-1}; // for graceful shutdown signalling
     PomaiMap *engine_map;
-    std::unique_ptr<pomai::ai::VectorStore> vec_store_; // VectorStore replaces VectorIndex
+    std::unique_ptr<pomai::core::PPSM> ppsm_; // shard-based index (lazy init)
+    std::unique_ptr<ShardManager> shard_mgr_; // owns shards (lazy)
     std::atomic<bool> running{true};
-    bool vec_store_inited_{false};
+    bool ppsm_inited_{false};
 
     struct Connection
     {
@@ -168,7 +182,7 @@ private:
         queue_response(conn, hdr, val_ptr, val_len);
     }
 
-    // parse and execute; extended to handle VSET and VSEARCH
+    // parse and execute; extended to handle VSET and VSEARCH via PPSM
     void execute_command(Connection *conn, const PomaiHeader &hdr_host, const char *body_ptr)
     {
         if (hdr_host.klen > pomai::config::SERVER_MAX_PART_BYTES || hdr_host.vlen > pomai::config::SERVER_MAX_PART_BYTES)
@@ -235,63 +249,51 @@ private:
 
             size_t dim = hdr_host.vlen / sizeof(float);
 
-            // lazy init of vector store on first VSET
-            if (!vec_store_)
+            // lazy init of shard manager + PPSM on first VSET
+            if (!ppsm_)
             {
-                vec_store_.reset(new pomai::ai::VectorStore());
-            }
-            if (!vec_store_inited_)
-            {
-                // conservative defaults for memory-constrained machines
-                const size_t fallback_max_elements = 16384; // safe default, can be raised via config
-                size_t max_elements = fallback_max_elements;
-
-                PomaiArena *arena = nullptr;
+                // determine shard count from runtime config
+                uint32_t shard_count = pomai::config::runtime.shard_count ? pomai::config::runtime.shard_count : static_cast<uint32_t>(std::max<int>(1, (int)std::thread::hardware_concurrency()));
                 try
                 {
-                    arena = engine_map->get_arena();
+                    shard_mgr_.reset(new ShardManager(shard_count));
                 }
-                catch (...)
+                catch (const std::exception &e)
                 {
-                    arena = nullptr;
-                }
-
-                if (arena != nullptr)
-                {
-                    uint64_t capacity = arena->get_capacity_bytes();
-                    if (capacity > 0)
-                    {
-                        uint64_t est_seeds = capacity / sizeof(Seed);
-                        if (est_seeds > 0)
-                        {
-                            // cap to a conservative maximum to avoid huge allocations on low-RAM machines
-                            max_elements = static_cast<size_t>(std::min<uint64_t>(est_seeds, static_cast<uint64_t>(fallback_max_elements)));
-                        }
-                    }
-                }
-
-                // HNSW params chosen conservative for smaller machines (tradeoff: recall vs memory)
-                size_t M = 8;
-                size_t ef_construction = 50;
-
-                bool ok_init = vec_store_->init(dim, max_elements, M, ef_construction, (arena != nullptr ? arena : nullptr));
-                if (!ok_init)
-                {
-                    std::cerr << "[Pomai] VectorStore init failed for dim=" << dim << " max_elements=" << max_elements << "\n";
+                    std::cerr << "[Pomai] ShardManager init failed: " << e.what() << "\n";
                     send_response_buffered(conn, OP_VSET, STATUS_ERR, nullptr, 0);
                     return;
                 }
-                vec_store_->attach_map(engine_map);
-                vec_store_inited_ = true;
 
-                std::cerr << "[Pomai] VectorStore initialized: dim=" << dim
-                          << " max_elements=" << max_elements << " M=" << M << " ef_construction=" << ef_construction << "\n";
+                // Use configured total max elements if provided, else fallback to a large default.
+                size_t max_elements = 0;
+                if (pomai::config::runtime.max_elements_total > 0)
+                    max_elements = static_cast<size_t>(pomai::config::runtime.max_elements_total);
+                else
+                    max_elements = 131072; // fallback 128K
+
+                // HNSW params (conservative)
+                size_t M = 8;
+                size_t ef_construction = 50;
+
+                try
+                {
+                    ppsm_.reset(new pomai::core::PPSM(shard_mgr_.get(), dim, max_elements, M, ef_construction, /*async_insert_ack=*/true));
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "[Pomai] PPSM init failed: " << e.what() << "\n";
+                    send_response_buffered(conn, OP_VSET, STATUS_ERR, nullptr, 0);
+                    return;
+                }
+                ppsm_inited_ = true;
+                std::cerr << "[Pomai] PPSM initialized: shards=" << shard_count << " dim=" << dim << " max_elements=" << max_elements << "\n";
             }
 
             bool ok = false;
             try
             {
-                ok = vec_store_->upsert(kptr, hdr_host.klen, reinterpret_cast<const float *>(vptr));
+                ok = ppsm_->addVec(kptr, hdr_host.klen, reinterpret_cast<const float *>(vptr));
             }
             catch (...)
             {
@@ -308,11 +310,12 @@ private:
                 PomaiMetrics::arena_alloc_fails.fetch_add(1, std::memory_order_relaxed);
                 send_response_buffered(conn, OP_VSET, STATUS_FULL, nullptr, 0);
             }
+            return;
         }
         else if (hdr_host.op == OP_VSEARCH)
         {
             // VSEARCH request body: [4B topk (network order)][query float32 bytes...]
-            if (!vec_store_)
+            if (!ppsm_)
             {
                 send_response_buffered(conn, OP_VSEARCH, STATUS_ERR, nullptr, 0);
                 return;
@@ -339,15 +342,7 @@ private:
             size_t dim = query_bytes / sizeof(float);
             const float *query = reinterpret_cast<const float *>(body_ptr + 4);
 
-            // Ensure vec_store initialized with same dim
-            if (!vec_store_inited_)
-            {
-                // cannot search before any VSET (no index)
-                send_response_buffered(conn, OP_VSEARCH, STATUS_ERR, nullptr, 0);
-                return;
-            }
-
-            auto results = vec_store_->search(query, dim, topk);
+            auto results = ppsm_->search(query, dim, topk);
 
             // Serialize results to binary buffer: repeated [4B keylen][key bytes][4B score_bits(network order)]
             std::vector<char> outbuf;
@@ -377,6 +372,28 @@ private:
                 send_response_buffered(conn, OP_VSEARCH, STATUS_OK, outbuf.data(), static_cast<uint32_t>(outbuf.size()));
             }
         }
+        else if (hdr_host.op == OP_VMEM)
+        {
+            // New: return PPSM memory usage as CSV: payload_bytes,index_overhead_bytes,total_bytes
+            if (!ppsm_)
+            {
+                send_response_buffered(conn, OP_VMEM, STATUS_ERR, nullptr, 0);
+                return;
+            }
+            try
+            {
+                auto mu = ppsm_->memoryUsage();
+                std::ostringstream ss;
+                ss << mu.payload_bytes << "," << mu.index_overhead_bytes << "," << mu.total_bytes;
+                std::string s = ss.str();
+                send_response_buffered(conn, OP_VMEM, STATUS_OK, s.c_str(), static_cast<uint32_t>(s.size()));
+            }
+            catch (...)
+            {
+                send_response_buffered(conn, OP_VMEM, STATUS_ERR, nullptr, 0);
+            }
+            return;
+        }
         else if (hdr_host.op == OP_PING)
         {
             const char pong[] = "PONG";
@@ -388,6 +405,11 @@ private:
         }
     }
 
+    // Try to parse and consume a single frame from the connection's input buffer.
+    // Returns:
+    //  - 0 if there isn't a complete frame yet
+    //  - SIZE_MAX if frame is invalid (caller must close connection)
+    //  - total_len consumed if a full frame was processed
     size_t try_consume_one_frame(Connection *conn)
     {
         if (conn->inbuf.size() < sizeof(PomaiHeader))
@@ -466,9 +488,10 @@ public:
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &ev) != 0)
             throw std::runtime_error("epoll_ctl ADD event_fd");
 
-        // vector store will be lazily initialized on first VSET (so we can derive dim from payload)
-        vec_store_.reset(nullptr);
-        vec_store_inited_ = false;
+        // ppsm_ and shard_mgr_ are lazily allocated on first VSET
+        ppsm_.reset(nullptr);
+        shard_mgr_.reset(nullptr);
+        ppsm_inited_ = false;
     }
 
     ~PomaiServer()
@@ -489,7 +512,7 @@ public:
         if (event_fd != -1)
         {
             ssize_t rr = write(event_fd, &one, sizeof(one));
-            (void)rr; // use the return value (silence warn_unused_result) but don't treat as fatal
+            (void)rr;
         }
     }
 
@@ -516,6 +539,7 @@ public:
 
                 if (fd == server_fd)
                 {
+                    // accept loop (edge-triggered)
                     while (true)
                     {
                         struct sockaddr_in peer{};
@@ -547,7 +571,7 @@ public:
                 {
                     uint64_t v = 0;
                     ssize_t rr = read(event_fd, &v, sizeof(v));
-                    (void)rr; // consume return to silence warn_unused_result
+                    (void)rr;
                     running.store(false);
                     break;
                 }

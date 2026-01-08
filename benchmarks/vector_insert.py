@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-bench_insert.py -- bulk insert random float vectors via VSET PWP.
+bench_insert.py -- bulk insert random float vectors via VSET PWP, then query server for vector-store memory usage.
 
 Usage:
-  ./benchmarks/bench_insert.py --host 127.0.0.1 --port 6379 --count 10000 --dim 64 --start 0 --batch 100
+  ./benchmarks/vector_insert.py --host 127.0.0.1 --port 6379 --count 10000 --dim 64 --start 0 --batch 100
 
-This will send count vectors named key_{i} with random floats in [0,1].
-It prints progress and a summary (total time, insert/sec).
+After inserts finish the script will call OP_VMEM and print the CSV: payload_bytes,index_overhead_bytes,total_bytes
 """
 import argparse
 import socket
@@ -17,6 +16,7 @@ import sys
 
 PWP_MAGIC = ord('P')
 OP_VSET = 10
+OP_VMEM = 12
 
 def send_one(host, port, key_bytes, vec_bytes, timeout=5):
     hdr = struct.pack("!BBHIII", PWP_MAGIC, OP_VSET, 0, len(key_bytes), len(vec_bytes), 0)
@@ -31,6 +31,28 @@ def send_one(host, port, key_bytes, vec_bytes, timeout=5):
             raise RuntimeError("bad mag")
         if status != 0:
             raise RuntimeError(f"server status {status}")
+
+def request_memusage(host, port, timeout=5):
+    hdr = struct.pack("!BBHIII", PWP_MAGIC, OP_VMEM, 0, 0, 0, 0)
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.sendall(hdr)
+        resp = s.recv(16)
+        if len(resp) < 16:
+            raise RuntimeError("short response")
+        magic, op, status, rklen, rvlen, reserved = struct.unpack("!BBHIII", resp)
+        if magic != PWP_MAGIC:
+            raise RuntimeError("bad mag")
+        if status != 0:
+            raise RuntimeError(f"server status {status}")
+        body = b''
+        left = rvlen
+        while left > 0:
+            chunk = s.recv(left)
+            if not chunk:
+                break
+            body += chunk
+            left -= len(chunk)
+        return body.decode('ascii', errors='replace')
 
 def float_list_to_bytes(values):
     return b''.join(struct.pack('f', float(x)) for x in values)
@@ -73,6 +95,14 @@ def main():
 
     elapsed = time.time() - t0
     print(f"Done inserts: total={total} errors={errors} time={elapsed:.2f}s rate={total/elapsed:.2f}/s")
+
+    # Request memory usage from server (if PPSM active)
+    try:
+        s = request_memusage(host, port)
+        print("Server memoryUsage (payload_bytes,index_overhead_bytes,total_bytes):")
+        print(s)
+    except Exception as e:
+        print(f"[WARN] memoryUsage request failed: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

@@ -1,14 +1,21 @@
 #pragma once
 // src/ai/vector_store.h
 //
-// VectorStore: a small wrapper combining an HNSW-based PPHNSW index with an
-// optional PP-IVF candidate filter (IVF + tiny PQ). The IVFPQ path reduces the
-// candidate set for search and avoids building a very large monolithic index
-// in memory on resource-constrained machines.
+// Shard-aware VectorStore wrapper.
 //
-// This version is shard-friendly and thread-safe: readers use shared_lock,
-// writers use unique_lock. Per-shard VectorStore instances should be created
-// and attached to per-shard PomaiMap/PomaiArena.
+// This file implements a VectorStore that can operate in two modes:
+//  - single-map (legacy): attach a single PomaiMap + PomaiArena (existing behavior)
+//  - sharded   : attach a ShardManager and the VectorStore will create one
+//                per-shard VectorStore instance, attach per-shard PomaiMap/Arena,
+//                and route upsert/remove to the shard for the key. Searches are
+//                executed in parallel across all shards and results merged.
+//
+// The public interface is unchanged for the common operations (init/attach_map/upsert/remove/search).
+// To enable sharding call attach_shard_manager() after init().
+//
+// Thread-safety:
+//  - Each per-shard VectorStore uses its own reader-writer locks (see per-shard implementation).
+//  - Sharded search runs per-shard searches in parallel using std::async and then merges results.
 
 #include <memory>
 #include <string>
@@ -27,72 +34,112 @@
 #include "src/core/map.h"
 #include "src/ai/pp_ivf.h"
 
+// shard support: include the manager + router + pps manager
+#include "src/core/shard_manager.h"
+#include "src/core/shard_router.h"
+#include "src/core/pps_manager.h"
+
 namespace pomai::ai
 {
 
     class VectorStore
     {
     public:
-        VectorStore() = default;
+        VectorStore();
         ~VectorStore();
 
-        // Initialize underlying PPHNSW index.
+        // Initialize underlying PPHNSW parameters. In sharded mode we'll split max_elements
+        // across shards (evenly). The 'arena' parameter is only used in single-map mode.
         bool init(size_t dim, size_t max_elements, size_t M, size_t ef_construction, pomai::memory::PomaiArena *arena = nullptr);
 
-        // Attach persistent PomaiMap (key->label storage)
+        // Attach persistent PomaiMap (legacy single-map mode).
         void attach_map(PomaiMap *map);
 
-        // Enable IVF-PQ filter (optional). Must be called after init().
+        // Attach ShardManager to enable sharded operation.
+        // Must be called after init() and before any upsert/remove/search if you want sharded mode.
+        // shard_count is the number of shards the manager exposes (should match manager internal count).
+        void attach_shard_manager(ShardManager *mgr, uint32_t shard_count);
+
+        // Enable IVF-PQ filter (optional). Must be called after init() (and before heavy upserts).
         bool enable_ivf(size_t num_clusters = 1024, size_t m_sub = 16, size_t nbits = 8, uint64_t seed = 12345);
 
         // Upsert / remove / search
         bool upsert(const char *key, size_t klen, const float *vec);
         bool remove(const char *key, size_t klen);
+        // Search returns vector of (key, score). Scores are squared L2 distances.
         std::vector<std::pair<std::string, float>> search(const float *query, size_t dim, size_t topk);
 
-        // Number of indexed items known in-memory
+        // Number of indexed items known in-memory (sum across shards or local cache)
         size_t size() const;
 
+        // ---------------- Memory usage reporting ----------------
+        // Approximate memory usage breakdown aggregated across mode.
+        struct MemoryUsage
+        {
+            uint64_t payload_bytes{0};        // bytes used by stored payloads (PPEHeader + payload)
+            uint64_t index_overhead_bytes{0}; // neighbor lists, internal tables, misc
+            uint64_t total_bytes{0};          // payload + overhead
+        };
+
+        // Return best-effort estimate of memory usage (bytes). Fast, non-blocking.
+        MemoryUsage memoryUsage() const noexcept;
+
     private:
-        size_t dim_{0};
-        pomai::memory::PomaiArena *arena_{nullptr};
-        PomaiMap *map_{nullptr};
-
-        // HNSW components
-        std::unique_ptr<hnswlib::L2Space> l2space_;
-        std::unique_ptr<PPHNSW<float>> pphnsw_;
-
-        // Optional IVFPQ filter
-        std::unique_ptr<PPIVF> ivf_;
-        bool ivf_enabled_{false};
-
-        // label <-> key mappings (in-memory cache)
-        mutable std::mutex label_map_mu_;
-        std::unordered_map<uint64_t, std::string> label_to_key_;
-        std::unordered_map<std::string, uint64_t> key_to_label_;
-
-        // monotonic label allocator
-        std::atomic<uint64_t> next_label_{1};
-
-        // PPPQ demoter thread state
-        std::thread ppq_demote_thread_;
-        std::atomic<bool> ppq_demote_running_{false};
-        uint64_t ppq_demote_interval_ms_{5000};
-        uint64_t ppq_demote_cold_thresh_ms_{5000};
-
-        // Reader-writer lock for concurrency:
-        // - upsert/remove take unique_lock
-        // - search takes shared_lock
-        mutable std::shared_mutex rw_mu_;
+        // Legacy single-map implementation (kept for compatibility)
+        bool init_single(size_t dim, size_t max_elements, size_t M, size_t ef_construction, pomai::memory::PomaiArena *arena);
+        // Sharded initialization: create per-shard VectorStore and initialize each.
+        bool init_sharded(size_t dim, size_t max_elements_total, size_t M, size_t ef_construction, ShardManager *mgr);
 
         // helpers
         std::unique_ptr<char[]> build_seed_buffer(const float *vec) const;
         bool store_label_in_map(uint64_t label, const char *key, size_t klen);
         uint64_t read_label_from_map(const char *key, size_t klen) const;
 
-        // internal helpers for PPPQ demoter
-        void start_pppq_demoter();
-        void stop_pppq_demoter();
+        // merge helper: merge sorted K lists into final topk (nearest)
+        static std::vector<std::pair<std::string, float>> merge_topk(const std::vector<std::vector<std::pair<std::string, float>>> &lists, size_t topk);
+
+        // configuration & state
+        size_t dim_{0};
+        size_t max_elements_total_{0};
+        size_t M_{0};
+        size_t ef_construction_{0};
+
+        // single-map mode members
+        PomaiMap *map_{nullptr};
+        pomai::memory::PomaiArena *arena_{nullptr};
+        std::unique_ptr<hnswlib::L2Space> l2space_;
+        std::unique_ptr<PPHNSW<float>> pphnsw_;
+        std::unique_ptr<PPIVF> ivf_;
+        bool ivf_enabled_{false};
+
+        // label <-> key mappings (in-memory cache) for single-mode
+        mutable std::mutex label_map_mu_;
+        std::unordered_map<uint64_t, std::string> label_to_key_;
+        std::unordered_map<std::string, uint64_t> key_to_label_;
+        std::atomic<uint64_t> next_label_{1};
+
+        // Reader-writer lock (single-mode). Per-shard VectorStore has its own locks.
+        mutable std::shared_mutex rw_mu_;
+
+        // Sharded mode members
+        ShardManager *shard_mgr_{nullptr};
+        uint32_t shard_count_{0};
+        // per-shard VectorStore instances (owned)
+        std::vector<std::unique_ptr<VectorStore>> per_shard_stores_; // note: recursive use — per-shard single-mode VectorStore
+        bool sharded_mode_{false};
+
+        // PPSM instance used in sharded mode to enqueue writes / run searches
+        std::unique_ptr<pomai::core::PPSM> ppsm_;
+
+        // PPPQ demoter thread state (single-mode)
+        std::thread ppq_demote_thread_;
+        std::atomic<bool> ppq_demote_running_{false};
+        uint64_t ppq_demote_interval_ms_{5000};
+        uint64_t ppq_demote_cold_thresh_ms_{5000};
+
+        // disable copy
+        VectorStore(const VectorStore &) = delete;
+        VectorStore &operator=(const VectorStore &) = delete;
     };
 
 } // namespace pomai::ai

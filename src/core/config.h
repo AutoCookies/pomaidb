@@ -51,11 +51,19 @@ namespace pomai::config
         // arena defaults (MB)
         std::uint64_t arena_mb_per_shard = 512;
 
-        // server
+        // server default port
         std::uint16_t default_port = 6379;
 
         // deterministic RNG for tests; empty = random_device
         std::optional<uint64_t> rng_seed{};
+
+        // Number of shards to create when using ShardManager / PPSM.
+        // 0 means "auto" (server may pick hardware_concurrency()). Can be set via env POMAI_SHARD_COUNT.
+        std::uint32_t shard_count = 0;
+
+        // Optional: total maximum elements for vector index (across all shards).
+        // Set via env POMAI_MAX_ELEMENTS_TOTAL (optional). 0 => use code default/fallback.
+        std::uint64_t max_elements_total = 0;
     };
 
     // Global runtime config (initialize early in main)

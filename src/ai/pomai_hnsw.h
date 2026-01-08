@@ -163,10 +163,15 @@ namespace pomai::ai
         void restorePPEHeaders();
 
         // Return the combined seed size from PomaiSpace (PPEHeader + payload)
-        size_t getSeedSize()
+        size_t getSeedSize() const
         {
             PomaiSpace<dist_t> *sp = pomai_space_owner_.get();
             return sp ? sp->get_data_size() : 0;
+        }
+
+        size_t elementCount() const noexcept
+        {
+            return static_cast<size_t>(this->cur_element_count.load(std::memory_order_relaxed));
         }
 
         // ----- PPPQ helpers -----
@@ -187,6 +192,7 @@ namespace pomai::ai
 
         // Query if the demoter is running.
         bool isBackgroundDemoterRunning() const noexcept { return demote_running_.load(std::memory_order_acquire); }
+        size_t estimatedMemoryUsageBytes(size_t avg_degree_multiplier = 2) const noexcept;
 
     private:
         // Internal helpers (implementation details in .cc). These are not part of public API,

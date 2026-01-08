@@ -10,8 +10,7 @@
         "${workspaceFolder}/src/ai",
         "${workspaceFolder}/src/ai/hnswlib",
         "${workspaceFolder}/tests",
-        "${workspaceFolder}/src/facade",
-        "${workspaceFolder}/src/sharding"
+        "${workspaceFolder}/src/facade"
       ],
       "defines": [],
       "compilerPath": "/usr/bin/g++",
