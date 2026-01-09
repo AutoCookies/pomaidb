@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <algorithm>
 #include <vector>
+#include <filesystem>
 
 namespace pomai::memory
 {
@@ -41,7 +42,11 @@ namespace pomai::memory
           blob_region_bytes_(0),
           blob_next_offset_(0),
           next_remote_id_(1),
-          rng_(std::random_device{}()) {}
+          pending_counter_(1),
+          rng_(std::random_device{}())
+    {
+        // pending_base_ is initialized later when allocate_region() runs.
+    }
 
     PomaiArena::PomaiArena(uint64_t bytes) : PomaiArena()
     {
@@ -50,11 +55,21 @@ namespace pomai::memory
 
     PomaiArena::~PomaiArena()
     {
+        // stop demote worker if running
+        {
+            std::lock_guard<std::mutex> lk(demote_mu_);
+            demote_worker_running_.store(false, std::memory_order_release);
+            demote_cv_.notify_all();
+        }
+        if (demote_worker_.joinable())
+            demote_worker_.join();
+
         cleanup();
     }
 
     PomaiArena::PomaiArena(PomaiArena &&o) noexcept
     {
+        // Lock source while stealing state
         std::lock_guard<std::mutex> lk(o.mu_);
         base_addr_ = o.base_addr_;
         capacity_bytes_ = o.capacity_bytes_;
@@ -72,7 +87,18 @@ namespace pomai::memory
         remote_map_ = std::move(o.remote_map_);
         remote_mmaps_ = std::move(o.remote_mmaps_);
         next_remote_id_ = o.next_remote_id_;
+
+        // atomic copy using load/store (can't assign std::atomic from std::atomic)
+        pending_counter_.store(o.pending_counter_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
         rng_ = std::move(o.rng_);
+
+#ifdef HAVE_PENDING_BASE_MEMBER
+        pending_base_ = o.pending_base_;
+#endif
+
+        demote_worker_running_.store(false);
+        o.demote_worker_running_.store(false);
 
         o.base_addr_ = nullptr;
         o.capacity_bytes_ = 0;
@@ -84,6 +110,7 @@ namespace pomai::memory
         o.seed_next_slot_ = 0;
         o.blob_next_offset_ = 0;
         o.next_remote_id_ = 1;
+        o.pending_counter_.store(1, std::memory_order_relaxed);
     }
 
     PomaiArena &PomaiArena::operator=(PomaiArena &&o) noexcept
@@ -109,7 +136,14 @@ namespace pomai::memory
             remote_map_ = std::move(o.remote_map_);
             remote_mmaps_ = std::move(o.remote_mmaps_);
             next_remote_id_ = o.next_remote_id_;
+
+            pending_counter_.store(o.pending_counter_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
             rng_ = std::move(o.rng_);
+
+#ifdef HAVE_PENDING_BASE_MEMBER
+            pending_base_ = o.pending_base_;
+#endif
         }
 
         o.base_addr_ = nullptr;
@@ -122,6 +156,7 @@ namespace pomai::memory
         o.seed_next_slot_ = 0;
         o.blob_next_offset_ = 0;
         o.next_remote_id_ = 1;
+        o.pending_counter_.store(1, std::memory_order_relaxed);
 
         return *this;
     }
@@ -143,7 +178,6 @@ namespace pomai::memory
         double use_gb = gb;
         if (use_gb <= 0.0)
         {
-            // default: 512MB per shard (compatible with earlier config)
             use_gb = static_cast<double>(512) / 1024.0;
         }
         uint64_t bytes = static_cast<uint64_t>(use_gb * 1024.0 * 1024.0 * 1024.0);
@@ -155,7 +189,6 @@ namespace pomai::memory
 
     PomaiArena PomaiArena::FromConfig()
     {
-        // Read runtime arena_mb_per_shard; fall back to 512 if unset or zero.
         uint64_t mb = pomai::config::runtime.arena_mb_per_shard;
         if (mb == 0)
             mb = 512;
@@ -171,11 +204,9 @@ namespace pomai::memory
 
         if (base_addr_)
         {
-            // already allocated
             return true;
         }
 
-        // Try to mmap with/without hugepages (best-effort)
 #ifdef MAP_HUGETLB
         void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
         if (p == MAP_FAILED)
@@ -199,10 +230,9 @@ namespace pomai::memory
         capacity_bytes_ = bytes;
 
         // Partition: seed region first, then blob region
-        seed_region_bytes_ = static_cast<uint64_t>(static_cast<double>(capacity_bytes_) * SEED_REGION_RATIO);
+        seed_region_bytes_ = static_cast<uint64_t>(static_cast<double>(capacity_bytes_) * 0.25);
         if (seed_region_bytes_ < sizeof(Seed))
             seed_region_bytes_ = sizeof(Seed);
-        // round down to multiple of Seed size to avoid partial slots
         seed_region_bytes_ = (seed_region_bytes_ / sizeof(Seed)) * sizeof(Seed);
         seed_base_ = base_addr_;
         seed_max_slots_ = seed_region_bytes_ / sizeof(Seed);
@@ -213,10 +243,122 @@ namespace pomai::memory
 
         blob_base_ = base_addr_ + seed_region_bytes_;
         blob_region_bytes_ = capacity_bytes_ - seed_region_bytes_;
-        blob_next_offset_ = 0;
+
+        // IMPORTANT: reserve the first block so alloc_blob never returns offset 0.
+        // Choose reservation as the minimum block (aligned) so subsequent allocations are non-zero.
+        uint64_t reserve_block = block_size_for(static_cast<uint64_t>(sizeof(uint32_t) + 1));
+        if (reserve_block >= blob_region_bytes_)
+        {
+            // Not enough room to reserve; fallback: set next offset to 1 (small non-zero)
+            blob_next_offset_ = 1;
+        }
+        else
+        {
+            // Mark the first block as reserved (we don't add it to freelist).
+            blob_next_offset_ = reserve_block;
+        }
 
         // init counters
         next_remote_id_ = 1;
+        pending_counter_.store(1, std::memory_order_relaxed);
+
+#ifdef HAVE_PENDING_BASE_MEMBER
+        pending_base_ = blob_region_bytes_ + (1ULL << 48);
+#endif
+
+        if (pomai::config::runtime.demote_async_max_pending > 0)
+            max_pending_demotes_ = static_cast<size_t>(pomai::config::runtime.demote_async_max_pending);
+
+        // start demote worker lazily
+        {
+            std::lock_guard<std::mutex> lk2(demote_mu_);
+            if (!demote_worker_running_.load(std::memory_order_acquire))
+            {
+                demote_worker_running_.store(true, std::memory_order_release);
+                demote_worker_ = std::thread([this]()
+                                             {
+                                                 while (demote_worker_running_.load(std::memory_order_acquire))
+                                                 {
+                                                     std::vector<DemoteTask> batch;
+                                                     batch.reserve(64);
+                                                     {
+                                                         std::unique_lock<std::mutex> qlk(demote_mu_);
+                                                         demote_cv_.wait_for(qlk, std::chrono::milliseconds(200), [this]()
+                                                                             { return !demote_queue_.empty() || !demote_worker_running_.load(std::memory_order_acquire); });
+                                                         if (!demote_worker_running_.load(std::memory_order_acquire) && demote_queue_.empty())
+                                                             break;
+                                                         size_t bytes_acc = 0;
+                                                         while (!demote_queue_.empty() && batch.size() < 256)
+                                                         {
+                                                             DemoteTask t = std::move(demote_queue_.front());
+                                                             demote_queue_.pop_front();
+                                                             bytes_acc += t.payload.size();
+                                                             batch.push_back(std::move(t));
+                                                             if (bytes_acc >= demote_batch_bytes_)
+                                                                 break;
+                                                         }
+                                                     }
+
+                                                     for (auto &task : batch)
+                                                     {
+                                                         uint64_t rid = task.remote_id;
+                                                         std::string fname = generate_remote_filename(rid);
+                                                         std::string tmpname = fname + ".tmp";
+                                                         int fd = open(tmpname.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
+                                                         if (fd < 0)
+                                                         {
+                                                             std::cerr << "PomaiArena::demote_worker: open tmp failed: " << strerror(errno) << "\n";
+                                                             std::lock_guard<std::mutex> lk(mu_);
+                                                             remote_map_.erase(rid);
+                                                             continue;
+                                                         }
+                                                         ssize_t left = static_cast<ssize_t>(task.payload.size());
+                                                         const char *ptr = task.payload.data();
+                                                         bool write_failed = false;
+                                                         while (left > 0)
+                                                         {
+                                                             ssize_t w = write(fd, ptr, static_cast<size_t>(left));
+                                                             if (w < 0)
+                                                             {
+                                                                 if (errno == EINTR)
+                                                                     continue;
+                                                                 std::cerr << "PomaiArena::demote_worker: write error: " << strerror(errno) << "\n";
+                                                                 write_failed = true;
+                                                                 break;
+                                                             }
+                                                             left -= w;
+                                                             ptr += w;
+                                                         }
+                                                         if (!write_failed)
+                                                         {
+                                                             fsync(fd);
+                                                             close(fd);
+                                                             if (rename(tmpname.c_str(), fname.c_str()) != 0)
+                                                             {
+                                                                 std::cerr << "PomaiArena::demote_worker: rename failed: " << strerror(errno) << "\n";
+                                                                 unlink(tmpname.c_str());
+                                                                 std::lock_guard<std::mutex> lk(mu_);
+                                                                 remote_map_.erase(rid);
+                                                                 continue;
+                                                             }
+
+                                                             {
+                                                                 std::lock_guard<std::mutex> lk(mu_);
+                                                                 remote_map_[rid] = fname;
+                                                             }
+                                                             std::clog << "[PomaiArena] demote_worker: wrote remote_id=" << rid << " -> " << fname << "\n";
+                                                         }
+                                                         else
+                                                         {
+                                                             close(fd);
+                                                             unlink(tmpname.c_str());
+                                                             std::lock_guard<std::mutex> lk(mu_);
+                                                             remote_map_.erase(rid);
+                                                         }
+                                                     }
+                                                 } });
+            }
+        }
 
         return true;
     }
@@ -283,11 +425,9 @@ namespace pomai::memory
             return nullptr; // exhausted
         }
 
-        // pointer to slot
         char *slot = seed_base_ + idx * sizeof(Seed);
         Seed *s = reinterpret_cast<Seed *>(slot);
 
-        // initialize fields to zero / safe defaults
         s->header.store(0ULL, std::memory_order_relaxed);
         s->entropy = 0;
         s->checksum = 0;
@@ -296,7 +436,6 @@ namespace pomai::memory
         std::memset(s->reserved, 0, sizeof(s->reserved));
         std::memset(s->payload, 0, sizeof(s->payload));
 
-        // add to active_seeds_
         active_pos_[idx] = active_seeds_.size();
         active_seeds_.push_back(idx);
 
@@ -313,18 +452,17 @@ namespace pomai::memory
         char *p = reinterpret_cast<char *>(s);
         if (p < seed_base_ || p >= seed_base_ + seed_region_bytes_)
             return;
+
         uint64_t idx = static_cast<uint64_t>((p - seed_base_) / sizeof(Seed));
         if (idx >= seed_max_slots_)
             return;
 
-        // clear logical contents
         s->header.store(0ULL, std::memory_order_release);
         s->entropy = 0;
         s->checksum = 0;
         s->type = 0;
         s->flags = 0;
 
-        // Remove from active_seeds_ (swap-remove)
         uint64_t pos = active_pos_[idx];
         if (pos != UINT64_MAX)
         {
@@ -335,7 +473,6 @@ namespace pomai::memory
             active_pos_[idx] = UINT64_MAX;
         }
 
-        // push into free_seeds_ for reuse
         free_seeds_.push_back(idx);
     }
 
@@ -364,27 +501,36 @@ namespace pomai::memory
             return nullptr;
 
         const uint64_t hdr = sizeof(uint32_t);
-        const uint64_t total = hdr + static_cast<uint64_t>(len) + 1; // extra nul
+        const uint64_t total = hdr + static_cast<uint64_t>(len) + 1;
         const uint64_t block = block_size_for(total);
 
         auto fit = free_lists_.find(block);
-        if (fit != free_lists_.end() && !fit->second.empty())
+        if (fit != free_lists_.end())
         {
-            uint64_t offset = fit->second.back();
-            fit->second.pop_back();
-            char *p = blob_base_ + offset;
-            uint32_t *lenptr = reinterpret_cast<uint32_t *>(p);
-            *lenptr = len;
-            char *payload = p + hdr;
-            payload[len] = '\0';
-            return p;
+            // try to find a non-zero offset from freelist (0 is reserved sentinel)
+            while (!fit->second.empty())
+            {
+                uint64_t offset = fit->second.back();
+                fit->second.pop_back();
+                if (offset == 0)
+                    continue; // skip reserved/invalid entry
+                if (offset + block <= blob_region_bytes_)
+                {
+                    char *p = blob_base_ + offset;
+                    uint32_t *lenptr = reinterpret_cast<uint32_t *>(p);
+                    *lenptr = len;
+                    char *payload = p + hdr;
+                    payload[len] = '\0';
+                    return p;
+                }
+                // otherwise ignore invalid entry and continue
+            }
         }
 
         // bump allocate (align to block)
         uint64_t aligned_next = (blob_next_offset_ + (block - 1)) & ~(block - 1);
         if (aligned_next + block > blob_region_bytes_)
         {
-            // No space available in arena blob region
             return nullptr;
         }
         uint64_t offset = aligned_next;
@@ -394,6 +540,25 @@ namespace pomai::memory
         char *payload = p + hdr;
         payload[len] = '\0';
         blob_next_offset_ = offset + block;
+
+        // Ensure we never return offset == 0 (should be guaranteed by reserve in allocate_region)
+        if (offset == 0)
+        {
+            // This should not happen; advance to next block and return adjusted pointer.
+            uint64_t next = block_size_for(hdr + 1);
+            if (next + block > blob_region_bytes_)
+            {
+                return nullptr;
+            }
+            offset = next;
+            p = blob_base_ + offset;
+            lenptr = reinterpret_cast<uint32_t *>(p);
+            *lenptr = len;
+            payload = p + hdr;
+            payload[len] = '\0';
+            blob_next_offset_ = offset + block;
+        }
+
         return p;
     }
 
@@ -408,6 +573,9 @@ namespace pomai::memory
             return;
 
         uint64_t offset = static_cast<uint64_t>(header_ptr - blob_base_);
+        if (offset == 0)
+            return; // never reuse reserved zero offset
+
         uint32_t stored_len = *reinterpret_cast<uint32_t *>(header_ptr);
         const uint64_t total = sizeof(uint32_t) + static_cast<uint64_t>(stored_len) + 1;
         const uint64_t block = block_size_for(total);
@@ -415,7 +583,6 @@ namespace pomai::memory
         auto &vec = free_lists_[block];
         if (vec.size() < MAX_FREELIST_PER_BUCKET)
             vec.push_back(offset);
-        // otherwise drop it; freelist capped
     }
 
     uint64_t PomaiArena::offset_from_blob_ptr(const char *p) const noexcept
@@ -437,6 +604,9 @@ namespace pomai::memory
         // Local
         if (offset < blob_region_bytes_)
         {
+            // reject reserved 0 offset as "not mapped"
+            if (offset == 0)
+                return nullptr;
             return blob_base_ + offset;
         }
 
@@ -452,6 +622,8 @@ namespace pomai::memory
             return nullptr;
 
         const std::string &fname = it->second;
+        if (fname.empty())
+            return nullptr; // pending
 
         int fd = open(fname.c_str(), O_RDONLY);
         if (fd < 0)
@@ -496,6 +668,8 @@ namespace pomai::memory
             return 0;
         if (local_offset >= blob_region_bytes_)
             return 0;
+        if (local_offset == 0)
+            return 0; // never demote reserved offset
 
         char *p = blob_base_ + local_offset;
         uint32_t blen = *reinterpret_cast<uint32_t *>(p);
@@ -532,13 +706,11 @@ namespace pomai::memory
 
         uint64_t block = block_size_for(total);
         auto &vec = free_lists_[block];
-        if (vec.size() < MAX_FREELIST_PER_BUCKET)
+        if (local_offset != 0 && vec.size() < MAX_FREELIST_PER_BUCKET)
             vec.push_back(local_offset);
 
         uint64_t remote_id = blob_region_bytes_ + id;
         remote_map_[remote_id] = fname;
-
-        std::cerr << "PomaiArena::demote_blob: demoted offset=" << local_offset << " -> file=" << fname << " remote_id=" << remote_id << " bytes=" << total << "\n";
 
         return remote_id;
     }
@@ -573,24 +745,14 @@ namespace pomai::memory
             {
                 if (errno == EINTR)
                     continue;
-                std::cerr << "PomaiArena::demote_blob_data: write error: " << strerror(errno) << "\n";
+                std::cerr << "PomaiArena::demote_blob_data: write failed: " << strerror(errno) << "\n";
                 close(fd);
                 unlink(tmpname.c_str());
                 return 0;
             }
-            w += n;
-            ptr += n;
             left -= static_cast<size_t>(n);
+            ptr += n;
         }
-
-        if (w != static_cast<ssize_t>(total_bytes))
-        {
-            std::cerr << "PomaiArena::demote_blob_data: short write (w=" << w << " expected=" << total_bytes << ")\n";
-            close(fd);
-            unlink(tmpname.c_str());
-            return 0;
-        }
-
         fsync(fd);
         close(fd);
         if (rename(tmpname.c_str(), fname.c_str()) != 0)
@@ -602,10 +764,63 @@ namespace pomai::memory
 
         uint64_t remote_id = blob_region_bytes_ + id;
         remote_map_[remote_id] = fname;
-
-        std::cerr << "PomaiArena::demote_blob_data: demoted direct buffer -> file=" << fname << " remote_id=" << remote_id << " bytes=" << total_bytes << "\n";
-
         return remote_id;
+    }
+
+    uint64_t PomaiArena::demote_blob_async(const char *data_with_header, uint32_t total_bytes)
+    {
+        if (!data_with_header || total_bytes == 0)
+            return 0;
+
+        uint64_t placeholder = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+#ifdef HAVE_PENDING_BASE_MEMBER
+            uint64_t ctr = pending_counter_.fetch_add(1, std::memory_order_acq_rel);
+            placeholder = pending_base_ + ctr;
+#else
+            uint64_t ctr = pending_counter_.fetch_add(1, std::memory_order_acq_rel);
+            placeholder = make_placeholder(ctr);
+#endif
+            remote_map_.emplace(placeholder, std::string());
+        }
+
+        DemoteTask task;
+        task.remote_id = placeholder;
+        task.payload.assign(data_with_header, data_with_header + total_bytes);
+
+        {
+            std::unique_lock<std::mutex> qlk(demote_mu_);
+            size_t configured_max = max_pending_demotes_;
+            if (pomai::config::runtime.demote_async_max_pending > 0)
+                configured_max = static_cast<size_t>(pomai::config::runtime.demote_async_max_pending);
+
+            if (demote_queue_.size() >= configured_max)
+            {
+                if (pomai::config::runtime.demote_sync_fallback)
+                {
+                    uint64_t final_id = demote_blob_data(task.payload.data(), static_cast<uint32_t>(task.payload.size()));
+                    {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        remote_map_.erase(placeholder);
+                    }
+                    return final_id;
+                }
+                else
+                {
+                    {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        remote_map_.erase(placeholder);
+                    }
+                    return 0;
+                }
+            }
+
+            demote_queue_.push_back(std::move(task));
+            demote_cv_.notify_one();
+        }
+
+        return placeholder;
     }
 
     uint64_t PomaiArena::promote_remote(uint64_t remote_id)
@@ -613,78 +828,86 @@ namespace pomai::memory
         std::lock_guard<std::mutex> lk(mu_);
         if (!base_addr_ || !blob_base_)
             return UINT64_MAX;
+
         auto it = remote_map_.find(remote_id);
         if (it == remote_map_.end())
             return UINT64_MAX;
+
         const std::string &fname = it->second;
+        if (fname.empty())
+            return UINT64_MAX;
 
         int fd = open(fname.c_str(), O_RDONLY);
         if (fd < 0)
+        {
             return UINT64_MAX;
+        }
         struct stat st;
         if (fstat(fd, &st) != 0)
         {
             close(fd);
             return UINT64_MAX;
         }
-        size_t filesize = static_cast<size_t>(st.st_size);
-        if (filesize < sizeof(uint32_t))
+        size_t sz = static_cast<size_t>(st.st_size);
+        if (sz == 0)
         {
             close(fd);
             return UINT64_MAX;
         }
-
-        std::vector<char> buf(filesize);
-        ssize_t r = pread(fd, buf.data(), filesize, 0);
+        std::vector<char> buf(sz);
+        ssize_t r = read(fd, buf.data(), sz);
         close(fd);
-        if (r != static_cast<ssize_t>(filesize))
+        if (r != static_cast<ssize_t>(sz))
             return UINT64_MAX;
 
         uint32_t blen = *reinterpret_cast<uint32_t *>(buf.data());
-        const uint64_t total = sizeof(uint32_t) + static_cast<uint64_t>(blen) + 1;
-        if (total != filesize)
+        if (static_cast<size_t>(blen) + sizeof(uint32_t) + 1 != sz)
+        {
+            return UINT64_MAX;
+        }
+
+        char *hdr = alloc_blob(blen);
+        if (!hdr)
+            return UINT64_MAX;
+        std::memcpy(hdr, buf.data(), sz);
+
+        uint64_t off = offset_from_blob_ptr(hdr);
+        if (off == UINT64_MAX)
             return UINT64_MAX;
 
-        const uint64_t block = block_size_for(total);
-
-        uint64_t offset = UINT64_MAX;
-        auto fit = free_lists_.find(block);
-        if (fit != free_lists_.end() && !fit->second.empty())
-        {
-            offset = fit->second.back();
-            fit->second.pop_back();
-            char *p = blob_base_ + offset;
-            std::memcpy(p, buf.data(), filesize);
-        }
-        else
-        {
-            uint64_t aligned_next = (blob_next_offset_ + (block - 1)) & ~(block - 1);
-            if (aligned_next + block > blob_region_bytes_)
-                return UINT64_MAX;
-            offset = aligned_next;
-            char *p = blob_base_ + offset;
-            std::memcpy(p, buf.data(), filesize);
-            blob_next_offset_ = offset + block;
-        }
-
-        auto mit = remote_mmaps_.find(remote_id);
-        if (mit != remote_mmaps_.end())
-        {
-            const char *addr = mit->second.first;
-            size_t sz = mit->second.second;
-            if (addr && sz > 0)
-            {
-                munmap(const_cast<char *>(addr), sz);
-            }
-            remote_mmaps_.erase(mit);
-        }
-
-        unlink(fname.c_str());
         remote_map_.erase(remote_id);
 
-        std::cerr << "PomaiArena::promote_remote: promoted remote_id=" << remote_id << " into offset=" << offset << "\n";
+        return off;
+    }
 
-        return offset;
+    uint64_t PomaiArena::resolve_pending_remote(uint64_t placeholder_remote_id) const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = remote_map_.find(placeholder_remote_id);
+        if (it == remote_map_.end())
+            return 0;
+        const std::string &fname = it->second;
+        if (fname.empty())
+            return 0;
+        return placeholder_remote_id;
+    }
+
+    size_t PomaiArena::get_demote_queue_length() const noexcept
+    {
+        std::lock_guard<std::mutex> lk(demote_mu_);
+        return demote_queue_.size();
+    }
+
+    void PomaiArena::set_demote_queue_max(size_t max_pending)
+    {
+        std::lock_guard<std::mutex> lk(demote_mu_);
+        max_pending_demotes_ = max_pending;
+    }
+
+    size_t PomaiArena::get_demote_queue_max() const noexcept
+    {
+        std::lock_guard<std::mutex> lk(demote_mu_);
+        return max_pending_demotes_;
     }
 
     const char *PomaiArena::blob_base_ptr() const noexcept
@@ -744,6 +967,14 @@ namespace pomai::memory
         active_seeds_.clear();
         active_pos_.clear();
         free_lists_.clear();
+
+        {
+            std::lock_guard<std::mutex> lk2(demote_mu_);
+            demote_worker_running_.store(false, std::memory_order_release);
+            demote_cv_.notify_all();
+        }
+        if (demote_worker_.joinable())
+            demote_worker_.join();
     }
 
 } // namespace pomai::memory

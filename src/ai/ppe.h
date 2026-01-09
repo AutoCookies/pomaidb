@@ -1,3 +1,27 @@
+/*
+ * src/ai/ppe.h
+ *
+ * PPEHeader: per-element header containing adaptive hints and storage flags.
+ *
+ * Updated:
+ *  - Added atomic flag helpers (atomic_set_flags / atomic_clear_flags / atomic_load_flags)
+ *    which use std::atomic_ref when available, and fall back to GCC/Clang __atomic
+ *    builtins otherwise. These helpers allow callers to set/clear flag bits using
+ *    atomic fetch-or / fetch-and semantics without races when multiple threads may
+ *    concurrently update flags.
+ *
+ *  - Call sites should use these helpers (instead of direct 'flags |= ...' or
+ *    'flags &= ~...' ) when updates may race with readers/writers.
+ *
+ * Notes:
+ *  - flags is still stored as a plain uint32_t so the struct remains POD-like for
+ *    placement-new into mmap'd memory. The atomic helpers operate directly on the
+ *    flags member with atomic builtins, which is safe provided the field is
+ *    naturally aligned (it is).
+ *  - For systems lacking atomic intrinsics, the code falls back to non-atomic
+ *    volatile updates (best-effort). This is unlikely for mainstream Linux x86/x86_64.
+ */
+
 #pragma once
 #include <atomic>
 #include <cstdint>
@@ -24,16 +48,14 @@ namespace pomai::ai
         std::atomic<double> ema_interval_ns{0.0};
 
         // 32-bit flags for storage and precision hints.
+        // Access/modification must use provided helpers when concurrency is possible.
         uint32_t flags{0};
 
         // Per-node adaptive hints (M and ef).
         std::atomic<uint16_t> hint_M{0};
         std::atomic<uint16_t> hint_ef{0};
 
-        // Stored label for the element. This field is written once at insert time
-        // and may be read concurrently by distance functions (non-atomic is OK for
-        // our use because label is written before the element becomes visible).
-        // Using atomic here to be safe under concurrent readers/writers.
+        // Stored label for the element.
         std::atomic<uint64_t> label{0};
 
         PPEHeader() noexcept = default;
@@ -42,6 +64,8 @@ namespace pomai::ai
         void set_precision(uint32_t bits) noexcept
         {
             uint32_t b = (bits & 0xFFu);
+            // flags update via atomic helpers is not required here in most cases because
+            // callers initialize precision before the element becomes visible. Use plain ops.
             flags = (flags & ~PPE_PRECISION_MASK) | (b << PPE_PRECISION_SHIFT);
         }
 
@@ -78,6 +102,54 @@ namespace pomai::ai
             while (oldv < v && !hint_ef.compare_exchange_weak(oldv, v, std::memory_order_relaxed))
             {
             }
+        }
+
+        // Atomic flag helpers
+        // Atomically set bits in flags (fetch-or).
+        inline void atomic_set_flags(uint32_t bits) noexcept
+        {
+#if defined(__cpp_lib_atomic_ref) && (__cpp_lib_atomic_ref >= 201811L)
+            std::atomic_ref<uint32_t> aref(flags);
+            aref.fetch_or(bits, std::memory_order_seq_cst);
+#else
+            // Portable fallback using GCC/Clang builtins (works on mainstream compilers).
+#if defined(__GNUC__) || defined(__clang__)
+            __atomic_fetch_or(&flags, bits, __ATOMIC_SEQ_CST);
+#else
+            // Last-resort fallback (non-atomic): best-effort.
+            flags |= bits;
+#endif
+#endif
+        }
+
+        // Atomically clear bits (fetch-and with complement).
+        inline void atomic_clear_flags(uint32_t bits) noexcept
+        {
+#if defined(__cpp_lib_atomic_ref) && (__cpp_lib_atomic_ref >= 201811L)
+            std::atomic_ref<uint32_t> aref(flags);
+            aref.fetch_and(~bits, std::memory_order_seq_cst);
+#else
+#if defined(__GNUC__) || defined(__clang__)
+            __atomic_fetch_and(&flags, ~bits, __ATOMIC_SEQ_CST);
+#else
+            flags &= ~bits;
+#endif
+#endif
+        }
+
+        // Atomically read flags
+        inline uint32_t atomic_load_flags() const noexcept
+        {
+#if defined(__cpp_lib_atomic_ref) && (__cpp_lib_atomic_ref >= 201811L)
+            std::atomic_ref<const uint32_t> aref(flags);
+            return aref.load(std::memory_order_acquire);
+#else
+#if defined(__GNUC__) || defined(__clang__)
+            return __atomic_load_n(&flags, __ATOMIC_SEQ_CST);
+#else
+            return flags;
+#endif
+#endif
         }
 
         // Update the predictor with an observed access (timestamp in ns).

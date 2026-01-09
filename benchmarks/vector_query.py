@@ -3,7 +3,7 @@
 bench_query.py -- concurrent query benchmark (VSEARCH).
 
 Usage:
-  ./benchmarks/bench_query.py --host 127.0.0.1 --port 6379 --topk 5 --dim 64 --qps 100 --clients 4 --duration 30
+  python3 ./benchmarks/vector_query.py --host 160.30.192.118 --dim 512 --topk 5 --qps 10 --clients 1 --duration 10
 
 Behavior:
   - Spawns `clients` worker threads

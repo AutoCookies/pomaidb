@@ -1,4 +1,3 @@
-#pragma once
 // src/memory/arena.h
 //
 // PomaiArena -- a simple mmap-backed arena that provides:
@@ -9,20 +8,21 @@
 //   - utilities to resolve an offset (stored in index payloads) to a pointer,
 //     including lazy mmap of demoted remote files.
 //
-// This header declares the public API. Implementation is in arena.cc.
+// This header declares the public API. Implementation is in arena.cc and
+// arena_async_demote.cc.
 //
-// Design notes
-//  - This is a pragmatic single-process, single-machine prototype design.
-//    Remote/demoted blobs are written to files in a configurable directory (defaults to /tmp).
-//  - All mutable state is protected by a single mutex (mu) to keep correctness simple.
-//    This is easy to reason about, though coarse-grained. Optimize later if needed.
-//  - Remote ids are encoded as: remote_id = blob_region_bytes + small_counter.
-//    That guarantees they never overlap with local offsets (which are < blob_region_bytes).
+// Notes (production-readiness):
+//  - Pending async demotes are represented by placeholder ids whose MSB is set.
+//    The async path publishes a placeholder immediately and resolves it later to
+//    a concrete remote id once the background worker finishes writing the blob.
+//  - The header provides a small PendingDemote helper used by the async path so
+//    callers can wait for completion if desired.
+//  - The design favors correctness and clear synchronization (mutexes + condition_variable).
 //
-// Thread safety: all public methods that mutate or read mutable state grab `mu`.
-// Methods that return raw pointers (blob_ptr_from_offset_for_map) return pointers
-// that remain valid until the arena is destroyed or promote_remote removes the mapping.
-// Users must not modify or munmap those pointers.
+// Threading: Most mutable members are protected by `mu_`. The async/pending maps
+// use `pending_mu_`. The demote queue is protected by `demote_mu_`.
+
+#pragma once
 
 #include <cstdint>
 #include <cstddef>
@@ -32,11 +32,44 @@
 #include <random>
 #include <mutex>
 #include <optional>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <atomic>
+#include <memory>
+#include <sstream>
+#include <iostream>
 
-struct Seed; // forward-declare; concrete definition in user's code (seed.h)
+struct Seed; // forward-declare; concrete definition in src/core/seed.h
 
 namespace pomai::memory
 {
+
+    // PendingDemote: small struct used by asynchronous demote helpers.
+    // Producers create a shared_ptr<PendingDemote>, publish it into pending_map_
+    // keyed by placeholder id, and background worker will set final_remote_id and
+    // notify via the condition variable when complete.
+    struct PendingDemote
+    {
+        PendingDemote() : done(false), final_remote_id(0) {}
+        std::mutex m;
+        std::condition_variable cv;
+        bool done;
+        uint64_t final_remote_id;
+    };
+
+    // Placeholder encoding helpers:
+    // We encode placeholders by setting the MSB (bit 63). This is simple,
+    // portable and avoids depending on arena internals. Real deployments may
+    // prefer a different scheme (e.g., using pending_base_ offsets).
+    static inline uint64_t make_placeholder(uint64_t ctr) noexcept
+    {
+        return (1ULL << 63) | (ctr & 0x7FFFFFFFFFFFFFFFULL);
+    }
+    static inline bool is_placeholder_id(uint64_t id) noexcept
+    {
+        return (id & (1ULL << 63)) != 0;
+    }
 
     class PomaiArena
     {
@@ -114,9 +147,32 @@ namespace pomai::memory
         // Returns remote_id (> blob_region_bytes_) on success, or 0 on failure.
         uint64_t demote_blob_data(const char *data_with_header, uint32_t total_bytes);
 
+        // Asynchronous demote: schedule data to be written to remote store by background worker.
+        // Returns a reserved remote_id (> blob_region_bytes_) on success immediately (file write happens asynchronously).
+        // If the internal demote queue is full the call will fall back to synchronous demote (writes inline) if
+        // config.demote_sync_fallback is true; otherwise returns 0 to signal demote not performed.
+        uint64_t demote_blob_async(const char *data_with_header, uint32_t total_bytes);
+
+        // New overload: accept void* (generic) for callers that already have packed blob bytes.
+        // Returns placeholder id (MSB set) or final remote id on sync fallback / failure (0).
+        uint64_t demote_blob_async(const void *data, uint32_t len);
+
         // Promote a remote id back into arena; returns new local offset on success,
         // UINT64_MAX on failure.
         uint64_t promote_remote(uint64_t remote_id);
+
+        // Resolve pending placeholder remote id to final remote id if the async demote completed.
+        // Returns 0 if not yet completed or if not found.
+        uint64_t resolve_pending_remote(uint64_t placeholder_remote_id) const;
+
+        // Resolve placeholder with optional wait: if maybe_placeholder is a placeholder id,
+        // wait up to timeout_ms for completion and return final remote id (or 0 on timeout/failure).
+        uint64_t resolve_pending_remote(uint64_t maybe_placeholder, uint64_t timeout_ms);
+
+        // Demote queue metrics
+        size_t get_demote_queue_length() const noexcept;
+        void set_demote_queue_max(size_t max_pending);
+        size_t get_demote_queue_max() const noexcept;
 
         // Quick accessors for region pointers (debug / external use)
         const char *blob_base_ptr() const noexcept;
@@ -125,7 +181,6 @@ namespace pomai::memory
         uint64_t seed_region_size() const noexcept;
 
         // ---------------- Factories for tests / convenience ------------
-
         // Create arena from MB/GB; returns a PomaiArena object (invalid if allocation failed).
         static PomaiArena FromMB(uint64_t mb);
         static PomaiArena FromGB(double gb);
@@ -164,7 +219,7 @@ namespace pomai::memory
         // slab freelists keyed by block size
         std::unordered_map<uint64_t, std::vector<uint64_t>> free_lists_;
 
-        // remote storage: remote_id -> filepath
+        // remote storage: remote_id -> filepath (empty string means pending)
         std::unordered_map<uint64_t, std::string> remote_map_;
 
         // cached mmap of remote files (lazy mappings)
@@ -173,22 +228,50 @@ namespace pomai::memory
         // remote id counter (starts at 1); remote_id = blob_region_bytes_ + next_remote_id_
         uint64_t next_remote_id_;
 
+        // pending async demote id counter (for diagnostics; remote ids reserved via next_remote_id_)
+        // Use atomic so async path can reserve placeholders without external locking.
+        std::atomic<uint64_t> pending_counter_{1};
+
+        // base value used for placeholder generation (if desired); kept for diagnostics/compatibility.
+        // (arena.cc computes and sets this during allocate_region)
+        uint64_t pending_base_{0};
+
         // random generator for sampling
         mutable std::mt19937_64 rng_;
 
         // coarse-grained mutex for all mutable state
         mutable std::mutex mu_;
 
-        // configuration
-        static constexpr double SEED_REGION_RATIO = 0.25; // fraction of capacity reserved for seeds
-        static constexpr uint64_t MIN_BLOB_BLOCK = 64;
-        static constexpr size_t MAX_FREELIST_PER_BUCKET = 4096;
+        // ----------------- Async demote bookkeeping & helpers --------------
+        // pending_map_ holds placeholders -> PendingDemote shared state so callers can wait.
+        mutable std::mutex pending_mu_;
+        std::unordered_map<uint64_t, std::shared_ptr<PendingDemote>> pending_map_;
+
+        // ----------------- Async demote worker ------------------
+        struct DemoteTask
+        {
+            uint64_t remote_id;        // reserved remote id assigned at enqueue time
+            std::vector<char> payload; // copy of [uint32_t len][data...][\0]
+        };
+
+        mutable std::mutex demote_mu_; // protects demote_queue_ and worker condition
+        std::condition_variable demote_cv_;
+        std::deque<DemoteTask> demote_queue_;
+        std::thread demote_worker_;
+        std::atomic<bool> demote_worker_running_{false};
+        size_t max_pending_demotes_{10000};             // bounded queue capacity (configurable)
+        size_t demote_batch_bytes_{4 * 1024 * 1024};    // batch bytes hint for worker
+        size_t demote_segment_size_{512 * 1024 * 1024}; // not used yet; reserved
 
         // directory where demoted blobs are written (can be changed if necessary)
         std::string remote_dir_ = "/tmp";
+        static constexpr uint64_t MIN_BLOB_BLOCK = 64;
+        static constexpr size_t MAX_FREELIST_PER_BUCKET = 4096;
     };
 
 } // namespace pomai::memory
 
-// Backwards compatibility: many files expect an unqualified PomaiArena type.
+// Provide a legacy unqualified alias in the global namespace so older code that
+// refers to `PomaiArena` (without namespace) continues to compile. This mirrors
+// the class into the global namespace as an alias, not a new type.
 using PomaiArena = pomai::memory::PomaiArena;

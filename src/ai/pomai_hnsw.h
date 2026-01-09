@@ -147,7 +147,7 @@ namespace pomai::ai
         void addQuantizedPoint(const float *vec, size_t dim, int bits, hnswlib::labeltype label, bool replace_deleted = false);
 
         // Count elements considered "cold" according to PPEHeader::is_cold_ns(threshold_ns).
-        size_t countColdSeeds(uint64_t threshold_ns);
+        size_t countColdSeeds(size_t limit = 0) const;
 
         // Adaptive search: temporarily modulate ef_ (panic_factor in [0,1]) and call Base::searchKnn.
         // Returns the same priority_queue form as Base::searchKnn.

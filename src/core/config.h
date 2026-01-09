@@ -64,6 +64,27 @@ namespace pomai::config
         // Optional: total maximum elements for vector index (across all shards).
         // Set via env POMAI_MAX_ELEMENTS_TOTAL (optional). 0 => use code default/fallback.
         std::uint64_t max_elements_total = 0;
+
+        // --- Phase 4: parameterizable thresholds (ms / counts) ----------------
+        // Maximum number of elements considered "hot" before we become aggressive about promotions.
+        // This can be used by demoter/promoter heuristics if desired.
+        std::uint64_t hot_size_limit = 65536;
+
+        // Lookahead window (milliseconds) used when considering promotions:
+        // if predicted next-access > now + promote_lookahead_ms then attempt promote.
+        std::uint64_t promote_lookahead_ms = 1000; // default 1 second
+
+        // Threshold used by PPPQ/predictor for deciding demotion/pack4 (milliseconds).
+        std::uint64_t demote_threshold_ms = 5000; // default 5 seconds
+
+        // Async demote configuration:
+        // - demote_async_max_pending: number of outstanding async demote tasks allowed (0 = disabled -> synchronous writes)
+        std::uint64_t demote_async_max_pending = 1000;
+
+        // If queue is full and demote_async_max_pending > 0, demote_sync_fallback controls behavior:
+        //  - true: perform synchronous demote write in caller (blocking)
+        //  - false: skip demotion when queue full (keep RAM representation)
+        bool demote_sync_fallback = true;
     };
 
     // Global runtime config (initialize early in main)

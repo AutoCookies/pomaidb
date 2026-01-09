@@ -1,10 +1,15 @@
-#include "pppq.h"
+#include "src/ai/pppq.h"
+
 #include <random>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <future>
+#include <chrono>
+
+#include "src/core/config.h"
 
 namespace pomai::ai
 {
@@ -21,11 +26,26 @@ namespace pomai::ai
     }
 
     PPPQ::PPPQ(size_t d, size_t m, size_t k, size_t max_elems, const std::string &mmap_file)
-        : dim_(d), m_(m), k_(k), max_elems_(max_elems), mmap_filename_(mmap_file)
+        : dim_(d), k_(k), max_elems_(max_elems), mmap_filename_(mmap_file)
     {
-        if (d % m != 0)
-            throw std::runtime_error("dim must be divisible by m");
-        subdim_ = d / m;
+        // Auto-correct 'm' if dimension is too small or not divisible
+        if (d < m)
+        {
+            m = d;
+            // std::cerr << "[PPPQ] Reduced m to " << m << " to match dim\n";
+        }
+
+        // Find largest divisor <= requested m
+        while (m > 0 && d % m != 0)
+        {
+            m--;
+        }
+        if (m == 0)
+            m = 1; // Fallback
+
+        m_ = m;
+        subdim_ = d / m_; // Safe now
+
         codebooks_.assign(m_ * k_ * subdim_, 0.0f);
         precomp_dists_.resize(m_);
         codes8_.assign(max_elems_ * m_, 0);
@@ -38,17 +58,43 @@ namespace pomai::ai
         for (size_t i = 0; i < max_elems_; ++i)
             ppe_vecs_.emplace_back();
 
+        pending_demotes_.store(0);
+        demote_tasks_completed_.store(0);
+        demote_bytes_written_.store(0);
+        demote_total_latency_ns_.store(0);
+
         // create/clear mmap file
         {
             std::ofstream f(mmap_filename_, std::ios::binary | std::ios::trunc);
             // Reserve space for max_elems_ * packed4BytesPerVec()
             size_t bytes = max_elems_ * packed4BytesPerVec();
             if (bytes)
-                f.seekp(bytes - 1), f.write("", 1);
+            {
+                // grow file to requested size (simple portable way)
+                f.seekp(static_cast<std::streamoff>(bytes - 1));
+                f.write("", 1);
+            }
         }
     }
 
-    PPPQ::~PPPQ() {}
+    PPPQ::~PPPQ()
+    {
+        // Wait for outstanding async demote tasks to complete
+        std::lock_guard<std::mutex> lk(demote_futures_mu_);
+        for (auto &fut : demote_futures_)
+        {
+            try
+            {
+                if (fut.valid())
+                    fut.get();
+            }
+            catch (...)
+            {
+                // ignore exceptions from demote tasks in destructor
+            }
+        }
+        demote_futures_.clear();
+    }
 
     int PPPQ::findNearestCode(const float *subvec, float *codebook) const
     {
@@ -167,8 +213,11 @@ namespace pomai::ai
     {
         if (id >= max_elems_)
             throw std::out_of_range("id beyond max_elems");
-        // Decide bits via PPE
-        uint8_t desired_bits = ppe_vecs_[id].predictBits(8, 5000 /*threshold ms*/);
+
+        // Decide bits via PPE using configurable demote threshold from config runtime
+        uint64_t demote_thresh_ms = pomai::config::runtime.demote_threshold_ms;
+        uint8_t desired_bits = ppe_vecs_[id].predictBits(8, demote_thresh_ms);
+
         // compute codes (always compute 8-bit full codes first)
         for (size_t sub = 0; sub < m_; ++sub)
         {
@@ -177,14 +226,58 @@ namespace pomai::ai
             int code = findNearestCode(subvec, cb);
             codes8_[id * m_ + sub] = (uint8_t)code;
         }
-        // if desired_bits == 4, pack and write to file immediately (demote).
+
+        // If desired_bits==4 we try to demote. We attempt async demote when configured; otherwise fallback to sync.
         if (desired_bits == 4)
         {
-            uint8_t nibble_buf[64]; // support up to m<=128
-            pack4From8(&codes8_[id * m_], nibble_buf);
-            writePacked4ToFile(id, nibble_buf, packed4BytesPerVec());
-            code_nbits_[id] = 4;
-            in_mmap_[id] = 1;
+            // prepare nibble buffer
+            std::vector<uint8_t> nibble_buf(packed4BytesPerVec());
+            pack4From8(&codes8_[id * m_], nibble_buf.data());
+
+            // Read async demote configuration from runtime
+            uint64_t max_pending = pomai::config::runtime.demote_async_max_pending;
+            bool do_async = (max_pending > 0);
+
+            if (do_async)
+            {
+                size_t cur = pending_demotes_.load(std::memory_order_acquire);
+                if (cur >= static_cast<size_t>(max_pending))
+                {
+                    // Backpressure: if sync fallback enabled, perform synchronous write; otherwise skip demote now.
+                    if (pomai::config::runtime.demote_sync_fallback)
+                    {
+                        writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
+                        code_nbits_[id] = 4;
+                        in_mmap_[id] = 1;
+                        // update metrics
+                        demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
+                        demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+                        // no latency measurement for sync path here
+                    }
+                    else
+                    {
+                        // Skip demotion due to backpressure; keep 8-bit in RAM for now.
+                        code_nbits_[id] = 8;
+                        in_mmap_[id] = 0;
+                    }
+                }
+                else
+                {
+                    schedule_async_demote(id, nibble_buf);
+                    // mark as "in-mmap" tentatively to avoid races (actual write updates in worker)
+                    code_nbits_[id] = 4;
+                    in_mmap_[id] = 1;
+                }
+            }
+            else
+            {
+                // No async support configured: synchronous demote (legacy)
+                writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
+                code_nbits_[id] = 4;
+                in_mmap_[id] = 1;
+                demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
+                demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         else
         {
@@ -235,8 +328,8 @@ namespace pomai::ai
             fs.open(mmap_filename_, std::ios::in | std::ios::out | std::ios::binary);
         }
         size_t offset = id * packed4BytesPerVec();
-        fs.seekp(offset);
-        fs.write((const char *)nibble_bytes, nibble_bytes_len);
+        fs.seekp(static_cast<std::streamoff>(offset));
+        fs.write(reinterpret_cast<const char *>(nibble_bytes), static_cast<std::streamsize>(nibble_bytes_len));
         fs.flush();
     }
 
@@ -245,8 +338,8 @@ namespace pomai::ai
         std::lock_guard<std::mutex> g(mmap_file_mtx_);
         std::ifstream fs(mmap_filename_, std::ios::binary);
         size_t offset = id * packed4BytesPerVec();
-        fs.seekg(offset);
-        fs.read((char *)nibble_bytes, nibble_bytes_len);
+        fs.seekg(static_cast<std::streamoff>(offset));
+        fs.read(reinterpret_cast<char *>(nibble_bytes), static_cast<std::streamsize>(nibble_bytes_len));
     }
 
     float PPPQ::approxDist(size_t id_a, size_t id_b)
@@ -297,7 +390,16 @@ namespace pomai::ai
 
     void PPPQ::purgeCold(uint64_t cold_thresh_ms)
     {
+        // If caller passed 0, use runtime default
+        if (cold_thresh_ms == 0)
+            cold_thresh_ms = pomai::config::runtime.demote_threshold_ms;
+
         uint64_t now = PPEPredictor::now_ms();
+
+        // Collect candidate ids first
+        std::vector<size_t> candidates;
+        candidates.reserve(256);
+
         for (size_t id = 0; id < max_elems_; ++id)
         {
             if (in_mmap_[id])
@@ -305,15 +407,168 @@ namespace pomai::ai
             uint64_t pred = ppe_vecs_[id].predictNext();
             if (pred < now + cold_thresh_ms)
             {
-                // demote: pack 4-bit and write to file, flag it
-                uint8_t nibble_buf[64];
-                pack4From8(&codes8_[id * m_], nibble_buf);
-                writePacked4ToFile(id, nibble_buf, packed4BytesPerVec());
+                candidates.push_back(id);
+            }
+        }
+
+        // Sort candidates by predicted next access descending (hot first publish)
+        std::sort(candidates.begin(), candidates.end(), [this](size_t a, size_t b)
+                  { return ppe_vecs_[a].predictNext() > ppe_vecs_[b].predictNext(); });
+
+        // Process demotion in the sorted order
+        for (size_t id : candidates)
+        {
+            // double-check flags (another thread might have changed)
+            if (in_mmap_[id])
+                continue;
+
+            // demote: pack 4-bit and either schedule async demote (preferred) or perform sync demote
+            std::vector<uint8_t> nibble_buf(packed4BytesPerVec());
+            pack4From8(&codes8_[id * m_], nibble_buf.data());
+
+            // decide async vs sync based on runtime config
+            uint64_t max_pending = pomai::config::runtime.demote_async_max_pending;
+            bool async_configured = (max_pending > 0);
+
+            if (async_configured)
+            {
+                size_t cur = pending_demotes_.load(std::memory_order_acquire);
+
+                if (cur >= static_cast<size_t>(max_pending))
+                {
+                    // backpressure reached
+                    if (pomai::config::runtime.demote_sync_fallback)
+                    {
+                        // Do synchronous demote
+                        writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
+                        in_mmap_[id] = 1;
+                        code_nbits_[id] = 4;
+                        // optionally zero RAM codes
+                        for (size_t s = 0; s < m_; ++s)
+                            codes8_[id * m_ + s] = 0;
+
+                        demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
+                        demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        // Skip demotion due to backpressure
+                        continue;
+                    }
+                }
+                else
+                {
+                    // schedule asynchronous demote
+                    schedule_async_demote(id, nibble_buf);
+                    // mark as demoted logically; worker will perform actual write
+                    in_mmap_[id] = 1;
+                    code_nbits_[id] = 4;
+                }
+            }
+            else
+            {
+                // synchronous fallback (legacy)
+                writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
                 in_mmap_[id] = 1;
                 code_nbits_[id] = 4;
-                // Optionally zero RAM codes (to free), here we keep but could memset to 0 to model freed RAM.
                 for (size_t s = 0; s < m_; ++s)
                     codes8_[id * m_ + s] = 0;
+
+                demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
+                demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void PPPQ::schedule_async_demote(size_t id, const std::vector<uint8_t> &nibble_buf)
+    {
+        // Increment pending counter (represents tasks in-flight or scheduled)
+        pending_demotes_.fetch_add(1, std::memory_order_acq_rel);
+
+        // Create async task and store future for join on destructor
+        auto fut = std::async(std::launch::async, [this, id, nibble_buf]()
+                              {
+            const auto t0 = std::chrono::steady_clock::now();
+            // Perform the file write under mmap_file_mtx_
+            bool success = false;
+            {
+                std::lock_guard<std::mutex> g(mmap_file_mtx_);
+                std::fstream fs(mmap_filename_, std::ios::in | std::ios::out | std::ios::binary);
+                if (!fs)
+                {
+                    std::ofstream f(mmap_filename_, std::ios::binary | std::ios::app);
+                    f.close();
+                    fs.open(mmap_filename_, std::ios::in | std::ios::out | std::ios::binary);
+                }
+                if (fs)
+                {
+                    size_t offset = id * packed4BytesPerVec();
+                    fs.seekp(static_cast<std::streamoff>(offset));
+                    fs.write(reinterpret_cast<const char *>(nibble_buf.data()), static_cast<std::streamsize>(nibble_buf.size()));
+                    fs.flush();
+                    success = true;
+                }
+            }
+
+            if (success)
+            {
+                // After successful write, zero RAM codes to free memory
+                for (size_t s = 0; s < m_; ++s)
+                    codes8_[id * m_ + s] = 0;
+
+                // flags in_mmap_ and code_nbits_ are set by caller prior to scheduling,
+                // but to be safe ensure in_mmap_ remains set.
+                in_mmap_[id] = 1;
+                code_nbits_[id] = 4;
+
+                const auto t1 = std::chrono::steady_clock::now();
+                uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                demote_total_latency_ns_.fetch_add(ns, std::memory_order_relaxed);
+                demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
+                demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+            {
+                // write failed: revert logical flags so caller may retry later
+                in_mmap_[id] = 0;
+                code_nbits_[id] = 8;
+            }
+
+            // Decrement pending counter
+            pending_demotes_.fetch_sub(1, std::memory_order_acq_rel); });
+
+        // store future
+        {
+            std::lock_guard<std::mutex> lk(demote_futures_mu_);
+            demote_futures_.push_back(std::move(fut));
+            // Optionally prune completed futures to avoid unbounded growth
+            if (demote_futures_.size() > 1024)
+            {
+                std::vector<std::future<void>> alive;
+                alive.reserve(demote_futures_.size());
+                for (auto &f : demote_futures_)
+                {
+                    if (f.valid())
+                    {
+                        // try wait_for 0 to see if ready
+                        if (f.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+                        {
+                            try
+                            {
+                                f.get();
+                            }
+                            catch (...)
+                            {
+                            }
+                            // drop
+                        }
+                        else
+                        {
+                            alive.push_back(std::move(f));
+                        }
+                    }
+                }
+                demote_futures_.swap(alive);
             }
         }
     }
