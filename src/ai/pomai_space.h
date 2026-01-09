@@ -111,25 +111,23 @@ namespace pomai::ai
             const PPEHeader *header = static_cast<const PPEHeader *>(ptr);
             const char *next_ptr = reinterpret_cast<const char *>(header) + sizeof(PPEHeader);
 
-            uint32_t flags = atomic_utils::atomic_load_u32(const_cast<uint32_t *>(&header->flags));
+            // Take an atomic snapshot of (flags, payload) to avoid races where a reader
+            // could see INDIRECT while payload==0.
+            uint32_t flags = 0;
+            uint64_t off_or_remote = 0;
+            bool ok = header->atomic_snapshot_payload_and_flags(reinterpret_cast<const uint64_t *>(next_ptr), flags, off_or_remote);
+            if (!ok)
+                return nullptr;
 
             if (flags & PPE_FLAG_INDIRECT)
             {
-                // POMAI UPDATE: We do NOT blindly return nullptr for REMOTE data anymore.
-                // We attempt to resolve it via the Arena.
-                // This implies "Slow access is better than No access".
-
-                const uint64_t *offset_ptr = reinterpret_cast<const uint64_t *>(next_ptr);
-                uint64_t off_or_remote = atomic_utils::atomic_load_u64(offset_ptr);
-
                 if (off_or_remote == 0)
-                    return nullptr; // Race condition / Not published
+                    return nullptr; // not published / invalid
 
                 if (!arena_)
                     return nullptr;
 
                 // 3. Try Direct Map / Lazy Load
-                // blob_ptr_from_offset_for_map handles both Local Offsets AND Remote IDs (via lazy mmap)
                 const char *blob_hdr = arena_->blob_ptr_from_offset_for_map(off_or_remote);
                 if (blob_hdr)
                 {
@@ -147,7 +145,6 @@ namespace pomai::ai
                 }
 
                 // 5. Fallback: Explicit Promote (Blocking IO)
-                // Only if previous attempts failed.
                 uint64_t new_local = arena_->promote_remote(off_or_remote);
                 if (new_local != UINT64_MAX)
                 {

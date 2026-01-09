@@ -1,25 +1,3 @@
-/*
- * src/ai/soa_ids_manager.cc
- *
- * Implementation of SoaIdsManager.
- *
- * Durable update algorithm (when durable==true):
- *   1) append WalEntry { idx, value } to WAL file and fsync WAL
- *   2) atomic_store into mapped ids array (std::atomic_ref if available)
- *   3) msync the 8-byte range of the ids mapping
- *   4) truncate the WAL to zero (so WAL is empty after each durable update)
- *
- * Recovery on startup:
- *  - If WAL contains entries, apply each entry (atomic_store + msync) then truncate the WAL.
- *
- * Notes:
- *  - This implementation favors simplicity and correctness; it truncates WAL after every
- *    durable update to keep recovery simple. For higher throughput you could batch WAL
- *    entries and truncate periodically (or use a ring log).
- *  - All file operations are guarded by wal_mu_ to keep sequences atomic from the
- *    perspective of this process.
- */
-
 #include "src/ai/soa_ids_manager.h"
 
 #include <sys/types.h>
@@ -33,6 +11,8 @@
 #include <vector>
 #include <system_error>
 #include <cassert>
+
+#include "src/ai/atomic_utils.h"
 
 namespace pomai::ai::soa
 {
@@ -190,17 +170,11 @@ namespace pomai::ai::soa
             }
 
             uint64_t *ptr = const_cast<uint64_t *>(ids_ptr()) + we.idx;
-#if defined(__cpp_lib_atomic_ref) || (__cplusplus >= 202002L)
-            {
-                std::atomic_ref<uint64_t> aref(*ptr);
-                aref.store(we.value, std::memory_order_release);
-            }
-#else
-            // fallback: write via volatile pointer (best-effort for single-process)
-            *(volatile uint64_t *)ptr = we.value;
-#endif
+
+            // Use atomic_utils to ensure correct atomic store ordering even for mmap'd memory.
+            pomai::ai::atomic_utils::atomic_store_u64(ptr, we.value);
+
             // msync that 8-byte range to persist update
-            // ids_mmap_.flush(offset, len)
             size_t offset = we.idx * sizeof(uint64_t);
             ids_mmap_.flush(offset, sizeof(uint64_t), /*sync=*/true);
         }
@@ -236,14 +210,7 @@ namespace pomai::ai::soa
         if (!durable)
         {
             // Fast path: atomic in-memory store only
-#if defined(__cpp_lib_atomic_ref) || (__cplusplus >= 202002L)
-            {
-                std::atomic_ref<uint64_t> aref(*ptr);
-                aref.store(value, std::memory_order_release);
-            }
-#else
-            *(volatile uint64_t *)ptr = value;
-#endif
+            pomai::ai::atomic_utils::atomic_store_u64(ptr, value);
             // Note: not msynced; durability not guaranteed
             return true;
         }
@@ -271,15 +238,8 @@ namespace pomai::ai::soa
             return false;
         }
 
-        // Apply atomic store to mapped ids
-#if defined(__cpp_lib_atomic_ref) || (__cplusplus >= 202002L)
-        {
-            std::atomic_ref<uint64_t> aref(*ptr);
-            aref.store(value, std::memory_order_release);
-        }
-#else
-        *(volatile uint64_t *)ptr = value;
-#endif
+        // Apply atomic store to mapped ids using atomic_utils
+        pomai::ai::atomic_utils::atomic_store_u64(ptr, value);
 
         // msync the 8-byte range to persist the ids file
         size_t offset = idx * sizeof(uint64_t);

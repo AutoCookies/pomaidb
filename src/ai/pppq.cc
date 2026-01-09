@@ -8,6 +8,7 @@
 #include <iostream>
 #include <future>
 #include <chrono>
+#include <atomic>
 
 #include "src/core/config.h"
 
@@ -49,8 +50,16 @@ namespace pomai::ai
         codebooks_.assign(m_ * k_ * subdim_, 0.0f);
         precomp_dists_.resize(m_);
         codes8_.assign(max_elems_ * m_, 0);
-        code_nbits_.assign(max_elems_, 8);
-        in_mmap_.assign(max_elems_, 0);
+
+        // initialize atomic per-id state
+        // Use heap-allocated arrays of atomics to avoid vector reallocation requirements
+        code_nbits_.reset(new std::atomic<uint8_t>[max_elems_]);
+        in_mmap_.reset(new std::atomic<uint8_t>[max_elems_]);
+        for (size_t i = 0; i < max_elems_; ++i)
+        {
+            code_nbits_[i].store(static_cast<uint8_t>(8), std::memory_order_release); // default 8 bits
+            in_mmap_[i].store(static_cast<uint8_t>(0), std::memory_order_release);    // default not in mmap
+        }
 
         // PPEPredictor contains a std::mutex (non-movable/non-copyable).
         // Avoid vector::resize which may attempt moves/copies; use reserve + emplace_back.
@@ -247,8 +256,8 @@ namespace pomai::ai
                     if (pomai::config::runtime.demote_sync_fallback)
                     {
                         writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                        code_nbits_[id] = 4;
-                        in_mmap_[id] = 1;
+                        code_nbits_[id].store(4, std::memory_order_release);
+                        in_mmap_[id].store(1, std::memory_order_release);
                         // update metrics
                         demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
                         demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
@@ -257,32 +266,32 @@ namespace pomai::ai
                     else
                     {
                         // Skip demotion due to backpressure; keep 8-bit in RAM for now.
-                        code_nbits_[id] = 8;
-                        in_mmap_[id] = 0;
+                        code_nbits_[id].store(8, std::memory_order_release);
+                        in_mmap_[id].store(0, std::memory_order_release);
                     }
                 }
                 else
                 {
                     schedule_async_demote(id, nibble_buf);
                     // mark as "in-mmap" tentatively to avoid races (actual write updates in worker)
-                    code_nbits_[id] = 4;
-                    in_mmap_[id] = 1;
+                    code_nbits_[id].store(4, std::memory_order_release);
+                    in_mmap_[id].store(1, std::memory_order_release);
                 }
             }
             else
             {
                 // No async support configured: synchronous demote (legacy)
                 writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                code_nbits_[id] = 4;
-                in_mmap_[id] = 1;
+                code_nbits_[id].store(4, std::memory_order_release);
+                in_mmap_[id].store(1, std::memory_order_release);
                 demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
                 demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
             }
         }
         else
         {
-            code_nbits_[id] = 8;
-            in_mmap_[id] = 0;
+            code_nbits_[id].store(8, std::memory_order_release);
+            in_mmap_[id].store(0, std::memory_order_release);
         }
         ppe_vecs_[id].touch();
     }
@@ -347,34 +356,41 @@ namespace pomai::ai
         if (id_a >= max_elems_ || id_b >= max_elems_)
             return std::numeric_limits<float>::infinity();
         // Ensure we have local 8-bit arrays for both (if stored 4-bit in file, unpack on demand)
-        uint8_t codes_a[256];
-        uint8_t codes_b[256];
+        uint8_t *codes_a = nullptr;
+        uint8_t *codes_b = nullptr;
+
+        std::vector<uint8_t> tmp_a;
+        std::vector<uint8_t> tmp_b;
+
         if (m_ > 256)
-            throw std::runtime_error("m too large for stack buffers in prototype");
+            throw std::runtime_error("m too large for buffers in prototype");
 
         // load A
-        if (in_mmap_[id_a])
+        if (in_mmap_[id_a].load(std::memory_order_acquire))
         {
-            uint8_t buf[64];
-            readPacked4FromFile(id_a, buf, packed4BytesPerVec());
-            unpack4To8(buf, codes_a);
+            std::vector<uint8_t> buf(packed4BytesPerVec());
+            readPacked4FromFile(id_a, buf.data(), packed4BytesPerVec());
+            tmp_a.resize(m_);
+            unpack4To8(buf.data(), tmp_a.data());
+            codes_a = tmp_a.data();
         }
         else
         {
-            for (size_t s = 0; s < m_; ++s)
-                codes_a[s] = codes8_[id_a * m_ + s];
+            // in-RAM 8-bit codes
+            codes_a = &codes8_[id_a * m_];
         }
         // load B
-        if (in_mmap_[id_b])
+        if (in_mmap_[id_b].load(std::memory_order_acquire))
         {
-            uint8_t buf[64];
-            readPacked4FromFile(id_b, buf, packed4BytesPerVec());
-            unpack4To8(buf, codes_b);
+            std::vector<uint8_t> buf(packed4BytesPerVec());
+            readPacked4FromFile(id_b, buf.data(), packed4BytesPerVec());
+            tmp_b.resize(m_);
+            unpack4To8(buf.data(), tmp_b.data());
+            codes_b = tmp_b.data();
         }
         else
         {
-            for (size_t s = 0; s < m_; ++s)
-                codes_b[s] = codes8_[id_b * m_ + s];
+            codes_b = &codes8_[id_b * m_];
         }
 
         // sum per-sub precomputed distances
@@ -402,7 +418,7 @@ namespace pomai::ai
 
         for (size_t id = 0; id < max_elems_; ++id)
         {
-            if (in_mmap_[id])
+            if (in_mmap_[id].load(std::memory_order_acquire))
                 continue; // already demoted
             uint64_t pred = ppe_vecs_[id].predictNext();
             if (pred < now + cold_thresh_ms)
@@ -419,7 +435,7 @@ namespace pomai::ai
         for (size_t id : candidates)
         {
             // double-check flags (another thread might have changed)
-            if (in_mmap_[id])
+            if (in_mmap_[id].load(std::memory_order_acquire))
                 continue;
 
             // demote: pack 4-bit and either schedule async demote (preferred) or perform sync demote
@@ -441,8 +457,8 @@ namespace pomai::ai
                     {
                         // Do synchronous demote
                         writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                        in_mmap_[id] = 1;
-                        code_nbits_[id] = 4;
+                        in_mmap_[id].store(1, std::memory_order_release);
+                        code_nbits_[id].store(4, std::memory_order_release);
                         // optionally zero RAM codes
                         for (size_t s = 0; s < m_; ++s)
                             codes8_[id * m_ + s] = 0;
@@ -461,16 +477,16 @@ namespace pomai::ai
                     // schedule asynchronous demote
                     schedule_async_demote(id, nibble_buf);
                     // mark as demoted logically; worker will perform actual write
-                    in_mmap_[id] = 1;
-                    code_nbits_[id] = 4;
+                    in_mmap_[id].store(1, std::memory_order_release);
+                    code_nbits_[id].store(4, std::memory_order_release);
                 }
             }
             else
             {
                 // synchronous fallback (legacy)
                 writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                in_mmap_[id] = 1;
-                code_nbits_[id] = 4;
+                in_mmap_[id].store(1, std::memory_order_release);
+                code_nbits_[id].store(4, std::memory_order_release);
                 for (size_t s = 0; s < m_; ++s)
                     codes8_[id * m_ + s] = 0;
 
@@ -518,8 +534,8 @@ namespace pomai::ai
 
                 // flags in_mmap_ and code_nbits_ are set by caller prior to scheduling,
                 // but to be safe ensure in_mmap_ remains set.
-                in_mmap_[id] = 1;
-                code_nbits_[id] = 4;
+                in_mmap_[id].store(1, std::memory_order_release);
+                code_nbits_[id].store(4, std::memory_order_release);
 
                 const auto t1 = std::chrono::steady_clock::now();
                 uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -530,8 +546,8 @@ namespace pomai::ai
             else
             {
                 // write failed: revert logical flags so caller may retry later
-                in_mmap_[id] = 0;
-                code_nbits_[id] = 8;
+                in_mmap_[id].store(0, std::memory_order_release);
+                code_nbits_[id].store(8, std::memory_order_release);
             }
 
             // Decrement pending counter

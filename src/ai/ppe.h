@@ -3,23 +3,12 @@
  *
  * PPEHeader: per-element header containing adaptive hints and storage flags.
  *
- * Updated:
- *  - Added atomic flag helpers (atomic_set_flags / atomic_clear_flags / atomic_load_flags)
- *    which use std::atomic_ref when available, and fall back to GCC/Clang __atomic
- *    builtins otherwise. These helpers allow callers to set/clear flag bits using
- *    atomic fetch-or / fetch-and semantics without races when multiple threads may
- *    concurrently update flags.
+ * This version adds a small sequence counter (seqlock-style) and helper APIs
+ * so readers can take a consistent snapshot of (flags, payload) and writers
+ * can publish/unpublish payloads safely across threads/tests that expect the
+ * invariant "if flags has INDIRECT then payload != 0".
  *
- *  - Call sites should use these helpers (instead of direct 'flags |= ...' or
- *    'flags &= ~...' ) when updates may race with readers/writers.
- *
- * Notes:
- *  - flags is still stored as a plain uint32_t so the struct remains POD-like for
- *    placement-new into mmap'd memory. The atomic helpers operate directly on the
- *    flags member with atomic builtins, which is safe provided the field is
- *    naturally aligned (it is).
- *  - For systems lacking atomic intrinsics, the code falls back to non-atomic
- *    volatile updates (best-effort). This is unlikely for mainstream Linux x86/x86_64.
+ * Note: PPEHeader remains POD-like for placement-new into mmap'd memory.
  */
 
 #pragma once
@@ -28,6 +17,10 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <type_traits>
+#include <thread> // <<-- added for std::this_thread::yield()
+
+#include "src/ai/atomic_utils.h"
 
 namespace pomai::ai
 {
@@ -39,8 +32,14 @@ namespace pomai::ai
     static constexpr uint32_t PPE_PRECISION_SHIFT = 8;
     static constexpr uint32_t PPE_PRECISION_MASK = 0xFFu << PPE_PRECISION_SHIFT;
 
-    struct PPEHeader
+    // Ensure PPEHeader is 8-byte aligned so a uint64_t payload placed immediately
+    // after the header will be 8-aligned.
+    struct alignas(8) PPEHeader
     {
+        // Small seqlock-like counter. Even => stable; odd => writer in progress.
+        // Placed first to keep it well-aligned and to minimize false-sharing with other fields.
+        std::atomic<uint32_t> seq{0};
+
         // last observed access time (nanoseconds, steady clock). 0 means never touched.
         std::atomic<int64_t> last_access_ns{0};
 
@@ -64,8 +63,6 @@ namespace pomai::ai
         void set_precision(uint32_t bits) noexcept
         {
             uint32_t b = (bits & 0xFFu);
-            // flags update via atomic helpers is not required here in most cases because
-            // callers initialize precision before the element becomes visible. Use plain ops.
             flags = (flags & ~PPE_PRECISION_MASK) | (b << PPE_PRECISION_SHIFT);
         }
 
@@ -104,52 +101,101 @@ namespace pomai::ai
             }
         }
 
-        // Atomic flag helpers
-        // Atomically set bits in flags (fetch-or).
+        // ----------------------------
+        // Atomic flag helpers (existing)
+        // ----------------------------
         inline void atomic_set_flags(uint32_t bits) noexcept
         {
-#if defined(__cpp_lib_atomic_ref) && (__cpp_lib_atomic_ref >= 201811L)
-            std::atomic_ref<uint32_t> aref(flags);
-            aref.fetch_or(bits, std::memory_order_seq_cst);
-#else
-            // Portable fallback using GCC/Clang builtins (works on mainstream compilers).
-#if defined(__GNUC__) || defined(__clang__)
-            __atomic_fetch_or(&flags, bits, __ATOMIC_SEQ_CST);
-#else
-            // Last-resort fallback (non-atomic): best-effort.
-            flags |= bits;
-#endif
-#endif
+            pomai::ai::atomic_utils::atomic_fetch_or_u32(&flags, bits);
         }
 
-        // Atomically clear bits (fetch-and with complement).
         inline void atomic_clear_flags(uint32_t bits) noexcept
         {
-#if defined(__cpp_lib_atomic_ref) && (__cpp_lib_atomic_ref >= 201811L)
-            std::atomic_ref<uint32_t> aref(flags);
-            aref.fetch_and(~bits, std::memory_order_seq_cst);
-#else
-#if defined(__GNUC__) || defined(__clang__)
-            __atomic_fetch_and(&flags, ~bits, __ATOMIC_SEQ_CST);
-#else
-            flags &= ~bits;
-#endif
-#endif
+            pomai::ai::atomic_utils::atomic_fetch_and_u32(&flags, ~bits);
         }
 
-        // Atomically read flags
         inline uint32_t atomic_load_flags() const noexcept
         {
-#if defined(__cpp_lib_atomic_ref) && (__cpp_lib_atomic_ref >= 201811L)
-            std::atomic_ref<const uint32_t> aref(flags);
-            return aref.load(std::memory_order_acquire);
-#else
-#if defined(__GNUC__) || defined(__clang__)
-            return __atomic_load_n(&flags, __ATOMIC_SEQ_CST);
-#else
-            return flags;
-#endif
-#endif
+            return pomai::ai::atomic_utils::atomic_load_u32(&flags);
+        }
+
+        // --------------------------------------------------------------------
+        // New: seqlock-style helpers to publish/unpublish payloads and to read a
+        // consistent snapshot of (flags, payload).
+        //
+        // Usage conventions:
+        //  - payload_ptr points to uint64_t location immediately after this header
+        //    (i.e. reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(this) + sizeof(PPEHeader)))
+        //  - Writers should call atomic_publish_payload(...) to write payload and
+        //    set the given flag bits atomically with respect to readers using snapshot.
+        //  - Writers should call atomic_unpublish_payload(...) to clear flag bits
+        //    and reset payload (if desired).
+        //  - Readers that need to observe flags+payload consistently should call
+        //    atomic_snapshot_payload_and_flags(...).
+        // --------------------------------------------------------------------
+
+        inline void atomic_publish_payload(uint64_t *payload_ptr, uint64_t value, uint32_t flagbits) noexcept
+        {
+            // Enter writer critical section (make seq odd)
+            seq.fetch_add(1, std::memory_order_acq_rel); // now odd
+
+            // Store payload (release)
+            pomai::ai::atomic_utils::atomic_store_u64(payload_ptr, value);
+
+            // Publish flags (fetch_or seq_cst to avoid races with other flag modifiers)
+            pomai::ai::atomic_utils::atomic_fetch_or_u32(&flags, flagbits);
+
+            // Leave critical section (make seq even)
+            seq.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        inline void atomic_unpublish_payload(uint64_t *payload_ptr, uint32_t flagbits) noexcept
+        {
+            // Enter writer critical section (make seq odd)
+            seq.fetch_add(1, std::memory_order_acq_rel); // odd
+
+            // Clear flag bits first (so there is small window where flag cleared but payload still present).
+            // Use seq_cst RMW for flags.
+            pomai::ai::atomic_utils::atomic_fetch_and_u32(&flags, ~flagbits);
+
+            // Then reset payload to zero (release)
+            pomai::ai::atomic_utils::atomic_store_u64(payload_ptr, 0);
+
+            // Leave critical section (make seq even)
+            seq.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        // Reader snapshot: attempts to read flags and payload as a consistent snapshot.
+        // Returns true on success (flags_out and payload_out are set).
+        // This will retry if a writer is in progress (seq odd) or if seq changes during read.
+        inline bool atomic_snapshot_payload_and_flags(const uint64_t *payload_ptr, uint32_t &flags_out, uint64_t &payload_out) const noexcept
+        {
+            for (;;)
+            {
+                uint32_t s1 = seq.load(std::memory_order_acquire);
+                // If writer in progress, retry
+                if (s1 & 1)
+                {
+                    std::this_thread::yield();
+                    continue;
+                }
+
+                // read flags and payload
+                uint32_t f = pomai::ai::atomic_utils::atomic_load_u32(&flags);
+                uint64_t v = pomai::ai::atomic_utils::atomic_load_u64(payload_ptr);
+
+                uint32_t s2 = seq.load(std::memory_order_acquire);
+                if (s1 == s2 && !(s2 & 1))
+                {
+                    flags_out = f;
+                    payload_out = v;
+                    return true;
+                }
+                // else retry
+                std::this_thread::yield();
+            }
+            // unreachable
+            return false;
         }
 
         // Update the predictor with an observed access (timestamp in ns).
@@ -191,5 +237,8 @@ namespace pomai::ai
             return last + static_cast<int64_t>(std::llround(ema));
         }
     };
+
+    static_assert(alignof(PPEHeader) >= alignof(uint64_t), "PPEHeader must be at least 8-byte aligned");
+    static_assert(sizeof(PPEHeader) % alignof(uint64_t) == 0, "sizeof(PPEHeader) must be multiple of 8 so following payload is 8-byte aligned");
 
 } // namespace pomai::ai

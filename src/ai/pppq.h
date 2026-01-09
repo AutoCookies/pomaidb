@@ -21,6 +21,7 @@
 #include <mutex>
 #include <atomic>
 #include <future>
+#include <memory> // <-- added for unique_ptr
 
 #include "ppe_predictor.h"
 
@@ -109,9 +110,12 @@ namespace pomai::ai
         // In-RAM per-vector storage:
         // - codes8_: each element id stores m bytes (one 0..k-1 per sub)
         // - when demoted to 4-bit we pack nibbles to mmap file; code_nbits_ stores current bitness per id
-        std::vector<uint8_t> codes8_;     // size max_elems_ * m_
-        std::vector<uint8_t> code_nbits_; // 8 or 4, size max_elems_
-        std::vector<uint8_t> in_mmap_;    // 0/1 flag size max_elems_
+        std::vector<uint8_t> codes8_; // size max_elems_ * m_
+
+        // Use contiguous arrays of std::atomic<uint8_t> allocated on heap to avoid
+        // std::vector<> move/copy constraints (std::atomic is not copyable).
+        std::unique_ptr<std::atomic<uint8_t>[]> code_nbits_; // 8 or 4, length max_elems_
+        std::unique_ptr<std::atomic<uint8_t>[]> in_mmap_;    // 0/1 flag length max_elems_
 
         // mmap/file-backed store file name and mutex
         std::string mmap_filename_;

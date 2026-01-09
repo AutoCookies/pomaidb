@@ -236,6 +236,17 @@ namespace pomai::memory
         std::lock_guard<std::mutex> lk(io_mu_);
         if (!base_addr_ || offset + len > mapped_size_)
             return false;
+
+        // Special-case 8-byte aligned loads: use atomic load helper to avoid torn reads
+        if (len == sizeof(uint64_t) && (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0))
+        {
+            uint64_t v = 0;
+            if (!atomic_load_u64_at(offset, v))
+                return false;
+            std::memcpy(dst, &v, sizeof(v));
+            return true;
+        }
+
         std::memcpy(dst, base_addr_ + offset, len);
         return true;
     }
@@ -247,6 +258,17 @@ namespace pomai::memory
         std::lock_guard<std::mutex> lk(io_mu_);
         if (!base_addr_ || offset + len > mapped_size_)
             return false;
+
+        // Special-case 8-byte aligned stores: use atomic store helper to avoid torn writes
+        if (len == sizeof(uint64_t) && (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0))
+        {
+            uint64_t val = 0;
+            std::memcpy(&val, src, sizeof(val));
+            uint64_t *ptr = reinterpret_cast<uint64_t *>(base_addr_ + offset);
+            pomai::ai::atomic_utils::atomic_store_u64(ptr, val);
+            return true;
+        }
+
         std::memcpy(base_addr_ + offset, src, len);
         return true;
     }
@@ -264,6 +286,17 @@ namespace pomai::memory
         {
             // no space left
             return SIZE_MAX;
+        }
+
+        // Special-case 8-byte aligned append: perform atomic store to avoid torn readers.
+        if (len == sizeof(uint64_t) && (reinterpret_cast<uintptr_t>(base_addr_ + off) % alignof(uint64_t) == 0))
+        {
+            uint64_t val = 0;
+            std::memcpy(&val, src, sizeof(val));
+            uint64_t *ptr = reinterpret_cast<uint64_t *>(base_addr_ + off);
+            pomai::ai::atomic_utils::atomic_store_u64(ptr, val);
+            append_offset_.store(off + len);
+            return off;
         }
 
         std::memcpy(base_addr_ + off, src, len);
@@ -413,9 +446,20 @@ namespace pomai::memory
         if (offset + sizeof(uint64_t) > mapped_size_)
             return false;
 
-        const uint64_t *ptr = reinterpret_cast<const uint64_t *>(base_addr_ + offset);
-        // atomic_utils::atomic_load_u64 returns uint64_t value
-        out = pomai::ai::atomic_utils::atomic_load_u64(ptr);
+        const void *addr = base_addr_ + offset;
+        // If address is naturally aligned, use atomic helper (strong ordering chosen in atomic_utils).
+        if (reinterpret_cast<uintptr_t>(addr) % alignof(uint64_t) == 0)
+        {
+            const uint64_t *ptr = reinterpret_cast<const uint64_t *>(addr);
+            out = pomai::ai::atomic_utils::atomic_load_u64(ptr);
+        }
+        else
+        {
+            // Fallback: memcpy under mutex to avoid torn reads within this process.
+            uint64_t tmp = 0;
+            std::memcpy(&tmp, addr, sizeof(tmp));
+            out = tmp;
+        }
         return true;
     }
 
@@ -428,8 +472,17 @@ namespace pomai::memory
         if (offset + sizeof(uint64_t) > mapped_size_)
             return false;
 
-        uint64_t *ptr = reinterpret_cast<uint64_t *>(base_addr_ + offset);
-        pomai::ai::atomic_utils::atomic_store_u64(ptr, value);
+        void *addr = base_addr_ + offset;
+        if (reinterpret_cast<uintptr_t>(addr) % alignof(uint64_t) == 0)
+        {
+            uint64_t *ptr = reinterpret_cast<uint64_t *>(addr);
+            pomai::ai::atomic_utils::atomic_store_u64(ptr, value);
+        }
+        else
+        {
+            // Fallback: memcpy under mutex to ensure coherent write in-process.
+            std::memcpy(addr, &value, sizeof(value));
+        }
         return true;
     }
 

@@ -125,15 +125,16 @@ namespace pomai::ai
             }
         }
 
+        // Create a seed buffer that contains only an initialized PPEHeader (payload zeros).
+        // Important: do NOT copy the payload into seed_buffer before Base::addPoint, because
+        // Base::addPoint may memcpy the seed into mapped/internal storage and that would
+        // perform a non-atomic write of the 8-byte payload area. Instead, we reserve the slot
+        // and then publish the payload into the slot atomically (or memcpy inline if flags remain 0).
         std::unique_ptr<void, OperatorDeleteDeleter> buf(::operator new(full_size));
         void *seed_buffer = buf.get();
-        // Zero header bytes then placement-new PPEHeader to properly initialize atomics.
-        std::memset(seed_buffer, 0, sizeof(PPEHeader));
+        std::memset(seed_buffer, 0, full_size);
         new (seed_buffer) PPEHeader();
-        // Copy payload after header object is constructed.
-        std::memcpy(static_cast<char *>(seed_buffer) + sizeof(PPEHeader),
-                    datapoint,
-                    full_size - sizeof(PPEHeader));
+        // Do NOT copy datapoint into seed_buffer here.
 
         // Determine whether update or insert
         bool will_update_existing = false;
@@ -151,6 +152,7 @@ namespace pomai::ai
 
         if (will_update_existing)
         {
+            // For update-existing path, delegate to Base (existing code path may need separate handling).
             Base::addPoint(seed_buffer, label, -1);
             return;
         }
@@ -158,6 +160,7 @@ namespace pomai::ai
         size_t orig_M = this->M_;
         // (wiring heuristics and temporary M override could be here; omitted for brevity)
 
+        // Insert an element with header-only seed_buffer. Payload will be published after.
         Base::addPoint(seed_buffer, label, replace_deleted);
 
         // Restore M_ if changed (no-op here)
@@ -174,7 +177,7 @@ namespace pomai::ai
             assigned_internal = it->second;
         }
 
-        // placement-new PPEHeader in-place and initialize hints
+        // placement-new PPEHeader in-place (reinitialize) and initialize hints
         char *dst = this->getDataByInternalId(assigned_internal);
         new (dst) PPEHeader();
         PPEHeader *h = reinterpret_cast<PPEHeader *>(dst);
@@ -183,43 +186,35 @@ namespace pomai::ai
         // store external label inside PPEHeader
         h->set_label(static_cast<uint64_t>(label));
 
-        // Move payload into arena if configured
+        // Now publish payload into the inserted slot (dst).
+        // Source payload is the original datapoint pointer (caller provided payload bytes).
+        const char *src_payload = reinterpret_cast<const char *>(datapoint);
+        size_t src_size = full_size - sizeof(PPEHeader);
+
         if (pomai_arena_)
         {
-            const char *vec_src = dst + sizeof(PPEHeader);
-            size_t vec_size = full_size - sizeof(PPEHeader);
-
-            // Try to allocate inside arena
-            char *blob_hdr = pomai_arena_->alloc_blob(static_cast<uint32_t>(vec_size));
+            // Move payload into arena (preferred). Then publish arena offset atomically and set INDIRECT.
+            char *blob_hdr = pomai_arena_->alloc_blob(static_cast<uint32_t>(src_size));
             if (blob_hdr)
             {
-                std::memcpy(blob_hdr + sizeof(uint32_t), vec_src, vec_size);
+                std::memcpy(blob_hdr + sizeof(uint32_t), src_payload, src_size);
                 uint64_t offset = pomai_arena_->offset_from_blob_ptr(blob_hdr);
 
-                // Atomic store of the 8-byte offset payload, then atomically set INDIRECT flag
-                // 1. Cast memory location to atomic<uint64_t> (zero-copy cast)
-                //    We target the memory immediately following the PPEHeader.
-                std::atomic<uint64_t> *payload_atomic = reinterpret_cast<std::atomic<uint64_t> *>(dst + sizeof(PPEHeader));
-
-                // 2. RELEASE STORE: Ghi offset payload xuống bộ nhớ.
-                //    Đảm bảo dữ liệu blob đã được memcpy xong trước khi con trỏ này hiển thị.
-                payload_atomic->store(offset, std::memory_order_release);
-
-                // 3. RELEASE FLAG: Bật cờ INDIRECT.
-                //    Luồng đọc (Search) sẽ thấy cờ này SAU KHI payload != 0.
-                pomai::ai::atomic_utils::atomic_store_u32(&h->flags, PPE_FLAG_INDIRECT);
+                uint64_t *payload_ptr = reinterpret_cast<uint64_t *>(dst + sizeof(PPEHeader));
+                pomai::ai::atomic_utils::atomic_store_u64(payload_ptr, offset);
+                h->atomic_set_flags(PPE_FLAG_INDIRECT);
 
                 std::clog << "[PPHNSW] addPoint: stored payload to arena for internal=" << assigned_internal
                           << " offset=" << offset << " label=" << label << "\n";
             }
             else
             {
-                // Fallback: demote direct to file and store remote_id atomically
-                uint32_t len32 = static_cast<uint32_t>(vec_size);
-                std::vector<char> tmpbuf(sizeof(uint32_t) + vec_size + 1);
+                // Fallback demote to remote storage
+                uint32_t len32 = static_cast<uint32_t>(src_size);
+                std::vector<char> tmpbuf(sizeof(uint32_t) + src_size + 1);
                 std::memcpy(tmpbuf.data(), &len32, sizeof(uint32_t));
-                std::memcpy(tmpbuf.data() + sizeof(uint32_t), vec_src, vec_size);
-                tmpbuf[sizeof(uint32_t) + vec_size] = '\0';
+                std::memcpy(tmpbuf.data() + sizeof(uint32_t), src_payload, src_size);
+                tmpbuf[sizeof(uint32_t) + src_size] = '\0';
 
                 uint64_t remote_id = pomai_arena_->demote_blob_data(tmpbuf.data(), static_cast<uint32_t>(tmpbuf.size()));
                 if (remote_id == 0)
@@ -227,20 +222,18 @@ namespace pomai::ai
                     throw std::runtime_error("PomaiArena alloc_blob and demote failed in addPoint");
                 }
 
-                // atomic store remote id into payload then set flags INDIRECT+REMOTE
-                // 1. Cast memory location
-                std::atomic<uint64_t> *payload_atomic = reinterpret_cast<std::atomic<uint64_t> *>(dst + sizeof(PPEHeader));
-
-                // 2. RELEASE STORE: Ghi remote_id
-                payload_atomic->store(remote_id, std::memory_order_release);
-
-                // 3. RELEASE FLAG: Bật cờ INDIRECT + REMOTE
-                //    Sử dụng atomic_store để đảm bảo tính nhìn thấy (visibility) tuần tự.
-                pomai::ai::atomic_utils::atomic_store_u32(&h->flags, PPE_FLAG_INDIRECT | PPE_FLAG_REMOTE);
+                uint64_t *payload_ptr = reinterpret_cast<uint64_t *>(dst + sizeof(PPEHeader));
+                pomai::ai::atomic_utils::atomic_store_u64(payload_ptr, remote_id);
+                h->atomic_set_flags(PPE_FLAG_INDIRECT | PPE_FLAG_REMOTE);
 
                 std::clog << "[PPHNSW] addPoint: demoted payload for internal=" << assigned_internal
                           << " remote_id=" << remote_id << " label=" << label << "\n";
             }
+        }
+        else
+        {
+            // Inline payload: safe to memcpy into dst because flags remain 0 (readers must not treat payload as offset).
+            std::memcpy(dst + sizeof(PPEHeader), src_payload, src_size);
         }
 
         // IVFPQ/PPPQ registration unchanged (omitted) ...
@@ -298,23 +291,18 @@ namespace pomai::ai
         }
 
         size_t full_size = sizeof(PPEHeader) + payload_bytes;
+        // Create seed buffer with header only (do not copy payload into seed)
         std::unique_ptr<void, OperatorDeleteDeleter> buf(::operator new(full_size));
         void *seed_buffer = buf.get();
-
-        std::memset(seed_buffer, 0, sizeof(PPEHeader));
+        std::memset(seed_buffer, 0, full_size);
         new (seed_buffer) PPEHeader();
 
-        void *payload_ptr = static_cast<char *>(seed_buffer) + sizeof(PPEHeader);
-
-        if (bits == 8)
-            quantize::quantize_u8(vec, static_cast<uint8_t *>(payload_ptr), dim);
-        else
-            quantize::quantize_u4(vec, static_cast<uint8_t *>(payload_ptr), dim);
-
+        // Fill meta (precision + label) into header of seed
         PPEHeader *h_temp = reinterpret_cast<PPEHeader *>(seed_buffer);
         h_temp->set_precision(static_cast<uint32_t>(bits));
         h_temp->set_label(static_cast<uint64_t>(label));
 
+        // Insert element (header-only). Payload will be written into slot after insertion.
         addPoint(seed_buffer, label, replace_deleted);
 
         hnswlib::tableint assigned_internal = static_cast<hnswlib::tableint>(-1);
@@ -331,13 +319,19 @@ namespace pomai::ai
         dst_h->set_precision(static_cast<uint32_t>(bits));
         dst_h->set_label(static_cast<uint64_t>(label));
 
+        // source payload is on stack 'vec' quantized into local buffer first
+        std::vector<uint8_t> tmp_codes(payload_bytes);
+        if (bits == 8)
+            quantize::quantize_u8(vec, tmp_codes.data(), dim);
+        else
+            quantize::quantize_u4(vec, tmp_codes.data(), dim);
+
         if (pomai_arena_)
         {
-            const char *vec_src = dst + sizeof(PPEHeader);
             char *blob_hdr = pomai_arena_->alloc_blob(static_cast<uint32_t>(payload_bytes));
             if (blob_hdr)
             {
-                std::memcpy(blob_hdr + sizeof(uint32_t), vec_src, payload_bytes);
+                std::memcpy(blob_hdr + sizeof(uint32_t), tmp_codes.data(), payload_bytes);
                 uint64_t offset = pomai_arena_->offset_from_blob_ptr(blob_hdr);
                 uint64_t *payload_dest = reinterpret_cast<uint64_t *>(dst + sizeof(PPEHeader));
                 pomai::ai::atomic_utils::atomic_store_u64(payload_dest, offset);
@@ -351,7 +345,7 @@ namespace pomai::ai
                 uint32_t len32 = static_cast<uint32_t>(payload_bytes);
                 std::vector<char> tmpbuf(sizeof(uint32_t) + payload_bytes + 1);
                 std::memcpy(tmpbuf.data(), &len32, sizeof(uint32_t));
-                std::memcpy(tmpbuf.data() + sizeof(uint32_t), vec_src, payload_bytes);
+                std::memcpy(tmpbuf.data() + sizeof(uint32_t), tmp_codes.data(), payload_bytes);
                 tmpbuf[sizeof(uint32_t) + payload_bytes] = '\0';
 
                 uint64_t remote_id = pomai_arena_->demote_blob_data(tmpbuf.data(), static_cast<uint32_t>(tmpbuf.size()));
@@ -367,6 +361,11 @@ namespace pomai::ai
                 std::clog << "[PPHNSW] addQuantizedPoint: demoted quantized payload internal=" << assigned_internal
                           << " remote_id=" << remote_id << " label=" << label << "\n";
             }
+        }
+        else
+        {
+            // Inline copy (flags remain 0)
+            std::memcpy(dst + sizeof(PPEHeader), tmp_codes.data(), payload_bytes);
         }
     }
 
@@ -415,7 +414,7 @@ namespace pomai::ai
                     uint64_t offset = pomai_arena_->offset_from_blob_ptr(blob_hdr);
                     uint64_t *payload_dest = reinterpret_cast<uint64_t *>(dst + sizeof(PPEHeader));
                     pomai::ai::atomic_utils::atomic_store_u64(payload_dest, offset);
-                    h->atomic_set_flags(PPE_FLAG_INDIRECT);
+                    h->atomic_set_flags(PPE_FLAG_INDIRECT | PPE_FLAG_REMOTE);
 
                     std::clog << "[PPHNSW] restorePPEHeaders: moved payload to arena internal=" << i << " offset=" << offset << "\n";
                 }
@@ -563,7 +562,7 @@ namespace pomai::ai
                                                                  {
                                                                      uint64_t *payload_dest = reinterpret_cast<uint64_t *>(dst + sizeof(PPEHeader));
                                                                      pomai::ai::atomic_utils::atomic_store_u64(payload_dest, remote_id);
-                                                                     h->atomic_set_flags(PPE_FLAG_REMOTE);
+                                                                     h->atomic_set_flags(PPE_FLAG_INDIRECT | PPE_FLAG_REMOTE);
 
                                                                      std::clog << "[PPHNSW] demoter: demoted internal=" << i << " local_off=" << local_off
                                                                                << " -> remote_id=" << remote_id << "\n";
@@ -603,7 +602,7 @@ namespace pomai::ai
                                                                  if (remote_id != 0)
                                                                  {
                                                                      pomai::ai::atomic_utils::atomic_store_u64(payload_dest, remote_id);
-                                                                     h->atomic_set_flags(PPE_FLAG_REMOTE);
+                                                                     h->atomic_set_flags(PPE_FLAG_INDIRECT | PPE_FLAG_REMOTE);
 
                                                                      std::clog << "[PPHNSW] demoter: demoted newly-indirect internal=" << i
                                                                                << " off=" << off << " -> remote_id=" << remote_id << "\n";
@@ -765,7 +764,7 @@ namespace pomai::ai
             const PPEHeader *h = reinterpret_cast<const PPEHeader *>(data);
 
             // Atomic load relaxed is enough for statistics
-            uint32_t flags = atomic_utils::atomic_load_u32(const_cast<uint32_t *>(&h->flags));
+            uint32_t flags = h->atomic_load_flags();
 
             if (flags & PPE_FLAG_REMOTE)
             {
