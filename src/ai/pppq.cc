@@ -272,10 +272,9 @@ namespace pomai::ai
                 }
                 else
                 {
+                    // schedule async demote; do NOT pre-publish flags here.
                     schedule_async_demote(id, nibble_buf);
-                    // mark as "in-mmap" tentatively to avoid races (actual write updates in worker)
-                    code_nbits_[id].store(4, std::memory_order_release);
-                    in_mmap_[id].store(1, std::memory_order_release);
+                    // do not set in_mmap_/code_nbits_ here: worker will set on success
                 }
             }
             else
@@ -474,11 +473,9 @@ namespace pomai::ai
                 }
                 else
                 {
-                    // schedule asynchronous demote
+                    // schedule asynchronous demote; worker sets flags upon successful write
                     schedule_async_demote(id, nibble_buf);
-                    // mark as demoted logically; worker will perform actual write
-                    in_mmap_[id].store(1, std::memory_order_release);
-                    code_nbits_[id].store(4, std::memory_order_release);
+                    // do NOT pre-set in_mmap_/code_nbits_ here
                 }
             }
             else
@@ -532,8 +529,7 @@ namespace pomai::ai
                 for (size_t s = 0; s < m_; ++s)
                     codes8_[id * m_ + s] = 0;
 
-                // flags in_mmap_ and code_nbits_ are set by caller prior to scheduling,
-                // but to be safe ensure in_mmap_ remains set.
+                // Worker publishes flags only after successful write.
                 in_mmap_[id].store(1, std::memory_order_release);
                 code_nbits_[id].store(4, std::memory_order_release);
 

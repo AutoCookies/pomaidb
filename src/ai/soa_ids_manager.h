@@ -45,8 +45,10 @@
 #include <string>
 #include <mutex>
 #include <vector>
+#include <memory>
 
 #include "src/memory/mmap_file_manager.h"
+#include "src/memory/wal_manager.h"
 
 namespace pomai::ai::soa
 {
@@ -86,8 +88,13 @@ namespace pomai::ai::soa
         bool atomic_update(size_t idx, uint64_t value, bool durable = false);
 
         // Replay WAL (apply pending entries) and truncate WAL. Safe to call multiple times.
-        // Called automatically on open(). Returns true on success.
+        // Called automatically on open. Returns true on success.
         bool replay_wal_and_truncate();
+
+        // Optional: enable structured WalManager and use it for replay/append.
+        // If called, wal_manager_ will be created and used instead of raw wal_fd_.
+        // Returns true on success.
+        bool enable_wal_manager(const std::string &wal_path, const pomai::memory::WalConfig &cfg = {});
 
     private:
         struct WalEntry
@@ -103,14 +110,16 @@ namespace pomai::ai::soa
         // members
         pomai::memory::MmapFileManager ids_mmap_;
         std::string ids_path_;
-        size_t num_entries_;
+        size_t num_entries_ = 0;
 
-        // WAL file descriptor and path
-        int wal_fd_;
+        // Existing raw WAL file descriptor & path (preserve legacy behavior)
+        int wal_fd_ = -1;
         std::string wal_path_;
 
-        // mutex protecting WAL operations and msync/truncate sequences
-        std::mutex wal_mu_;
+        // Optional structured WalManager (new, preferred). When present, it is used
+        // for replay and append; the raw wal_fd_ path is kept for compatibility.
+        std::unique_ptr<pomai::memory::WalManager> wal_manager_;
+        std::mutex wal_mu_; // protects WAL operations (both raw fd and wal_manager)
     };
 
 } // namespace pomai::ai::soa

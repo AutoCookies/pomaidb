@@ -30,7 +30,7 @@ Mục tiêu: hoàn thiện VectorStore 10/10 (single & sharded modes), an toàn 
 
 ## P1 — Tests & verification
 
-- [ ] Add unit tests for PPE flags ordering & publish patterns  
+- [x] Add unit tests for PPE flags ordering & publish patterns  
   - Mô tả: test that readers never observe flags=INDIRECT while payload is zero/partial (simulate writer ordering).  
   - Files: new test e.g. `tests/atomic/ppe_publish_test.cc`  
   - Acceptance: no inconsistent observations under stress (multi-threaded).
@@ -38,7 +38,7 @@ Mục tiêu: hoàn thiện VectorStore 10/10 (single & sharded modes), an toàn 
 - [x] Run atomic mmap test and fix issues discovered  
   - Status: DONE (atomic_mmap_test PASS).
 
-- [ ] Add tests for PPPQ demote/promote concurrent state (in_mmap/code_nbits)  
+- [x] Add tests for PPPQ demote/promote concurrent state (in_mmap/code_nbits)  
   - Mô tả: concurrent demote worker + readers should observe consistent code_nbits/in_mmap state when async demote in-flight.  
   - Files: `tests/pppq/pppq_demote_concurrency_test.cc`  
   - Acceptance: no inconsistent reads, statistics counters coherent.

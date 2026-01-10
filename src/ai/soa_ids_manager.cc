@@ -11,6 +11,7 @@
 #include <vector>
 #include <system_error>
 #include <cassert>
+#include <memory> // <-- added for std::make_unique used in enable_wal_manager
 
 #include "src/ai/atomic_utils.h"
 
@@ -18,7 +19,7 @@ namespace pomai::ai::soa
 {
 
     // Match declaration (noexcept) in the header
-    SoaIdsManager::SoaIdsManager() noexcept : num_entries_(0), wal_fd_(-1) {}
+    SoaIdsManager::SoaIdsManager() noexcept = default;
 
     SoaIdsManager::~SoaIdsManager()
     {
@@ -45,10 +46,23 @@ namespace pomai::ai::soa
         if (!ensure_mapped_ids(num_entries, create_if_missing))
             return false;
 
-        if (!open_wal_file_if_needed())
-            return false;
+        // If a structured WAL manager was already configured, open it (enable_wal_manager may
+        // have been called earlier). Otherwise open raw wal fd as legacy.
+        if (wal_manager_)
+        {
+            if (!wal_manager_->open(wal_path_, true, pomai::memory::WalConfig{}))
+            {
+                std::cerr << "SoaIdsManager::open: wal_manager_->open failed\n";
+                return false;
+            }
+        }
+        else
+        {
+            if (!open_wal_file_if_needed())
+                return false;
+        }
 
-        // replay WAL if any
+        // replay WAL if any (WalManager path will be used if present)
         if (!replay_wal_and_truncate())
             return false;
 
@@ -63,9 +77,15 @@ namespace pomai::ai::soa
             ::close(wal_fd_);
             wal_fd_ = -1;
         }
+        wal_path_.clear();
+
+        if (wal_manager_)
+        {
+            wal_manager_.reset(nullptr);
+        }
+
         ids_mmap_.close();
         ids_path_.clear();
-        wal_path_.clear();
         num_entries_ = 0;
     }
 
@@ -103,7 +123,19 @@ namespace pomai::ai::soa
 
     bool SoaIdsManager::open_wal_file_if_needed()
     {
-        // open WAL for append/read/write
+        // If structured WalManager is configured, use it instead of raw fd
+        if (wal_manager_)
+        {
+            if (!wal_manager_->open(wal_path_, true, pomai::memory::WalConfig{}))
+            {
+                std::cerr << "SoaIdsManager::open_wal_file_if_needed: wal_manager_->open failed\n";
+                return false;
+            }
+            // leave wal_fd_ unchanged (legacy) but prefer wal_manager_
+            return true;
+        }
+
+        // open WAL for append/read/write (legacy)
         int fd = ::open(wal_path_.c_str(), O_RDWR | O_CREAT, 0600);
         if (fd < 0)
         {
@@ -116,6 +148,53 @@ namespace pomai::ai::soa
 
     bool SoaIdsManager::replay_wal_and_truncate()
     {
+        // Prefer wal_manager_ if configured
+        if (wal_manager_)
+        {
+            bool ok = wal_manager_->replay([this](uint16_t type, const void *payload, uint32_t len, uint64_t /*seq*/) -> bool
+                                           {
+                if (type == pomai::memory::WAL_REC_IDS_UPDATE)
+                {
+                    if (!payload || len != static_cast<uint32_t>(sizeof(WalEntry)))
+                    {
+                        std::cerr << "SoaIdsManager::replay_wal_and_truncate: wal record size mismatch\n";
+                        return false; // abort replay
+                    }
+                    WalEntry we;
+                    std::memcpy(&we, payload, sizeof(we));
+                    if (we.idx >= num_entries_)
+                    {
+                        std::cerr << "SoaIdsManager::replay_wal_and_truncate: wal entry index out of range: " << we.idx << "\n";
+                        return true; // continue
+                    }
+                    uint64_t *ptr = const_cast<uint64_t *>(ids_ptr()) + static_cast<size_t>(we.idx);
+                    pomai::ai::atomic_utils::atomic_store_u64(ptr, we.value);
+
+                    size_t offset = static_cast<size_t>(we.idx) * sizeof(uint64_t);
+                    if (!ids_mmap_.flush(offset, sizeof(uint64_t), /*sync=*/true))
+                    {
+                        std::cerr << "SoaIdsManager::replay_wal_and_truncate: msync failed for idx=" << we.idx << "\n";
+                        return false;
+                    }
+                }
+                // ignore other record types
+                return true; });
+
+            if (!ok)
+            {
+                std::cerr << "SoaIdsManager::replay_wal_and_truncate: wal_manager_->replay failed\n";
+                return false;
+            }
+
+            if (!wal_manager_->truncate_to_zero())
+            {
+                std::cerr << "SoaIdsManager::replay_wal_and_truncate: wal_manager_->truncate_to_zero failed\n";
+                // not fatal
+            }
+            return true;
+        }
+
+        // Legacy path: use raw wal_fd_ and simple fixed-size WalEntry records
         if (wal_fd_ == -1)
             return true; // nothing to do
 
@@ -169,13 +248,13 @@ namespace pomai::ai::soa
                 continue;
             }
 
-            uint64_t *ptr = const_cast<uint64_t *>(ids_ptr()) + we.idx;
+            uint64_t *ptr = const_cast<uint64_t *>(ids_ptr()) + static_cast<size_t>(we.idx);
 
             // Use atomic_utils to ensure correct atomic store ordering even for mmap'd memory.
             pomai::ai::atomic_utils::atomic_store_u64(ptr, we.value);
 
             // msync that 8-byte range to persist update
-            size_t offset = we.idx * sizeof(uint64_t);
+            size_t offset = static_cast<size_t>(we.idx) * sizeof(uint64_t);
             ids_mmap_.flush(offset, sizeof(uint64_t), /*sync=*/true);
         }
 
@@ -194,16 +273,6 @@ namespace pomai::ai::soa
     {
         if (idx >= num_entries_)
             return false;
-        if (wal_fd_ == -1)
-        {
-            // WAL not opened; try to open in place
-            std::lock_guard<std::mutex> lk(wal_mu_);
-            if (wal_fd_ == -1)
-            {
-                if (!open_wal_file_if_needed())
-                    return false;
-            }
-        }
 
         uint64_t *ptr = const_cast<uint64_t *>(ids_ptr()) + idx;
 
@@ -215,14 +284,56 @@ namespace pomai::ai::soa
             return true;
         }
 
-        // Durable path: WAL -> fsync WAL -> atomic_store -> msync id -> truncate WAL
+        std::lock_guard<std::mutex> lk(wal_mu_);
+
+        // If structured WAL manager is available, use it (preferred)
+        if (wal_manager_)
+        {
+            // prepare payload = [idx:u64][value:u64]
+            uint8_t payload[sizeof(uint64_t) * 2];
+            std::memcpy(payload + 0, &idx, sizeof(uint64_t));
+            std::memcpy(payload + sizeof(uint64_t), &value, sizeof(uint64_t));
+
+            auto seq = wal_manager_->append_record(pomai::memory::WAL_REC_IDS_UPDATE, payload, static_cast<uint32_t>(sizeof(payload)));
+            if (!seq)
+            {
+                std::cerr << "SoaIdsManager::atomic_update: wal_manager_->append_record failed\n";
+                return false;
+            }
+
+            // apply atomic store to mapped ids
+            pomai::ai::atomic_utils::atomic_store_u64(ptr, value);
+
+            // msync the 8-byte range to persist the ids file
+            size_t offset = idx * sizeof(uint64_t);
+            if (!ids_mmap_.flush(offset, sizeof(uint64_t), /*sync=*/true))
+            {
+                std::cerr << "SoaIdsManager::atomic_update: msync failed for idx=" << idx << "\n";
+                return false;
+            }
+
+            // Truncate WAL (we've persisted data)
+            if (!wal_manager_->truncate_to_zero())
+            {
+                std::cerr << "SoaIdsManager::atomic_update: wal_manager_->truncate_to_zero failed (warning)\n";
+                // not fatal
+            }
+
+            return true;
+        }
+
+        // Legacy raw WAL fd path (existing behavior)
+        if (wal_fd_ == -1)
+        {
+            if (!open_wal_file_if_needed())
+                return false;
+        }
+
         WalEntry we;
         we.idx = static_cast<uint64_t>(idx);
         we.value = value;
 
-        std::lock_guard<std::mutex> lk(wal_mu_);
-
-        // Append WAL entry
+        // Append WAL entry (legacy)
         ssize_t w = write(wal_fd_, &we, sizeof(we));
         if (w != static_cast<ssize_t>(sizeof(we)))
         {
@@ -233,8 +344,6 @@ namespace pomai::ai::soa
         if (fsync(wal_fd_) != 0)
         {
             std::cerr << "SoaIdsManager::atomic_update: fsync wal failed: " << strerror(errno) << "\n";
-            // attempt to continue but signal failure
-            // Note: we choose failure here
             return false;
         }
 
@@ -247,7 +356,6 @@ namespace pomai::ai::soa
         {
             std::cerr << "SoaIdsManager::atomic_update: msync ids failed for idx=" << idx << "\n";
             // attempt to continue; WAL has entry and will be replayed on restart
-            // Ideally we should report error
         }
 
         // Truncate WAL to zero (we applied the single entry)
@@ -259,6 +367,47 @@ namespace pomai::ai::soa
         // Reset file offset to end (should be zero)
         lseek(wal_fd_, 0, SEEK_END);
 
+        return true;
+    }
+
+    bool SoaIdsManager::enable_wal_manager(const std::string &wal_path, const pomai::memory::WalConfig &cfg)
+    {
+        std::lock_guard<std::mutex> lk(wal_mu_);
+
+        // If already configured, ensure path matches
+        if (wal_manager_)
+        {
+            if (wal_manager_->path() == wal_path)
+                return true;
+            // else reset and recreate
+            wal_manager_.reset(nullptr);
+        }
+
+        wal_manager_ = std::make_unique<pomai::memory::WalManager>();
+        if (!wal_manager_->open(wal_path, true, cfg))
+        {
+            std::cerr << "SoaIdsManager::enable_wal_manager: WalManager::open failed\n";
+            wal_manager_.reset(nullptr);
+            return false;
+        }
+
+        // If a legacy wal_fd_ exists, close it and rely on wal_manager_ exclusively
+        if (wal_fd_ != -1)
+        {
+            ::close(wal_fd_);
+            wal_fd_ = -1;
+        }
+
+        // Replay existing WAL via wal_manager_ to ensure we are consistent
+        if (!replay_wal_and_truncate())
+        {
+            std::cerr << "SoaIdsManager::enable_wal_manager: replay after enable failed\n";
+            // keep wal_manager_ but signal failure
+            return false;
+        }
+
+        // store path for informational parity
+        wal_path_ = wal_path;
         return true;
     }
 

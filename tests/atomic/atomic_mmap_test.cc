@@ -46,7 +46,7 @@ int main()
             pomai::ai::atomic_utils::atomic_store_u32(flag, 1u);
             // small pause then clear for next iteration
             // clear flag then payload to simulate updates
-            // Use release ordering to clear in same pattern: clear flag first then clear payload to 0
+            // Use seq_cst to clear in same pattern: clear flag first then clear payload to 0
             pomai::ai::atomic_utils::atomic_store_u32(flag, 0u);
             pomai::ai::atomic_utils::atomic_store_u64(payload, 0ULL);
         }
