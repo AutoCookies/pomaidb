@@ -1,3 +1,12 @@
+/*
+ src/core/pps_manager.cc
+
+ Updated worker insertion logic to choose the correct PPHNSW insertion API
+ (addPoint vs addQuantizedPoint) based on the underlying index payload layout.
+ This ensures sharded (PPSM) inserts match the single-map insertion behavior
+ and prevents payload_size mismatch exceptions observed in integration tests.
+*/
+
 #include "src/core/pps_manager.h"
 
 #include <algorithm>
@@ -181,12 +190,40 @@ namespace pomai::core
             {
                 std::unique_lock<std::shared_mutex> idx_lk(sh.index_mu);
 
-                int quant_bits = 8;
-                // compute vector length expected by space (underlying payload bytes / sizeof(float))
-                size_t underlying_bytes = sh.l2space->get_data_size();
-                size_t vec_len = (underlying_bytes >= sizeof(float)) ? (underlying_bytes / sizeof(float)) : 0;
+                // Determine the expected payload layout for this shard's index and
+                // call the matching add API so behavior matches single-map insertion.
+                size_t expected_bytes = 0;
+                if (sh.l2space)
+                    expected_bytes = sh.l2space->get_data_size();
 
-                sh.pphnsw->addQuantizedPoint(task->vec.data(), vec_len, quant_bits, static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                if (expected_bytes == (static_cast<size_t>(dim_) * sizeof(float)))
+                {
+                    // Full float payload expected
+                    sh.pphnsw->addPoint(task->vec.data(), static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                }
+                else if (expected_bytes == static_cast<size_t>(dim_))
+                {
+                    // Quantized 8-bit payload (one byte per dimension)
+                    sh.pphnsw->addQuantizedPoint(task->vec.data(), dim_, /*bits=*/8, static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                }
+                else if (expected_bytes == static_cast<size_t>((dim_ + 1) / 2))
+                {
+                    // Packed 4-bit payload (nibbles)
+                    sh.pphnsw->addQuantizedPoint(task->vec.data(), dim_, /*bits=*/4, static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                }
+                else
+                {
+                    // Unknown layout: try full float path as a conservative fallback,
+                    // but throw if the underlying call fails so the issue surfaces.
+                    if (sh.pphnsw)
+                    {
+                        sh.pphnsw->addPoint(task->vec.data(), static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                    }
+                    else
+                    {
+                        throw std::runtime_error("PPSM worker: unknown index payload layout; cannot add point");
+                    }
+                }
 
                 if (sh.map)
                 {

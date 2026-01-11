@@ -85,6 +85,16 @@ namespace pomai::config
         //  - true: perform synchronous demote write in caller (blocking)
         //  - false: skip demotion when queue full (keep RAM representation)
         bool demote_sync_fallback = true;
+
+        // --- Phase 2: fingerprint / prefilter tuning --------------------------
+        // Default number of fingerprint bits (SimHash). Typical values: 256, 512.
+        // Can be overridden via env POMAI_FINGERPRINT_BITS
+        std::uint32_t fingerprint_bits = 512;
+
+        // Hamming distance threshold (max allowed bits differing) used by prefilter
+        // when collecting candidate indices. Typical default for 512-bit SimHash: 64..128.
+        // Can be overridden via env POMAI_PREFILTER_HAMMING_THRESHOLD
+        std::uint32_t prefilter_hamming_threshold = 128;
     };
 
     // Global runtime config (initialize early in main)

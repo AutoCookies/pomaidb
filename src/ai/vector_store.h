@@ -1,21 +1,4 @@
 #pragma once
-// src/ai/vector_store.h
-//
-// Shard-aware VectorStore wrapper.
-//
-// This file implements a VectorStore that can operate in two modes:
-//  - single-map (legacy): attach a single PomaiMap + PomaiArena (existing behavior)
-//  - sharded   : attach a ShardManager and the VectorStore will create one
-//                per-shard VectorStore instance, attach per-shard PomaiMap/Arena,
-//                and route upsert/remove to the shard for the key. Searches are
-//                executed in parallel across all shards and results merged.
-//
-// The public interface is unchanged for the common operations (init/attach_map/upsert/remove/search).
-// To enable sharding call attach_shard_manager() after init().
-//
-// Thread-safety:
-//  - Each per-shard VectorStore uses its own reader-writer locks (see per-shard implementation).
-//  - Sharded search runs per-shard searches in parallel using std::async and then merges results.
 
 #include <memory>
 #include <string>
@@ -41,6 +24,18 @@
 
 namespace pomai::ai
 {
+    // Forward-declare FingerprintEncoder to avoid including fingerprint.h in this header.
+    class FingerprintEncoder;
+}
+
+namespace pomai::ai::soa
+{
+    // Forward-declare SoA helper (defined in src/ai/vector_store_soa.h)
+    class VectorStoreSoA;
+}
+
+namespace pomai::ai
+{
 
     class VectorStore
     {
@@ -59,6 +54,9 @@ namespace pomai::ai
         // Must be called after init() and before any upsert/remove/search if you want sharded mode.
         // shard_count is the number of shards the manager exposes (should match manager internal count).
         void attach_shard_manager(ShardManager *mgr, uint32_t shard_count);
+
+        // Attach SoA storage helper (optional). Ownership transferred.
+        void attach_soa(std::unique_ptr<pomai::ai::soa::VectorStoreSoA> soa);
 
         // Enable IVF-PQ filter (optional). Must be called after init() (and before heavy upserts).
         bool enable_ivf(size_t num_clusters = 1024, size_t m_sub = 16, size_t nbits = 8, uint64_t seed = 12345);
@@ -112,6 +110,11 @@ namespace pomai::ai
         std::unique_ptr<PPIVF> ivf_;
         bool ivf_enabled_{false};
 
+        // SoA + fingerprint helpers (phase 2)
+        std::unique_ptr<pomai::ai::soa::VectorStoreSoA> soa_;
+        std::unique_ptr<FingerprintEncoder> fingerprint_;
+        size_t fingerprint_bytes_{0};
+
         // label <-> key mappings (in-memory cache) for single-mode
         mutable std::mutex label_map_mu_;
         std::unordered_map<uint64_t, std::string> label_to_key_;
@@ -141,5 +144,48 @@ namespace pomai::ai
         VectorStore(const VectorStore &) = delete;
         VectorStore &operator=(const VectorStore &) = delete;
     };
+
+    // ---------------------------
+    // Inline helper implementations ...
+    // ---------------------------
+
+    inline std::unique_ptr<char[]> VectorStore::build_seed_buffer(const float *vec) const
+    {
+        if (!vec || dim_ == 0)
+            return nullptr;
+        size_t payload_size = dim_ * sizeof(float);
+        auto buf = std::make_unique<char[]>(payload_size);
+        std::memcpy(buf.get(), reinterpret_cast<const char *>(vec), payload_size);
+        return buf;
+    }
+
+    inline bool VectorStore::store_label_in_map(uint64_t label, const char *key, size_t klen)
+    {
+        if (!map_ || !key || klen == 0)
+            return false;
+        uint64_t le = label;
+        const char *vptr = reinterpret_cast<const char *>(&le);
+        bool ok = map_->put(key, static_cast<uint32_t>(klen), vptr, static_cast<uint32_t>(sizeof(le)));
+        if (!ok)
+            return false;
+        // mark seed as vector if present
+        Seed *s = map_->find_seed(key, static_cast<uint32_t>(klen));
+        if (s)
+            s->type = Seed::OBJ_VECTOR;
+        return true;
+    }
+
+    inline uint64_t VectorStore::read_label_from_map(const char *key, size_t klen) const
+    {
+        if (!map_ || !key || klen == 0)
+            return 0;
+        uint32_t outlen = 0;
+        const char *val = map_->get(key, static_cast<uint32_t>(klen), &outlen);
+        if (!val || outlen != sizeof(uint64_t))
+            return 0;
+        uint64_t label = 0;
+        std::memcpy(&label, val, sizeof(label));
+        return label;
+    }
 
 } // namespace pomai::ai

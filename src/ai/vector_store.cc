@@ -1,12 +1,14 @@
 // updated src/ai/vector_store.cc
 //
-// Added automatic capacity estimation (estimate_max_elements) and conservative
-// defaults (M <= 8, ef_construction <= 50) when initializing VectorStore.
-// If an arena is available we account for storing payloads indirectly which
-// drastically reduces per-element memory footprint.
+// Phase 2 additions: integrate fingerprint (SimHash) + SoA prefilter path (single-mode).
+// - attach_soa() to attach SoA mapping and create fingerprint encoder.
+// - on upsert() when a new label is created, write fingerprint into SoA.
+// - on search() if SoA+fingerprint available: run prefilter -> refine_topk_l2 -> map labels -> return topk.
 //
-// Also added memoryUsage() implementation to report estimated memory usage.
-// Wired PPHNSW background demoter to use config.promote_lookahead_ms.
+// This file fixes previous compile errors by including the full VectorStoreSoA
+// definition and restoring the chosen_max_elements computation used to set
+// max_elements_total_. It also ensures fingerprint encoder is created when SoA is
+// attached or when init() runs and SoA already present.
 
 #include "src/ai/vector_store.h"
 
@@ -20,9 +22,17 @@
 #include <sys/sysinfo.h> // get_free_ram_bytes
 #include <unistd.h>
 #include <sstream>
+#include <thread>
+#include <queue>
 
 #include "src/core/config.h" // <- added to read promote_lookahead_ms when starting demoter
 #include "src/ai/ppe.h"
+#include "src/ai/fingerprint.h"
+#include "src/ai/prefilter.h"
+#include "src/ai/refine.h"
+#include "src/ai/vector_store_soa.h" // need full definition here
+#include "src/ai/ids_block.h"
+#include "src/ai/atomic_utils.h"
 
 using namespace pomai::memory;
 
@@ -107,6 +117,25 @@ namespace pomai::ai
         M_ = M;
         ef_construction_ = ef_construction;
 
+        // If soa_ already attached and fingerprint not created yet, create encoder now.
+        if (soa_ && !fingerprint_)
+        {
+            uint32_t bits = (soa_->fingerprint_bits() != 0) ? soa_->fingerprint_bits() : static_cast<uint32_t>(pomai::config::runtime.fingerprint_bits);
+            try
+            {
+                fingerprint_ = FingerprintEncoder::createSimHash(dim_, static_cast<size_t>(bits));
+                if (fingerprint_)
+                    fingerprint_bytes_ = fingerprint_->bytes();
+                else
+                    fingerprint_bytes_ = 0;
+            }
+            catch (...)
+            {
+                fingerprint_.reset();
+                fingerprint_bytes_ = 0;
+            }
+        }
+
         // If caller passed max_elements==0 or a small value, compute a conservative
         // estimate using free RAM and (if available) arena capacity.
         size_t chosen_max_elements = max_elements;
@@ -130,8 +159,6 @@ namespace pomai::ai
         }
 
         // Choose a conservative maximum:
-        // - If caller provided a value > 0, allow it but warn and possibly bump if it's too small.
-        // - If caller provided 0, pick from estimates; prefer est_ram but cap by est_arena if smaller.
         if (chosen_max_elements == 0)
         {
             size_t pick = 16384; // baseline floor
@@ -145,10 +172,8 @@ namespace pomai::ai
         }
         else
         {
-            // if caller value is smaller than RAM estimate, we may bump it up slightly to better utilize memory
             if (est_ram > chosen_max_elements && est_ram <= chosen_max_elements * 4)
                 chosen_max_elements = est_ram;
-            // but never exceed 1M by default
             chosen_max_elements = std::min<size_t>(chosen_max_elements, 1000000);
         }
 
@@ -160,7 +185,6 @@ namespace pomai::ai
             if (!shard_mgr_)
                 return false;
 
-            // create PPSM instance if not already present. PPSM expects total capacity.
             try
             {
                 if (!ppsm_)
@@ -202,23 +226,30 @@ namespace pomai::ai
         }
     }
 
-    bool VectorStore::enable_ivf(size_t num_clusters, size_t m_sub, size_t nbits, uint64_t seed)
+    void VectorStore::attach_soa(std::unique_ptr<pomai::ai::soa::VectorStoreSoA> soa)
     {
-        if (sharded_mode_)
+        if (!soa)
+            return;
+        soa_ = std::move(soa);
+
+        // prefer SoA-specified fingerprint bits; fall back to runtime config default
+        uint32_t bits = (soa_->fingerprint_bits() != 0) ? soa_->fingerprint_bits() : static_cast<uint32_t>(pomai::config::runtime.fingerprint_bits);
+        if (dim_ != 0 && bits > 0 && !fingerprint_)
         {
-            // Not supporting IVFPQ across PPSM in this simple wrapper.
-            return false;
+            try
+            {
+                fingerprint_ = FingerprintEncoder::createSimHash(dim_, static_cast<size_t>(bits));
+                if (fingerprint_)
+                    fingerprint_bytes_ = fingerprint_->bytes();
+                else
+                    fingerprint_bytes_ = 0;
+            }
+            catch (...)
+            {
+                fingerprint_.reset();
+                fingerprint_bytes_ = 0;
+            }
         }
-        if (dim_ == 0)
-            return false;
-        ivf_.reset(new PPIVF(dim_, num_clusters, m_sub, nbits));
-        if (!ivf_->init_random_seed(seed))
-        {
-            ivf_.reset();
-            return false;
-        }
-        ivf_enabled_ = true;
-        return true;
     }
 
     bool VectorStore::upsert(const char *key, size_t klen, const float *vec)
@@ -231,7 +262,6 @@ namespace pomai::ai
             return ppsm_->addVec(key, klen, vec);
         }
 
-        // Single-mode path
         std::unique_lock<std::shared_mutex> write_lock(rw_mu_);
 
         if (!pphnsw_)
@@ -262,17 +292,10 @@ namespace pomai::ai
         try
         {
             // Determine what payload layout the index expects:
-            // seed_size = sizeof(PPEHeader) + underlying_payload_bytes
             size_t seed_size = pphnsw_->getSeedSize();
             if (seed_size < sizeof(PPEHeader))
                 throw std::runtime_error("VectorStore::upsert: invalid seed size from index");
             size_t payload_bytes = seed_size - sizeof(PPEHeader);
-
-            // Decide how to insert:
-            // - If index expects full float payload: payload_bytes == dim * sizeof(float) => call addPoint
-            // - If index expects 8-bit quantized payload: payload_bytes == dim => call addQuantizedPoint(..., bits=8)
-            // - If index expects packed-4 payload: payload_bytes == (dim+1)/2 => call addQuantizedPoint(..., bits=4)
-            // Otherwise error.
 
             // Helper lambda to store label mapping & optional WAL on successful insert
             auto finalize_label_after_insert = [&](uint64_t new_label) -> bool
@@ -298,6 +321,23 @@ namespace pomai::ai
                     key_to_label_[skey] = new_label;
                     label_to_key_[new_label] = skey;
                 }
+
+                // Phase2: if SoA + fingerprint present, write fingerprint into SoA
+                if (soa_ && fingerprint_)
+                {
+                    try
+                    {
+                        std::vector<uint8_t> fp(fingerprint_bytes_);
+                        fingerprint_->compute(vec, fp.data());
+                        // append into SoA (pq_packed not used here)
+                        soa_->append_vector(fp.data(), static_cast<uint32_t>(fp.size()), nullptr, 0, new_label);
+                    }
+                    catch (...)
+                    {
+                        // non-fatal; continue
+                    }
+                }
+
                 return true;
             };
 
@@ -385,10 +425,9 @@ namespace pomai::ai
         {
             if (!ppsm_)
                 return false;
-            // Best-effort: remove from shared map and let PPSM worker observe it (or provide API to remove by label)
-            if (!map_)
-                return false;
-            return map_->erase(std::string(key, key + klen).c_str());
+            // Delegate remove to PPSM which routes to the correct shard worker.
+            // PPSM::removeKey returns whether the operation was accepted.
+            return ppsm_->removeKey(key, klen);
         }
 
         std::unique_lock<std::shared_mutex> write_lock(rw_mu_);
@@ -428,6 +467,7 @@ namespace pomai::ai
             }
         }
 
+        // Note: We currently do not remove/update SoA fingerprint entry (left as-is).
         return map_erased;
     }
 
@@ -440,11 +480,99 @@ namespace pomai::ai
             return ppsm_->search(query, dim, topk);
         }
 
-        // single-mode search (unchanged)
+        // single-mode: if SoA + fingerprint available, prefer prefilter + refine path
         std::vector<std::pair<std::string, float>> out;
         if (!pphnsw_ || !query || dim != dim_ || topk == 0)
             return out;
 
+        // Phase2 prefilter path
+        if (soa_ && fingerprint_ && soa_->fingerprint_bits() > 0 && soa_->ids_ptr() != nullptr)
+        {
+            try
+            {
+                // compute query fingerprint bytes
+                std::vector<uint8_t> qfp(fingerprint_bytes_);
+                fingerprint_->compute(query, qfp.data());
+
+                // Build a compacted DB containing only published fingerprints to avoid
+                // torn reads during concurrent appends. We use soa_->fingerprint_ptr(i)
+                // which checks the per-slot publish flag and returns nullptr for unpublished.
+                size_t nv = static_cast<size_t>(soa_->num_vectors());
+                std::vector<size_t> published_indices;
+                published_indices.reserve(nv);
+                std::vector<uint8_t> db_compact;
+                db_compact.reserve(nv * fingerprint_bytes_);
+
+                for (size_t i = 0; i < nv; ++i)
+                {
+                    const uint8_t *p = soa_->fingerprint_ptr(i);
+                    if (p)
+                    {
+                        published_indices.push_back(i);
+                        db_compact.insert(db_compact.end(), p, p + fingerprint_bytes_);
+                    }
+                }
+
+                // If no published fingerprints present, fall back to HNSW search
+                if (!published_indices.empty())
+                {
+                    // choose threshold from config (fall back to sensible default)
+                    uint32_t hamming_thresh = static_cast<uint32_t>(pomai::config::runtime.prefilter_hamming_threshold);
+                    if (hamming_thresh == 0)
+                        hamming_thresh = 128;
+
+                    // collect candidate indices in compacted space
+                    std::vector<size_t> compact_candidates;
+                    pomai::ai::prefilter::collect_candidates_threshold(qfp.data(), fingerprint_bytes_, db_compact.data(), published_indices.size(), hamming_thresh, compact_candidates);
+
+                    if (!compact_candidates.empty())
+                    {
+                        // map compacted candidate indices back to original SoA indices
+                        std::vector<size_t> candidates;
+                        candidates.reserve(compact_candidates.size());
+                        for (size_t ci : compact_candidates)
+                            candidates.push_back(published_indices[ci]);
+
+                        // refine topk using exact vectors referenced by ids block
+                        const uint64_t *ids_block = soa_->ids_ptr();
+                        auto refined = pomai::ai::refine::refine_topk_l2(query, dim_, candidates, ids_block, arena_, topk);
+
+                        // refined returns pairs (soaid_idx, distance)
+                        out.reserve(refined.size());
+                        for (auto &p : refined)
+                        {
+                            size_t soaid = p.first;
+                            float dist = p.second;
+                            uint64_t identry = soa_->id_entry_at(soaid);
+                            std::string key;
+                            {
+                                std::lock_guard<std::mutex> lk(label_map_mu_);
+                                auto it = label_to_key_.find(identry);
+                                if (it != label_to_key_.end())
+                                    key = it->second;
+                            }
+                            if (key.empty() && map_)
+                            {
+                                // fallback: if identry is numeric label, stringify
+                                key = std::to_string(identry);
+                            }
+                            out.emplace_back(std::move(key), dist);
+                            if (out.size() >= topk)
+                                break;
+                        }
+                        return out;
+                    }
+                }
+                // else fallthrough to HNSW search
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "VectorStore::search prefilter/refine exception: " << e.what() << "\n";
+                // fall back to HNSW search
+            }
+        }
+
+        // Fallback: HNSW search (existing)
         try
         {
             auto buf = build_seed_buffer(query);
@@ -654,115 +782,10 @@ namespace pomai::ai
             // reasonable interval (1s)
             uint64_t interval_ms = 1000;
 
-            //------------------------TEST SAU KHI DEBUG XONG THÌ BỎ COMMENT VÌ ĐÂY LÀ BASE------------------------------------
             pphnsw_->startBackgroundDemoter(interval_ms, lookahead_ns);
-            //------------------------TEST SAU KHI DEBUG XONG THÌ BỎ COMMENT VÌ ĐÂY LÀ BASE------------------------------------
         }
 
         return true;
     }
 
-    bool VectorStore::init_sharded(size_t dim, size_t max_elements_total, size_t M, size_t ef_construction, ShardManager *mgr)
-    {
-        if (!mgr || shard_count_ == 0)
-            return false;
-        // create per-shard VectorStore instances and initialize each with shard-specific arena/map
-        per_shard_stores_.clear();
-        per_shard_stores_.resize(shard_count_);
-
-        // split max_elements evenly (at least 1)
-        size_t base = std::max<size_t>(1, max_elements_total / shard_count_);
-        for (uint32_t i = 0; i < shard_count_; ++i)
-        {
-            Shard *s = mgr->get_shard_by_id(i);
-            if (!s)
-                return false;
-
-            auto store = std::make_unique<VectorStore>();
-            // initialize per-shard as single-mode instances: pass per-shard arena and per-shard max_elements
-            bool ok = store->init(dim, base, M, ef_construction, s->get_arena());
-            if (!ok)
-                return false;
-            store->attach_map(s->get_map());
-            per_shard_stores_[i] = std::move(store);
-        }
-        return true;
-    }
-
-    std::unique_ptr<char[]> VectorStore::build_seed_buffer(const float *vec) const
-    {
-        size_t payload_size = dim_ * sizeof(float);
-        std::unique_ptr<char[]> buf(new char[payload_size]);
-        std::memcpy(buf.get(), reinterpret_cast<const char *>(vec), payload_size);
-        return buf;
-    }
-
-    bool VectorStore::store_label_in_map(uint64_t label, const char *key, size_t klen)
-    {
-        if (!map_)
-            return false;
-        uint64_t le = label;
-        const char *vptr = reinterpret_cast<const char *>(&le);
-        bool ok = map_->put(key, static_cast<uint32_t>(klen), vptr, static_cast<uint32_t>(sizeof(le)));
-        if (!ok)
-            return false;
-        Seed *s = map_->find_seed(key, static_cast<uint32_t>(klen));
-        if (s)
-            s->type = Seed::OBJ_VECTOR;
-        return true;
-    }
-
-    uint64_t VectorStore::read_label_from_map(const char *key, size_t klen) const
-    {
-        if (!map_)
-            return 0;
-        uint32_t outlen = 0;
-        const char *val = map_->get(key, static_cast<uint32_t>(klen), &outlen);
-        if (!val || outlen != sizeof(uint64_t))
-            return 0;
-        uint64_t label = 0;
-        std::memcpy(&label, val, sizeof(label));
-        return label;
-    }
-
-    // Merge k-sorted-ish lists (not strictly sorted) by score and pick topk smallest distances.
-    std::vector<std::pair<std::string, float>> VectorStore::merge_topk(const std::vector<std::vector<std::pair<std::string, float>>> &lists, size_t topk)
-    {
-        // Use a max-heap of current best topk to keep final topk smallest
-        using Item = std::pair<float, std::pair<std::string, size_t>>; // (score, (key, src_index))
-        struct Cmp
-        {
-            bool operator()(Item const &a, Item const &b) const { return a.first < b.first; }
-        }; // max-heap
-        std::priority_queue<Item, std::vector<Item>, Cmp> heap;
-
-        for (size_t i = 0; i < lists.size(); ++i)
-        {
-            const auto &lst = lists[i];
-            for (const auto &pr : lst)
-            {
-                float score = pr.second;
-                if (heap.size() < topk)
-                {
-                    heap.push({score, {pr.first, i}});
-                }
-                else if (score < heap.top().first)
-                {
-                    heap.pop();
-                    heap.push({score, {pr.first, i}});
-                }
-            }
-        }
-
-        std::vector<std::pair<std::string, float>> out;
-        out.reserve(heap.size());
-        while (!heap.empty())
-        {
-            auto it = heap.top();
-            heap.pop();
-            out.emplace_back(it.second.first, it.first);
-        }
-        std::reverse(out.begin(), out.end());
-        return out;
-    }
 } // namespace pomai::ai

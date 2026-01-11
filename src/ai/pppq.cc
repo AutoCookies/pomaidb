@@ -1,3 +1,7 @@
+// updated src/ai/pppq.cc - enforce strict publish/unpublish ordering for demotion flags
+// Worker sets code_nbits first then in_mmap; synchronous paths follow same order.
+// Uses seq_cst atomic stores for these flag updates for robustness.
+
 #include "src/ai/pppq.h"
 
 #include <random>
@@ -57,8 +61,8 @@ namespace pomai::ai
         in_mmap_.reset(new std::atomic<uint8_t>[max_elems_]);
         for (size_t i = 0; i < max_elems_; ++i)
         {
-            code_nbits_[i].store(static_cast<uint8_t>(8), std::memory_order_release); // default 8 bits
-            in_mmap_[i].store(static_cast<uint8_t>(0), std::memory_order_release);    // default not in mmap
+            code_nbits_[i].store(static_cast<uint8_t>(8), std::memory_order_seq_cst); // default 8 bits
+            in_mmap_[i].store(static_cast<uint8_t>(0), std::memory_order_seq_cst);    // default not in mmap
         }
 
         // PPEPredictor contains a std::mutex (non-movable/non-copyable).
@@ -256,8 +260,9 @@ namespace pomai::ai
                     if (pomai::config::runtime.demote_sync_fallback)
                     {
                         writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                        code_nbits_[id].store(4, std::memory_order_release);
-                        in_mmap_[id].store(1, std::memory_order_release);
+                        // publish: set payload indicator first, then flag (seq_cst)
+                        code_nbits_[id].store(4, std::memory_order_seq_cst);
+                        in_mmap_[id].store(1, std::memory_order_seq_cst);
                         // update metrics
                         demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
                         demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
@@ -266,31 +271,32 @@ namespace pomai::ai
                     else
                     {
                         // Skip demotion due to backpressure; keep 8-bit in RAM for now.
-                        code_nbits_[id].store(8, std::memory_order_release);
-                        in_mmap_[id].store(0, std::memory_order_release);
+                        code_nbits_[id].store(8, std::memory_order_seq_cst);
+                        in_mmap_[id].store(0, std::memory_order_seq_cst);
                     }
                 }
                 else
                 {
-                    // schedule async demote; do NOT pre-publish flags here.
+                    // schedule async demote; worker will publish flags upon successful write.
                     schedule_async_demote(id, nibble_buf);
-                    // do not set in_mmap_/code_nbits_ here: worker will set on success
+                    // do not set in_mmap_/code_nbits_ here: worker will set on success (ensures correct order)
                 }
             }
             else
             {
                 // No async support configured: synchronous demote (legacy)
                 writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                code_nbits_[id].store(4, std::memory_order_release);
-                in_mmap_[id].store(1, std::memory_order_release);
+                // publish: payload indicator then flag
+                code_nbits_[id].store(4, std::memory_order_seq_cst);
+                in_mmap_[id].store(1, std::memory_order_seq_cst);
                 demote_bytes_written_.fetch_add(static_cast<uint64_t>(nibble_buf.size()), std::memory_order_relaxed);
                 demote_tasks_completed_.fetch_add(1, std::memory_order_relaxed);
             }
         }
         else
         {
-            code_nbits_[id].store(8, std::memory_order_release);
-            in_mmap_[id].store(0, std::memory_order_release);
+            code_nbits_[id].store(8, std::memory_order_seq_cst);
+            in_mmap_[id].store(0, std::memory_order_seq_cst);
         }
         ppe_vecs_[id].touch();
     }
@@ -365,7 +371,7 @@ namespace pomai::ai
             throw std::runtime_error("m too large for buffers in prototype");
 
         // load A
-        if (in_mmap_[id_a].load(std::memory_order_acquire))
+        if (in_mmap_[id_a].load(std::memory_order_seq_cst))
         {
             std::vector<uint8_t> buf(packed4BytesPerVec());
             readPacked4FromFile(id_a, buf.data(), packed4BytesPerVec());
@@ -379,7 +385,7 @@ namespace pomai::ai
             codes_a = &codes8_[id_a * m_];
         }
         // load B
-        if (in_mmap_[id_b].load(std::memory_order_acquire))
+        if (in_mmap_[id_b].load(std::memory_order_seq_cst))
         {
             std::vector<uint8_t> buf(packed4BytesPerVec());
             readPacked4FromFile(id_b, buf.data(), packed4BytesPerVec());
@@ -417,7 +423,7 @@ namespace pomai::ai
 
         for (size_t id = 0; id < max_elems_; ++id)
         {
-            if (in_mmap_[id].load(std::memory_order_acquire))
+            if (in_mmap_[id].load(std::memory_order_seq_cst))
                 continue; // already demoted
             uint64_t pred = ppe_vecs_[id].predictNext();
             if (pred < now + cold_thresh_ms)
@@ -434,7 +440,7 @@ namespace pomai::ai
         for (size_t id : candidates)
         {
             // double-check flags (another thread might have changed)
-            if (in_mmap_[id].load(std::memory_order_acquire))
+            if (in_mmap_[id].load(std::memory_order_seq_cst))
                 continue;
 
             // demote: pack 4-bit and either schedule async demote (preferred) or perform sync demote
@@ -456,8 +462,9 @@ namespace pomai::ai
                     {
                         // Do synchronous demote
                         writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                        in_mmap_[id].store(1, std::memory_order_release);
-                        code_nbits_[id].store(4, std::memory_order_release);
+                        // publish: payload then flag
+                        code_nbits_[id].store(4, std::memory_order_seq_cst);
+                        in_mmap_[id].store(1, std::memory_order_seq_cst);
                         // optionally zero RAM codes
                         for (size_t s = 0; s < m_; ++s)
                             codes8_[id * m_ + s] = 0;
@@ -473,17 +480,17 @@ namespace pomai::ai
                 }
                 else
                 {
-                    // schedule asynchronous demote; worker sets flags upon successful write
+                    // schedule asynchronous demote
                     schedule_async_demote(id, nibble_buf);
-                    // do NOT pre-set in_mmap_/code_nbits_ here
+                    // mark as demoted logically will be done by worker; do not pre-publish flags here.
                 }
             }
             else
             {
                 // synchronous fallback (legacy)
                 writePacked4ToFile(id, nibble_buf.data(), nibble_buf.size());
-                in_mmap_[id].store(1, std::memory_order_release);
-                code_nbits_[id].store(4, std::memory_order_release);
+                code_nbits_[id].store(4, std::memory_order_seq_cst);
+                in_mmap_[id].store(1, std::memory_order_seq_cst);
                 for (size_t s = 0; s < m_; ++s)
                     codes8_[id * m_ + s] = 0;
 
@@ -525,13 +532,14 @@ namespace pomai::ai
 
             if (success)
             {
-                // After successful write, zero RAM codes to free memory
+                // After successful write, publish file-backed payload indicator then flag (strict order)
+                // First set payload indicator (code_nbits), then set in_mmap flag.
+                code_nbits_[id].store(4, std::memory_order_seq_cst);
+                in_mmap_[id].store(1, std::memory_order_seq_cst);
+
+                // After publishing we can zero RAM codes to free memory (optional)
                 for (size_t s = 0; s < m_; ++s)
                     codes8_[id * m_ + s] = 0;
-
-                // Worker publishes flags only after successful write.
-                in_mmap_[id].store(1, std::memory_order_release);
-                code_nbits_[id].store(4, std::memory_order_release);
 
                 const auto t1 = std::chrono::steady_clock::now();
                 uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -541,9 +549,9 @@ namespace pomai::ai
             }
             else
             {
-                // write failed: revert logical flags so caller may retry later
-                in_mmap_[id].store(0, std::memory_order_release);
-                code_nbits_[id].store(8, std::memory_order_release);
+                // write failed: ensure we did not publish flags; leave object as not-in-mmap
+                in_mmap_[id].store(0, std::memory_order_seq_cst);
+                code_nbits_[id].store(8, std::memory_order_seq_cst);
             }
 
             // Decrement pending counter

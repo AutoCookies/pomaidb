@@ -34,6 +34,9 @@ namespace pomai::config
                   << " ms, demote_async_max_pending = " << runtime.demote_async_max_pending
                   << ", demote_sync_fallback = " << (runtime.demote_sync_fallback ? "true" : "false") << "\n";
 
+        std::cerr << "[config] fingerprint_bits = " << runtime.fingerprint_bits
+                  << ", prefilter_hamming_threshold = " << runtime.prefilter_hamming_threshold << "\n";
+
         return true;
     }
     static bool runtime_defaults_initialized = init_runtime_defaults();
@@ -90,6 +93,12 @@ namespace pomai::config
             else
                 runtime.demote_sync_fallback = false;
         }
+
+        // Phase 2: fingerprint & prefilter env overrides
+        if (auto v = u64_from_env("POMAI_FINGERPRINT_BITS"))
+            runtime.fingerprint_bits = static_cast<std::uint32_t>(*v);
+        if (auto v = u64_from_env("POMAI_PREFILTER_HAMMING_THRESHOLD"))
+            runtime.prefilter_hamming_threshold = static_cast<std::uint32_t>(*v);
 
         // NOTE: We intentionally DO NOT read POMAI_SHARD_COUNT from the environment here.
         // The default shard_count is already set above to hardware_concurrency().

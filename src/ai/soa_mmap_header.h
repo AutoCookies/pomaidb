@@ -91,6 +91,12 @@ namespace pomai::ai::soa
         uint64_t fingerprints_offset;
         uint64_t fingerprints_size;
 
+        // Small per-vector publish flags for fingerprints: one uint32_t per vector.
+        // Readers should check this flag (atomic load) before reading the fingerprint bytes
+        // to avoid torn reads. If this offset is zero the flags block is absent.
+        uint64_t fingerprint_flags_offset;
+        uint64_t fingerprint_flags_size;
+
         // PQ codes (8-bit): one byte per (vector, subquantizer).
         uint64_t pq_codes_offset;
         uint64_t pq_codes_size;
@@ -119,7 +125,9 @@ namespace pomai::ai::soa
 
         // Padding reserved for future fields and to make the struct 256 bytes.
         // Do not use this area for persistent metadata unless versioned.
-        std::array<char, 256 - 152> _pad;
+        // NOTE: compute the size based on actual bytes before this pad (176),
+        // so pad length = 256 - 176 = 80.
+        std::array<char, 80> _pad;
 
         /* --- Helper methods --- */
 
