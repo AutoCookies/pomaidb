@@ -118,6 +118,17 @@ namespace pomai::ai
         demote_futures_.clear();
     }
 
+    // ---------------- new trivial accessor ----------------
+
+    uint8_t PPPQ::get_code_nbits(size_t id) const noexcept
+    {
+        if (id >= max_elems_)
+            return 8; // conservative default
+        return static_cast<uint8_t>(code_nbits_[id].load(std::memory_order_acquire));
+    }
+
+    // ---------------- metrics ----------------
+
     double PPPQ::get_demote_avg_latency_ms() const noexcept
     {
         uint64_t done = demote_tasks_completed_.load(std::memory_order_acquire);

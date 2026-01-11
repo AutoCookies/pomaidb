@@ -304,6 +304,7 @@ namespace pomai::memory
         return off;
     }
 
+    // updated flush() to page-align msync range to avoid EINVAL on platforms
     bool MmapFileManager::flush(size_t offset, size_t len, bool sync)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
@@ -320,8 +321,19 @@ namespace pomai::memory
         if (flush_off + flush_len > mapped_size_)
             return false;
 
-        int flags = sync ? MS_SYNC : MS_ASYNC;
-        if (msync(base_addr_ + flush_off, flush_len, flags) != 0)
+        // msync requires the address and length to be page-aligned on many systems.
+        // Compute page-aligned region that fully covers [flush_off, flush_off + flush_len).
+        long ps = sysconf(_SC_PAGESIZE);
+        if (ps <= 0)
+            ps = 4096;
+        size_t page = static_cast<size_t>(ps);
+
+        size_t page_off = (flush_off / page) * page;
+        size_t end = flush_off + flush_len;
+        size_t page_end = ((end + page - 1) / page) * page;
+        size_t msync_len = page_end - page_off;
+
+        if (msync(base_addr_ + page_off, msync_len, sync ? MS_SYNC : MS_ASYNC) != 0)
         {
             std::cerr << "MmapFileManager::flush: msync failed: " << strerror(errno) << "\n";
             return false;

@@ -35,6 +35,9 @@ namespace pomai::ai
         PPPQ(size_t d, size_t m, size_t k, size_t max_elems, const std::string &mmap_file = "pppq_codes.mmap");
         ~PPPQ();
 
+        // Return current stored bitness for given id (4 or 8). Safe to call concurrently.
+        uint8_t get_code_nbits(size_t id) const noexcept;
+
         // train and insert
         void train(const float *samples, size_t n_samples, size_t max_iters = 10);
         void addVec(const float *vec, size_t id);

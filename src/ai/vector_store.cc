@@ -1279,7 +1279,6 @@ namespace pomai::ai
             pq_.reset();
             pq_packed_bytes_ = 0;
         }
-
         return true;
     }
 
