@@ -774,6 +774,26 @@ namespace pomai::ai
         return count;
     }
 
+    // --- getDataByLabel: map an external label to the internal data pointer (PPEHeader + payload).
+    // This provides safe access to index memory for a given label. Returns nullptr if not found.
+    template <typename dist_t>
+    char *PPHNSW<dist_t>::getDataByLabel(hnswlib::labeltype label)
+    {
+        std::unique_lock<std::mutex> lock(this->label_lookup_lock);
+        auto it = this->label_lookup_.find(label);
+        if (it == this->label_lookup_.end())
+            return nullptr;
+        hnswlib::tableint internal = it->second;
+        try
+        {
+            return this->getDataByInternalId(internal);
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
     // explicit instantiation for float
     template class PPHNSW<float>;
 

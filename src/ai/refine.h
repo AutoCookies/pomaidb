@@ -14,7 +14,7 @@
  *  - The ids block entries are encoded using IdEntry (src/ai/ids_block.h). We handle:
  *      * LOCAL_OFFSET entries => vector stored inside arena blob region
  *      * REMOTE_ID entries    => vector stored as demoted file; blob_ptr_from_offset_for_map will mmap lazily
- *      * LABEL entries        => no vector payload available -> treated as missing (skipped)
+ *      * LABEL entries        => may be resolved via optional callback supplied by caller
  *  - Blob layout expected: [uint32_t length_bytes][payload bytes...][\0]
  *    For full float vectors the payload should contain length_bytes == dim * sizeof(float).
  *
@@ -27,13 +27,13 @@
  *  - Caller receives only successfully refined candidates in the result vector.
  *
  * Usage example:
- *   auto top = refine::refine_topk_l2(query, dim, candidate_ids, ids_block_ptr, arena, K);
+ *   // supply optional fetcher to resolve LABEL id_entries from index memory:
+ *   std::function<bool(uint64_t id_entry, std::vector<float>& out)> fetcher = ...
+ *   auto top = refine::refine_topk_l2(query, dim, candidate_ids, ids_block_ptr, arena, K, fetcher);
  *
  * Returns:
  *   Vector of pairs (id, score) sorted ascending for L2 (best/smallest first),
  *   and descending for inner-product (best/largest first).
- *
- * Clean, commented, production-quality code.
  */
 
 #pragma once
@@ -42,6 +42,7 @@
 #include <cstdint>
 #include <vector>
 #include <utility>
+#include <functional>
 
 #include "src/ai/candidate_collector.h"
 #include "src/ai/ids_block.h"
@@ -52,30 +53,23 @@ namespace pomai::ai::refine
 
     // Compute top-K exact L2 distances for the given candidates.
     //
-    // Parameters:
-    //  - query: pointer to query float vector (length dim)
-    //  - dim: dimensionality
-    //  - candidate_ids: list of candidate element indices (each index used to lookup ids_block[idx])
-    //  - ids_block: pointer to uint64_t ids/offsets block (length >= max(candidate_ids)+1). Each entry encoded via IdEntry.
-    //  - arena: pointer to PomaiArena used to resolve local offsets / remote ids (must be non-null if any LOCAL/REMOTE entries present)
-    //  - K: return up to K best candidates (smallest L2 distances)
-    //
-    // Returns:
-    //  - vector of pairs (id, distance) sorted ascending by distance (best first).
+    // An optional fetcher callback may be supplied to resolve LABEL id_entries:
+    //   std::function<bool(uint64_t id_entry, std::vector<float>& out_buf)>
+    // The callback should return true and fill out_buf (dim floats) on success.
     std::vector<std::pair<size_t, float>> refine_topk_l2(const float *query, size_t dim,
                                                          const std::vector<size_t> &candidate_ids,
                                                          const uint64_t *ids_block,
                                                          pomai::memory::PomaiArena *arena,
-                                                         size_t K);
+                                                         size_t K,
+                                                         std::function<bool(uint64_t, std::vector<float>&)> label_fetcher = nullptr);
 
     // Compute top-K exact inner-product scores for the given candidates.
-    //
-    // Semantics similar to refine_topk_l2, except we compute dot(query, vec).
-    // Result is sorted descending by score (best/largest first).
+    // Optional label_fetcher accessor as above.
     std::vector<std::pair<size_t, float>> refine_topk_ip(const float *query, size_t dim,
                                                          const std::vector<size_t> &candidate_ids,
                                                          const uint64_t *ids_block,
                                                          pomai::memory::PomaiArena *arena,
-                                                         size_t K);
+                                                         size_t K,
+                                                         std::function<bool(uint64_t, std::vector<float>&)> label_fetcher = nullptr);
 
 } // namespace pomai::ai::refine

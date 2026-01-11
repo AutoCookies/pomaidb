@@ -22,6 +22,9 @@
 #include "src/core/shard_manager.h"
 #include "src/core/shard_router.h"
 #include "src/core/pps_manager.h"
+#include "src/ai/candidate_collector.h"
+#include "src/ai/codebooks.h"
+#include "src/ai/pq_eval.h"
 
 namespace pomai::ai
 {
@@ -86,6 +89,11 @@ namespace pomai::ai
         // Return best-effort estimate of memory usage (bytes). Fast, non-blocking.
         MemoryUsage memoryUsage() const noexcept;
 
+        // PQ / Codebooks (single declaration)
+        Codebooks codebooks_;
+        std::unique_ptr<ProductQuantizer> pq_;
+        size_t pq_packed_bytes_{0};
+
     private:
         // Legacy single-map implementation (kept for compatibility)
         bool init_single(size_t dim, size_t max_elements, size_t M, size_t ef_construction, pomai::memory::PomaiArena *arena);
@@ -119,17 +127,15 @@ namespace pomai::ai
         std::unique_ptr<FingerprintEncoder> fingerprint_;
         size_t fingerprint_bytes_{0};
 
-        // PQ support (Phase 3)
-        // - in-RAM ProductQuantizer (trained at init or loaded from codebooks)
-        std::unique_ptr<ProductQuantizer> pq_;
-        // - number of bytes per packed-4 code (packed storage per-vector)
-        size_t pq_packed_bytes_{0};
-
         // label <-> key mappings (in-memory cache) for single-mode
         mutable std::mutex label_map_mu_;
         std::unordered_map<uint64_t, std::string> label_to_key_;
         std::unordered_map<std::string, uint64_t> key_to_label_;
         std::atomic<uint64_t> next_label_{1};
+
+        // NEW: map id_entry (what's stored in SoA ids block) -> label, used when SoA stores local offsets
+        // protected by label_map_mu_
+        std::unordered_map<uint64_t, uint64_t> identry_to_label_;
 
         // Reader-writer lock (single-mode). Per-shard VectorStore has its own locks.
         mutable std::shared_mutex rw_mu_;

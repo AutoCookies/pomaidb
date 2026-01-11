@@ -24,16 +24,19 @@ namespace pomai::ai::refine
 
     // Helper: fetch vector into out_buf (size dim).
     // Returns true on success, false on failure.
-    static bool fetch_vector_by_identry(uint64_t id_entry, pomai::memory::PomaiArena *arena,
-                                        size_t dim, std::vector<float> &out_buf)
+    // This helper now accepts an optional label_fetcher lambda to resolve LABEL entries.
+    static bool fetch_vector_by_identry(uint64_t id_entry,
+                                        pomai::memory::PomaiArena *arena,
+                                        size_t dim,
+                                        std::vector<float> &out_buf,
+                                        std::function<bool(uint64_t, std::vector<float>&)> label_fetcher)
     {
-        if (!arena)
-            return false;
-
         using namespace pomai::ai::soa;
 
         if (IdEntry::is_local_offset(id_entry))
         {
+            if (!arena)
+                return false;
             uint64_t local_off = IdEntry::unpack_local_offset(id_entry);
             const char *p = arena->blob_ptr_from_offset_for_map(local_off);
             if (!p)
@@ -49,6 +52,8 @@ namespace pomai::ai::refine
         }
         else if (IdEntry::is_remote_id(id_entry))
         {
+            if (!arena)
+                return false;
             uint64_t remote_id = IdEntry::unpack_remote_id(id_entry);
             const char *p = arena->blob_ptr_from_offset_for_map(remote_id);
             if (!p)
@@ -68,6 +73,15 @@ namespace pomai::ai::refine
             out_buf.resize(dim);
             std::memcpy(out_buf.data(), payload, expect_bytes);
             return true;
+        }
+        else if (IdEntry::is_label(id_entry))
+        {
+            // Attempt to resolve via supplied label_fetcher callback.
+            if (label_fetcher)
+            {
+                return label_fetcher(id_entry, out_buf);
+            }
+            return false;
         }
         else
         {
@@ -106,7 +120,8 @@ namespace pomai::ai::refine
                                                                     const uint64_t *ids_block,
                                                                     pomai::memory::PomaiArena *arena,
                                                                     size_t K,
-                                                                    bool is_ip)
+                                                                    bool is_ip,
+                                                                    std::function<bool(uint64_t, std::vector<float>&)> label_fetcher)
     {
         CandidateCollector coll(K);
         std::vector<float> buf;
@@ -120,7 +135,7 @@ namespace pomai::ai::refine
             if (raw == pomai::ai::soa::IdEntry::EMPTY)
                 continue;
 
-            bool ok = fetch_vector_by_identry(raw, arena, dim, buf);
+            bool ok = fetch_vector_by_identry(raw, arena, dim, buf, label_fetcher);
             if (!ok)
                 continue;
 
@@ -155,18 +170,20 @@ namespace pomai::ai::refine
                                                          const std::vector<size_t> &candidate_ids,
                                                          const uint64_t *ids_block,
                                                          pomai::memory::PomaiArena *arena,
-                                                         size_t K)
+                                                         size_t K,
+                                                         std::function<bool(uint64_t, std::vector<float>&)> label_fetcher)
     {
-        return refine_topk_common(query, dim, candidate_ids, ids_block, arena, K, false);
+        return refine_topk_common(query, dim, candidate_ids, ids_block, arena, K, false, label_fetcher);
     }
 
     std::vector<std::pair<size_t, float>> refine_topk_ip(const float *query, size_t dim,
                                                          const std::vector<size_t> &candidate_ids,
                                                          const uint64_t *ids_block,
                                                          pomai::memory::PomaiArena *arena,
-                                                         size_t K)
+                                                         size_t K,
+                                                         std::function<bool(uint64_t, std::vector<float>&)> label_fetcher)
     {
-        return refine_topk_common(query, dim, candidate_ids, ids_block, arena, K, true);
+        return refine_topk_common(query, dim, candidate_ids, ids_block, arena, K, true, label_fetcher);
     }
 
 } // namespace pomai::ai::refine

@@ -194,6 +194,11 @@ namespace pomai::ai
         bool isBackgroundDemoterRunning() const noexcept { return demote_running_.load(std::memory_order_acquire); }
         size_t estimatedMemoryUsageBytes(size_t avg_degree_multiplier = 2) const noexcept;
 
+        // Return pointer to data block (PPEHeader + payload) for a given external label.
+        // Returns nullptr if label not found.
+        // Note: returned pointer points into internal index memory; caller must not modify it.
+        char *getDataByLabel(hnswlib::labeltype label);
+
     private:
         // Internal helpers (implementation details in .cc). These are not part of public API,
         // but declared here for completeness; they remain private to the class.
