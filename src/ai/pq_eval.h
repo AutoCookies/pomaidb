@@ -32,6 +32,8 @@
  *                             const uint8_t *codes, size_t n, float *out);
  *   void pq_approx_dist_batch_packed4(const float *tables, size_t m, size_t k,
  *                                     const uint8_t *packed_codes, size_t n, float *out);
+ *   void pq_approx_dist_batch_raw8(const float *tables, size_t m, size_t k,
+ *                                  const uint8_t *raw8_codes, size_t n, float *out);
  *
  */
 
@@ -61,5 +63,12 @@ namespace pomai::ai
     // - This function unpacks each candidate into a small stack/local buffer then sums using tables.
     void pq_approx_dist_batch_packed4(const float *tables, size_t m, size_t k,
                                       const uint8_t *packed_codes, size_t n, float *out);
+
+    // Batch evaluate N candidate codes stored as raw 8-bit per-subquantizer codes.
+    // - raw8_codes layout: N * m bytes, candidate i starts at raw8_codes + i*m
+    // - This function is used when PQ codes are stored as raw bytes (one byte per subquantizer)
+    //   which is required when k > 16 or when SoA provides raw storage for codes.
+    void pq_approx_dist_batch_raw8(const float *tables, size_t m, size_t k,
+                                   const uint8_t *raw8_codes, size_t n, float *out);
 
 } // namespace pomai::ai

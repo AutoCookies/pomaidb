@@ -204,4 +204,29 @@ namespace pomai::ai
         }
     }
 
+    // New: raw 8-bit PQ codes batch evaluator.
+    // This processes codes stored as contiguous m bytes per vector (no packing).
+    // It clamps codes that are out-of-range to (k-1) to avoid UB if data is malformed.
+    void pq_approx_dist_batch_raw8(const float *tables, size_t m, size_t k,
+                                   const uint8_t *raw8_codes, size_t n, float *out)
+    {
+        if (!tables || !raw8_codes || !out || m == 0 || k == 0)
+            return;
+
+        for (size_t vi = 0; vi < n; ++vi)
+        {
+            const uint8_t *codes = raw8_codes + vi * m;
+            double acc = 0.0;
+            for (size_t sub = 0; sub < m; ++sub)
+            {
+                uint32_t ci = static_cast<uint32_t>(codes[sub]);
+                // safety clamp: if a code is >= k (malformed), clamp to last centroid
+                if (ci >= static_cast<uint32_t>(k))
+                    ci = static_cast<uint32_t>(k - 1);
+                acc += static_cast<double>(tables[sub * k + ci]);
+            }
+            out[vi] = static_cast<float>(acc);
+        }
+    }
+
 } // namespace pomai::ai

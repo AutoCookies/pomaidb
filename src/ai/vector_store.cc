@@ -4,7 +4,7 @@
  * VectorStore with fingerprint + PQ integration (Phase 2/3).
  * - fingerprints: SimHash-based bitpacked stored in SoA
  * - PQ: ProductQuantizer trained at init_single, encodes on upsert and stores packed4 codes in SoA
- * - Search: prefilter (Hamming) -> PQ approximate eval on packed4 -> refine exact top-k
+ * - Search: prefilter (Hamming) -> PQ approximate eval on packed4/raw8 -> refine exact top-k
  *
  * Notes:
  * - This file keeps previous VectorStore semantics for fallback HNSW search.
@@ -654,34 +654,65 @@ namespace pomai::ai
                     }
 
                     // PQ approximate if available AND safe to use
-                    // NOTE: PQ approximate eval using packed4 codes is only safe when k <= 16 (codes fit in 4 bits).
-                    // For k > 16 you'd need raw 8-bit codes + a different eval path. To avoid incorrect pruning
-                    // we only enable PQ approximate when pq_->k() <= 16 and SoA provides packed4 storage.
                     bool use_pq_approx = false;
-                    if (pq_ && pq_->k() <= 16 && pq_packed_bytes_ > 0 && soa_->pq_m() != 0 && soa_->pq_k() != 0)
-                        use_pq_approx = true;
+                    bool soa_has_raw_codes = (soa_ && soa_->pq_codes_ptr(0) != nullptr);
+                    bool soa_has_packed = (pq_packed_bytes_ > 0 && soa_ && soa_->pq_packed_ptr(0) != nullptr);
+
+                    if (pq_ && soa_->pq_m() != 0 && soa_->pq_k() != 0)
+                    {
+                        if (pq_->k() > 16 && soa_has_raw_codes)
+                        {
+                            // can use raw8 approximate evaluation
+                            use_pq_approx = true;
+                        }
+                        else if (pq_->k() <= 16 && soa_has_packed)
+                        {
+                            // can use packed4 approximate evaluation
+                            use_pq_approx = true;
+                        }
+                    }
 
                     if (use_pq_approx)
                     {
-                        std::vector<uint8_t> packed_compact;
-                        packed_compact.reserve(candidates.size() * pq_packed_bytes_);
-                        for (size_t idx : candidates)
-                        {
-                            const uint8_t *pc = soa_->pq_packed_ptr(idx);
-                            if (pc)
-                                packed_compact.insert(packed_compact.end(), pc, pc + pq_packed_bytes_);
-                            else
-                                packed_compact.insert(packed_compact.end(), pq_packed_bytes_, 0);
-                        }
-
                         // compute PQ distance tables (ProductQuantizer)
                         std::vector<float> tables(pq_->m() * pq_->k());
                         pq_->compute_distance_tables(query, tables.data());
 
-                        // compute approximate distances for all candidates
+                        // compute approximate distances for all candidates (choose packed4 or raw8 as appropriate)
                         std::vector<float> approx_dists(candidates.size());
-                        pq_approx_dist_batch_packed4(tables.data(), pq_->m(), pq_->k(),
-                                                     packed_compact.data(), candidates.size(), approx_dists.data());
+
+                        if (pq_->k() > 16 && soa_has_raw_codes)
+                        {
+                            // use raw 8-bit codes stored in SoA
+                            std::vector<uint8_t> raw_compact;
+                            raw_compact.reserve(candidates.size() * pq_->m());
+                            for (size_t idx : candidates)
+                            {
+                                const uint8_t *pc = soa_->pq_codes_ptr(idx); // returns pointer to m bytes of raw codes
+                                if (pc)
+                                    raw_compact.insert(raw_compact.end(), pc, pc + pq_->m());
+                                else
+                                    raw_compact.insert(raw_compact.end(), pq_->m(), 0);
+                            }
+                            pq_approx_dist_batch_raw8(tables.data(), pq_->m(), pq_->k(),
+                                                      raw_compact.data(), candidates.size(), approx_dists.data());
+                        }
+                        else
+                        {
+                            // fallback: use packed4 path (existing behaviour)
+                            std::vector<uint8_t> packed_compact;
+                            packed_compact.reserve(candidates.size() * pq_packed_bytes_);
+                            for (size_t idx : candidates)
+                            {
+                                const uint8_t *pc = soa_->pq_packed_ptr(idx);
+                                if (pc)
+                                    packed_compact.insert(packed_compact.end(), pc, pc + pq_packed_bytes_);
+                                else
+                                    packed_compact.insert(packed_compact.end(), pq_packed_bytes_, 0);
+                            }
+                            pq_approx_dist_batch_packed4(tables.data(), pq_->m(), pq_->k(),
+                                                         packed_compact.data(), candidates.size(), approx_dists.data());
+                        }
 
                         // pick top Napprox
                         size_t Napprox = std::min<size_t>(std::max<size_t>(topk, 100), static_cast<size_t>(256));
