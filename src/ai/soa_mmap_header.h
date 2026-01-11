@@ -9,6 +9,7 @@
  *    describing the layout offsets/sizes of the major blocks that follow:
  *      * codebooks (PQ centroids)
  *      * fingerprints (bitpacked SimHash/OPQ-sign)
+ *      * fingerprint publish flags (uint32 per-slot)
  *      * pq_codes (8-bit per-subcode storage)
  *      * pq_packed4 (optional 4-bit packed on-disk codes)
  *      * ids (uint64 label/arena-offset per vector)
@@ -27,7 +28,6 @@
  *  - The header_size field allows future expansion (consumer should read
  *    'header_size' then mmap at least that many bytes).
  *
- * 10/10: clean, self-documented, compact.
  */
 
 #pragma once
@@ -91,9 +91,9 @@ namespace pomai::ai::soa
         uint64_t fingerprints_offset;
         uint64_t fingerprints_size;
 
-        // Small per-vector publish flags for fingerprints: one uint32_t per vector.
-        // Readers should check this flag (atomic load) before reading the fingerprint bytes
-        // to avoid torn reads. If this offset is zero the flags block is absent.
+        // NEW: Fingerprint publish flags block (one uint32_t per slot).
+        // Writers set the per-slot flag to 1 after fully writing the fingerprint bytes.
+        // Readers check this flag (atomic_load_u32) and skip slot when flag == 0.
         uint64_t fingerprint_flags_offset;
         uint64_t fingerprint_flags_size;
 
@@ -125,8 +125,8 @@ namespace pomai::ai::soa
 
         // Padding reserved for future fields and to make the struct 256 bytes.
         // Do not use this area for persistent metadata unless versioned.
-        // NOTE: compute the size based on actual bytes before this pad (176),
-        // so pad length = 256 - 176 = 80.
+        // NOTE: adjust pad length to keep total sizeof(SoaMmapHeader) == 256.
+        // Current bytes before pad = 176, so pad = 256 - 176 = 80.
         std::array<char, 80> _pad;
 
         /* --- Helper methods --- */

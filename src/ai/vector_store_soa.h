@@ -1,19 +1,20 @@
-// src/ai/vector_store_soa.h
-//
-// Simple SoA-backed Vector Store helper (phase 1).
-//
-// Responsibilities (Phase 1):
-//  - Create/open a single mmap'd SoA file with SoaMmapHeader layout.
-//  - Provide append_vector(...) to write a fingerprint, packed PQ bytes and a 64-bit id/offset entry
-//    into the preallocated slots.
-//  - Provide read accessors: pq_packed_ptr(idx) and id_entry_at(idx) and basic metadata accessors.
-//
-// This is an intentionally small, robust implementation to satisfy tests and
-// provide foundations for later features (atomic WAL, dynamic growth, codebooks etc).
-//
-// Threading:
-//  - append_vector is serialized by an internal mutex (simple and safe for tests).
-//
+/*
+ * src/ai/vector_store_soa.h
+ *
+ * Simple SoA-backed Vector Store helper (phase 1).
+ *
+ * Responsibilities (Phase 1):
+ *  - Create/open a single mmap'd SoA file with SoaMmapHeader layout.
+ *  - Provide append_vector(...) to write a fingerprint, packed PQ bytes and a 64-bit id/offset entry
+ *    into the preallocated slots.
+ *  - Provide read accessors: pq_packed_ptr(idx) and id_entry_at(idx) and basic metadata accessors.
+ *
+ * This is an intentionally small, robust implementation to satisfy tests and
+ * provide foundations for later features (atomic WAL, dynamic growth, codebooks etc).
+ *
+ * Threading:
+ *  - append_vector is serialized by an internal mutex (simple and safe for tests).
+ */
 
 #pragma once
 
@@ -75,18 +76,32 @@ public:
     // Append a vector entry into the next free slot.
     // - fp: pointer to fingerprint bytes (may be nullptr if fingerprint_bits == 0)
     // - fp_len: length in bytes of fingerprint (must equal header fingerprint_bytes)
-    // - pq_packed: pointer to packed-4 PQ bytes (if pq_m==0 then can be nullptr)
-    // - pq_len: length of packed PQ bytes (must equal header packed bytes)
+    // - pq_packed_or_codes: pointer to packed-4 bytes OR raw 8-bit codes depending on pq_len
+    // - pq_len: length of pq_packed_or_codes (either pq_packed_bytes or pq_m), or 0
     // - id_entry: the uint64 value to store in ids array (label/offset)
     // Returns index (0..num_vectors-1) on success, SIZE_MAX on failure/full.
     size_t append_vector(const uint8_t *fp, uint32_t fp_len,
-                         const uint8_t *pq_packed, uint32_t pq_len,
+                         const uint8_t *pq_packed_or_codes, uint32_t pq_len,
                          uint64_t id_entry);
 
     // Accessors used by tests ------------------------------------------------
 
     // pointer to packed PQ bytes for index (read-only). Returns nullptr if index out-of-range
     const uint8_t *pq_packed_ptr(size_t idx) const noexcept;
+
+    // pointer to raw 8-bit PQ codes for index (read-only). Returns nullptr if absent.
+    const uint8_t *pq_codes_ptr(size_t idx) const noexcept;
+
+    // pointer to codebooks block (raw floats) when present. Returns nullptr if absent.
+    const float *codebooks_ptr() const noexcept;
+
+    // total size in bytes of codebooks block (0 if absent)
+    size_t codebooks_size_bytes() const noexcept;
+
+    // Write codebooks floats into the reserved codebooks block.
+    // - src: pointer to floats (count = codebooks_size_bytes() / sizeof(float))
+    // Returns true on success.
+    bool write_codebooks(const float *src, size_t float_count);
 
     // read id entry atomically
     uint64_t id_entry_at(size_t idx) const noexcept;

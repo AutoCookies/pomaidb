@@ -137,7 +137,7 @@ int main(int argc, char **argv)
     if (fp_bits == 0)
         fp_bits = 512;
 
-    auto soa = pomai::ai::soa::VectorStoreSoA::create_new(soa_path, N, static_cast<uint32_t>(dim), /*pq_m*/0, /*pq_k*/0, fp_bits, /*ppe*/0, std::string());
+    auto soa = pomai::ai::soa::VectorStoreSoA::create_new(soa_path, N, static_cast<uint32_t>(dim), /*pq_m*/8, /*pq_k*/256, fp_bits, /*ppe*/0, std::string());
     if (!soa)
     {
         std::cerr << "Failed to create SoA mapping\n";

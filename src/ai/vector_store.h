@@ -1,3 +1,4 @@
+// Updated: add ProductQuantizer member and packed4 bookkeeping for PQ integration
 #pragma once
 
 #include <memory>
@@ -26,6 +27,9 @@ namespace pomai::ai
 {
     // Forward-declare FingerprintEncoder to avoid including fingerprint.h in this header.
     class FingerprintEncoder;
+
+    // Forward-declare ProductQuantizer for PQ support (complete type only needed in .cc)
+    class ProductQuantizer;
 }
 
 namespace pomai::ai::soa
@@ -114,6 +118,12 @@ namespace pomai::ai
         std::unique_ptr<pomai::ai::soa::VectorStoreSoA> soa_;
         std::unique_ptr<FingerprintEncoder> fingerprint_;
         size_t fingerprint_bytes_{0};
+
+        // PQ support (Phase 3)
+        // - in-RAM ProductQuantizer (trained at init or loaded from codebooks)
+        std::unique_ptr<ProductQuantizer> pq_;
+        // - number of bytes per packed-4 code (packed storage per-vector)
+        size_t pq_packed_bytes_{0};
 
         // label <-> key mappings (in-memory cache) for single-mode
         mutable std::mutex label_map_mu_;

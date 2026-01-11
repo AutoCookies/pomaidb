@@ -1,22 +1,3 @@
-// src/ai/vector_store_soa.cc
-//
-// Phase 1 implementation for VectorStoreSoA declared in vector_store_soa.h
-//
-// NOTE: Added a small per-slot publish flag array for fingerprints and updated
-// the on-disk layout computations to align block offsets. The alignment rules
-// used:
-//
-//  - codebooks (floats)    : 4-byte alignment
-//  - fingerprints (bytes)  : 4-byte alignment
-//  - fingerprint flags     : 4-byte alignment (uint32_t per-slot)
-//  - pq_packed4             : 1-byte alignment (packed bytes)
-//  - ids                    : 8-byte alignment (uint64_t per-slot)
-//  - ppe                    : 8-byte alignment (PPEEntry aligned to 8)
-//
-// The same alignment policy is applied when computing the total mapping size
-// (create_new / open_or_create) and when writing the header (build_and_write_header)
-// so the reserved mmap size always matches the offsets written into the header.
-
 #include "src/ai/vector_store_soa.h"
 
 #include <cstring>
@@ -40,10 +21,27 @@ static inline size_t align_up(size_t offset, size_t align) noexcept
 
 // -------------------- static size helpers --------------------
 
-// For phase 1 we reserve zero for codebooks (not used by tests).
-size_t VectorStoreSoA::compute_codebooks_size_bytes(uint32_t /*dim*/, uint16_t /*pq_m*/, uint16_t /*pq_k*/) noexcept
+// codebooks size: m * k * subdim * sizeof(float)
+// subdim = max(1, dim / m)
+size_t VectorStoreSoA::compute_codebooks_size_bytes(uint32_t dim, uint16_t pq_m, uint16_t pq_k) noexcept
 {
-    return 0;
+    if (dim == 0 || pq_m == 0 || pq_k == 0)
+        return 0;
+    size_t m = static_cast<size_t>(pq_m);
+    size_t k = static_cast<size_t>(pq_k);
+    size_t subdim = (dim / pq_m);
+    if (subdim == 0)
+        subdim = 1;
+    // check overflow: m * k * subdim * sizeof(float)
+    if (subdim > (std::numeric_limits<size_t>::max() / sizeof(float)))
+        return 0;
+    size_t floats = m;
+    if (k > (std::numeric_limits<size_t>::max() / floats)) return 0;
+    floats *= k;
+    if (subdim > (std::numeric_limits<size_t>::max() / floats)) return 0;
+    floats *= subdim;
+    if (floats > (std::numeric_limits<size_t>::max() / sizeof(float))) return 0;
+    return static_cast<size_t>(floats * sizeof(float));
 }
 
 size_t VectorStoreSoA::compute_fingerprints_size_bytes(uint64_t num_vectors, uint16_t fingerprint_bits) noexcept
@@ -68,9 +66,14 @@ size_t VectorStoreSoA::compute_fingerprint_flags_size_bytes(uint64_t num_vectors
     return static_cast<size_t>(num_vectors) * sizeof(uint32_t);
 }
 
-size_t VectorStoreSoA::compute_pq_codes_size_bytes(uint64_t /*num_vectors*/, uint16_t /*pq_m*/) noexcept
+// PQ codes (8-bit per subquantizer) total size = num_vectors * pq_m
+size_t VectorStoreSoA::compute_pq_codes_size_bytes(uint64_t num_vectors, uint16_t pq_m) noexcept
 {
-    return 0;
+    if (pq_m == 0 || num_vectors == 0)
+        return 0;
+    if (static_cast<size_t>(pq_m) > (std::numeric_limits<size_t>::max() / num_vectors))
+        return 0;
+    return static_cast<size_t>(num_vectors) * static_cast<size_t>(pq_m);
 }
 
 size_t VectorStoreSoA::compute_pq_packed4_size_bytes(uint64_t num_vectors, uint16_t pq_m) noexcept
@@ -139,7 +142,7 @@ std::unique_ptr<VectorStoreSoA> VectorStoreSoA::create_new(const std::string &pa
         offset += codebooks_sz;
     }
 
-    // fingerprints -> align 4 (byte-packed but floats may be accessed elsewhere)
+    // fingerprints -> align 4 (byte-packed)
     if (fingerprints_sz > 0)
     {
         offset = align_up(offset, 4);
@@ -153,7 +156,7 @@ std::unique_ptr<VectorStoreSoA> VectorStoreSoA::create_new(const std::string &pa
         offset += fingerprint_flags_sz;
     }
 
-    // pq_codes (8-bit) -> no special alignment
+    // pq_codes (8-bit per-subquantizer) -> no strict alignment (1)
     if (pq_codes_sz > 0)
     {
         offset = align_up(offset, 1);
@@ -563,10 +566,14 @@ bool VectorStoreSoA::build_and_write_header(uint64_t num_vectors,
     std::memcpy(const_cast<char *>(base_ptr_), &h, sizeof(SoaMmapHeader));
 
     // zero/initialize blocks
+    if (h.codebooks_offset != 0 && h.codebooks_size != 0)
+        std::memset(const_cast<char *>(base_ptr_) + static_cast<size_t>(h.codebooks_offset), 0, static_cast<size_t>(h.codebooks_size));
     if (h.fingerprints_offset != 0 && h.fingerprints_size != 0)
         std::memset(const_cast<char *>(base_ptr_) + static_cast<size_t>(h.fingerprints_offset), 0, static_cast<size_t>(h.fingerprints_size));
     if (h.fingerprint_flags_offset != 0 && h.fingerprint_flags_size != 0)
         std::memset(const_cast<char *>(base_ptr_) + static_cast<size_t>(h.fingerprint_flags_offset), 0, static_cast<size_t>(h.fingerprint_flags_size));
+    if (h.pq_codes_offset != 0 && h.pq_codes_size != 0)
+        std::memset(const_cast<char *>(base_ptr_) + static_cast<size_t>(h.pq_codes_offset), 0, static_cast<size_t>(h.pq_codes_size));
     if (h.pq_packed4_offset != 0 && h.pq_packed4_size != 0)
         std::memset(const_cast<char *>(base_ptr_) + static_cast<size_t>(h.pq_packed4_offset), 0, static_cast<size_t>(h.pq_packed4_size));
     if (h.ids_offset != 0 && h.ids_size != 0)
@@ -621,20 +628,27 @@ bool VectorStoreSoA::init_from_mapping()
 // -------------------- append / read ----------------------------------------------------
 
 size_t VectorStoreSoA::append_vector(const uint8_t *fp, uint32_t fp_len,
-                                     const uint8_t *pq_packed, uint32_t pq_len,
+                                     const uint8_t *pq_packed_or_codes, uint32_t pq_len,
                                      uint64_t id_entry)
 {
     if (!hdr_ || !base_ptr_)
         return SIZE_MAX;
 
+    // Validate fingerprint length
     if (fingerprint_bytes_ != fp_len)
     {
         if (fingerprint_bytes_ != 0 || fp_len != 0)
             return SIZE_MAX;
     }
-    if (pq_packed_bytes_ != pq_len)
+
+    // pq_len can be either:
+    //  - pq_m (raw 8-bit codes) when pq_codes block is used, or
+    //  - pq_packed_bytes_ (packed4) when pq_packed4 block used, or 0 if none.
+    if (pq_len != 0)
     {
-        if (pq_packed_bytes_ != 0 || pq_len != 0)
+        bool ok_raw = (hdr_->pq_codes_offset != 0 && pq_len == static_cast<uint32_t>(hdr_->pq_m));
+        bool ok_packed = (hdr_->pq_packed4_offset != 0 && pq_packed_bytes_ > 0 && pq_len == static_cast<uint32_t>(pq_packed_bytes_));
+        if (!ok_raw && !ok_packed)
             return SIZE_MAX;
     }
 
@@ -644,29 +658,48 @@ size_t VectorStoreSoA::append_vector(const uint8_t *fp, uint32_t fp_len,
     if (idx >= hdr_->num_vectors)
         return SIZE_MAX;
 
+    // Write PQ raw codes or packed4 first (if provided).
+    if (pq_len != 0)
+    {
+        // raw 8-bit codes
+        if (hdr_->pq_codes_offset != 0 && pq_len == static_cast<uint32_t>(hdr_->pq_m))
+        {
+            char *dst_codes = const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->pq_codes_offset) + static_cast<size_t>(idx) * static_cast<size_t>(hdr_->pq_m);
+            std::memcpy(dst_codes, pq_packed_or_codes, pq_len);
+        }
+        // packed4
+        else if (hdr_->pq_packed4_offset != 0 && pq_packed_bytes_ > 0 && pq_len == static_cast<uint32_t>(pq_packed_bytes_))
+        {
+            char *dst_pq = const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->pq_packed4_offset) + static_cast<size_t>(idx) * pq_packed_bytes_;
+            std::memcpy(dst_pq, pq_packed_or_codes, pq_len);
+        }
+        else
+        {
+            return SIZE_MAX;
+        }
+    }
+
+    // Write IDs next.
+    if (hdr_->ids_offset != 0 && hdr_->ids_size != 0)
+    {
+        uint64_t *ids_base = reinterpret_cast<uint64_t *>(const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->ids_offset));
+        pomai::ai::atomic_utils::atomic_store_u64(ids_base + idx, id_entry);
+    }
+
+    // Finally, write fingerprint bytes and atomically publish the per-slot flag.
+    // Publishing the flag is done after PQ and IDs are in place to avoid readers
+    // observing a published fingerprint without corresponding id/pq data.
     if (hdr_->fingerprints_offset != 0 && fingerprint_bytes_ > 0 && fp && fp_len > 0)
     {
         char *dst_fp = const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->fingerprints_offset) + static_cast<size_t>(idx) * fingerprint_bytes_;
         std::memcpy(dst_fp, fp, fp_len);
 
-        // publish fingerprint by setting the per-slot flag (atomic store)
+        // publish fingerprint flag last (atomic store)
         if (hdr_->fingerprint_flags_offset != 0 && hdr_->fingerprint_flags_size != 0)
         {
             uint32_t *flags_base = reinterpret_cast<uint32_t *>(const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->fingerprint_flags_offset));
             pomai::ai::atomic_utils::atomic_store_u32(flags_base + idx, 1u);
         }
-    }
-
-    if (hdr_->pq_packed4_offset != 0 && pq_packed_bytes_ > 0 && pq_packed && pq_len > 0)
-    {
-        char *dst_pq = const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->pq_packed4_offset) + static_cast<size_t>(idx) * pq_packed_bytes_;
-        std::memcpy(dst_pq, pq_packed, pq_len);
-    }
-
-    if (hdr_->ids_offset != 0 && hdr_->ids_size != 0)
-    {
-        uint64_t *ids_base = reinterpret_cast<uint64_t *>(const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->ids_offset));
-        pomai::ai::atomic_utils::atomic_store_u64(ids_base + idx, id_entry);
     }
 
     next_index_.store(idx + 1, std::memory_order_release);
@@ -682,6 +715,48 @@ const uint8_t *VectorStoreSoA::pq_packed_ptr(size_t idx) const noexcept
     if (idx >= static_cast<size_t>(hdr_->num_vectors))
         return nullptr;
     return reinterpret_cast<const uint8_t *>(base_ptr_ + static_cast<size_t>(hdr_->pq_packed4_offset) + idx * pq_packed_bytes_);
+}
+
+const uint8_t *VectorStoreSoA::pq_codes_ptr(size_t idx) const noexcept
+{
+    if (!hdr_ || !base_ptr_)
+        return nullptr;
+    if (hdr_->pq_codes_offset == 0 || hdr_->pq_codes_size == 0 || hdr_->pq_m == 0)
+        return nullptr;
+    if (idx >= static_cast<size_t>(hdr_->num_vectors))
+        return nullptr;
+    return reinterpret_cast<const uint8_t *>(base_ptr_ + static_cast<size_t>(hdr_->pq_codes_offset) + idx * static_cast<size_t>(hdr_->pq_m));
+}
+
+const float *VectorStoreSoA::codebooks_ptr() const noexcept
+{
+    if (!hdr_ || !base_ptr_)
+        return nullptr;
+    if (hdr_->codebooks_offset == 0 || hdr_->codebooks_size == 0)
+        return nullptr;
+    return reinterpret_cast<const float *>(base_ptr_ + static_cast<size_t>(hdr_->codebooks_offset));
+}
+
+size_t VectorStoreSoA::codebooks_size_bytes() const noexcept
+{
+    if (!hdr_)
+        return 0;
+    return static_cast<size_t>(hdr_->codebooks_size);
+}
+
+bool VectorStoreSoA::write_codebooks(const float *src, size_t float_count)
+{
+    if (!hdr_ || !base_ptr_ || !src)
+        return false;
+    if (hdr_->codebooks_offset == 0 || hdr_->codebooks_size == 0)
+        return false;
+    size_t expected_floats = static_cast<size_t>(hdr_->codebooks_size) / sizeof(float);
+    if (float_count != expected_floats)
+        return false;
+    char *dst = const_cast<char *>(base_ptr_) + static_cast<size_t>(hdr_->codebooks_offset);
+    std::memcpy(dst, reinterpret_cast<const char *>(src), static_cast<size_t>(hdr_->codebooks_size));
+    // flush codebooks block synchronously
+    return mmap_.flush(static_cast<size_t>(hdr_->codebooks_offset), static_cast<size_t>(hdr_->codebooks_size), true);
 }
 
 const uint8_t *VectorStoreSoA::fingerprint_ptr(size_t idx) const noexcept

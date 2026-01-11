@@ -8,6 +8,7 @@
  *  - encode() to produce m-byte PQ codes
  *  - pack4/unpack4 helpers for 4-bit on-disk storage
  *  - simple save/load for codebooks (raw binary)
+ *  - compute_distance_tables for query-time PQ table computation
  *
  * The k-means implementation is intentionally simple and robust. It is
  * adequate for offline training in the prototype/PoC phase.
@@ -298,6 +299,49 @@ namespace pomai::ai
         codebooks_.resize(expected);
         f.read(reinterpret_cast<char *>(codebooks_.data()), static_cast<std::streamsize>(expected * sizeof(float)));
         return f.good();
+    }
+
+    void ProductQuantizer::compute_distance_tables(const float *query, float *out_tables) const
+    {
+        if (!query || !out_tables)
+            return;
+
+        // for each subquantizer
+        for (size_t sub = 0; sub < m_; ++sub)
+        {
+            size_t sub_off = sub * subdim_;
+            size_t sub_len = subdim_;
+            if (sub == m_ - 1)
+            {
+                size_t used = subdim_ * (m_ - 1);
+                if (dim_ > used)
+                    sub_len = dim_ - used;
+            }
+
+            const float *centroids_base = &codebooks_[sub * (k_ * subdim_)];
+            for (size_t c = 0; c < k_; ++c)
+            {
+                const float *centroid = centroids_base + c * subdim_;
+                double sum = 0.0;
+                for (size_t d = 0; d < sub_len; ++d)
+                {
+                    double diff = static_cast<double>(query[sub_off + d]) - static_cast<double>(centroid[d]);
+                    sum += diff * diff;
+                }
+                out_tables[sub * k_ + c] = static_cast<float>(sum);
+            }
+        }
+    }
+
+    bool ProductQuantizer::load_codebooks_from_buffer(const float *src, size_t float_count)
+    {
+        if (!src)
+            return false;
+        size_t expected = m_ * k_ * subdim_;
+        if (float_count != expected)
+            return false;
+        codebooks_.assign(src, src + float_count);
+        return true;
     }
 
 } // namespace pomai::ai
