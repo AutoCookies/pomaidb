@@ -1,13 +1,20 @@
 /*
- src/core/pps_manager.cc
-
- Updated worker insertion logic to choose the correct PPHNSW insertion API
- (addPoint vs addQuantizedPoint) based on the underlying index payload layout.
- This ensures sharded (PPSM) inserts match the single-map insertion behavior
- and prevents payload_size mismatch exceptions observed in integration tests.
-*/
+ * src/core/pps_manager.cc
+ *
+ * Pomai Pomegranate Shard Manager (PPSM) Implementation.
+ *
+ * Major Features:
+ * 1. Distributed/Sharded Ingestion.
+ * 2. Hybrid Storage (HNSW + SoA).
+ * 3. Holographic Search (Scatter-Gather).
+ */
 
 #include "src/core/pps_manager.h"
+#include "src/ai/holographic_scanner.h"
+#include "src/ai/quantize.h"
+#include "src/core/seed.h"
+#include "src/core/config.h"
+#include "src/ai/ids_block.h" // <-- Added: Required for IdEntry usage
 
 #include <algorithm>
 #include <future>
@@ -16,13 +23,12 @@
 #include <sstream>
 #include <cstring>
 #include <vector>
-
-#include "src/ai/quantize.h"
-#include "src/core/seed.h"
+#include <filesystem>
 
 namespace pomai::core
 {
 
+    // Helper to get current time in milliseconds
     static inline uint64_t now_ms()
     {
         using namespace std::chrono;
@@ -43,8 +49,9 @@ namespace pomai::core
           async_insert_ack_(async_insert_ack)
     {
         if (!shard_mgr_)
-            throw std::invalid_argument("PPSM: shard_mgr null");
+            throw std::invalid_argument("PPSM: shard_mgr is null");
 
+        // Discover shards from the manager
         uint32_t discovered = 0;
         for (uint32_t i = 0; i < 1024; ++i)
         {
@@ -52,28 +59,39 @@ namespace pomai::core
                 break;
             ++discovered;
         }
+
         if (discovered == 0)
-            throw std::runtime_error("PPSM: shard_mgr has no shards");
+            throw std::runtime_error("PPSM: shard_mgr has no shards available");
 
         shards_.reserve(discovered);
         per_shard_max_ = std::max<size_t>(1, max_elements_total_ / discovered);
 
+        // Initialize state for each shard
         for (uint32_t i = 0; i < discovered; ++i)
         {
             Shard *sh = shard_mgr_->get_shard_by_id(i);
             if (!sh)
                 break;
+
             auto s = std::make_unique<ShardState>();
             s->id = i;
             s->arena = sh->get_arena();
             s->map = sh->get_map();
-            bool ok = initPerShard(*s, dim_, per_shard_max_, M_, ef_construction_);
-            if (!ok)
+
+            // Initialize PPHNSW index
+            if (!initPerShard(*s, dim_, per_shard_max_, M_, ef_construction_))
             {
                 std::ostringstream ss;
                 ss << "PPSM: failed to init per-shard HNSW for shard " << i;
                 throw std::runtime_error(ss.str());
             }
+
+            // Initialize SoA (Structure of Arrays) storage for Holographic Search
+            if (!initSoAPerShard(*s, dim_))
+            {
+                std::cerr << "PPSM: Warning: Failed to init SoA for shard " << i << ". Holographic search will be disabled for this shard.\n";
+            }
+
             shards_.push_back(std::move(s));
         }
 
@@ -83,17 +101,18 @@ namespace pomai::core
     PPSM::~PPSM()
     {
         stopWorkers();
-
         for (auto &s : shards_)
         {
             if (s)
             {
                 s->pphnsw.reset();
                 s->l2space.reset();
+                s->soa.reset();
             }
         }
     }
 
+    // Initialize PPHNSW (Graph Index) for a specific shard
     bool PPSM::initPerShard(ShardState &s, size_t dim, size_t per_shard_max, size_t M, size_t ef_construction)
     {
         try
@@ -110,6 +129,59 @@ namespace pomai::core
             std::cerr << "PPSM initPerShard exception: " << e.what() << "\n";
             return false;
         }
+        return true;
+    }
+
+    // Initialize SoA (VectorStoreSoA) for a specific shard
+    bool PPSM::initSoAPerShard(ShardState &s, size_t dim)
+    {
+        // Define path for SoA file: ./data/shard_{id}.soa
+        // Ensure directory exists
+        std::string data_dir = "./data";
+        if (!std::filesystem::exists(data_dir))
+        {
+            std::filesystem::create_directory(data_dir);
+        }
+        std::string soa_path = data_dir + "/shard_" + std::to_string(s.id) + ".soa";
+
+        // Configuration for SoA headers
+        uint16_t pq_m = 8;    // Default sub-quantizers
+        uint16_t pq_k = 256;  // Default centroids per sub
+        uint32_t fp_bits = pomai::config::runtime.fingerprint_bits;
+
+        ai::soa::SoaMmapHeader hdr_template{};
+        hdr_template.num_vectors = per_shard_max_; // Align with PPHNSW capacity
+        hdr_template.dim = static_cast<uint32_t>(dim);
+        hdr_template.pq_m = pq_m;
+        hdr_template.pq_k = pq_k;
+        hdr_template.fingerprint_bits = static_cast<uint16_t>(fp_bits);
+
+        s.soa = std::make_unique<ai::soa::VectorStoreSoA>();
+        if (!s.soa->open_or_create(soa_path, hdr_template))
+        {
+            std::cerr << "PPSM: Failed to open/create SoA file: " << soa_path << "\n";
+            return false;
+        }
+
+        // Initialize Encoders
+        try
+        {
+            // Fingerprint Encoder (SimHash)
+            if (fp_bits > 0)
+            {
+                s.fp_enc = ai::FingerprintEncoder::createSimHash(dim, fp_bits);
+            }
+
+            // Product Quantizer
+            s.pq = std::make_unique<ai::ProductQuantizer>(dim, pq_m, pq_k);
+            s.pq_packed_bytes = ai::ProductQuantizer::packed4BytesPerVec(pq_m);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "PPSM: Error initializing encoders for shard " << s.id << ": " << e.what() << "\n";
+            return false;
+        }
+
         return true;
     }
 
@@ -182,6 +254,7 @@ namespace pomai::core
                     sh.q.pop_front();
                 }
             }
+
             if (!task)
                 continue;
 
@@ -190,41 +263,32 @@ namespace pomai::core
             {
                 std::unique_lock<std::shared_mutex> idx_lk(sh.index_mu);
 
-                // Determine the expected payload layout for this shard's index and
-                // call the matching add API so behavior matches single-map insertion.
+                // --- 1. Insert into PPHNSW (Graph Index) ---
                 size_t expected_bytes = 0;
                 if (sh.l2space)
                     expected_bytes = sh.l2space->get_data_size();
 
                 if (expected_bytes == (static_cast<size_t>(dim_) * sizeof(float)))
                 {
-                    // Full float payload expected
-                    sh.pphnsw->addPoint(task->vec.data(), static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                    sh.pphnsw->addPoint(task->vec.data(), static_cast<hnswlib::labeltype>(task->label), task->replace);
                 }
                 else if (expected_bytes == static_cast<size_t>(dim_))
                 {
-                    // Quantized 8-bit payload (one byte per dimension)
-                    sh.pphnsw->addQuantizedPoint(task->vec.data(), dim_, /*bits=*/8, static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                    sh.pphnsw->addQuantizedPoint(task->vec.data(), dim_, 8, static_cast<hnswlib::labeltype>(task->label), task->replace);
                 }
                 else if (expected_bytes == static_cast<size_t>((dim_ + 1) / 2))
                 {
-                    // Packed 4-bit payload (nibbles)
-                    sh.pphnsw->addQuantizedPoint(task->vec.data(), dim_, /*bits=*/4, static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
+                    sh.pphnsw->addQuantizedPoint(task->vec.data(), dim_, 4, static_cast<hnswlib::labeltype>(task->label), task->replace);
                 }
                 else
                 {
-                    // Unknown layout: try full float path as a conservative fallback,
-                    // but throw if the underlying call fails so the issue surfaces.
                     if (sh.pphnsw)
-                    {
-                        sh.pphnsw->addPoint(task->vec.data(), static_cast<hnswlib::labeltype>(task->label), /*replace_deleted=*/task->replace);
-                    }
+                        sh.pphnsw->addPoint(task->vec.data(), static_cast<hnswlib::labeltype>(task->label), task->replace);
                     else
-                    {
-                        throw std::runtime_error("PPSM worker: unknown index payload layout; cannot add point");
-                    }
+                        throw std::runtime_error("PPSM worker: unknown index payload layout");
                 }
 
+                // --- 2. Update Map (Key-Value Store) ---
                 if (sh.map)
                 {
                     uint64_t le = task->label;
@@ -241,6 +305,44 @@ namespace pomai::core
                 {
                     std::lock_guard<std::mutex> gl(sh.label_map_mu);
                     sh.label_to_key[static_cast<uint64_t>(task->label)] = task->key;
+                }
+
+                // --- 3. Insert into SoA (Structure of Arrays) for Holographic Search ---
+                if (sh.soa)
+                {
+                    std::vector<uint8_t> fp_buf;
+                    if (sh.fp_enc)
+                    {
+                        fp_buf.resize(sh.fp_enc->bytes());
+                        sh.fp_enc->compute(task->vec.data(), fp_buf.data());
+                    }
+
+                    std::vector<uint8_t> pq_codes;
+                    std::vector<uint8_t> pq_packed;
+                    const uint8_t *pq_ptr = nullptr;
+                    uint32_t pq_len = 0;
+
+                    if (sh.pq)
+                    {
+                        pq_codes.resize(sh.pq->m());
+                        sh.pq->encode(task->vec.data(), pq_codes.data());
+
+                        size_t packed_sz = ai::ProductQuantizer::packed4BytesPerVec(sh.pq->m());
+                        pq_packed.resize(packed_sz);
+                        ai::ProductQuantizer::pack4From8(pq_codes.data(), pq_packed.data(), sh.pq->m());
+
+                        pq_ptr = pq_packed.data();
+                        pq_len = static_cast<uint32_t>(packed_sz);
+                    }
+
+                    // Use IdEntry pack helpers (Safe now that ids_block.h is included)
+                    uint64_t id_entry = ai::soa::IdEntry::pack_label(task->label);
+
+                    sh.soa->append_vector(
+                        fp_buf.empty() ? nullptr : fp_buf.data(),
+                        static_cast<uint32_t>(fp_buf.size()),
+                        pq_ptr, pq_len,
+                        id_entry);
                 }
 
                 sh.ppe.touch();
@@ -271,6 +373,7 @@ namespace pomai::core
     {
         if (!key || klen == 0 || !vec)
             return false;
+
         uint32_t sid = computeShard(key, klen);
         if (sid >= shards_.size())
             sid = static_cast<uint32_t>(shards_.size()) - 1;
@@ -289,6 +392,7 @@ namespace pomai::core
         t->key.assign(key, key + klen);
         t->vec.assign(vec, vec + dim_);
         t->replace = (existing_label != 0);
+
         if (t->replace)
             t->label = static_cast<labeltype>(existing_label);
         else
@@ -323,6 +427,7 @@ namespace pomai::core
     {
         if (!key || klen == 0)
             return false;
+
         uint32_t sid = computeShard(key, klen);
         if (sid >= shards_.size())
             sid = static_cast<uint32_t>(shards_.size()) - 1;
@@ -350,6 +455,7 @@ namespace pomai::core
         return map_erased;
     }
 
+    // Standard Search: Uses PPHNSW (Graph Index)
     std::vector<std::pair<std::string, float>> PPSM::search(const float *query, size_t dim, size_t topk)
     {
         if (!query || dim != dim_ || topk == 0)
@@ -368,12 +474,15 @@ namespace pomai::core
             std::vector<std::pair<std::string, float>> out;
             if (!shptr || !shptr->pphnsw)
                 return out;
+
             std::shared_lock<std::shared_mutex> idx_lk(shptr->index_mu);
             try
             {
                 std::vector<char> payload(qdim * sizeof(float));
                 std::memcpy(payload.data(), reinterpret_cast<const char *>(qptr), qdim * sizeof(float));
+                
                 auto pq = shptr->pphnsw->searchKnnAdaptive(payload.data(), topk, 0.0f);
+                
                 std::vector<std::pair<std::string, float>> tmp;
                 while (!pq.empty())
                 {
@@ -381,6 +490,7 @@ namespace pomai::core
                     pq.pop();
                     float dist = pr.first;
                     uint64_t label = static_cast<uint64_t>(pr.second);
+                    
                     std::string key;
                     {
                         std::lock_guard<std::mutex> gl(shptr->label_map_mu);
@@ -415,6 +525,96 @@ namespace pomai::core
         }
 
         return merge_results(parts, topk);
+    }
+
+    // Holographic Search: Uses SoA Scan (SimHash + PQ)
+    std::vector<std::pair<std::string, float>> PPSM::searchHolographic(const float *query, size_t dim, size_t topk)
+    {
+        if (!query || dim != dim_ || topk == 0)
+            return {};
+
+        std::vector<std::future<std::vector<ai::HolographicScanner::ScanResult>>> futs;
+        futs.reserve(shards_.size());
+
+        for (auto &s : shards_)
+        {
+            ShardState *shptr = s.get();
+            futs.push_back(std::async(std::launch::async, [shptr, query, topk]()
+                                      {
+                if (!shptr->soa) return std::vector<ai::HolographicScanner::ScanResult>{};
+
+                std::shared_lock<std::shared_mutex> idx_lk(shptr->index_mu);
+                
+                return ai::HolographicScanner::scan_shard(
+                    shptr->soa.get(),
+                    shptr->fp_enc.get(),
+                    shptr->pq.get(),
+                    query,
+                    topk
+                ); }));
+        }
+
+        using Item = std::pair<float, std::string>;
+        struct Cmp
+        {
+            bool operator()(const Item &a, const Item &b) const { return a.first < b.first; }
+        };
+        std::priority_queue<Item, std::vector<Item>, Cmp> heap;
+
+        for (size_t i = 0; i < futs.size(); ++i)
+        {
+            try
+            {
+                auto shard_results = futs[i].get();
+                ShardState *shptr = shards_[i].get();
+
+                for (const auto &res : shard_results)
+                {
+                    std::string key;
+                    if (ai::soa::IdEntry::is_label(res.id_entry))
+                    {
+                        uint64_t lbl = ai::soa::IdEntry::unpack_label(res.id_entry);
+                        {
+                            std::lock_guard<std::mutex> gl(shptr->label_map_mu);
+                            auto it = shptr->label_to_key.find(lbl);
+                            if (it != shptr->label_to_key.end())
+                                key = it->second;
+                            else
+                                key = std::to_string(lbl);
+                        }
+                    }
+                    else
+                    {
+                        key = std::to_string(res.id_entry);
+                    }
+
+                    float score = res.score;
+                    if (heap.size() < topk)
+                    {
+                        heap.emplace(score, key);
+                    }
+                    else if (score < heap.top().first)
+                    {
+                        heap.pop();
+                        heap.emplace(score, key);
+                    }
+                }
+            }
+            catch (...)
+            {
+            }
+        }
+
+        std::vector<std::pair<std::string, float>> out;
+        out.reserve(heap.size());
+        while (!heap.empty())
+        {
+            auto it = heap.top();
+            heap.pop();
+            out.emplace_back(it.second, it.first);
+        }
+        std::reverse(out.begin(), out.end());
+        return out;
     }
 
     std::vector<std::pair<std::string, float>> PPSM::merge_results(const std::vector<std::vector<std::pair<std::string, float>>> &parts, size_t topk)
@@ -462,7 +662,6 @@ namespace pomai::core
         {
             if (!s)
                 continue;
-            // Not exposing PPHNSW size; could be tracked separately.
             if (s->pphnsw)
             {
                 sum += s->pphnsw->elementCount();
@@ -471,7 +670,6 @@ namespace pomai::core
         return sum;
     }
 
-    // ---------------- Memory usage reporting ----------------
     PPSM::MemoryUsage PPSM::memoryUsage() const noexcept
     {
         MemoryUsage out{};
@@ -482,34 +680,26 @@ namespace pomai::core
 
             for (const auto &s : shards_)
             {
-                if (!s)
-                    continue;
-                if (!s->pphnsw)
+                if (!s || !s->pphnsw)
                     continue;
 
                 try
                 {
-                    // Use PPHNSW helper to get element count and seed size
                     size_t cnt = s->pphnsw->elementCount();
                     size_t seed_size = s->pphnsw->getSeedSize();
 
                     uint64_t payload_bytes = static_cast<uint64_t>(seed_size) * static_cast<uint64_t>(cnt);
-
-                    // estimated total bytes (payload + graph overhead + misc) from PPHNSW
                     size_t estimated_total = s->pphnsw->estimatedMemoryUsageBytes(/*avg_degree_multiplier=*/2);
 
                     uint64_t index_over = 0;
                     if (estimated_total > payload_bytes)
                         index_over = static_cast<uint64_t>(estimated_total) - payload_bytes;
-                    else
-                        index_over = 0;
 
                     total_payload += payload_bytes;
                     total_index_overhead += index_over;
                 }
                 catch (...)
                 {
-                    // ignore shard errors and continue
                 }
             }
 
@@ -519,7 +709,6 @@ namespace pomai::core
         }
         catch (...)
         {
-            // on unexpected errors return zeros
         }
         return out;
     }

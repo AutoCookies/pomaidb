@@ -1,18 +1,11 @@
-/*
- * src/ai/pppq.h
- *
- * PPPQ: prototype Product Quantizer with optional async demotion and basic metrics.
- *
- * This header exposes the PPPQ class (train, addVec, approxDist, purgeCold)
- * and lightweight demotion metrics used for instrumentation.
- *
- * Implementation notes:
- *  - Per-id metadata (code_nbits_, in_mmap_) are stored as atomic arrays.
- *  - A per-id sequence counter seq_ is used to provide a stable snapshot
- *    protocol for readers observing demote-related metadata and payload.
- *  - Async demote tasks are scheduled via std::async and tracked with futures.
- */
-
+// Expose stable snapshot API publicly so external readers/tests can obtain a
+// consistent (seq-protected) snapshot of per-id metadata + packed payload.
+// This avoids fragile sequences where tests read in_mmap/code_nbits separately
+// and observe transient, inconsistent states during demotion.
+//
+// The wrapper is intentionally lightweight and forwards to the existing private
+// stable_snapshot_read(...) implementation which performs the seq-protocol
+// + file mutex protected read of packed bytes when needed.
 #pragma once
 
 #include <vector>
@@ -37,6 +30,23 @@ namespace pomai::ai
 
         // Return current stored bitness for given id (4 or 8). Safe to call concurrently.
         uint8_t get_code_nbits(size_t id) const noexcept;
+
+        // Exposed stable snapshot reader for tests/readers:
+        // - id: element id to sample
+        // - out_in_mmap: returned in_mmap flag (0/1)
+        // - out_nbits: returned code bitness (4/8)
+        // - out_buf: if in_mmap==1, contains packed bytes (packed4); otherwise empty
+        // - max_attempts: optional retry limit (default 100); private impl uses small backoff loop
+        //
+        // Returns true when a consistent snapshot was obtained.
+        bool stable_snapshot_read_pub(size_t id,
+                                      uint8_t &out_in_mmap,
+                                      uint8_t &out_nbits,
+                                      std::vector<uint8_t> &out_buf,
+                                      size_t max_attempts = 100)
+        {
+            return stable_snapshot_read(id, out_in_mmap, out_nbits, out_buf, max_attempts);
+        }
 
         // train and insert
         void train(const float *samples, size_t n_samples, size_t max_iters = 10);
@@ -75,7 +85,7 @@ namespace pomai::ai
         // async demote scheduling
         void schedule_async_demote(size_t id, const std::vector<uint8_t> &nibble_buf);
 
-        // stable snapshot reader (member so it can access private state)
+        // stable snapshot reader (member) -----------------------------------
         // Returns true if a consistent snapshot was observed within max_attempts.
         // on success out_buf contains packed bytes when in_mmap==1, otherwise out_buf may be empty.
         bool stable_snapshot_read(size_t id,

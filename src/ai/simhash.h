@@ -5,19 +5,9 @@
  *
  * - Produces a bit-packed fingerprint (N bits) for an input float vector.
  * - Default configuration: 512 bits (recommended for good prefilter selectivity).
- * - Internally stores `bits` dense random projection vectors (each length `dim`)
- *   sampled from a standard normal distribution. Fingerprint bit i = sign(dot(proj_i, vec)).
  *
- * Notes:
- * - This is intentionally simple and portable. For maximum performance you may
- *   replace the dense random projections by structured or sparse projections,
- *   or perform an OPQ rotation (outside this module) and call compute() on
- *   the rotated vector (OPQ-sign).
- *
- * - The compute() entrypoint writes packed bytes to the provided buffer of
- *   length bytes() == (bits + 7) / 8.
- *
- * API quality goals: clear, documented, thread-safe for concurrent reads.
+ * Updates:
+ * - Added 'simhash' namespace with 'hamming_dist' helper for HolographicScanner.
  */
 
 #pragma once
@@ -26,6 +16,16 @@
 #include <cstdint>
 #include <vector>
 #include <random>
+
+// Use GCC/Clang builtin for popcount if available for max performance
+#ifdef __GNUC__
+#define POPCOUNT64(x) __builtin_popcountll(x)
+#define POPCOUNT32(x) __builtin_popcount(x)
+#else
+#include <bit>
+#define POPCOUNT64(x) std::popcount(x)
+#define POPCOUNT32(x) std::popcount(x)
+#endif
 
 namespace pomai::ai
 {
@@ -71,5 +71,33 @@ namespace pomai::ai
         // Helper: compute sign for one projection row (dot product)
         inline bool dot_sign(const float *vec, const float *proj_row) const;
     };
+
+    // --- Helper namespace for distance functions (Required by HolographicScanner) ---
+    namespace simhash
+    {
+        // Compute Hamming distance between two bit vectors of length 'bytes'.
+        // This is a hot-path function used during scanning.
+        static inline uint32_t hamming_dist(const uint8_t *a, const uint8_t *b, size_t bytes)
+        {
+            uint32_t dist = 0;
+            size_t i = 0;
+
+            // Process 64-bit chunks for speed (8 bytes at a time)
+            for (; i + 8 <= bytes; i += 8)
+            {
+                uint64_t va = *reinterpret_cast<const uint64_t *>(a + i);
+                uint64_t vb = *reinterpret_cast<const uint64_t *>(b + i);
+                dist += POPCOUNT64(va ^ vb);
+            }
+
+            // Process remaining bytes
+            for (; i < bytes; ++i)
+            {
+                uint8_t x = a[i] ^ b[i];
+                dist += POPCOUNT32(x);
+            }
+            return dist;
+        }
+    }
 
 } // namespace pomai::ai

@@ -22,6 +22,9 @@
 #include "src/core/shard_manager.h" // ShardManager
 #include "src/ai/pomai_hnsw.h"
 #include "src/ai/ppe_predictor.h"
+#include "src/ai/vector_store_soa.h"
+#include "src/ai/fingerprint.h"
+#include "src/ai/pq.h"
 
 namespace pomai::core
 {
@@ -62,6 +65,7 @@ namespace pomai::core
 
         // Return approximate MemoryUsage aggregated over all shards.
         MemoryUsage memoryUsage() const noexcept;
+        std::vector<std::pair<std::string, float>> searchHolographic(const float *query, size_t dim, size_t topk);
 
     private:
         struct Task
@@ -97,6 +101,12 @@ namespace pomai::core
             // label -> key map for this shard (protected by label_map_mu)
             std::unordered_map<uint64_t, std::string> label_to_key;
             mutable std::mutex label_map_mu;
+
+            std::unique_ptr<ai::soa::VectorStoreSoA> soa;
+            std::unique_ptr<ai::FingerprintEncoder> fp_enc;
+            std::unique_ptr<ai::ProductQuantizer> pq;
+
+            size_t pq_packed_bytes{0};
         };
 
         uint32_t computeShard(const char *key, size_t klen) const noexcept;
@@ -105,6 +115,7 @@ namespace pomai::core
         void stopWorkers();
 
         bool initPerShard(ShardState &s, size_t dim, size_t per_shard_max, size_t M, size_t ef_construction);
+        bool initSoAPerShard(ShardState &s, size_t dim);
 
         static std::vector<std::pair<std::string, float>> merge_results(const std::vector<std::vector<std::pair<std::string, float>>> &parts, size_t topk);
 

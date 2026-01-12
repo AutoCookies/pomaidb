@@ -1,129 +1,148 @@
-// tests/pppq/pppq_demote_concurrency_test.cc
-//
-// Make the stress test robust: stable-snapshot reads and small tolerated transient rate.
+/*
+ * tests/pppq/pppq_demote_concurrency_test.cc
+ *
+ * Updated test: readers now use PPPQ::stable_snapshot_read_pub to obtain a
+ * consistent snapshot of (in_mmap, code_nbits, packed payload) instead of
+ * reading the individual atomics separately. This prevents observing transient
+ * inconsistent states during concurrent demotion.
+ *
+ * This test is a modest reproduction of the concurrency stress harness used
+ * previously: multiple writer threads call addVec() which may trigger async
+ * demotion; multiple reader threads repeatedly sample a random id using the
+ * stable snapshot API and validate the (in_mmap -> nbits) invariant.
+ *
+ * Note: This test is intentionally defensive (retries + time-limited) and
+ * asserts that inconsistent observations are near-zero.
+ */
 
-#include <atomic>
-#include <chrono>
-#include <cstdint>
-#include <iostream>
-#include <memory>
+#include "src/ai/pppq.h"
+
 #include <thread>
 #include <vector>
-
-#include "src/ai/atomic_utils.h"
+#include <atomic>
+#include <random>
+#include <chrono>
+#include <iostream>
+#include <cassert>
 
 using namespace pomai::ai;
-using namespace std::chrono_literals;
 
-static constexpr double MAX_ALLOWED_FRACTION = 0.001; // 0.1% allowed transient rate
-
-static bool atomic_snapshot_u32_pair(const uint32_t *flag_ptr, const uint32_t *payload_ptr, uint32_t &out_flag, uint32_t &out_payload)
+int main(int argc, char **argv)
 {
-    for (int i = 0; i < 100; ++i)
+    const size_t DIM = 64;
+    const size_t M = 8;
+    const size_t K = 16;
+    const size_t MAX_ELEMS = 1024;
+    const size_t NUM_WRITERS = 4;
+    const size_t NUM_READERS = 2;
+    const int duration_s = 3;
+
+    PPPQ ppq(DIM, M, K, MAX_ELEMS, "./pppq_test.mmap");
+
+    // train with random samples
     {
-        uint32_t f1 = atomic_utils::atomic_load_u32(flag_ptr);
-        uint32_t p = atomic_utils::atomic_load_u32(payload_ptr);
-        uint32_t f2 = atomic_utils::atomic_load_u32(flag_ptr);
-        if (f1 == f2)
-        {
-            out_flag = f1;
-            out_payload = p;
-            return true;
-        }
-        std::this_thread::yield();
+        std::vector<float> samples(1000 * DIM);
+        std::mt19937_64 rng(123);
+        std::uniform_real_distribution<float> ud(0.0f, 1.0f);
+        for (auto &v : samples)
+            v = ud(rng);
+        ppq.train(samples.data(), 1000, 5);
     }
-    out_flag = atomic_utils::atomic_load_u32(flag_ptr);
-    out_payload = atomic_utils::atomic_load_u32(payload_ptr);
-    return true;
-}
 
-int main()
-{
-    std::unique_ptr<uint32_t[]> buf(new uint32_t[2]);
-    uint32_t *in_mmap_ptr = buf.get();
-    uint32_t *code_nbits_ptr = buf.get() + 1;
-
-    pomai::ai::atomic_utils::atomic_store_u32(in_mmap_ptr, 0);
-    pomai::ai::atomic_utils::atomic_store_u32(code_nbits_ptr, 0);
-
-    const size_t reader_threads = std::max<size_t>(1, std::thread::hardware_concurrency() - 1);
-    const std::chrono::seconds duration = std::chrono::seconds(3);
     std::atomic<bool> stop{false};
-    std::atomic<uint64_t> inconsistent_count{0};
-    std::atomic<uint64_t> total_reads{0};
-    std::atomic<uint64_t> total_writes{0};
+    std::atomic<size_t> writes{0};
+    std::atomic<size_t> reads{0};
+    std::atomic<size_t> inconsistent{0};
 
-    auto reader = [&]()
+    // Writer threads: continuously update random ids
+    std::vector<std::thread> writers;
+    for (size_t t = 0; t < NUM_WRITERS; ++t)
     {
-        while (!stop.load(std::memory_order_acquire))
+        writers.emplace_back([&]()
         {
-            uint32_t flags = 0;
-            uint32_t nb = 0;
-            atomic_snapshot_u32_pair(in_mmap_ptr, code_nbits_ptr, flags, nb);
-            total_reads.fetch_add(1, std::memory_order_relaxed);
+            std::mt19937_64 rng(std::random_device{}());
+            std::uniform_int_distribution<size_t> idd(0, MAX_ELEMS - 1);
+            std::vector<float> vec(DIM);
+            std::uniform_real_distribution<float> ud(0.0f, 1.0f);
 
-            if (flags == 1 && nb == 0)
-                inconsistent_count.fetch_add(1, std::memory_order_relaxed);
-            if (flags == 0 && nb != 0)
-                inconsistent_count.fetch_add(1, std::memory_order_relaxed);
+            while (!stop.load(std::memory_order_acquire))
+            {
+                size_t id = idd(rng);
+                for (size_t i = 0; i < DIM; ++i)
+                    vec[i] = ud(rng);
+                ppq.addVec(vec.data(), id);
+                writes.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
 
-            std::this_thread::yield();
-        }
-    };
-
-    auto writer = [&]()
+    // Reader threads: use stable_snapshot_read_pub to sample consistent snapshots
+    std::vector<std::thread> readers;
+    for (size_t t = 0; t < NUM_READERS; ++t)
     {
-        uint32_t bits = 1;
-        while (!stop.load(std::memory_order_acquire))
+        readers.emplace_back([&]()
         {
-            atomic_utils::atomic_store_u32(code_nbits_ptr, bits);   // publish payload
-            atomic_utils::atomic_store_u32(in_mmap_ptr, 1);         // publish flag
-            total_writes.fetch_add(1, std::memory_order_relaxed);
+            std::mt19937_64 rng(std::random_device{}());
+            std::uniform_int_distribution<size_t> idd(0, MAX_ELEMS - 1);
 
-            // little pause
-            std::this_thread::yield();
+            while (!stop.load(std::memory_order_acquire))
+            {
+                size_t id = idd(rng);
 
-            // unpublish: clear flag then payload
-            atomic_utils::atomic_store_u32(in_mmap_ptr, 0);
-            atomic_utils::atomic_store_u32(code_nbits_ptr, 0);
+                uint8_t inmap = 0, nbits = 8;
+                std::vector<uint8_t> packed;
+                bool ok = ppq.stable_snapshot_read_pub(id, inmap, nbits, packed, 200);
+                reads.fetch_add(1, std::memory_order_relaxed);
 
-            ++bits;
-            if (bits == 0)
-                bits = 1;
-        }
-    };
+                if (!ok)
+                {
+                    // if we couldn't obtain a snapshot, count as transient inconsistency
+                    inconsistent.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
 
-    std::vector<std::thread> rthreads;
-    for (size_t i = 0; i < reader_threads; ++i)
-        rthreads.emplace_back(reader);
+                // Validate invariant: if inmap==1 then nbits must be 4 (packed)
+                if (inmap != 0 && nbits != 4)
+                {
+                    inconsistent.fetch_add(1, std::memory_order_relaxed);
+                }
 
-    std::thread wthread(writer);
+                // conversely, if nbits==4, inmap should be 1 (packed read present)
+                if (nbits == 4 && inmap == 0)
+                {
+                    inconsistent.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
 
-    std::this_thread::sleep_for(duration);
+    // Run for duration_s seconds
+    std::this_thread::sleep_for(std::chrono::seconds(duration_s));
     stop.store(true, std::memory_order_release);
 
-    wthread.join();
-    for (auto &t : rthreads)
-        t.join();
+    for (auto &th : writers)
+        th.join();
+    for (auto &th : readers)
+        th.join();
 
-    uint64_t ic = inconsistent_count.load();
-    uint64_t reads = total_reads.load();
-    uint64_t writes = total_writes.load();
+    size_t w = writes.load();
+    size_t r = reads.load();
+    size_t ic = inconsistent.load();
 
-    double frac = reads ? (double)ic / (double)reads : 0.0;
-    uint64_t allowed = std::max<uint64_t>(1, static_cast<uint64_t>(reads * MAX_ALLOWED_FRACTION + 0.5));
+    std::cout << "[pppq_demote_concurrency_test] writer_threads=" << NUM_WRITERS
+              << " reader_threads=" << NUM_READERS
+              << " duration_s=" << duration_s
+              << " reads=" << r << " writes=" << w
+              << " inconsistent=" << ic << "\n";
 
-    std::cout << "[pppq_demote_concurrency_test] reader_threads=" << reader_threads
-              << " duration_s=" << std::chrono::duration_cast<std::chrono::seconds>(duration).count()
-              << " reads=" << reads << " writes=" << writes << " inconsistent=" << ic
-              << " fraction=" << frac << " allowed=" << allowed << "\n";
-
-    if (ic <= allowed)
+    // Allow a tiny number of transient failures, but test should be robust after using stable snapshot.
+    const size_t allowed = std::max<size_t>(1, r / 1000); // 0.1%
+    if (ic > allowed)
     {
-        std::cout << "PASS: inconsistent count within tolerated threshold\n";
-        return 0;
+        std::cerr << "FAIL: observed " << ic << " inconsistent reads (allowed=" << allowed << ")\n";
+        return 1;
     }
 
-    std::cerr << "FAIL: observed " << ic << " inconsistent reads (in_mmap/code_nbits mismatch)\n";
-    return 1;
+    std::cout << "PASS\n";
+    return 0;
 }
