@@ -1,4 +1,3 @@
-// src/core/config.cc
 #include "src/core/config.h"
 #include <cstdlib>
 #include <string>
@@ -38,7 +37,7 @@ namespace pomai::config
         // 1. Hardware defaults first
         set_hardware_defaults();
 
-        // 2. Override with ENV variables
+        // 2. Override with ENV variables (legacy support)
         if (auto v = env_u64("POMAI_PORT")) 
             runtime.default_port = static_cast<std::uint16_t>(*v);
         
@@ -54,12 +53,22 @@ namespace pomai::config
         
         const char *sync_fb = std::getenv("POMAI_DEMOTE_SYNC_FALLBACK");
         if (sync_fb) {
-            runtime.demote_sync_fallback = (std::strcmp(sync_fb, "1") == 0 || strcasecmp(sync_fb, "true") == 0);
+            runtime.demote_sync_fallback = (std::strcmp(sync_fb, "1") == 0 || std::strcmp(sync_fb, "true") == 0 || std::strcmp(sync_fb, "TRUE") == 0);
         }
 
         // Algo Tuning
         if (auto v = env_u64("POMAI_FINGERPRINT_BITS"))
             runtime.fingerprint_bits = static_cast<std::uint32_t>(*v);
+
+        // Optional vector dimension via env (legacy)
+        if (auto v = env_u64("POMAI_DIM"))
+            runtime.dim = static_cast<std::uint32_t>(*v);
+
+        // Optional disable synapse via env (legacy)
+        const char *ds = std::getenv("POMAI_DISABLE_SYNAPSE");
+        if (ds) {
+            runtime.disable_synapse = (std::strcmp(ds, "1") == 0 || std::strcmp(ds, "true") == 0 || std::strcmp(ds, "TRUE") == 0);
+        }
 
         // [FIX] Legacy Map Env Vars (Optional overrides)
         if (auto v = env_u64("POMAI_INITIAL_ENTROPY"))
@@ -70,8 +79,26 @@ namespace pomai::config
 
     void init_from_args(int argc, char **argv)
     {
-        (void)argc;
-        (void)argv;
+        // parse simple CLI flags:
+        // --arena-mb <n>, --shards <n>, --dim <n>, --port <n>, --disable-synapse
+        for (int i = 1; i < argc; ++i) {
+            const char* a = argv[i];
+            if (std::strcmp(a, "--arena-mb") == 0 && i + 1 < argc) {
+                try { runtime.arena_mb_per_shard = static_cast<uint64_t>(std::stoull(argv[++i])); }
+                catch (...) {}
+            } else if (std::strcmp(a, "--shards") == 0 && i + 1 < argc) {
+                try { runtime.shard_count = static_cast<uint32_t>(std::stoul(argv[++i])); }
+                catch (...) {}
+            } else if (std::strcmp(a, "--dim") == 0 && i + 1 < argc) {
+                try { runtime.dim = static_cast<uint32_t>(std::stoul(argv[++i])); }
+                catch (...) {}
+            } else if (std::strcmp(a, "--port") == 0 && i + 1 < argc) {
+                try { runtime.default_port = static_cast<uint16_t>(std::stoul(argv[++i])); }
+                catch (...) {}
+            } else if (std::strcmp(a, "--disable-synapse") == 0) {
+                runtime.disable_synapse = true;
+            }
+        }
     }
 
 } // namespace pomai::config

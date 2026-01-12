@@ -1,5 +1,5 @@
-// src/core/config.h
 #pragma once
+
 #include <cstdint>
 #include <string>
 #include <atomic>
@@ -29,7 +29,7 @@ namespace pomai::config
     constexpr uint8_t SEED_FLAG_INLINE = 0;
     constexpr uint8_t SEED_FLAG_INDIRECT = 0x1;
 
-    // --- Runtime Configuration (Tunable via ENV) ---
+    // --- Runtime Configuration (Tunable via CLI flags or ENV) ---
     struct Runtime
     {
         // 1. Server Basics
@@ -50,6 +50,12 @@ namespace pomai::config
         // 4. Algorithm Tuning (Orbit/SimHash)
         std::uint32_t fingerprint_bits = 512;
         std::uint32_t prefilter_hamming_threshold = 128;
+
+        // NEW: vector dimensionality
+        std::uint32_t dim = 0;
+
+        // NEW: disable synapse codec via flag (no env needed)
+        bool disable_synapse = false;
         
         // [FIX] Restore Map tuning parameters required by src/core/map.h
         std::uint32_t harvest_sample = 5;
