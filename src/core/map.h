@@ -43,7 +43,7 @@ private:
     std::vector<Seed *> table; // array of pointers into the Arena
     uint64_t size;
     uint64_t mask;
-    PomaiArena *arena; // Map does NOT own arena
+    pomai::memory::PomaiArena *arena; // Map does NOT own arena
 
     // Tunables (snapshotted from pomai::config::runtime at construction)
     uint32_t initial_entropy_;
@@ -252,7 +252,7 @@ private:
     }
 
 public:
-    PomaiMap(PomaiArena *a, uint64_t size_power_of_2) : arena(a),
+    PomaiMap(pomai::memory::PomaiArena *a, uint64_t size_power_of_2) : arena(a),
                                                         initial_entropy_(static_cast<uint32_t>(pomai::config::runtime.initial_entropy)),
                                                         max_entropy_(static_cast<uint32_t>(pomai::config::runtime.max_entropy)),
                                                         harvest_sample_(static_cast<int>(pomai::config::runtime.harvest_sample)),
@@ -454,7 +454,7 @@ public:
     Seed *find_seed(const char *key) { return find_seed(key, strlen(key)); }
 
     // Expose arena pointer for external modules (read-only)
-    PomaiArena *get_arena() const { return arena; }
+    pomai::memory::PomaiArena *get_arena() const { return arena; }
 
     // Visitor to iterate initialized seeds (safe snapshot of pointers)
     // Callback is invoked for each Seed* that is non-null and is_initialized().

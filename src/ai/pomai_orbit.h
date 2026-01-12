@@ -1,120 +1,152 @@
-/*
- * src/ai/pomai_orbit.h
- *
- * POMAI ORBIT: The Unified Proprietary Vector Engine.
- *
- * Architecture:
- * 1. Routing Layer (RAM): A custom Navigable Small World (NSW) graph of Centroids.
- * 2. Storage Layer (Arena): "Gravity Buckets" storing contiguous SoA blocks.
- *
- * Philosophy:
- * - Robustness: No complex pointer chasing. Append-only buckets.
- * - Performance: Sequential access patterns optimized for SIMD and SSD prefetching.
- * - Simplicity: Unified mode. No distinction between Index and Storage.
- */
-
 #pragma once
 
 #include <vector>
 #include <atomic>
 #include <shared_mutex>
 #include <memory>
+#include <string>
+#include <filesystem>
+#include <fstream>
 #include <cmath>
+#include <cstdint>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
 
-#include "src/memory/arena.h"
 #include "src/ai/fingerprint.h"
 #include "src/ai/pq.h"
 #include "src/core/config.h"
+#include "src/core/synapse_codec.h"
+#include "src/ai/network_cortex.h" // [NEW] Hệ thần kinh
+
+// Forward-declare both arena flavors to avoid heavy includes here.
+// PomaiArena is the original mmap-backed arena; ShardArena is the newer per-shard bump allocator.
+namespace pomai::memory { class PomaiArena; class ShardArena; }
 
 namespace pomai::ai::orbit
 {
+    // [FIXED] Magic Number hợp lệ (ASCII 'POMA' = 0x504F4D41)
+    struct SchemaHeader {
+        uint32_t magic_number = 0x504F4D41;
+        uint32_t version = 1;
+        uint64_t dim;
+        uint64_t num_centroids;
+        uint64_t total_vectors;
+    };
 
-    // --- Core Constants ---
-    constexpr uint32_t MAX_BUCKET_CAPACITY = 4096; // Fits nicely in hugepages / sequential reads
-    constexpr uint32_t ORBIT_SEED_DIM = 64;        // Dimension of centroids (can be compressed)
-
-    // --- On-Disk Structures (Must be POD / Packed) ---
-
-    // 1. The Bucket Header (Lives at the start of a blob in Arena)
     struct BucketHeader
     {
-        uint32_t centroid_id;        // ID of the centroid owning this bucket
-        std::atomic<uint32_t> count; // Number of vectors currently in this bucket
-        uint64_t next_bucket_offset; // Linked list if bucket overflows (0 = end)
+        uint32_t centroid_id;
+        std::atomic<uint32_t> count;
 
-        // SoA Offsets (Relative to struct start)
+        // next bucket offset (atomic so readers can traverse lock-free)
+        std::atomic<uint64_t> next_bucket_offset;
+
         uint32_t off_fingerprints;
         uint32_t off_pq_codes;
-        uint32_t off_vectors; // Offset to raw float data (optional/cold)
-        uint32_t off_ids;     // Offset to external IDs (labels)
+        uint32_t off_vectors;
+        uint32_t off_ids;
+        float synapse_scale;
+
+        // Freeze/defrost bookkeeping (added fields)
+        // If is_frozen == true then payload was demoted; disk_offset holds remote id (encoded with MSB set)
+        bool is_frozen;
+        uint64_t disk_offset;
+        uint64_t last_access_ms;
     };
 
-    // 2. The Centroid Node (Lives in RAM for Routing)
     struct OrbitNode
     {
-        std::vector<float> vector;       // The centroid vector
-        std::vector<uint32_t> neighbors; // NSW graph connections
-        uint64_t bucket_offset;          // Pointer to the first bucket in Arena
-        std::shared_mutex mu;            // Protects bucket expansion
+        std::vector<float> vector;
+        std::vector<uint32_t> neighbors;
+        std::atomic<uint64_t> bucket_offset{0}; // atomic so readers can snapshot lock-free
+        std::shared_mutex mu;            // writers keep mutex; readers do not take it
     };
 
-    // --- The Engine ---
+    // Small adapter that lets PomaiOrbit call into either PomaiArena or ShardArena
+    // without forcing a single concrete type across the entire codebase.
+    struct ArenaView
+    {
+        ArenaView() : pa(nullptr), sa(nullptr) {}
+        explicit ArenaView(pomai::memory::PomaiArena *a) : pa(a), sa(nullptr) {}
+        explicit ArenaView(pomai::memory::ShardArena *s) : pa(nullptr), sa(s) {}
+
+        char *alloc_blob(uint32_t len) const;
+        uint64_t offset_from_blob_ptr(const char *p) const noexcept;
+        const char *blob_ptr_from_offset_for_map(uint64_t offset) const;
+        std::vector<char> read_remote_blob(uint64_t remote_id) const;
+
+        // helpers to test which is set
+        bool is_pomai_arena() const { return pa != nullptr; }
+        bool is_shard_arena() const { return sa != nullptr; }
+
+    private:
+        pomai::memory::PomaiArena *pa;
+        pomai::memory::ShardArena *sa;
+    };
 
     class PomaiOrbit
     {
     public:
-        // Config
         struct Config
         {
-            size_t dim;
-            size_t num_centroids = 1024; // Default routing complexity
-            size_t m_neighbors = 16;     // Graph connectivity
+            size_t dim = 0;
+            std::string data_path = "./data";
+
+            size_t num_centroids = 0;
+            size_t m_neighbors = 16;
+            bool use_synapse_4bit = true;
+
             bool use_pq = true;
             bool use_fingerprint = true;
+            bool use_kmeans_pp = true;
+            bool adaptive_probe = true;
+
+            // [NETWORK] Có bật tính năng sinh học không?
+            bool use_cortex = true;
         };
 
-        PomaiOrbit(const Config &cfg, pomai::memory::PomaiArena *arena);
+        // Constructors: accept either arena flavor
+        PomaiOrbit(const Config& cfg, pomai::memory::PomaiArena* arena);
+        PomaiOrbit(const Config& cfg, pomai::memory::ShardArena* arena);
         ~PomaiOrbit();
 
-        // --- Core API ---
+        bool train(const float* data, size_t n);
+        bool insert(const float* vec, uint64_t label);
+        std::vector<std::pair<uint64_t, float>> search(const float* query, size_t k, size_t nprobe = 0);
 
-        // Train the routing layer (Centroids + PQ).
-        // Must be called once before inserting massive data.
-        bool train(const float *data, size_t n);
+        // New: random-access get/remove by label for training & lifecycle ops
+        bool get(uint64_t label, std::vector<float>& out_vec);
+        bool remove(uint64_t label);
 
-        // Insert a vector.
-        // 1. Search Orbit Graph -> Find nearest Centroid.
-        // 2. Append to that Centroid's Bucket.
-        bool insert(const float *vec, uint64_t label);
-
-        // Search.
-        // 1. Search Orbit Graph -> Find 'nprobe' nearest Centroids.
-        // 2. Scan those Buckets (Fingerprint -> PQ -> Exact).
-        std::vector<std::pair<uint64_t, float>> search(const float *query, size_t k, size_t nprobe = 3);
-
-        // Durability
-        bool save_routing(const std::string &path);
-        bool load_routing(const std::string &path);
+        void save_schema();
+        bool load_schema();
+        bool save_routing(const std::string& path);
+        bool load_routing(const std::string& path);
 
     private:
         Config cfg_;
-        pomai::memory::PomaiArena *arena_;
-
-        // AI Components
+        ArenaView arena_;                      // unified view to underlying arena
         std::unique_ptr<ProductQuantizer> pq_;
         std::unique_ptr<FingerprintEncoder> fp_;
+        std::vector<std::unique_ptr<OrbitNode>> centroids_;
 
-        // Routing Graph (In-Memory)
-        std::vector<OrbitNode> centroids_;
+        std::unique_ptr<NetworkCortex> cortex_;
 
-        // Helper: Find closest centroid to a vector (Greedy Graph Search)
-        uint32_t find_nearest_centroid(const float *vec);
+        uint32_t dynamic_bucket_capacity_ = 128;
+        std::string schema_file_path_;
 
-        // Helper: Find Top-N closest centroids (Beam Search)
-        std::vector<uint32_t> find_routing_centroids(const float *vec, size_t n);
+        // In-memory index: Label -> blob offset (fast VGET)
+        std::unordered_map<uint64_t, uint64_t> label_to_bucket_;
+        mutable std::shared_mutex label_map_mu_;
 
-        // Helper: Allocate a new bucket in Arena and link it
+        // Soft-deleted labels set
+        std::unordered_set<uint64_t> deleted_labels_;
+        mutable std::shared_mutex del_mu_;
+
+        uint32_t find_nearest_centroid(const float* vec);
+        std::vector<uint32_t> find_routing_centroids(const float* vec, size_t n);
         uint64_t alloc_new_bucket(uint32_t centroid_id);
+        void init_centroids_kmeans_pp(const float* data, size_t n, size_t k, std::vector<size_t>& indices, std::mt19937& rng);
     };
-
-} // namespace pomai::ai::orbit
+}

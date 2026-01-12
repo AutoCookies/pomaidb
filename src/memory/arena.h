@@ -161,6 +161,11 @@ namespace pomai::memory
         // UINT64_MAX on failure.
         uint64_t promote_remote(uint64_t remote_id);
 
+        // [NEW] Read remote blob content into a temporary buffer (RAM).
+        // Used for on-the-fly search of frozen buckets without permanent promotion.
+        // Returns a vector containing the full blob (header + payload). Empty on failure.
+        std::vector<char> read_remote_blob(uint64_t remote_id) const;
+
         // Resolve pending placeholder remote id to final remote id if the async demote completed.
         // Returns 0 if not yet completed or if not found.
         uint64_t resolve_pending_remote(uint64_t placeholder_remote_id) const;
@@ -270,8 +275,3 @@ namespace pomai::memory
     };
 
 } // namespace pomai::memory
-
-// Provide a legacy unqualified alias in the global namespace so older code that
-// refers to `PomaiArena` (without namespace) continues to compile. This mirrors
-// the class into the global namespace as an alias, not a new type.
-using PomaiArena = pomai::memory::PomaiArena;

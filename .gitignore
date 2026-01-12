@@ -10,7 +10,6 @@ cache-server
 *.exe
 *.test
 *.out
-.history
 
 # Không ignore go.sum! 
 # go.sum  <-- ĐỪNG IGNORE CÁI NÀY
@@ -30,3 +29,9 @@ cpu.prof
 coverage.out
 build
 *.mmap
+*.log
+*.prof
+*.csv
+./build
+./data
+./.history

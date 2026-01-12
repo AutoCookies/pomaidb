@@ -1,11 +1,15 @@
-// sharding/shard.h
 #pragma once
+// src/core/shard.h
+//
+// Lightweight Shard wrapper owning a PomaiArena and a PomaiMap.
+// Keeps construction simple and throws on allocation failure.
 
 #include <memory>
 #include <stdexcept>
 #include <iostream>
-#include "src/core/map.h"
+
 #include "src/memory/arena.h"
+#include "src/core/map.h"
 
 namespace pomai::core
 {
@@ -23,7 +27,6 @@ namespace pomai::core
         // Constructor expects arena size in GB and the number of map slots (power of two).
         Shard(double size_gb, uint64_t map_slots)
         {
-            // PomaiArena is in pomai::memory namespace
             auto a = pomai::memory::PomaiArena::FromGB(size_gb);
             if (!a.is_valid())
             {
