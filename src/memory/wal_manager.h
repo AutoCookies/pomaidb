@@ -22,8 +22,10 @@ namespace pomai::memory
     // Record types (extend as needed)
     enum WalRecordType : uint16_t
     {
-        WAL_REC_IDS_UPDATE = 1,   // payload: struct { uint64_t idx; uint64_t value; }
-        WAL_REC_CHECKPOINT = 100, // optional checkpoint record
+        WAL_REC_IDS_UPDATE = 1,        // payload: struct { uint64_t idx; uint64_t value; }
+        WAL_REC_CREATE_MEMBRANCE = 10, // payload: text "name|dim|ram_mb"
+        WAL_REC_DROP_MEMBRANCE = 11,   // payload: text "name"
+        WAL_REC_CHECKPOINT = 100       // optional checkpoint record (manifest snapshot)
     };
 
     struct WalConfig
@@ -69,7 +71,7 @@ namespace pomai::memory
         // Returns true on success, false on fatal error (e.g., I/O error).
         bool replay(const std::function<bool(uint16_t, const void *, uint32_t, uint64_t)> &apply_cb);
 
-        // Truncate WAL file to zero length. Safe to call after successful replay.
+        // Truncate WAL file to zero length. Safe to call after successful replay / snapshot.
         bool truncate_to_zero();
 
         // Path accessors for tests/observability

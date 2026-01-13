@@ -1,486 +1,473 @@
 #!/usr/bin/env python3
 """
-benchmarks/benchmark_vs.py
+benchmarks/benchmark_q1_paper.py
+--------------------------------
+POMAIDB SCIENTIFIC BENCHMARK SUITE (Q1 PAPER GRADE)
+--------------------------------
+Mục tiêu: Tạo ra bộ dữ liệu và biểu đồ đạt chuẩn công bố khoa học (IEEE/ACM).
 
-Comprehensive benchmark runner for Pomai server (Raw vs Synapse modes).
+Các chỉ số đo lường (Metrics):
+1. Throughput (QPS): Scalability theo kích thước dữ liệu.
+2. Latency Profile: P50, P95, P99, P99.9 (Tail Latency), StdDev.
+3. Resource Efficiency: CPU/RAM time-series correlation.
+4. Latency Distribution: CDF (Cumulative Distribution Function).
 
-Features:
-- Start/stop server binary with environment overrides.
-- Insert (VSET), Get (VGET), Delete (VDEL), and Search (VSEARCH) benchmarks.
-- Supports concurrent search clients to measure throughput & latency distributions.
-- Collects process memory/cpu (via psutil) and writes CSV summary.
-- Configurable via CLI args and environment variables.
-
-Usage examples:
-  # Run default benchmark (1M vectors, dim 512) for both Raw and Synapse modes
-  python3 benchmarks/benchmark_vs.py --vectors 1000000 --dim 512
-
-  # Only run Synapse mode with 100k vectors
-  python3 benchmarks/benchmark_vs.py --mode syn --vectors 100000 --dim 128
-
-Notes:
-- Requires psutil (pip install psutil) for memory/cpu stats.
-- Ensure SERVER_BIN points to built server binary (default ./build/pomai-server).
+Yêu cầu: python3-numpy, python3-matplotlib, python3-psutil
 """
 
-from __future__ import annotations
-
-import argparse
-import csv
-import os
 import socket
-import struct
-import subprocess
-import sys
-import threading
 import time
 import random
+import threading
+import csv
+import os
+import sys
 import statistics
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+import datetime
+from typing import List, Dict, Tuple
 
 try:
     import psutil
-except Exception:
-    psutil = None
+    import matplotlib.pyplot as plt
+    import numpy as np
+except ImportError as e:
+    print(f"ERROR: Thiếu thư viện khoa học. Hãy cài đặt: {e.name}")
+    print("Run: sudo apt install python3-numpy python3-matplotlib python3-psutil")
+    sys.exit(1)
 
-# ---------------- Default configuration ----------------
-DEFAULT_HOST = os.environ.get("POMAI_BENCH_HOST", "127.0.0.1")
-DEFAULT_PORT = int(os.environ.get("POMAI_BENCH_PORT", "7777"))
-DEFAULT_SERVER_BIN = os.environ.get("POMAI_SERVER_BIN", "./build/pomai-server")
+# --- CONFIGURATION ---
+HOST = "127.0.0.1"
+PORT = 7777
+SERVER_BIN_NAME = "pomai_server" # Tên process chính xác của server
 
-# ---------------- RESP helpers ----------------
-def build_resp_command(parts: List[bytes]) -> bytes:
-    # parts: list of byte strings (each is an argument)
-    out = bytearray()
-    out += b"*" + str(len(parts)).encode() + b"\r\n"
-    for p in parts:
-        out += b"$" + str(len(p)).encode() + b"\r\n"
-        out += p + b"\r\n"
-    return bytes(out)
+# Experimental Parameters
+DIM = 512
+WARMUP_VECTORS = 2000
+MILESTONES = [10000, 50000, 100000, 200000, 500000, 1000000] # Tăng lên nếu máy mạnh: [100k, 500k, 1M]
+SEARCH_TRIALS = 5000  # Số lần search để lấy mẫu thống kê (N > 1000 cho định lý giới hạn trung tâm)
+CONCURRENCY = 1       # Single-thread client để đo Raw Latency chính xác nhất (Latency-focus)
 
-# ---------------- Simple TCP client ----------------
-class PomaiClient:
-    def __init__(self, host: str, port: int, timeout: float = 5.0):
+# Output
+OUTPUT_DIR = "pomai_scientific_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# --- HIGH-PRECISION SYSTEM MONITOR ---
+class SystemMonitor(threading.Thread):
+    """
+    Thu thập dữ liệu hệ thống với độ phân giải cao (High-resolution Telemetry)
+    Chạy song song với Benchmark để tương quan giữa Load và Resource.
+    """
+    def __init__(self, target_process_name, interval=0.1):
+        super().__init__()
+        self.target_name = target_process_name
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.history = {
+            "timestamp": [],
+            "cpu_percent": [],
+            "ram_mb": [],
+            "phase": [] # Ghi chú giai đoạn (Insert/Search)
+        }
+        self.current_phase = "Init"
+        self.process = None
+        self._find_process()
+
+    def _find_process(self):
+        for proc in psutil.process_iter(['pid', 'name']):
+            if self.target_name in proc.info['name']:
+                self.process = proc
+                print(f"[SystemMonitor] Attached to PID {proc.info['pid']}")
+                return
+        print(f"[SystemMonitor] WARNING: Process '{self.target_name}' not found. RAM/CPU will be 0.")
+
+    def set_phase(self, phase_name):
+        self.current_phase = phase_name
+
+    def run(self):
+        start_time = time.time()
+        while not self.stop_event.is_set():
+            now = time.time() - start_time
+            cpu = 0.0
+            mem = 0.0
+            if self.process:
+                try:
+                    # with_children=True để tính cả các thread con
+                    cpu = self.process.cpu_percent(interval=None) 
+                    mem = self.process.memory_info().rss / (1024 * 1024)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    self.process = None # Process died?
+
+            self.history["timestamp"].append(now)
+            self.history["cpu_percent"].append(cpu)
+            self.history["ram_mb"].append(mem)
+            self.history["phase"].append(self.current_phase)
+            
+            time.sleep(self.interval)
+
+    def stop(self):
+        self.stop_event.set()
+
+# --- OPTIMIZED SQL CLIENT ---
+class ScientificClient:
+    def __init__(self, host, port):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1) # Tắt Nagle's alg cho low latency
+        self.sock.settimeout(60.0)
         self.host = host
         self.port = port
-        self.timeout = timeout
-        self.sock: Optional[socket.socket] = None
-        self.lock = threading.Lock()
+        self.recv_buf = bytearray()
 
-    def connect(self, retries: int = 10, wait: float = 0.5) -> bool:
-        for _ in range(retries):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                s.connect((self.host, self.port))
-                s.settimeout(self.timeout)
-                self.sock = s
-                return True
-            except Exception:
-                time.sleep(wait)
-        return False
-
-    def close(self) -> None:
+    def connect(self):
         try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-        self.sock = None
-
-    def send(self, data: bytes) -> None:
-        if not self.sock:
-            raise RuntimeError("socket not connected")
-        mv = memoryview(data)
-        sent = 0
-        while sent < len(data):
-            n = self.sock.send(mv[sent:])
-            if n == 0:
-                raise RuntimeError("socket send returned 0")
-            sent += n
-
-    def recv_some(self, maxbytes: int = 65536) -> bytes:
-        if not self.sock:
-            return b""
-        try:
-            return self.sock.recv(maxbytes) or b""
-        except socket.timeout:
-            return b""
-        except Exception:
-            return b""
-
-    def send_and_recv(self, data: bytes, expect_lines: int = 1, timeout: float = 5.0) -> bytes:
-        # thread-safe send+recv for simple usages
-        with self.lock:
-            self.send(data)
-            # collect until we see at least expect_lines newlines or timeout
-            deadline = time.time() + timeout
-            buf = bytearray()
-            while time.time() < deadline and buf.count(b"\n") < expect_lines:
-                chunk = self.recv_some(65536)
-                if chunk:
-                    buf.extend(chunk)
-                else:
-                    time.sleep(0.001)
-            return bytes(buf)
-
-# ---------------- Process utils ----------------
-def start_server(bin_path: str, env: Dict[str, str], stdout_path: str = "pomai_server_stdout.log",
-                 stderr_path: str = "pomai_server_stderr.log") -> subprocess.Popen:
-    env_copy = os.environ.copy()
-    env_copy.update(env)
-    # ensure port env variable if provided
-    stdout_f = open(stdout_path, "ab")
-    stderr_f = open(stderr_path, "ab")
-    proc = subprocess.Popen([bin_path], env=env_copy, stdout=stdout_f, stderr=stderr_f)
-    return proc
-
-def stop_server(proc: subprocess.Popen, timeout: float = 3.0) -> None:
-    try:
-        proc.terminate()
-        proc.wait(timeout=timeout)
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-def get_process_stats(pid: int) -> Tuple[float, float]:
-    if psutil is None:
-        return (0.0, 0.0)
-    try:
-        p = psutil.Process(pid)
-        mem_mb = p.memory_info().rss / (1024.0 * 1024.0)
-        # cpu_percent requires a prior interval; use a small sample
-        cpu_pct = p.cpu_percent(interval=0.1)
-        return (mem_mb, cpu_pct)
-    except Exception:
-        return (0.0, 0.0)
-
-def vset_batch(client: PomaiClient, start_idx: int, count: int, dim: int, key_prefix: str = "key",
-               max_retries: int = 3) -> None:
-    """
-    Send count VSET commands in a single TCP stream. On BrokenPipe/socket error,
-    try to reconnect and resend the batch up to max_retries times.
-    """
-    parts = []
-    for i in range(start_idx, start_idx + count):
-        key = f"{key_prefix}:{i}".encode()
-        vec = [random.random() for _ in range(dim)]
-        vec_bytes = struct.pack(f"{dim}f", *vec)
-        cmd = build_resp_command([b"VSET", key, vec_bytes])
-        parts.append(cmd)
-    data = b"".join(parts)
-
-    retries = 0
-    while True:
-        try:
-            client.send(data)
-            # read back responses (one line per VSET). We'll read until we've got 'count' lines or timeout.
-            deadline = time.time() + max(10.0, 0.05 * count)
-            lines = 0
-            buf = bytearray()
-            while time.time() < deadline and lines < count:
-                chunk = client.recv_some(65536)
-                if not chunk:
-                    time.sleep(0.001)
-                    continue
-                buf.extend(chunk)
-                lines = buf.count(b"\n")
-            return
-        except BrokenPipeError:
-            retries += 1
-            if retries > max_retries:
-                raise
-            # attempt reconnect
-            client.close()
-            time.sleep(0.2)
-            if not client.connect(retries=5, wait=0.2):
-                raise RuntimeError("vset_batch: failed to reconnect to server after BrokenPipe")
-            # on reconnect, retry sending the batch
+            self.sock.connect((self.host, self.port))
+            return True
         except OSError as e:
-            # Generic socket error: try reconnect similarly
-            retries += 1
-            if retries > max_retries:
-                raise
-            client.close()
-            time.sleep(0.2)
-            if not client.connect(retries=5, wait=0.2):
-                raise RuntimeError(f"vset_batch: socket error and reconnect failed: {e}")
+            print(f"[Client] Connection failed: {e}")
+            return False
 
+    def close(self):
+        self.sock.close()
 
-def insert_vectors_streaming(client: PomaiClient, total: int, dim: int, batch_size: int,
-                             key_prefix: str = "key") -> Tuple[float, List[float]]:
-    """
-    Insert `total` vectors via VSET in batches. On batch failure we attempt reconnect and retry
-    each batch up to a few times. Returns overall QPS (based on successfully sent vectors) and per-batch durations.
-    """
-    batch_times = []
-    t_start = time.time()
-    sent = 0
-    while sent < total:
-        cur = min(batch_size, total - sent)
-        t0 = time.time()
-        try:
-            vset_batch(client, sent, cur, dim, key_prefix)
-        except Exception as e:
-            # If server died, propagate to caller after printing helpful diagnostics.
-            print(f"[bench] Error sending batch starting at {sent}: {e!r}")
-            print("[bench] Check server logs: pomai_server_stdout.log and pomai_server_stderr.log")
-            # compute partial QPS from what we sent successfully so far
-            t_now = time.time()
-            elapsed = max(1e-6, t_now - t_start)
-            qps = sent / elapsed
-            return qps, batch_times
-        t1 = time.time()
-        batch_times.append(t1 - t0)
-        sent += cur
-    t_end = time.time()
-    total_time = max(1e-6, t_end - t_start)
-    qps = total / total_time
-    return qps, batch_times
+    def send_raw(self, data: bytes):
+        self.sock.sendall(data)
 
-def vget_one(client: PomaiClient, label_or_key: str, expect_bytes: Optional[int] = None) -> Tuple[float, bool]:
-    cmd = build_resp_command([b"VGET", label_or_key.encode()])
-    t0 = time.time()
-    client.send_and_recv(cmd, expect_lines=1, timeout=2.0)
-    t1 = time.time()
-    return (t1 - t0) * 1000.0, True
+    def recv_response_exact(self):
+        """Đọc chính xác một phản hồi (dựa vào marker <END>)"""
+        marker = b"<END>\n"
+        while True:
+            if marker in self.recv_buf:
+                idx = self.recv_buf.find(marker)
+                resp = self.recv_buf[:idx]
+                self.recv_buf = self.recv_buf[idx+len(marker):]
+                return resp
+            
+            chunk = self.sock.recv(65536)
+            if not chunk: raise ConnectionError("Socket closed unexpected")
+            self.recv_buf.extend(chunk)
 
-def vdel_one(client: PomaiClient, label_or_key: str) -> Tuple[float, bool]:
-    cmd = build_resp_command([b"VDEL", label_or_key.encode()])
-    t0 = time.time()
-    client.send_and_recv(cmd, expect_lines=1, timeout=2.0)
-    t1 = time.time()
-    return (t1 - t0) * 1000.0, True
+# --- EXPERIMENT LOGIC ---
 
-def vsearch_one(client: PomaiClient, dim: int, topk: int) -> Tuple[float, bool]:
-    query = struct.pack(f"{dim}f", *[random.random() for _ in range(dim)])
-    cmd = build_resp_command([b"VSEARCH", query, str(topk).encode()])
-    t0 = time.time()
-    resp = client.send_and_recv(cmd, expect_lines=1, timeout=5.0)
-    t1 = time.time()
-    # crude check: response should start with '*' for array
-    ok = resp.startswith(b"*")
-    return (t1 - t0) * 1000.0, ok
-
-def concurrent_search_benchmark(host: str, port: int, dim: int, topk: int, iters: int, concurrency: int) -> Dict:
-    """
-    Run `iters` searches distributed among `concurrency` worker threads; measure latencies and throughput.
-    Returns dict with latencies list and total_ops/sec.
-    """
-    latencies: List[float] = []
-    successes = 0
-    lock = threading.Lock()
-
-    def worker(run_count: int):
-        nonlocal successes
-        c = PomaiClient(host, port)
-        if not c.connect(retries=3):
-            return
-        for _ in range(run_count):
-            try:
-                lat_ms, ok = vsearch_one(c, dim, topk)
-                with lock:
-                    latencies.append(lat_ms)
-                    if ok:
-                        successes += 1
-            except Exception:
-                with lock:
-                    latencies.append(9999.0)
-        c.close()
-
-    per_thread = max(1, iters // concurrency)
-    threads = []
-    t0 = time.time()
-    for i in range(concurrency):
-        t = threading.Thread(target=worker, args=(per_thread,))
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
-    t1 = time.time()
-    duration = max(1e-6, t1 - t0)
-    total_ops = len(latencies)
-    qps = total_ops / duration
-    return {"latencies_ms": latencies, "qps": qps, "successes": successes}
-
-# ---------------- Reporting ----------------
-def summarize_latencies(latencies: List[float]) -> Dict[str, float]:
-    if not latencies:
-        return {}
-    sorted_l = sorted(latencies)
-    n = len(sorted_l)
-    def pct(p):
-        idx = min(n - 1, max(0, int(p * n) - 1))
-        return sorted_l[idx]
-    return {
-        "count": n,
-        "mean_ms": statistics.mean(sorted_l),
-        "median_ms": statistics.median(sorted_l),
-        "p90_ms": pct(0.90),
-        "p95_ms": pct(0.95),
-        "p99_ms": pct(0.99),
-        "max_ms": max(sorted_l),
-    }
-
-def save_csv_summary(rows: List[Dict], path: str) -> None:
-    if not rows:
-        return
-    keys = sorted(rows[0].keys())
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-    print(f"Saved CSV summary to {path}")
-
-# ---------------- Orchestrate a test case (mode) ----------------
-def run_mode(mode: str, server_bin: str, port: int, vectors: int, dim: int, batch: int,
-             search_iters: int, search_concurrency: int, topk: int,
-             arena_mb: Optional[int]) -> Dict:
-    """
-    mode: "raw" or "syn"
-    """
-    print(f"\n=== Mode: {mode} ===")
-    env = {"POMAI_PORT": str(port)}
-    if arena_mb:
-        env["POMAI_ARENA_MB"] = str(arena_mb)
-    if mode == "raw":
-        env["POMAI_DISABLE_SYNAPSE"] = "1"
-    else:
-        env.pop("POMAI_DISABLE_SYNAPSE", None)
-    # Start server
-    proc = start_server(server_bin, env)
-    time.sleep(2.0)  # wait for server to initialize
-    if proc.poll() is not None:
-        print("Server process exited unexpectedly; check logs.")
-        return {}
-
-    client = PomaiClient(DEFAULT_HOST, port)
-    if not client.connect(retries=10):
-        print("Failed to connect client to server")
-        stop_server(proc)
-        return {}
-
-    # Warmup / ensure server ready
-    # send a small VSET
+def generate_vector_pool(size, dim):
+    """Sinh vector trước để không tốn CPU lúc đo"""
+    print(f"[Generator] Pre-generating {size} vectors (Dim={dim})...")
+    # Sử dụng numpy để sinh nhanh nếu có, fallback về list comprehension
     try:
-        key = b"__bench_init__"
-        vec = struct.pack(f"{dim}f", *([0.0] * dim))
-        client.send(build_resp_command([b"VSET", key, vec]))
-        _ = client.recv_some(4096)
-    except Exception:
-        pass
+        data = np.random.rand(size, dim).astype(np.float32)
+        # Convert to string format for SQL
+        return [",".join(map(lambda x: f"{x:.4f}", row)) for row in data]
+    except:
+        return [",".join(f"{random.random():.4f}" for _ in range(dim)) for _ in range(size)]
 
-    # 1) Insert benchmark
-    t_ins_start = time.time()
-    qps_ins, batch_times = insert_vectors_streaming(client, vectors, dim, batch)
-    t_ins_end = time.time()
-    mem_mb_before, cpu_before = get_process_stats(proc.pid)
-    print(f"Insert done: qps_insert={qps_ins:.2f}, elapsed={t_ins_end - t_ins_start:.2f}s")
-
-    # 2) Search benchmark (concurrent)
-    search_res = concurrent_search_benchmark(DEFAULT_HOST, port, dim, topk, search_iters, search_concurrency)
-    lat_summary = summarize_latencies(search_res["latencies_ms"])
-    print(f"Search: qps_search={search_res['qps']:.2f}, mean_lat={lat_summary.get('mean_ms',0):.2f}ms p95={lat_summary.get('p95_ms',0):.2f}ms")
-
-    # 3) VGET spot-check (10 random)
-    get_lats = []
-    for _ in range(10):
-        idx = random.randrange(0, vectors)
-        key = f"key:{idx}"
-        lm, ok = vget_one(client, key)
-        get_lats.append(lm)
-
-    # 4) VDEL spot-check (10 random)
-    del_lats = []
-    for _ in range(10):
-        idx = random.randrange(0, vectors)
-        key = f"key:{idx}"
-        lm, ok = vdel_one(client, key)
-        del_lats.append(lm)
-
-    mem_mb_after, cpu_after = get_process_stats(proc.pid)
-
-    client.close()
-    stop_server(proc)
-
-    result = {
-        "mode": mode,
-        "insert_qps": qps_ins,
-        "insert_time_s": (t_ins_end - t_ins_start),
-        "search_qps": search_res["qps"],
-        "search_mean_ms": lat_summary.get("mean_ms", 0.0),
-        "search_p95_ms": lat_summary.get("p95_ms", 0.0),
-        "get_mean_ms": statistics.mean(get_lats) if get_lats else 0.0,
-        "del_mean_ms": statistics.mean(del_lats) if del_lats else 0.0,
-        "mem_mb_before": mem_mb_before,
-        "mem_mb_after": mem_mb_after,
-        "cpu_before": cpu_before,
-        "cpu_after": cpu_after,
+def calculate_statistics(latencies_ms: List[float]) -> Dict:
+    """Tính toán các chỉ số thống kê nâng cao"""
+    arr = np.array(latencies_ms)
+    return {
+        "min": np.min(arr),
+        "max": np.max(arr),
+        "avg": np.mean(arr),
+        "std_dev": np.std(arr),
+        "p50": np.percentile(arr, 50),
+        "p90": np.percentile(arr, 90),
+        "p95": np.percentile(arr, 95),
+        "p99": np.percentile(arr, 99),
+        "p99_9": np.percentile(arr, 99.9), # Tail latency quan trọng
+        "samples": len(arr)
     }
-    return result
 
-# ---------------- CLI ----------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Pomai benchmark runner (Raw vs Synapse)")
-    p.add_argument("--server-bin", default=DEFAULT_SERVER_BIN, help="Path to pomai-server binary")
-    p.add_argument("--host", default=DEFAULT_HOST)
-    p.add_argument("--port", type=int, default=DEFAULT_PORT)
-    p.add_argument("--mode", choices=["both", "raw", "syn"], default="both")
-    p.add_argument("--vectors", type=int, default=100000, help="Number of vectors to insert for the test")
-    p.add_argument("--dim", type=int, default=128, help="Vector dimensionality")
-    p.add_argument("--batch", type=int, default=200, help="Insert batch size")
-    p.add_argument("--search-iters", type=int, default=1000, help="Total search operations for benchmark")
-    p.add_argument("--concurrency", type=int, default=4, help="Concurrent search clients")
-    p.add_argument("--topk", type=int, default=10)
-    p.add_argument("--arena-mb-raw", type=int, default=4096, help="Arena MB for raw mode")
-    p.add_argument("--arena-mb-syn", type=int, default=1024, help="Arena MB for syn mode")
-    p.add_argument("--csv-out", default="pomai_benchmark_summary.csv")
-    return p.parse_args()
+def run_scientific_suite():
+    monitor = SystemMonitor(SERVER_BIN_NAME)
+    monitor.start()
+    
+    client = ScientificClient(HOST, PORT)
+    if not client.connect():
+        monitor.stop()
+        return None
 
-def main():
-    args = parse_args()
-    global DEFAULT_HOST, DEFAULT_PORT
-    DEFAULT_HOST = args.host
-    DEFAULT_PORT = args.port
+    MEMBR = "pomai_research_db"
+    results = [] # List of dicts storing metrics per milestone
 
-    modes = []
-    if args.mode == "both":
-        modes = ["raw", "syn"]
-    else:
-        modes = [args.mode]
+    try:
+        # 1. INIT
+        print("=== [PHASE 0] Initialization & Warmup ===")
+        client.send_raw(f"DROP MEMBRANCE {MEMBR};\n".encode())
+        client.recv_response_exact() # Ignore err if not exists
+        
+        # Cấp phát bộ nhớ lớn để tránh realloc trong quá trình đo
+        client.send_raw(f"CREATE MEMBRANCE {MEMBR} DIM {DIM} RAM 2048;\n".encode())
+        print(client.recv_response_exact().decode())
 
-    results = []
-    for m in modes:
-        arena_mb = args.arena_mb_raw if m == "raw" else args.arena_mb_syn
-        res = run_mode(m, args.server_bin, args.port, args.vectors, args.dim, args.batch,
-                       args.search_iters, args.concurrency, args.topk, arena_mb)
-        if res:
-            results.append(res)
+        # Warmup: Nạp một ít dữ liệu để nóng cache CPU/OS
+        monitor.set_phase("Warmup")
+        w_pool = generate_vector_pool(WARMUP_VECTORS, DIM)
+        for i, v in enumerate(w_pool):
+            client.send_raw(f"INSERT INTO {MEMBR} VALUES (w_{i}, [{v}]);\n".encode())
+            client.recv_response_exact()
+        print("-> Warmup complete.")
 
-    # Save CSV
-    rows = []
-    for r in results:
-        row = {
-            "mode": r.get("mode", ""),
-            "insert_qps": r.get("insert_qps", 0.0),
-            "insert_time_s": r.get("insert_time_s", 0.0),
-            "search_qps": r.get("search_qps", 0.0),
-            "search_mean_ms": r.get("search_mean_ms", 0.0),
-            "search_p95_ms": r.get("search_p95_ms", 0.0),
-            "get_mean_ms": r.get("get_mean_ms", 0.0),
-            "del_mean_ms": r.get("del_mean_ms", 0.0),
-            "mem_mb_before": r.get("mem_mb_before", 0.0),
-            "mem_mb_after": r.get("mem_mb_after", 0.0),
-            "cpu_before": r.get("cpu_before", 0.0),
-            "cpu_after": r.get("cpu_after", 0.0),
-        }
-        rows.append(row)
-    save_csv_summary(rows, args.csv_out)
-    print("Done.")
+        current_count = WARMUP_VECTORS
+        
+        # 2. MAIN LOOP
+        query_pool = generate_vector_pool(100, DIM) # 100 queries mẫu tái sử dụng
+
+        for target in MILESTONES:
+            monitor.set_phase(f"Idle_{target}")
+            time.sleep(2.0) # Cool-down giữa các mốc để CPU hạ nhiệt, ổn định baseline
+
+            needed = target - current_count
+            if needed > 0:
+                print(f"\n=== [MILESTONE] Scaling to {target:,} vectors (Adding {needed:,}) ===")
+                monitor.set_phase(f"Insert_{target}")
+                
+                # --- INSERT MEASUREMENT (Throughput Focus) ---
+                # Dùng batch lớn để đo max throughput của server
+                batch_pool = generate_vector_pool(min(needed, 5000), DIM)
+                pool_len = len(batch_pool)
+                
+                t_start = time.time()
+                batch_size = 200 # Pipeline depth
+                
+                for i in range(0, needed, batch_size):
+                    cmds = []
+                    this_batch = min(batch_size, needed - i)
+                    for j in range(this_batch):
+                        idx = current_count + i + j
+                        vec = batch_pool[idx % pool_len]
+                        cmds.append(f"INSERT INTO {MEMBR} VALUES (k_{idx}, [{vec}]);")
+                    
+                    payload = "\n".join(cmds) + "\n"
+                    client.send_raw(payload.encode())
+                    
+                    # Consume responses
+                    for _ in range(this_batch):
+                        client.recv_response_exact()
+                
+                dur = time.time() - t_start
+                insert_qps = needed / dur
+                print(f"-> Insert Done. Throughput: {insert_qps:.2f} vectors/s")
+                current_count = target
+            
+            # --- SEARCH MEASUREMENT (Latency Focus) ---
+            print(f"=== [MEASURE] Searching @ {target:,} vectors ===")
+            monitor.set_phase(f"Search_{target}")
+            
+            latencies = []
+            
+            # Đo từng query một (Ping-Pong) để lấy chính xác Latency phía Client
+            # Không dùng Pipelining ở đây vì muốn đo độ trễ thực tế của từng request.
+            for k in range(SEARCH_TRIALS):
+                q_vec = query_pool[k % 100]
+                cmd = f"SEARCH {MEMBR} QUERY ([{q_vec}]) TOP 10;\n"
+                
+                t0 = time.time()
+                client.send_raw(cmd.encode())
+                resp = client.recv_response_exact()
+                t1 = time.time()
+                
+                latencies.append((t1 - t0) * 1000.0) # ms
+            
+            stats = calculate_statistics(latencies)
+            print(f"-> Latency Profile: Avg={stats['avg']:.2f}ms | P99={stats['p99']:.2f}ms | Tail(P99.9)={stats['p99_9']:.2f}ms")
+            
+            # Snapshot Resource usage tại thời điểm này
+            # Lấy trung bình RAM trong giai đoạn search vừa rồi
+            idx_start = -1
+            try:
+                # Tìm index trong history bắt đầu phase search hiện tại
+                rev_phases = list(reversed(monitor.history["phase"]))
+                offset = rev_phases.index(f"Search_{target}")
+                idx_start = len(monitor.history["phase"]) - 1 - offset
+            except ValueError:
+                idx_start = -1
+            
+            ram_avg = 0
+            if idx_start != -1:
+                segment = monitor.history["ram_mb"][idx_start:]
+                if segment: ram_avg = np.mean(segment)
+
+            results.append({
+                "vectors": target,
+                "insert_qps": insert_qps if needed > 0 else 0,
+                "search_qps": SEARCH_TRIALS / (sum(latencies)/1000.0), # Derived QPS from sequential latency
+                "stats": stats,
+                "ram_mb": ram_avg,
+                "raw_latencies": latencies # Lưu lại để vẽ Boxplot/CDF
+            })
+
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted by user.")
+    except Exception as e:
+        print(f"\n[!] Exception: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\n[TEARDOWN] Stopping monitor and closing connection...")
+        monitor.stop()
+        monitor.join()
+        try:
+            client.send_raw(f"DROP MEMBRANCE {MEMBR};\n".encode())
+            client.close()
+        except: pass
+
+    return results, monitor.history
+
+# --- SCIENTIFIC PLOTTING (MATPLOTLIB) ---
+
+def generate_report(res_data, sys_data):
+    print(f"\n=== Generating Scientific Report in '{OUTPUT_DIR}' ===")
+    
+    # Style configuration for Paper (IEEE style ish)
+    plt.rcParams.update({
+        'font.family': 'serif',
+        'font.size': 10,
+        'axes.labelsize': 11,
+        'axes.titlesize': 12,
+        'xtick.labelsize': 10,
+        'ytick.labelsize': 10,
+        'legend.fontsize': 10,
+        'figure.titlesize': 14
+    })
+
+    # Data prep
+    vectors = [r['vectors'] for r in res_data]
+    
+    # ---------------------------------------------------------
+    # FIG 1: Scalability & Throughput (QPS vs Data Size)
+    # ---------------------------------------------------------
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    ax1.set_title("Fig 1. Search Scalability Analysis")
+    ax1.set_xlabel("Database Size (Vectors)")
+    ax1.set_ylabel("Search Latency (ms)")
+    ax1.grid(True, linestyle='--', alpha=0.5)
+
+    # Plot Latencies
+    p50 = [r['stats']['p50'] for r in res_data]
+    p99 = [r['stats']['p99'] for r in res_data]
+    p999 = [r['stats']['p99_9'] for r in res_data]
+
+    l1, = ax1.plot(vectors, p50, 'o-', color='#2ca02c', label='P50 (Median)')
+    l2, = ax1.plot(vectors, p99, 's-', color='#1f77b4', label='P99 Latency')
+    l3, = ax1.plot(vectors, p999, '^--', color='#d62728', label='P99.9 (Tail)')
+
+    ax1.legend(handles=[l1, l2, l3], loc='upper left')
+    
+    # Secondary Axis for QPS
+    ax2 = ax1.twinx()
+    search_qps = [r['search_qps'] for r in res_data]
+    l4, = ax2.plot(vectors, search_qps, 'x:', color='#7f7f7f', label='Est. Sequential QPS', alpha=0.7)
+    ax2.set_ylabel("Sequential Throughput (ops/s)")
+    
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/fig1_scalability.png", dpi=300)
+    print("-> Generated Fig 1: Scalability")
+
+    # ---------------------------------------------------------
+    # FIG 2: Latency Distribution (Box Plot)
+    # Shows the stability and jitter at each milestone
+    # ---------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.set_title("Fig 2. Latency Distribution per Milestone")
+    ax.set_ylabel("Latency (ms)")
+    ax.set_xlabel("Dataset Size")
+    ax.grid(True, axis='y', linestyle='--', alpha=0.5)
+
+    raw_data = [r['raw_latencies'] for r in res_data]
+    ax.boxplot(raw_data, labels=[f"{v//1000}k" for v in vectors], showfliers=False) # Hide extreme outliers for clearer view
+    
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/fig2_latency_boxplot.png", dpi=300)
+    print("-> Generated Fig 2: Latency Boxplot")
+
+    # ---------------------------------------------------------
+    # FIG 3: Cumulative Distribution Function (CDF)
+    # The most important chart for performance engineers
+    # ---------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.set_title("Fig 3. Search Latency CDF (Tail Analysis)")
+    ax.set_xlabel("Latency (ms)")
+    ax.set_ylabel("Cumulative Probability")
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    # Plot CDF for the largest dataset
+    largest_run = res_data[-1]
+    sorted_lat = np.sort(largest_run['raw_latencies'])
+    yvals = np.arange(len(sorted_lat)) / float(len(sorted_lat) - 1)
+    
+    ax.plot(sorted_lat, yvals, label=f"N={largest_run['vectors']:,}", linewidth=2)
+    # Zoom in to the "knee" (90% - 100%)
+    ax.set_xlim(left=0, right=largest_run['stats']['p99_9'] * 1.2) 
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/fig3_latency_cdf.png", dpi=300)
+    print("-> Generated Fig 3: Latency CDF")
+
+    # ---------------------------------------------------------
+    # FIG 4: System Resource Timeline
+    # ---------------------------------------------------------
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.set_title("Fig 4. System Resource Usage Timeline")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("CPU Usage (%)", color='tab:blue')
+    
+    t = sys_data['timestamp']
+    cpu = sys_data['cpu_percent']
+    ram = sys_data['ram_mb']
+    
+    ax1.fill_between(t, cpu, color='tab:blue', alpha=0.3)
+    ax1.plot(t, cpu, color='tab:blue', linewidth=1, label="CPU %")
+    ax1.tick_params(axis='y', labelcolor='tab:blue')
+    ax1.set_ylim(0, max(100, max(cpu)*1.2))
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("RAM Usage (MB)", color='tab:orange')
+    ax2.plot(t, ram, color='tab:orange', linewidth=2, label="RAM MB")
+    ax2.tick_params(axis='y', labelcolor='tab:orange')
+
+    # Annotate Phases
+    # Simple logic: find where phase changes
+    phases = sys_data['phase']
+    last_p = ""
+    for i, p in enumerate(phases):
+        if p != last_p and p != "Init":
+            plt.axvline(x=t[i], color='k', linestyle=':', alpha=0.5)
+            # Only label major phases to avoid clutter
+            if "Insert" in p or "Search" in p:
+                y_pos = ax2.get_ylim()[1] * 0.95
+                ax1.text(t[i], 80, p.split('_')[0], rotation=90, verticalalignment='center', fontsize=8, alpha=0.7)
+        last_p = p
+
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_DIR}/fig4_resources.png", dpi=300)
+    print("-> Generated Fig 4: Resource Timeline")
+
+    # ---------------------------------------------------------
+    # CSV DUMP (Raw Data for Peer Review)
+    # ---------------------------------------------------------
+    csv_path = f"{OUTPUT_DIR}/pomai_metrics_table.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Vectors", "Insert_QPS", "Search_Avg_Lat", "Search_P50", "Search_P99", "Search_P99.9", "RAM_MB"])
+        for r in res_data:
+            writer.writerow([
+                r['vectors'], 
+                f"{r['insert_qps']:.2f}", 
+                f"{r['stats']['avg']:.3f}",
+                f"{r['stats']['p50']:.3f}",
+                f"{r['stats']['p99']:.3f}",
+                f"{r['stats']['p99_9']:.3f}",
+                f"{r['ram_mb']:.1f}"
+            ])
+    print(f"-> Saved Metrics Table: {csv_path}")
 
 if __name__ == "__main__":
-    main()
+    print(f"--- STARTING SCIENTIFIC BENCHMARK SUITE ---")
+    print(f"Target: {HOST}:{PORT}")
+    print(f"Milestones: {MILESTONES}")
+    
+    res, sys_mon = run_scientific_suite()
+    
+    if res and len(res) > 0:
+        generate_report(res, sys_mon)
+        print("\n[SUCCESS] Benchmark complete. Report generated.")
+    else:
+        print("\n[FAILURE] No results generated.")

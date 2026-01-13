@@ -74,3 +74,13 @@ echo "Linking server from ${SERVER_SRC} -> ${OUT_BIN}"
 echo "Build complete."
 echo "  archive: ${ARCHIVE}"
 echo "  server:  ${OUT_BIN}"
+
+# Build Pomai CLI if present
+CLI_SRC="${SRC_DIR}/pomai_cli.cc"
+CLI_BIN="${BUILD_DIR}/pomai_cli"
+if [ -f "$CLI_SRC" ]; then
+  echo "Linking CLI from ${CLI_SRC} -> ${CLI_BIN}"
+  "${CXX}" ${CXXFLAGS} "$CLI_SRC" "${ARCHIVE}" -o "${CLI_BIN}"
+  echo "Build complete."
+  echo "  cli:     ${CLI_BIN}"
+fi
