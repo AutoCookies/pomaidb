@@ -219,4 +219,7 @@ Tested on commodity hardware (Dell Latitude E5440, 2 Cores, 8GB RAM):
 
 ## License
 
-[Insert License Here]
+1. You are free to copy, modify, and distribute the code for PERSONAL, EDUCATIONAL, or RESEARCH purposes.
+2. You must give appropriate credit to the original author (Quan Van).
+3. You may NOT use this code for COMMERCIAL purposes (e.g., selling it, wrapping it in a paid service, or using it inside a proprietary product) without explicit permission from the author.
+4. If you modify the code, you must share your modifications under this same license.
