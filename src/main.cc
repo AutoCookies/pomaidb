@@ -104,6 +104,7 @@ int main(int argc, char **argv)
         kv_arena.seed_rng(std::random_device{}());
 
     int port = static_cast<int>(pomai::config::runtime.default_port);
+    print_banner(port);
 
     try
     {
@@ -123,8 +124,6 @@ int main(int argc, char **argv)
 
         // 5. Start Server – wiring PomaiDB (multi-membrance) vào!
         PomaiServer server(&map, pomai_db.get(), port);
-
-        print_banner(port);
 
         // 6. Signal Handlers
         struct sigaction sa{};

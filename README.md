@@ -3,223 +3,262 @@
 <p align="center">
   <img src="assets/logo.png" alt="PomaiDB Logo" width="200">
   <br>
-  <i>High-performance, embedded-ready vector database for the Edge.</i>
+  <i><b>The vector database for humans, not just machines.</b></i>
 </p>
 
-PomaiDB is a high-performance, embedded-ready vector database written in modern C++20. It is designed for low-latency similarity search on commodity hardware, utilizing a custom "Pomegranate" architecture that combines multi-schema support (Membrances), lock-free indexing, and SIMD-accelerated quantization.
+---
+
+AI should not require expensive machines.  
+**PomaiDB** makes vector search possible on hardware everyone already owns:  
+old laptops, edge boxes, offline workstations, and humble VMs.
+
+---
+
+## Why PomaiDB Exists
+
+Modern AI infrastructure assumes expensive hardware and abundant resources.
+
+**PomaiDB challenges that assumption.**
+
+**We believe:**
+- AI should run on machines in real life, not just in datacenters.
+- Infrastructure should adapt to resource limits, not crash.
+- Systems must degrade gracefully, never fail catastrophically.
+- Everyone—not just big tech—should have access to fast, usable vector search.
+
+---
 
 ## Overview
 
-PomaiDB distinguishes itself by avoiding heavy external dependencies. It implements its own storage engine, memory allocator, and write-ahead logging (WAL) system. The system is optimized for "Edge AI" scenarios where RAM efficiency and CPU cycle conservation are critical.
+PomaiDB exists because **most modern AI infrastructure assumes abundance**—RAM, CPU, connectivity.  
+We know that **data lives everywhere**, including the edge, developing markets, offline offices, and underpowered laptops.
+
+PomaiDB is a **high-performance, embedded-ready vector database** written in modern C++20.  
+It is designed for **low-latency similarity search on commodity hardware**, using a custom "Pomegranate" architecture that combines multi-schema support, lock-free indexing, WAL, and SIMD-accelerated quantization—all with **zero external dependencies**.
+
+> **PomaiDB treats the OS as a collaborator, not an enemy:**  
+> It leverages the page cache, mmap, and atomic file semantics, refusing to "fight" Linux.
+
+## Who PomaiDB Is For
+
+PomaiDB is built for:
+- Developers running AI on old laptops or small VMs
+- Teams deploying vector search on edge or offline systems
+- Engineers who care about stability more than benchmarks
+- Anyone who believes AI infrastructure should be humane
+
+## What Makes PomaiDB Different
+
+PomaiDB does not aim to win raw benchmarks.
+It aims to survive.
+
+- If resources drop, PomaiDB degrades gracefully.
+- If load spikes, PomaiDB protects the system.
+- If hardware is weak, PomaiDB adapts — not crashes.
 
 ## Core Architecture and Algorithms
 
-### 1. Multi-Membrance Storage
+### 1. **Multi-Membrance Storage**
+Not just multi-index, but **multi-membrance**: PomaiDB divides vectorspaces into fully isolated logical areas ("membrances"). Each membrance can have its own dimensionality, RAM limits, and persistence.
 
-Unlike traditional single-index vector stores, PomaiDB utilizes a **Multi-Membrance** architecture. A "Membrance" is an isolated vector space with its own dimensionality, RAM allocation, and storage path.
+Why?  
+**To support real concurrent workloads, multi-tenancy, and test/dev isolation—without "locking the world” for every schema change.**
 
-* **Isolation:** Operations on one membrance (e.g., `INSERT`, `SEARCH`) do not lock or affect others.
-* **Management:** Membrances are managed via a persistent `manifest` file and protected by a `std::shared_mutex` at the database level, allowing concurrent reads while ensuring safety during `CREATE` or `DROP` operations.
+---
 
-### 2. The "Pomegranate" Indexing (IVF + HNSW-like Routing)
+### 2. **Pomegranate Indexing (IVF + Adaptive Routing)**
+Instead of dogmatic HNSW/IVF, PomaiDB fuses strong ideas:
 
-The core search engine (`PomaiOrbit`) uses an Inverted File (IVF) structure with several optimizations:
+- **Centroid Initialization:** via K-Means++ for consistent clustering.
+- **Dynamic Bucketing:** Vectors packed by closest centroid, stored via lock-free allocators.
+- **Routing Graph:** Centroids are connected similar to HNSW, allowing fast search without brute-forcing all clusters.
 
-* **Centroid Initialization:** Uses **K-Means++** to initialize centroids, ensuring a statistically distributed starting point for clusters.
-* **Dynamic Bucketing:** Vectors are assigned to buckets based on the nearest centroid. Buckets are allocated via the `ShardArena` allocator.
-* **Routing Graph:** Centroids are connected in a graph structure similar to HNSW (Hierarchical Navigable Small World), allowing the search algorithm to quickly locate the nearest centroids (`nprobe`) without scanning the entire centroid list.
+Why?  
+**To combine the practical strengths of both "global cluster first" and "navigate like a human"—without copying untuned academic code.**
 
-### 3. SynapseCodec (4-bit Quantization)
+---
 
-To maximize memory efficiency, PomaiDB does not always store full 32-bit floating-point vectors in the hot path.
+### 3. **SynapseCodec (4-bit Compression, Delta Quantization)**
+Not all vectors merit 32-bit floats in RAM.  
+PomaiDB quantizes deltas between a vector and its centroid using **4-bit nibbles** (~8x RAM savings).  
+Distance is approximated using SIMD LUTs; exact refinement is possible on-demand.
 
-* **Delta Compression:** It calculates the delta between the inserted vector and its assigned centroid.
-* **4-bit Packing:** These deltas are compressed into 4-bit nibbles. This reduces memory footprint by approximately 8x compared to raw `float32` storage.
-* **SIMD Lookup:** During search, a Look-Up Table (LUT) is precomputed using the query vector. Distances are then approximated using AVX2 SIMD instructions on the packed 4-bit data.
+Why?  
+**Because the trade-off between RAM, speed, and recall must be tunable—especially on small machines.**
 
-### 4. SimHash Prefiltering
+---
 
-Before performing expensive distance calculations (L2 or Dot Product), candidates are filtered using **SimHash** (Sign-bit Projections).
+### 4. **SimHash Prefiltering**
+Before running L2/Dot-Product on candidates, PomaiDB computes 512-bit SimHash fingerprints.  
+Candidates with a high Hamming distance to the query are _immediately_ discarded using POPCNT.
 
-* **Fingerprinting:** A 512-bit fingerprint is generated for every vector using random hyperplanes.
-* **Hamming Distance:** During search, the Hamming distance between the query fingerprint and candidate fingerprints is calculated using `POPCNT` instructions.
-* **Early Rejection:** Candidates exceeding a Hamming distance threshold (default 140) are immediately discarded, significantly reducing CPU load.
+Why?  
+**Because sometimes approximate recall is enough, and your CPU cycles are precious.**
 
-### 5. ShardArena Memory Allocator
+---
 
-PomaiDB uses a custom bump-pointer allocator named `ShardArena`.
+### 5. **ShardArena Allocator**
+Custom bump-pointer allocator with...
 
-* **mmap & Huge Pages:** It allocates large blocks of memory using `mmap` (attempting `MAP_HUGETLB` for performance).
-* **Zero-Copy Persistence:** Data can be "frozen" (demoted) to disk. The system uses memory mapping to read these files, relying on the OS page cache for lazy loading without explicit serialization overhead.
-* **Lock-Free Reads:** Readers can traverse atomic offsets without acquiring locks, ensuring high read throughput even during write operations.
+- **mmap, Huge Pages:** for large object allocation and minimal fragmentation.
+- **Zero-Copy Persistence:** “Freezing” a bucket to disk is just a remapping—no serialization ceremony.
+- **Atomic Offsets, Lock-Free Readers:** Massive throughput, even under light contention.
 
-### 6. Write-Ahead Log (WAL)
+**Design Philosophy:**  
+PomaiDB relies on the OS, trusting page cache and atomic renames, not reinventing "mini-filesystems" inside a user process.
 
-Data integrity is ensured via a custom WAL implementation.
+---
 
-* **Structure:** Operations (Create/Drop Membrance) are appended to a log file with CRC32 checksums.
-* **Crash Recovery:** On startup, the WAL is replayed to restore the database state.
-* **Atomicity:** Critical file operations use atomic rename patterns to prevent corruption.
+### 6. **Write-Ahead Log (WAL) and Crash Recovery**
+Not “just for show.” WAL is implemented with:
 
-## Building from Source
+- **Simple, CRC32-checksummed logs.**  
+- **Atomic file operations** (rename patterns).
+- **Crash resilience:** DB is consistent after power loss (we replay the WAL until successful).
 
-### Prerequisites
+Why?  
+**Because reliability is not optional, even on the edge.**
 
-* **Compiler:** GCC or Clang with C++20 support.
-* **OS:** Linux (Recommended) or macOS. Windows support is experimental via WSL.
-* **Tools:** CMake (3.10+), Make.
+---
 
-### Build Steps
+### 7. **WhisperGrain: Energy Operating System**
 
-```bash
-# 1. Create a build directory
-mkdir build
-cd build
+PomaiDB is not another “dumb” search engine hard-coded to eat RAM.  
+The **WhisperGrain** controller transforms PomaiDB into a living system:
 
-# 2. Configure the project
-cmake ..
+- Every search and vector op is translated to "ops" (operation units).
+- A dynamic budget—based on real-time latency, CPU, and system health—decides how hard to try, when to degrade, when to do exact refine.
+- The result?  
+  - **PomaiDB simply does not crash under load:** Quality and recall are traded _gracefully_ for health.
+  - **No wild tail-latency spikes:** Your device is safe, no matter what abuse you give it.
 
-# 3. Compile (use -j for parallel build)
-make -j$(nproc)
+Why?  
+**Because AI should fade gracefully on bad days, not ruin your system.**
 
-```
-
-This will generate two binaries:
-
-* `pomai-server`: The database server instance.
-* `pomai-cli`: The interactive SQL client.
-
-## Running the Server
-
-Start the server by running the binary. It listens on port 7777 by default.
-
-```bash
-./pomai-server
-
-```
-
-**Environment Variables:**
-
-* `POMAI_DB_DIR`: Set the root directory for data storage (default: `./data/pomai_db`).
-* `POMAI_PORT`: Override the default listening port.
-
-## Using the CLI
-
-Connect to the server using the client tool:
-
-```bash
-./pomai-cli -h 127.0.0.1 -p 7777
-
-```
-
-## PomaiSQL Protocol Specification
-
-PomaiDB uses a custom text-based protocol inspired by SQL. All commands must end with a semicolon (`;`).
-
-### 1. Data Definition (DDL)
-
-**Create a new Membrance (Schema):**
-
-```sql
-CREATE MEMBRANCE <name> DIM <dimension> RAM <size_in_mb>;
--- Example:
-CREATE MEMBRANCE images DIM 512 RAM 1024;
-
-```
-
-**Drop a Membrance:**
-
-```sql
-DROP MEMBRANCE <name>;
-
-```
-
-**List all Membrances:**
-
-```sql
-SHOW MEMBRANCES;
-
-```
-
-### 2. Context Management
-
-**Select a Membrance for subsequent operations:**
-
-```sql
-USE <name>;
--- Example:
-USE images;
-
-```
-
-### 3. Data Manipulation (DML)
-
-**Insert a Vector:**
-
-```sql
--- Full syntax:
-INSERT INTO <name> VALUES (<label>, [<v1>, <v2>, ...]);
-
--- Short syntax (after USE):
-INSERT VALUES (<label>, [<v1>, <v2>, ...]);
-
--- Example:
-INSERT VALUES (photo_001, [0.12, 0.45, 0.99, ...]);
-
-```
-
-**Search for Nearest Neighbors:**
-
-```sql
--- Full syntax:
-SEARCH <name> QUERY ([<v1>, <v2>, ...]) TOP <k>;
-
--- Short syntax (after USE):
-SEARCH QUERY ([<v1>, <v2>, ...]) TOP <k>;
-
--- Example:
-SEARCH QUERY ([0.12, 0.45, 0.99, ...]) TOP 5;
-
-```
-
-**Retrieve a Vector by Label:**
-
-```sql
-GET <name> LABEL <label>;
--- Short syntax:
-GET LABEL <label>;
-
-```
-
-**Delete a Vector (Soft Delete):**
-
-```sql
-DELETE <name> LABEL <label>;
-
-```
-
-### 4. Bulk Operations
-
-**Load Binary Data (Fast Ingestion):**
-Loads a flat binary file directly into memory. The file format must be: Header [Magic|Count|Dim] followed by packed [Vector|Label] records.
-
-```sql
-LOAD BINARY '<path_to_file>' INTO <name>;
-
-```
+---
 
 ## Performance Benchmarks
 
-Tested on commodity hardware (Dell Latitude E5440, 2 Cores, 8GB RAM):
+Tested on Dell Latitude E5440 (2 Cores, 8GB RAM):
 
-* **Dataset:** 1,000,000 Vectors (512-dim).
-* **Search Latency (P50):** ~0.46ms.
-* **Search Latency (P99.9):** < 0.60ms.
-* **Throughput:** Scalable O(1) complexity relative to dataset size due to IVF clustering.
+- **Dataset:** 1,000,000 vectors (512-dim)
+- **Search Latency (P50):** ~0.46ms
+- **P99.9:** < 0.60ms
+
+> **Note:** These figures are averages under controlled load, with recall and nprobe adaptively traded for latency. See WhisperGrain for details.
+
+---
+
+## Building from Source
+
+**Prerequisites:**  
+- GCC/Clang with C++20
+- Linux/macOS (Windows via WSL)
+- CMake ≥ 3.10, Make
+
+```bash
+# 1. Create and enter build directory
+mkdir build && cd build
+# 2. Configure
+cmake ..
+# 3. Build
+make -j$(nproc)
+```
+
+Binaries:
+- `pomai-server` — main server
+- `pomai-cli` — SQL client
+
+---
+
+## Running the Server
+
+```bash
+./pomai-server
+```
+**Env vars:**
+- `POMAI_DB_DIR` = data root (`./data/pomai_db` default)
+- `POMAI_PORT`   = override listen port (default: 7777)
+
+---
+
+## Using the CLI
+
+```bash
+./pomai-cli -h 127.0.0.1 -p 7777
+```
+
+---
+
+## PomaiSQL Protocol
+
+Custom, SQL-inspired. Commands end with `;`.
+
+**Create Schema:**
+```sql
+CREATE MEMBRANCE name DIM N RAM MB;
+SHOW MEMBRANCES;
+```
+**Insert/Select Context:**
+```sql
+USE myspace;
+INSERT VALUES (photo_001, [0.12, 0.45, ...]);
+SEARCH QUERY ([0.12, 0.45, ...]) TOP 5;
+```
+**Retrieve or Delete:**
+```sql
+GET LABEL photo_001;
+DELETE LABEL photo_001;
+```
+**Bulk Ingest:**
+```sql
+LOAD BINARY '/path/vectors.bin' INTO myspace;
+```
+
+---
+
+## Why Use PomaiDB?
+- Because your data is _not_ always in the cloud.
+- Because not everyone has a 128GB server.
+- Because crash-only design is unacceptable for real users.
+- Because you want a database that fights for you—not the other way around.
+
+---
 
 ## License
 
-1. You are free to copy, modify, and distribute the code for PERSONAL, EDUCATIONAL, or RESEARCH purposes.
-2. You must give appropriate credit to the original author (Quan Van).
-3. You may NOT use this code for COMMERCIAL purposes (e.g., selling it, wrapping it in a paid service, or using it inside a proprietary product) without explicit permission from the author.
-4. If you modify the code, you must share your modifications under this same license.
+PomaiDB is released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).  
+See `LICENSE` for details.
+
+> We deeply encourage both academic and practical use,
+> but ask you to **credit the original author (Quan Van)** and **contribute improvements** for the benefit of the community.
+
+---
+
+## Citation
+
+If you use PomaiDB in academic or research projects:
+
+```
+@misc{pomai,
+  author={Quan Van},
+  title={PomaiDB: Vector Search for Every Machine},
+  url={https://github.com/quann/PomaiDB},
+  year={2024}
+}
+```
+
+---
+
+## A Final Word
+
+**PomaiDB is not just code.**  
+It is a manifesto:
+
+- That _state-of-the-art_ belongs to everyone.
+- That _robustness_ is possible, even on weak hardware.
+- That a database can be proud of what it doesn’t demand.
+
+Welcome to the new edge of AI.
+
+---

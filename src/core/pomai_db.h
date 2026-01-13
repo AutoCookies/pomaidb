@@ -33,6 +33,7 @@
 #include "src/memory/shard_arena.h"
 #include "src/ai/pomai_orbit.h"
 #include "src/memory/wal_manager.h"
+#include "src/core/metadata_index.h" // metadata index for per-membrance pre-filtering
 
 namespace pomai::core
 {
@@ -42,6 +43,10 @@ namespace pomai::core
         size_t dim = 0;
         size_t ram_mb = 256;
         std::string engine = "orbit";
+
+        // Optional toggle: if true the Membrance will allocate a MetadataIndex on construction.
+        // Useful to avoid the small memory cost for membs that won't use metadata filtering.
+        bool enable_metadata_index = true;
     };
 
     struct Membrance
@@ -52,6 +57,11 @@ namespace pomai::core
         std::string data_path; // directory on disk for this membrance
         std::unique_ptr<pomai::memory::ShardArena> arena;
         std::unique_ptr<pomai::ai::orbit::PomaiOrbit> orbit;
+
+        // Optional per-membrance metadata inverted index (Tag -> [label ids]).
+        // Server checks for non-null before using it. Kept as unique_ptr so we can
+        // lazily enable/disable and avoid persisting if not needed.
+        std::unique_ptr<MetadataIndex> meta_index;
 
         // Construct a membrance and initialize its arena + orbit.
         // data_root is the base directory where per-membrance directory will be created.
@@ -100,7 +110,7 @@ namespace pomai::core
 
         // members
         std::unordered_map<std::string, std::unique_ptr<Membrance>> membrances_;
-        mutable std::shared_mutex mu_; // <<-- changed to shared_mutex for concurrent read/write
+        mutable std::shared_mutex mu_; // allow concurrent readers for searches while writers create/drop
 
         // persistence
         std::string data_root_;     // base data directory

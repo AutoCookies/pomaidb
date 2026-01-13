@@ -3,11 +3,12 @@
  * Pomai-CLI: PomaiDB interactive shell, PostgreSQL-like, user-friendly 10/10.
  *
  * Features:
- *   - Kết nối tới PomaiDB server thông qua TCP (text protocol chuẩn SQL-like).
- *   - Cú pháp: CREATE MEMBRANCE, USE, INSERT INTO, SEARCH, GET, SHOW, DROP, EXIT,...
- *   - Tự động lưu màng đang chọn (CURRENT membrance).
- *   - Hỗ trợ tất cả thao tác vector chuẩn (CLI/PomaiSQL).
- *   - Dễ mở rộng UI (support history, highlight...).
+ * - Kết nối tới PomaiDB server thông qua TCP (text protocol chuẩn SQL-like).
+ * - Cú pháp: CREATE MEMBRANCE, USE, INSERT INTO, SEARCH, GET, SHOW, DROP, EXIT,...
+ * - Tự động lưu màng đang chọn (CURRENT membrance).
+ * - Hỗ trợ tất cả thao tác vector chuẩn (CLI/PomaiSQL).
+ * - [NEW] Hỗ trợ Metadata: INSERT ... TAGS(...) và SEARCH ... WHERE ...
+ * - Dễ mở rộng UI (support history, highlight...).
  *
  * 2024 - Lựu CLI cho Pomai vector database.
  */
@@ -38,6 +39,12 @@ typedef int socklen_t;
 
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 7777
+
+// ANSI Colors for CLI
+#define ANSI_RESET "\033[0m"
+#define ANSI_GREEN "\033[32m"
+#define ANSI_YELLOW "\033[33m"
+#define ANSI_CYAN "\033[36m"
 
 class PomaiSocket
 {
@@ -166,10 +173,10 @@ private:
     void print_welcome()
     {
         std::cout
-            << "\n============================\n"
-            << "  PomaiDB CLI — PomaiSQL Mode\n"
+            << "\n============================================\n"
+            << ANSI_YELLOW << "  PomaiDB CLI — PomaiSQL Mode (Metadata V2)" << ANSI_RESET << "\n"
             << "  Type 'help;' for syntax, '\\q' to exit.\n"
-            << "============================\n"
+            << "============================================\n"
             << "(Tip: End command with ;)\n";
     }
     void prompt()
@@ -177,7 +184,7 @@ private:
         std::string inbuf;
         while (true)
         {
-            std::cout << (current_membr_.empty() ? "[pomai]> " : ("[pomai/" + current_membr_ + "]> "));
+            std::cout << (current_membr_.empty() ? ANSI_CYAN "[pomai]> " ANSI_RESET : (ANSI_CYAN "[pomai/" + current_membr_ + "]> " ANSI_RESET));
             std::getline(std::cin, inbuf);
             if (std::cin.eof())
                 break;
@@ -201,7 +208,7 @@ private:
                 std::string u, name;
                 iss >> u >> name;
                 current_membr_ = name.substr(0, name.length() - 1); // remove ;
-                std::cout << "Switched to membrance: " << current_membr_ << "\n";
+                std::cout << "Switched to membrance: " << ANSI_GREEN << current_membr_ << ANSI_RESET << "\n";
                 continue;
             }
 
@@ -250,23 +257,32 @@ private:
                 continue;
             }
 
-            // If current_membr_ is set, allow short form: INSERT VALUES, SEARCH QUERY, GET LABEL
+            // --- SHORT SYNTAX SUPPORT (Prepend current_membr_) ---
+
+            // Support: INSERT VALUES (...) [TAGS (...)]
             if (current_membr_ != "" && up.rfind("INSERT VALUES", 0) == 0 && up.back() == ';')
             {
                 std::ostringstream oss;
+                // substr(6) removes "INSERT", keeps " VALUES..."
+                // Result: "INSERT INTO <membr> VALUES..."
                 oss << "INSERT INTO " << current_membr_ << " " << cmd.substr(6);
                 sock_->sendln(oss.str());
                 std::cout << sock_->recv_multiline();
                 continue;
             }
+
+            // Support: SEARCH QUERY (...) [WHERE ...]
             if (current_membr_ != "" && up.rfind("SEARCH QUERY", 0) == 0 && up.back() == ';')
             {
                 std::ostringstream oss;
+                // substr(6) removes "SEARCH", keeps " QUERY..."
+                // Result: "SEARCH <membr> QUERY..."
                 oss << "SEARCH " << current_membr_ << " " << cmd.substr(6);
                 sock_->sendln(oss.str());
                 std::cout << sock_->recv_multiline();
                 continue;
             }
+
             if (current_membr_ != "" && up.rfind("GET LABEL", 0) == 0 && up.back() == ';')
             {
                 std::ostringstream oss;
@@ -282,20 +298,37 @@ private:
         }
         std::cout << "Bye Pomai!\n";
     }
+
     void print_help()
     {
-        std::cout <<
-            R"(Available PomaiSQL commands:
-- CREATE MEMBRANCE <name> DIM <n> [RAM <mb>];
-- USE <name>;
-- INSERT INTO <name> VALUES (<label>, [1.0,2.0,3.0,...]);
-- SEARCH <name> QUERY ([1.0,2.0,...]) TOP k;
-- GET <name> LABEL <label>;
-- DROP MEMBRANCE <name>;
-- SHOW MEMBRANCES;
-- Short syntax (with USE): INSERT VALUES (...); SEARCH QUERY (...); GET LABEL ...;
-- Type \q or EXIT; to quit.
-)";
+        std::cout << ANSI_YELLOW << R"(
+Available PomaiSQL commands:
+  DDL:
+    - CREATE MEMBRANCE <name> DIM <n> [RAM <mb>];
+    - DROP MEMBRANCE <name>;
+    - SHOW MEMBRANCES;
+    - USE <name>;
+
+  DML:
+    - INSERT INTO <name> VALUES (<label>, [...]) [TAGS (key:val, ...)];
+    - SEARCH <name> QUERY ([...]) [WHERE key='val'] TOP k;
+    - GET <name> LABEL <label>;
+    - DELETE <name> LABEL <label>;
+
+  Shortcuts (when USE <name> is active):
+    - INSERT VALUES (...) [TAGS (...)];
+    - SEARCH QUERY ([...]) [WHERE ...] TOP k;
+    - GET LABEL <label>;
+
+  Examples:
+    > CREATE MEMBRANCE products DIM 128 RAM 256;
+    > USE products;
+    > INSERT VALUES (shoe_1, [0.1, 0.2...]) TAGS (type:shoe, color:red);
+    > SEARCH QUERY ([0.1, 0.2...]) WHERE color='red' TOP 5;
+
+  Misc:
+    - Type \q or EXIT; to quit.
+)" << ANSI_RESET << "\n";
     }
 };
 

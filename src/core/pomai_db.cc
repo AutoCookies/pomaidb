@@ -7,6 +7,7 @@
  */
 
 #include "src/core/pomai_db.h"
+#include "src/core/metadata_index.h"
 
 #include <filesystem>
 #include <fstream>
@@ -63,6 +64,21 @@ namespace pomai::core
         cfg_orbit.data_path = data_path;
         // Let first membrance optionally run cortex; keep default behavior.
         orbit = std::make_unique<pomai::ai::orbit::PomaiOrbit>(cfg_orbit, arena.get());
+
+        // Initialize metadata index if requested (best-effort).
+        try
+        {
+            if (cfg.enable_metadata_index)
+            {
+                meta_index = std::make_unique<MetadataIndex>();
+            }
+        }
+        catch (...)
+        {
+            // non-fatal: leave meta_index null if allocation fails
+            meta_index.reset();
+            std::clog << "[PomaiDB] Warning: could not allocate MetadataIndex for membrance " << name << "\n";
+        }
 
         // If there's an existing schema file under data_path, PomaiOrbit constructor tries to load it.
     }
