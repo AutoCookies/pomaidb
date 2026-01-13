@@ -1,8 +1,10 @@
-Here is the comprehensive `README.md` for PomaiDB. It is written in professional, technical English, focusing on architectural details and algorithmic implementations as requested, without the use of icons or emojis.
-
----
-
 # PomaiDB
+
+<p align="center">
+  <img src="assets/logo.png" alt="PomaiDB Logo" width="200">
+  <br>
+  <i>High-performance, embedded-ready vector database for the Edge.</i>
+</p>
 
 PomaiDB is a high-performance, embedded-ready vector database written in modern C++20. It is designed for low-latency similarity search on commodity hardware, utilizing a custom "Pomegranate" architecture that combines multi-schema support (Membrances), lock-free indexing, and SIMD-accelerated quantization.
 
