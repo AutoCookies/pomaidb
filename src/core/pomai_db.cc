@@ -574,4 +574,12 @@ namespace pomai::core
         return ok;
     }
 
+    bool PomaiDB::insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
+    {
+        Membrance *m = get_membrance(membr);
+        if (!m)
+            return false;
+        return m->orbit->insert_batch(batch);
+    }
+
 } // namespace pomai::core

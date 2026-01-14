@@ -102,6 +102,7 @@ namespace pomai::core
         // Expose manifest/wal helpers (for tests/tools)
         bool save_manifest();
         bool save_all_membrances();
+        bool insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
 
     private:
         // Persistence helpers

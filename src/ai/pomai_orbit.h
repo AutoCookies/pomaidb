@@ -121,6 +121,7 @@ namespace pomai::ai::orbit
 
         bool train(const float *data, size_t n);
         bool insert(const float *vec, uint64_t label);
+        bool insert_batch(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
         std::vector<std::pair<uint64_t, float>> search(const float *query, size_t k, size_t nprobe = 0);
 
         // Random-access get/remove by label

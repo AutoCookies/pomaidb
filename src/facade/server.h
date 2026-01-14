@@ -616,34 +616,50 @@ private:
                     }
                 }
 
-                // Do the inserts as a batch. We'll insert each tuple into orbit and attach tags (if any).
-                size_t success = 0;
+                // --- Fast Batch Insert Path ---
+                // Prepare batch payload for PomaiDB
+                std::vector<std::pair<uint64_t, std::vector<float>>> batch_data;
+                batch_data.reserve(tuples.size());
+                std::vector<uint64_t> inserted_hashes;
+                if (!global_tags.empty())
+                    inserted_hashes.reserve(tuples.size());
+
                 for (auto &tp : tuples)
                 {
-                    const std::string &label = tp.first;
-                    const std::vector<float> &vec = tp.second;
-                    uint64_t label_hash = hash_key(label);
+                    uint64_t label_hash = hash_key(tp.first);
+                    batch_data.emplace_back(label_hash, std::move(tp.second));
+                    if (!global_tags.empty())
+                        inserted_hashes.push_back(label_hash);
+                }
 
-                    bool ok = m->orbit->insert(vec.data(), label_hash);
-                    if (ok)
+                bool ok_batch = false;
+                try
+                {
+                    ok_batch = pomai_db_->insert_batch(name, batch_data);
+                }
+                catch (...)
+                {
+                    ok_batch = false;
+                }
+
+                // If batch insert succeeded, attach global tags (if any) via membrance meta index
+                if (ok_batch && !global_tags.empty() && m->meta_index)
+                {
+                    for (uint64_t h : inserted_hashes)
                     {
-                        ++success;
-                        if (!global_tags.empty() && m->meta_index)
+                        try
                         {
-                            try
-                            {
-                                m->meta_index->add_tags(label_hash, global_tags);
-                            }
-                            catch (...)
-                            {
-                                std::clog << "[PomaiServer] Warning: failed to add tags for label\n";
-                            }
+                            m->meta_index->add_tags(h, global_tags);
+                        }
+                        catch (...)
+                        {
+                            std::clog << "[PomaiServer] Warning: failed to add tags for label " << h << "\n";
                         }
                     }
                 }
 
                 std::ostringstream ss;
-                ss << "OK: inserted " << success << " / " << tuples.size() << "\n";
+                ss << "OK: inserted " << (ok_batch ? batch_data.size() : 0) << " / " << tuples.size() << (ok_batch ? " (batch)" : " (failed)") << "\n";
                 return ss.str();
             }
         }
