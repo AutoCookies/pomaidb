@@ -20,6 +20,7 @@
 #include "src/memory/shard_arena.h"
 #include "src/ai/eternalecho_quantizer.h"
 #include "src/ai/whispergrain.h"
+#include "src/core/cpu_kernels.h"
 
 #include <new>
 #include <algorithm>
@@ -71,18 +72,6 @@ namespace pomai::ai::orbit
         if (sa)
             return sa->read_remote_blob(remote_id);
         return {};
-    }
-
-    // ---- small helpers (l2sq) ----
-    static inline float l2sq(const float *a, const float *b, size_t dim)
-    {
-        float sum = 0.0f;
-        for (size_t i = 0; i < dim; ++i)
-        {
-            float diff = a[i] - b[i];
-            sum += diff * diff;
-        }
-        return sum;
     }
 
     // ------------------- Constructors / Destructors -------------------
@@ -259,19 +248,22 @@ namespace pomai::ai::orbit
         }
 
         // Build neighbor lists (simple nearest centroids)
-        for (size_t i = 0; i < num_c; ++i)
         {
-            std::vector<std::pair<float, uint32_t>> dists;
-            for (size_t j = 0; j < num_c; ++j)
+            L2Func kern = get_pomai_l2sq_kernel();
+            for (size_t i = 0; i < num_c; ++i)
             {
-                if (i == j)
-                    continue;
-                float d = l2sq(centroids_[i]->vector.data(), centroids_[j]->vector.data(), cfg_.dim);
-                dists.push_back({d, static_cast<uint32_t>(j)});
+                std::vector<std::pair<float, uint32_t>> dists;
+                for (size_t j = 0; j < num_c; ++j)
+                {
+                    if (i == j)
+                        continue;
+                    float d = kern(centroids_[i]->vector.data(), centroids_[j]->vector.data(), cfg_.dim);
+                    dists.push_back({d, static_cast<uint32_t>(j)});
+                }
+                std::sort(dists.begin(), dists.end());
+                for (size_t k = 0; k < std::min(dists.size(), cfg_.m_neighbors); ++k)
+                    centroids_[i]->neighbors.push_back(dists[k].second);
             }
-            std::sort(dists.begin(), dists.end());
-            for (size_t k = 0; k < std::min(dists.size(), cfg_.m_neighbors); ++k)
-                centroids_[i]->neighbors.push_back(dists[k].second);
         }
 
         // allocate initial buckets
@@ -336,9 +328,10 @@ namespace pomai::ai::orbit
     {
         uint32_t best = 0;
         float min_d = std::numeric_limits<float>::max();
+        L2Func kern = get_pomai_l2sq_kernel();
         for (size_t i = 0; i < centroids_.size(); ++i)
         {
-            float d = l2sq(vec, centroids_[i]->vector.data(), cfg_.dim);
+            float d = kern(vec, centroids_[i]->vector.data(), cfg_.dim);
             if (d < min_d)
             {
                 min_d = d;
@@ -357,7 +350,8 @@ namespace pomai::ai::orbit
         std::unordered_set<uint32_t> visited;
 
         uint32_t entry = 0;
-        pq.push({l2sq(vec, centroids_[entry]->vector.data(), cfg_.dim), entry});
+        L2Func kern = get_pomai_l2sq_kernel();
+        pq.push({kern(vec, centroids_[entry]->vector.data(), cfg_.dim), entry});
         visited.insert(entry);
 
         std::vector<uint32_t> res;
@@ -373,7 +367,7 @@ namespace pomai::ai::orbit
             {
                 if (visited.insert(nb).second)
                 {
-                    float d = l2sq(vec, centroids_[nb]->vector.data(), cfg_.dim);
+                    float d = kern(vec, centroids_[nb]->vector.data(), cfg_.dim);
                     pq.push({d, nb});
                 }
             }
@@ -793,6 +787,8 @@ namespace pomai::ai::orbit
         using ResPair = std::pair<float, uint64_t>;
         std::priority_queue<ResPair> topk;
 
+        L2Func kern = get_pomai_l2sq_kernel();
+
         for (uint32_t cid : targets)
         {
             uint64_t current_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
@@ -867,7 +863,7 @@ namespace pomai::ai::orbit
 
                     std::vector<float> recon(cfg_.dim);
                     eeq_->decode(code, recon.data());
-                    float dist = l2sq(query, recon.data(), cfg_.dim);
+                    float dist = kern(query, recon.data(), cfg_.dim);
 
                     if (topk.size() < k)
                         topk.push({dist, id});
@@ -907,6 +903,8 @@ namespace pomai::ai::orbit
         // legacy filtered search (unchanged)
         if (!query || k == 0 || candidates.empty())
             return {};
+
+        L2Func kern = get_pomai_l2sq_kernel();
 
         // snapshot label->bucket
         std::vector<std::pair<uint64_t, uint64_t>> entries;
@@ -1038,7 +1036,7 @@ namespace pomai::ai::orbit
 
                 std::vector<float> recon(cfg_.dim);
                 eeq_->decode(code, recon.data());
-                float dist = l2sq(query, recon.data(), cfg_.dim);
+                float dist = kern(query, recon.data(), cfg_.dim);
 
                 if (topk.size() < k)
                     topk.push({dist, id});
@@ -1154,7 +1152,8 @@ namespace pomai::ai::orbit
 
         std::vector<float> recon(cfg_.dim);
         eeq_->decode(code, recon.data());
-        out_dist = l2sq(query, recon.data(), cfg_.dim);
+        L2Func kern = get_pomai_l2sq_kernel();
+        out_dist = kern(query, recon.data(), cfg_.dim);
         return true;
     }
 

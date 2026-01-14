@@ -3,6 +3,9 @@
  *
  * Pomai Orbit Server v2 – Multi-membrance, multi-dim, fully concurrent
  * 2024 – True lựu server: tạo màng tự do, mỗi màng một phổi, INSERT/SEARCH/GET/DEL độc lập.
+ *
+ * NOTE: This variant prints detailed startup/initialization information and
+ *       does not show the previous "version" banner string as requested.
  */
 
 #include "src/core/config.h"
@@ -11,6 +14,7 @@
 #include "src/core/seed.h"
 #include "src/core/pomai_db.h"
 #include "src/facade/server.h"
+#include "src/core/cpu_kernels.h"
 
 #include <signal.h>
 #include <sys/resource.h>
@@ -21,6 +25,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <iomanip>
+#include <cstdlib>
 
 std::mutex g_exit_mutex;
 std::condition_variable g_exit_cv;
@@ -35,7 +40,7 @@ static void on_signal(int /*signum*/)
     g_exit_cv.notify_one();
 }
 
-// Some ANSI coloring for banner
+// Some ANSI coloring for banner (minimal)
 #define ANSI_RESET "\033[0m"
 #define ANSI_BOLD "\033[1m"
 #define ANSI_RED "\033[31m"
@@ -45,6 +50,7 @@ static void on_signal(int /*signum*/)
 
 void print_banner(int port)
 {
+    // Minimal banner without version text per request
     std::cout << ANSI_RED << R"(
   _____  ____  __  __          _____ 
  |  __ \|  _ \|  \/  |   /\   |_   _|   )"
@@ -54,7 +60,7 @@ void print_banner(int port)
  |  ___/| |_| | |\/| | / /\ \   | |  
  | |    |____/| |  | |/ ____ \ _| |_ 
  |_|          |_|  |_/_/    \_\_____|   )"
-              << ANSI_RESET << "  v2.0 (10/10 Multischema)" << "\n\n";
+              << ANSI_RESET << "\n\n";
     std::cout << "  " << ANSI_GREEN << "PORT       : " << ANSI_RESET << port << "\n";
     std::cout << "  " << ANSI_GREEN << "PID        : " << ANSI_RESET << getpid() << "\n";
     std::cout << "  " << ANSI_CYAN << "-------------------------------------" << ANSI_RESET << "\n";
@@ -67,7 +73,39 @@ int main(int argc, char **argv)
     pomai::config::init_from_env();
     pomai::config::init_from_args(argc, argv);
 
-    // 2. System tuning
+    // Initialize CPU kernels before any threads or heavy workloads
+    pomai_init_cpu_kernels();
+
+    // Print detailed startup info
+    std::clog << "[Init] Pomai startup\n";
+    // Kernel chosen
+    {
+        L2Func k = get_pomai_l2sq_kernel();
+        const char *kn = kernel_name_from_ptr(k);
+        std::clog << "[Init] CPU kernel selected: " << kn << "\n";
+    }
+
+#if POMAI_HAS_BUILTIN_CPU_SUPPORTS
+    // Report CPU features visible to __builtin_cpu_supports (best-effort)
+    std::clog << "[Init] CPU features:";
+    if (__builtin_cpu_supports("sse"))
+        std::clog << " sse";
+    if (__builtin_cpu_supports("sse2"))
+        std::clog << " sse2";
+    if (__builtin_cpu_supports("sse4.1"))
+        std::clog << " sse4.1";
+    if (__builtin_cpu_supports("avx"))
+        std::clog << " avx";
+    if (__builtin_cpu_supports("avx2"))
+        std::clog << " avx2";
+    if (__builtin_cpu_supports("avx512f"))
+        std::clog << " avx512f";
+    if (__builtin_cpu_supports("fma"))
+        std::clog << " fma";
+    std::clog << "\n";
+#endif
+
+    // 2. System tuning: rlimit and report
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
     {
@@ -76,6 +114,12 @@ int main(int argc, char **argv)
             want = rl.rlim_max;
         rl.rlim_cur = want;
         setrlimit(RLIMIT_NOFILE, &rl);
+
+        std::clog << "[Init] RLIMIT_NOFILE: cur=" << rl.rlim_cur << " max=" << rl.rlim_max << "\n";
+    }
+    else
+    {
+        std::clog << "[Init] RLIMIT_NOFILE: getrlimit failed\n";
     }
 
     // 3. Legacy KV Arena (để support SET/GET)
@@ -97,11 +141,25 @@ int main(int argc, char **argv)
         slots = 1;
     PomaiMap map(&kv_arena, slots);
 
+    std::clog << "[Init] KV arena: capacity_bytes=" << kv_arena.get_capacity_bytes()
+              << " max_seeds=" << max_seeds << " map_slots=" << slots << "\n";
+
     // RNG Init
     if (pomai::config::runtime.rng_seed.has_value())
+    {
         kv_arena.seed_rng(*pomai::config::runtime.rng_seed);
+        std::clog << "[Init] RNG seeded from config: " << *pomai::config::runtime.rng_seed << "\n";
+    }
     else
-        kv_arena.seed_rng(std::random_device{}());
+    {
+        uint64_t s = std::random_device{}();
+        kv_arena.seed_rng(s);
+        std::clog << "[Init] RNG seeded from random_device: " << s << "\n";
+    }
+
+    // Hardware/concurrency info
+    unsigned hc = std::thread::hardware_concurrency();
+    std::clog << "[Init] hardware_concurrency: " << (hc ? std::to_string(hc) : std::string("unknown")) << "\n";
 
     int port = static_cast<int>(pomai::config::runtime.default_port);
     print_banner(port);
@@ -111,16 +169,36 @@ int main(int argc, char **argv)
         // 4. Khởi tạo PomaiDB (đa màng lưu!)
         auto pomai_db = std::make_unique<pomai::core::PomaiDB>();
 
+        // Print repository/data paths (best-effort)
+        {
+            const char *env_root = std::getenv("POMAI_DB_DIR");
+            std::string data_root = env_root ? std::string(env_root) : std::string("./data/pomai_db");
+            std::clog << "[Init] Data root: " << data_root << "\n";
+            std::clog << "[Init] Manifest: " << (data_root + "/membrances.manifest") << "\n";
+            std::clog << "[Init] WAL: " << (data_root + "/wal.log") << "\n";
+        }
+
         // 4b. Tùy chọn: tạo màng mặc định để thuận tiện test
         pomai::core::MembranceConfig images_cfg;
         images_cfg.dim = 512;
         images_cfg.ram_mb = 256;
-        pomai_db->create_membrance("images", images_cfg);
+        bool ok_images = pomai_db->create_membrance("images", images_cfg);
+        std::clog << "[Init] create_membrance(images) -> " << (ok_images ? "ok" : "fail/existed") << " dim=" << images_cfg.dim << " ram_mb=" << images_cfg.ram_mb << "\n";
 
         pomai::core::MembranceConfig audio_cfg;
         audio_cfg.dim = 128;
         audio_cfg.ram_mb = 128;
-        pomai_db->create_membrance("audio", audio_cfg);
+        bool ok_audio = pomai_db->create_membrance("audio", audio_cfg);
+        std::clog << "[Init] create_membrance(audio) -> " << (ok_audio ? "ok" : "fail/existed") << " dim=" << audio_cfg.dim << " ram_mb=" << audio_cfg.ram_mb << "\n";
+
+        // Print current membrances list
+        {
+            auto list = pomai_db->list_membrances();
+            std::clog << "[Init] Membrances (" << list.size() << "):";
+            for (auto &m : list)
+                std::clog << " " << m;
+            std::clog << "\n";
+        }
 
         // 5. Start Server – wiring PomaiDB (multi-membrance) vào!
         PomaiServer server(&map, pomai_db.get(), port);

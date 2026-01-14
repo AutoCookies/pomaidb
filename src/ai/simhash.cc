@@ -11,16 +11,13 @@
  */
 
 #include "src/ai/simhash.h"
+#include "src/core/cpu_kernels.h" // use pomai_dot adaptive kernel
 
 #include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <cassert>
 #include <stdexcept>
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
 
 namespace pomai::ai
 {
@@ -50,48 +47,12 @@ namespace pomai::ai
 
     SimHash::~SimHash() = default;
 
-    // Vectorized dot-sign: AVX2 when available, otherwise scalar.
+    // Vectorized dot-sign: use adaptive kernel via pomai_dot
     inline bool SimHash::dot_sign(const float *vec, const float *proj_row) const
     {
-        // Prefer AVX2 when compiled and supported at runtime
-    #if defined(__AVX2__)
-        // __builtin_cpu_supports is GCC/Clang specific; safe to call on those compilers.
-        if (__builtin_cpu_supports("avx2"))
-        {
-            const size_t V = 8; // 8 floats per __m256
-            size_t i = 0;
-            __m256 acc = _mm256_setzero_ps();
-
-            for (; i + V - 1 < dim_; i += V)
-            {
-                __m256 a = _mm256_loadu_ps(vec + i);
-                __m256 b = _mm256_loadu_ps(proj_row + i);
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(a, b));
-            }
-
-            // horizontal add acc to single float
-            __m128 lo = _mm256_castps256_ps128(acc);
-            __m128 hi = _mm256_extractf128_ps(acc, 1);
-            __m128 sum128 = _mm_add_ps(lo, hi);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            sum128 = _mm_hadd_ps(sum128, sum128);
-            float acc_f = _mm_cvtss_f32(sum128);
-            double accd = static_cast<double>(acc_f);
-
-            // tail
-            for (; i < dim_; ++i)
-            {
-                accd += static_cast<double>(vec[i]) * static_cast<double>(proj_row[i]);
-            }
-            return accd >= 0.0;
-        }
-    #endif
-
-        // Scalar fallback (robust)
-        double acc = 0.0;
-        for (size_t i = 0; i < dim_; ++i)
-            acc += static_cast<double>(vec[i]) * static_cast<double>(proj_row[i]);
-        return acc >= 0.0;
+        // Call adaptive dot kernel from cpu_kernels.h (selects AVX2/AVX512/NEON/scalar at init)
+        float acc = ::pomai_dot(vec, proj_row, dim_);
+        return acc >= 0.0f;
     }
 
     void SimHash::compute(const float *vec, uint8_t *out_bytes) const

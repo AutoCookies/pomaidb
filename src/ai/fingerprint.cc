@@ -16,12 +16,14 @@
 
 #include "src/ai/fingerprint.h"
 #include "src/ai/simhash.h"
+#include "src/core/cpu_kernels.h" // <-- use pomai_dot kernel for rotation
 
 #include <fstream>
 #include <cstring>
 #include <stdexcept>
 #include <iostream>
 #include <cmath>
+#include <vector>
 
 namespace pomai::ai
 {
@@ -87,19 +89,19 @@ namespace pomai::ai
             }
 
             // Apply rotation: out = R * vec  (R is row-major)
-            // Use scratch_ as temporary buffer (per-instance scratch; reads-only after construction)
-            // Note: scratch_ is mutable to allow thread-safety: each call uses local vector on stack instead.
+            // Use a local buffer to avoid contention on mutable scratch_
             std::vector<float> local;
             local.resize(dim_);
             const float *R = rotation_.data();
+
+            // Use optimized dot kernel for each row
+            DotFunc dotk = get_pomai_dot_kernel();
+
             for (size_t r = 0; r < dim_; ++r)
             {
                 const float *rrow = R + r * dim_;
-                double acc = 0.0;
-                // simple dot product
-                for (size_t c = 0; c < dim_; ++c)
-                    acc += static_cast<double>(rrow[c]) * static_cast<double>(vec[c]);
-                local[r] = static_cast<float>(acc);
+                // replace manual loop with dot kernel
+                local[r] = dotk(rrow, vec, dim_);
             }
 
             simhash_.compute(local.data(), out_bytes);
@@ -116,13 +118,14 @@ namespace pomai::ai
             std::vector<float> local;
             local.resize(dim_);
             const float *R = rotation_.data();
+
+            // Use optimized dot kernel for each row
+            DotFunc dotk = get_pomai_dot_kernel();
+
             for (size_t r = 0; r < dim_; ++r)
             {
                 const float *rrow = R + r * dim_;
-                double acc = 0.0;
-                for (size_t c = 0; c < dim_; ++c)
-                    acc += static_cast<double>(rrow[c]) * static_cast<double>(vec[c]);
-                local[r] = static_cast<float>(acc);
+                local[r] = dotk(rrow, vec, dim_);
             }
 
             simhash_.compute_words(local.data(), out_words, word_count);

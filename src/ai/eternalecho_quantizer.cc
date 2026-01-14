@@ -19,6 +19,7 @@
  */
 
 #include "src/ai/eternalecho_quantizer.h"
+#include "src/core/cpu_kernels.h"
 
 #include <random>
 #include <cmath>
@@ -145,6 +146,10 @@ namespace pomai::ai
         std::vector<int8_t> signs;    // size b_k
         std::vector<float> recon_layer(dim_, 0.0f);
 
+        // cache kernels
+        DotFunc dotk = get_pomai_dot_kernel();
+        FmaFunc fmak = get_pomai_fma_kernel();
+
         for (size_t k = 0; k < layers; ++k)
         {
             uint32_t b = cfg_.bits_per_layer[k];
@@ -159,10 +164,9 @@ namespace pomai::ai
             for (uint32_t j = 0; j < b; ++j)
             {
                 const float *col_ptr = &proj_[(static_cast<size_t>(col0 + j) * dim_)];
-                double acc = 0.0;
-                for (size_t d = 0; d < dim_; ++d)
-                    acc += static_cast<double>(col_ptr[d]) * static_cast<double>(residual[d]);
-                proj_vals[j] = static_cast<float>(acc);
+                // use optimized dot kernel
+                float accf = dotk(col_ptr, residual.data(), dim_);
+                proj_vals[j] = accf;
                 signs[j] = (proj_vals[j] >= 0.0f) ? int8_t(+1) : int8_t(-1);
             }
 
@@ -192,18 +196,16 @@ namespace pomai::ai
             pack_signs_to_bytes(signs, packed);
             code.sign_bytes.push_back(std::move(packed));
 
-            // reconstruct layer echo: recon_layer = scale * sum_j sign_j * col_j
+            // reconstruct layer echo using fma: recon_layer += (scale * sign_j) * col_j
             std::fill(recon_layer.begin(), recon_layer.end(), 0.0f);
             for (uint32_t j = 0; j < b; ++j)
             {
                 const float *col_ptr = &proj_[(static_cast<size_t>(col0 + j) * dim_)];
                 float sgn = static_cast<float>(signs[j]);
-                for (size_t d = 0; d < dim_; ++d)
-                    recon_layer[d] += sgn * col_ptr[d];
+                float coeff = scale * sgn;
+                // use optimized fma kernel to accumulate
+                fmak(recon_layer.data(), col_ptr, coeff, dim_);
             }
-            // scale multiply
-            for (size_t d = 0; d < dim_; ++d)
-                recon_layer[d] *= scale;
 
             // subtract from residual
             for (size_t d = 0; d < dim_; ++d)
@@ -243,6 +245,8 @@ namespace pomai::ai
         size_t layers = layer_offsets_.size();
         size_t use_layers = std::min<size_t>(depth, layers);
 
+        FmaFunc fmak = get_pomai_fma_kernel();
+
         for (size_t k = 0; k < use_layers; ++k)
         {
             uint32_t b = (k < code.bits_per_layer.size()) ? code.bits_per_layer[k] : cfg_.bits_per_layer[k];
@@ -279,10 +283,9 @@ namespace pomai::ai
             {
                 const float *col_ptr = &proj_[(static_cast<size_t>(col0 + j) * dim_)];
                 float sgn = static_cast<float>(signs[j]);
-                for (size_t d = 0; d < dim_; ++d)
-                {
-                    out_vec[d] += scale * sgn * col_ptr[d];
-                }
+                float coeff = scale * sgn;
+                // use optimized fma kernel to accumulate
+                fmak(out_vec, col_ptr, coeff, dim_);
             }
         }
     }
@@ -296,6 +299,8 @@ namespace pomai::ai
         out.clear();
         out.resize(layers);
 
+        DotFunc dotk = get_pomai_dot_kernel();
+
         for (size_t k = 0; k < layers; ++k)
         {
             uint32_t b = cfg_.bits_per_layer[k];
@@ -305,10 +310,8 @@ namespace pomai::ai
             for (uint32_t j = 0; j < b; ++j)
             {
                 const float *col_ptr = &proj_[(static_cast<size_t>(col0 + j) * dim_)];
-                double acc = 0.0;
-                for (size_t d = 0; d < dim_; ++d)
-                    acc += static_cast<double>(col_ptr[d]) * static_cast<double>(query[d]);
-                out[k][j] = static_cast<float>(acc);
+                // use optimized dot kernel
+                out[k][j] = dotk(col_ptr, query, dim_);
             }
         }
     }

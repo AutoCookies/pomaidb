@@ -15,6 +15,7 @@
  */
 
 #include "src/ai/pq.h"
+#include "src/core/cpu_kernels.h" // <- added to reuse l2sq kernel
 
 #include <random>
 #include <algorithm>
@@ -322,13 +323,9 @@ namespace pomai::ai
             for (size_t c = 0; c < k_; ++c)
             {
                 const float *centroid = centroids_base + c * subdim_;
-                double sum = 0.0;
-                for (size_t d = 0; d < sub_len; ++d)
-                {
-                    double diff = static_cast<double>(query[sub_off + d]) - static_cast<double>(centroid[d]);
-                    sum += diff * diff;
-                }
-                out_tables[sub * k_ + c] = static_cast<float>(sum);
+                // Use optimized L2 kernel for subvector distance
+                float dist = l2sq(query + sub_off, centroid, sub_len);
+                out_tables[sub * k_ + c] = dist;
             }
         }
     }
