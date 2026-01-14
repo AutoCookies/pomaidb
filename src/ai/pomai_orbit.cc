@@ -37,7 +37,7 @@ namespace pomai::ai::orbit
 
     // Conservative per-entry bytes for serialized EchoCode.
     // Increase if eeq_cfg uses more bits/layers.
-    static constexpr size_t MAX_ECHO_BYTES = 48;
+    static constexpr size_t MAX_ECHO_BYTES = 64;
 
     // ----------------- ArenaView dispatch impl -----------------
     char *ArenaView::alloc_blob(uint32_t len) const

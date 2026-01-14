@@ -86,8 +86,6 @@ def parse_args():
                    help="Run only the milestone incremental experiment (skip optional micro-sweep)")
     p.add_argument("--skip-micro", action="store_true", help="Skip micro-sweep insert profiling")
     p.add_argument("--skip-plots", action="store_true", help="Skip writing plots (write JSON/CSV only)")
-    p.add_argument("--max-insert", default=2000000, type=int,
-                   help="Safety cap: do not insert more than this many vectors")
     return p.parse_args()
 
 # -------------------------
@@ -475,7 +473,7 @@ def run_scientific_suite(args):
         except Exception:
             pass
 
-        ctl.send_all(f"CREATE MEMBRANCE {MEMBR} DIM {args.dim} RAM 4096;\n".encode())
+        ctl.send_all(f"CREATE MEMBRANCE {MEMBR} DIM {args.dim} RAM 12288;\n".encode())
         rsp = ctl.recv_response_exact()
         print("[*] Create response:", rsp.decode(errors='ignore').strip())
 
@@ -484,10 +482,6 @@ def run_scientific_suite(args):
 
         # iterate milestones (respect safety cap)
         for target in args.milestones:
-            if target > args.max_insert:
-                print(f"[*] Skipping milestone {target} (above max_insert {args.max_insert})")
-                continue
-
             monitor.set_phase(f"idle_{target}")
             time.sleep(0.2)
             need = target - current
@@ -521,8 +515,12 @@ def run_scientific_suite(args):
                         ptr += block
 
                     # progress print every ~100k inserted or every few loops
-                    if (current + ptr) // 10000 > printed_progress:
-                        printed_progress = (current + ptr) // 10000
+                    if (current + ptr) // 50000 > printed_progress:
+                        printed_progress = (current + ptr) // 50000
+                        print(f"  [progress] inserted {current+ptr:,} / {target:,}")
+
+                    if (current + ptr) // 500000 > printed_progress:
+                        printed_progress = (current + ptr) // 500000
                         print(f"  [progress] inserted {current+ptr:,} / {target:,}")
 
                 dur = time.time() - t0
