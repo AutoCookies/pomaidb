@@ -1,4 +1,3 @@
-/* src/ai/network_cortex.h */
 #pragma once
 
 #include <cstdint>
@@ -23,12 +22,12 @@ namespace pomai::ai::orbit
     // Cấu trúc gói tin siêu nhỏ (Packed struct để gửi qua mạng)
     #pragma pack(push, 1)
     struct PheromonePacket {
-        uint32_t magic = 0x504F4D41; // 'POMA'
-        uint8_t type;                // PheromoneType
-        uint16_t sender_port;        // Port TCP để fetch dữ liệu (nếu cần)
-        uint64_t node_id;            // Định danh Node (SimHash của IP + Time)
-        uint32_t payload_len;        // Độ dài dữ liệu đi kèm
-        // Payload sẽ nằm ngay sau struct này
+        uint32_t magic;     // 'POMA' == 0x504F4D41
+        uint8_t type;       // PheromoneType
+        uint16_t sender_port;
+        uint64_t node_id;
+        uint32_t payload_len;
+        // Payload nằm ngay sau struct này
     };
     #pragma pack(pop)
 
@@ -39,33 +38,48 @@ namespace pomai::ai::orbit
         float load_factor; // 0.0 - 1.0 (RAM usage)
     };
 
+    // Lightweight, robust UDP broadcast listener/emitter for local discovery.
+    // - Non-blocking friendly (uses poll() with timeout inside listen loop).
+    // - Thread-safe neighbours map.
+    // - Minimal heap allocations on hot path.
     class NetworkCortex
     {
     public:
-        NetworkCortex(uint16_t udp_port = 7777);
+        explicit NetworkCortex(uint16_t udp_port = 7777);
         ~NetworkCortex();
 
+        // start/stop lifecycle (start spawns listener+pulse background threads)
         void start();
         void stop();
 
-        // Phát tán mùi hương (Broadcast UDP)
+        // Emit broadcast pheromone. Payload is truncated to a safe UDP payload if too large.
         void emit_pheromone(PheromoneType type, const void* data, size_t len);
 
-        // Lấy danh sách hàng xóm đang sống
+        // Snapshot copy of discovered neighbors
         std::vector<NeighborInfo> get_neighbors();
 
     private:
-        int sockfd_;
+        // internal helpers
+        void listen_loop();
+        void pulse_loop();
+        void process_packet(const sockaddr_in& sender, const uint8_t* buf, size_t len);
+        uint64_t make_instance_node_id() const noexcept;
+
+        int sockfd_ = -1;
         uint16_t port_;
-        std::atomic<bool> running_;
+        std::atomic<bool> running_{false};
         std::thread listener_thread_;
-        std::thread pulse_thread_; // Nhịp tim định kỳ
+        std::thread pulse_thread_;
 
         std::mutex neighbors_mu_;
         std::unordered_map<uint64_t, NeighborInfo> neighbors_;
 
-        void listen_loop();
-        void pulse_loop();
-        void process_packet(const sockaddr_in& sender, const std::vector<uint8_t>& buffer);
+        // stable instance node id (used to ignore our own broadcasts)
+        uint64_t node_id_ = 0;
+
+        // tuning constants
+        static constexpr size_t RECV_BUF_SZ = 4096;
+        static constexpr size_t SAFE_UDP_PAYLOAD = 1400; // avoid fragmentation
+        static constexpr int POLL_TIMEOUT_MS = 500;
     };
 }

@@ -1,36 +1,19 @@
+#pragma once
 /*
  * src/ai/ids_block.h
  *
  * Compact, versioned helpers for the per-vector IDs/offsets block used by the
- * SoA mmap layout. Each vector has a single 8-byte (uint64_t) entry that
- * encodes one of:
- *   - a local arena offset (payload stored in PomaiArena blob region)
- *   - a remote segment id + offset (demoted blob on disk)
- *   - an external label id (application label)
+ * SoA mmap layout.
  *
- * Encoding strategy (62 usable payload bits + 2 tag bits in MSBs):
- *   - tag 00 : local offset        => value format: (0b00 << 62) | (offset & PAYLOAD_MASK)
- *   - tag 01 : remote id           => value format: (0b01 << 62) | (remote_id & PAYLOAD_MASK)
- *   - tag 10 : external label id   => value format: (0b10 << 62) | (label & PAYLOAD_MASK)
- *   - tag 11 : reserved / unused
+ * Improvements:
+ *  - Added safe "try_pack" helpers to avoid silent truncation when payload
+ *    does not fit into 62 bits.
+ *  - Added small atomic helpers (declarations) implemented in ids_block.cc
+ *    to make it convenient and safe to update entries stored in mmap'd memory.
+ *  - Extra utility functions: fits_payload, tag_of.
  *
- * This provides a compact, fixed-size representation (8 bytes per vector)
- * and avoids ambiguity between offsets and labels. Consumers must ensure the
- * original numeric values fit in 62 bits (practically always true).
- *
- * Threading:
- *   - The helpers here are simple pack/unpack functions. Atomicity on update
- *     is the caller's responsibility. For in-memory concurrent updates you can
- *     use std::atomic<uint64_t> or std::atomic_ref<uint64_t> on mapped memory.
- *
- * Usage:
- *   uint64_t entry = IdEntry::pack_local_offset(offset);
- *   if (IdEntry::is_local_offset(entry)) { uint64_t off = IdEntry::unpack_local_offset(entry); ... }
- *
- * Clean, documented, minimal.
+ * Note: This header stays lightweight and suitable for inlining hot path bit ops.
  */
-
-#pragma once
 
 #include <cstdint>
 #include <cstddef>
@@ -76,9 +59,15 @@ namespace pomai::ai::soa
             return TAG_LABEL | (label & PAYLOAD_MASK);
         }
 
+        // Safe try-pack helpers — return false when value doesn't fit (no silent truncation)
+        // Implemented in ids_block.cc (non-inline) to keep header small.
+        static bool try_pack_local_offset(uint64_t offset, uint64_t &out) noexcept;
+        static bool try_pack_remote_id(uint64_t remote_id, uint64_t &out) noexcept;
+        static bool try_pack_label(uint64_t label, uint64_t &out) noexcept;
+
         // Predicate helpers
         static inline bool is_empty(uint64_t v) noexcept { return v == EMPTY; }
-        static inline bool is_local_offset(uint64_t v) noexcept { return (v & TAG_MASK) == TAG_LOCAL && v != EMPTY; }
+        static inline bool is_local_offset(uint64_t v) noexcept { return ((v & TAG_MASK) == TAG_LOCAL) && (v != EMPTY); }
         static inline bool is_remote_id(uint64_t v) noexcept { return (v & TAG_MASK) == TAG_REMOTE; }
         static inline bool is_label(uint64_t v) noexcept { return (v & TAG_MASK) == TAG_LABEL; }
 
@@ -86,9 +75,35 @@ namespace pomai::ai::soa
         static inline uint64_t unpack_local_offset(uint64_t v) noexcept { return v & PAYLOAD_MASK; }
         static inline uint64_t unpack_remote_id(uint64_t v) noexcept { return v & PAYLOAD_MASK; }
         static inline uint64_t unpack_label(uint64_t v) noexcept { return v & PAYLOAD_MASK; }
+
+        // Utility helpers
+        static inline bool fits_payload(uint64_t v) noexcept { return (v & ~PAYLOAD_MASK) == 0; }
+        static inline uint64_t tag_of(uint64_t v) noexcept { return v & TAG_MASK; }
     };
 
     // Ensure platform has 8-byte uint64_t (sensible check)
     static_assert(sizeof(uint64_t) == 8, "Platform requires 8-byte uint64_t");
+    static_assert(IdEntry::PAYLOAD_MASK == ((1ULL << 62) - 1ULL), "PAYLOAD_MASK must be 62 bits");
+
+    // -------------------------
+    // Atomic helpers (declarations)
+    // -------------------------
+    //
+    // Convenience wrappers to perform atomic load/store/CAS into memory that may be mmap'd.
+    // These functions use the platform/compiler atomic builtins under the hood (see ids_block.cc)
+    // and are safe to call on addresses that may live in shared/mmap'd memory.
+    //
+    // Note: call sites that already manage atomicity can avoid these helpers and operate on
+    // std::atomic<uint64_t> or use pomai::ai::atomic_utils directly.
+    //
+    // - atomic_store_entry(ptr, v): store v with release semantics
+    // - atomic_load_entry(ptr): load value with acquire semantics
+    // - atomic_compare_exchange_entry(ptr, expected, desired): CAS (seq_cst), returns true on success,
+    //     on failure 'expected' is updated with current value.
+    //
+
+    void atomic_store_entry(uint64_t *ptr, uint64_t v) noexcept;
+    uint64_t atomic_load_entry(const uint64_t *ptr) noexcept;
+    bool atomic_compare_exchange_entry(uint64_t *ptr, uint64_t &expected, uint64_t desired) noexcept;
 
 } // namespace pomai::ai::soa

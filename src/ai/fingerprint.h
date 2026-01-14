@@ -71,16 +71,16 @@ namespace pomai::ai
 
         // Create a plain SimHash encoder.
         // - dim: dimensionality of input vectors
-        // - bits: number of sign-bits to produce (typical 256/512)
+        // - bits: number of sign-bits to produce (typical 256/512). If 0, runtime config value is used.
         // - seed: RNG seed used by SimHash to initialize projection matrix
-        static std::unique_ptr<FingerprintEncoder> createSimHash(size_t dim, size_t bits = 512, uint64_t seed = 123456789ULL);
+        static std::unique_ptr<FingerprintEncoder> createSimHash(size_t dim, size_t bits = 0, uint64_t seed = 123456789ULL);
 
         // Create an OPQ-sign encoder: applies rotation (dim x dim) then SimHash.
         // - rotation_path: optional path to a binary rotation matrix file (row-major floats).
         //   If empty or load fails, identity rotation is used.
         // - dim/bits/seed as above.
         static std::unique_ptr<FingerprintEncoder> createOPQSign(size_t dim,
-                                                                 size_t bits = 512,
+                                                                 size_t bits = 0,
                                                                  const std::string &rotation_path = std::string(),
                                                                  uint64_t seed = 123456789ULL);
     };

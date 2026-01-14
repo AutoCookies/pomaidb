@@ -1,37 +1,47 @@
-# Stage 1: Build
-FROM golang:1.25-alpine AS builder
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++ \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY src ./src
+
+RUN mkdir -p build
+
+RUN g++ -O3 -ffast-math -pthread \
+    src/main.cc \
+    src/core/*.cc \
+    src/ai/*.cc \
+    src/memory/*.cc \
+    src/utils/*.cc \
+    src/external/*.cc \
+    src/facade/*.cc \
+    src/tools/*.cc \
+    -o build/pomai_server
+
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash pomai
+USER pomai
 
 WORKDIR /app
 
-# Copy dependency files
-COPY go.mod go.sum ./
-RUN go mod download
+COPY --from=builder /app/build/pomai_server .
 
-# Copy source code
-COPY . .
+USER root
+RUN mkdir -p /data && chown pomai:pomai /data
+USER pomai
 
-# Build binary (Static binary)
-RUN CGO_ENABLED=0 GOOS=linux go build -o pomai-server ./cmd/server/main.go
+ENV POMAI_DB_DIR=/data
+ENV POMAI_PORT=7777
 
-# Stage 2: Run (Dùng Alpine cho nhẹ)
-FROM alpine:latest
+EXPOSE 7777
 
-WORKDIR /root/
-
-# Copy binary từ builder
-COPY --from=builder /app/pomai-server .
-
-# Tạo thư mục data để mount volume
-RUN mkdir -p ./data
-
-# Thiết lập biến môi trường mặc định
-ENV PORT=8080
-ENV DATA_DIR=./data
-ENV SHARD_COUNT=256
-ENV PERSISTENCE=file
-
-# Expose port
-EXPOSE 8080
-
-# Chạy server
-CMD ["./pomai-server"]
+CMD ["./pomai_server"]

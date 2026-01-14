@@ -1,19 +1,30 @@
+version: '3.8'
+
 services:
-  pomai-cache:
-    build: .
-    container_name: pomai-cache-node
+  pomai:
+    build: . 
+    image: pomaidb:local
+    container_name: pomai_server
     restart: unless-stopped
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '4'     
+          memory: 12G   
+  
     ports:
-      - "8080:8080"
+      - "7777:7777/udp" 
+      - "7777:7777/tcp"
+    
     volumes:
-      # Map thư mục data của máy thật vào container (đồng nhất với Dockerfile /data)
-      - ./data:/data
+      - ./pomai_data:/data
+   
     environment:
-      - PORT=8080
-      - DATA_DIR=/data
-    # Healthcheck: dùng curl -f (curl có thể cần được cài trong image)
-    healthcheck:
-      test: [ "CMD", "sh", "-c", "curl -f http://localhost:8080/health || exit 1" ]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      - POMAI_DB_DIR=/data
+      - POMAI_PORT=7777
+
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536

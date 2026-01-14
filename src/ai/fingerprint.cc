@@ -17,6 +17,7 @@
 #include "src/ai/fingerprint.h"
 #include "src/ai/simhash.h"
 #include "src/core/cpu_kernels.h" // <-- use pomai_dot kernel for rotation
+#include "src/core/config.h"      // for runtime.fingerprint_bits
 
 #include <fstream>
 #include <cstring>
@@ -73,8 +74,8 @@ namespace pomai::ai
             // If rotation supplied, its size must be dim*dim. Otherwise rotation_ is empty.
             if (!rotation_.empty() && rotation_.size() != dim_ * dim_)
                 throw std::invalid_argument("OPQSignEncoder: rotation size mismatch");
-            // Preallocate rotation scratch (per-call stack buffer alternative).
-            scratch_.resize(dim_);
+            // NOTE: removed per-instance scratch_ vector to avoid races and heap churn.
+            // We use a thread-local scratch buffer inside compute() to avoid per-call mallocs.
         }
 
         size_t bytes() const noexcept override { return simhash_.bytes(); }
@@ -89,22 +90,36 @@ namespace pomai::ai
             }
 
             // Apply rotation: out = R * vec  (R is row-major)
-            // Use a local buffer to avoid contention on mutable scratch_
-            std::vector<float> local;
-            local.resize(dim_);
             const float *R = rotation_.data();
 
-            // Use optimized dot kernel for each row
-            DotFunc dotk = get_pomai_dot_kernel();
+            // Thread-local scratch buffer to avoid repeated allocations in hot path.
+            // Bound the thread-local reservation to avoid unbounded memory per thread.
+            static thread_local std::vector<float> scratch;
+            constexpr size_t MAX_THREAD_SCRATCH = 262144; // max floats (~1 MiB) per thread buffer
+            float *local_ptr = nullptr;
+            std::vector<float> fallback; // used only if dim_ > MAX_THREAD_SCRATCH
 
+            if (dim_ <= MAX_THREAD_SCRATCH)
+            {
+                if (scratch.size() < dim_)
+                    scratch.resize(dim_);
+                local_ptr = scratch.data();
+            }
+            else
+            {
+                // Rare path for extremely large dims: allocate once for this call to remain correct.
+                fallback.resize(dim_);
+                local_ptr = fallback.data();
+            }
+
+            // Use the central kernel directly (pomai_dot) to compute each row dot product.
             for (size_t r = 0; r < dim_; ++r)
             {
                 const float *rrow = R + r * dim_;
-                // replace manual loop with dot kernel
-                local[r] = dotk(rrow, vec, dim_);
+                local_ptr[r] = ::pomai_dot(rrow, vec, dim_);
             }
 
-            simhash_.compute(local.data(), out_bytes);
+            simhash_.compute(local_ptr, out_bytes);
         }
 
         void compute_words(const float *vec, uint64_t *out_words, size_t word_count) const override
@@ -115,27 +130,40 @@ namespace pomai::ai
                 return;
             }
 
-            std::vector<float> local;
-            local.resize(dim_);
             const float *R = rotation_.data();
 
-            // Use optimized dot kernel for each row
-            DotFunc dotk = get_pomai_dot_kernel();
+            // Thread-local scratch buffer same as above
+            static thread_local std::vector<float> scratch;
+            constexpr size_t MAX_THREAD_SCRATCH = 262144; // max floats (~1 MiB) per thread buffer
+            float *local_ptr = nullptr;
+            std::vector<float> fallback;
+
+            if (dim_ <= MAX_THREAD_SCRATCH)
+            {
+                if (scratch.size() < dim_)
+                    scratch.resize(dim_);
+                local_ptr = scratch.data();
+            }
+            else
+            {
+                fallback.resize(dim_);
+                local_ptr = fallback.data();
+            }
 
             for (size_t r = 0; r < dim_; ++r)
             {
                 const float *rrow = R + r * dim_;
-                local[r] = dotk(rrow, vec, dim_);
+                local_ptr[r] = ::pomai_dot(rrow, vec, dim_);
             }
 
-            simhash_.compute_words(local.data(), out_words, word_count);
+            simhash_.compute_words(local_ptr, out_words, word_count);
         }
 
     private:
         size_t dim_;
         SimHash simhash_;
         std::vector<float> rotation_;
-        mutable std::vector<float> scratch_; // used only as temporary if needed
+        // Removed: mutable std::vector<float> scratch_;  <-- avoid shared mutable member
     };
 
     // -------------------- Rotation matrix helpers --------------------
@@ -189,7 +217,15 @@ namespace pomai::ai
 
     std::unique_ptr<FingerprintEncoder> FingerprintEncoder::createSimHash(size_t dim, size_t bits, uint64_t seed)
     {
-        return std::unique_ptr<FingerprintEncoder>(new SimHashEncoder(dim, bits, seed));
+        // If caller passes bits==0, use runtime config default (centralized)
+        size_t use_bits = bits;
+        if (use_bits == 0)
+        {
+            use_bits = static_cast<size_t>(pomai::config::runtime.fingerprint_bits);
+            if (use_bits == 0)
+                use_bits = 512; // final fallback
+        }
+        return std::unique_ptr<FingerprintEncoder>(new SimHashEncoder(dim, use_bits, seed));
     }
 
     std::unique_ptr<FingerprintEncoder> FingerprintEncoder::createOPQSign(size_t dim,
@@ -197,9 +233,17 @@ namespace pomai::ai
                                                                           const std::string &rotation_path,
                                                                           uint64_t seed)
     {
+        // If bits==0 use runtime default
+        size_t use_bits = bits;
+        if (use_bits == 0)
+        {
+            use_bits = static_cast<size_t>(pomai::config::runtime.fingerprint_bits);
+            if (use_bits == 0)
+                use_bits = 512;
+        }
         std::vector<float> rotation = load_rotation_matrix(rotation_path, dim);
         // If rotation empty -> identity (internal handling)
-        return std::unique_ptr<FingerprintEncoder>(new OPQSignEncoder(dim, bits, seed, std::move(rotation)));
+        return std::unique_ptr<FingerprintEncoder>(new OPQSignEncoder(dim, use_bits, seed, std::move(rotation)));
     }
 
 } // namespace pomai::ai

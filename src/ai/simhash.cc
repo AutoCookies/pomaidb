@@ -4,20 +4,20 @@
  * Vectorized SimHash implementation — AVX2 accelerated dot-products with safe scalar fallback.
  *
  * Notes:
- *  - We keep the public API unchanged (SimHash::compute, compute_vec, compute_words).
- *  - At runtime, when compiled with AVX2 support, we use __builtin_cpu_supports("avx2")
- *    to guard the AVX2 kernel for portability on heterogeneous machines.
- *  - This implementation focuses on accelerating the inner dot-product (the hot path).
+ *  - The hot-path dot product uses the adaptive kernel from cpu_kernels.h via pomai_dot.
+ *  - hamming_dist moved here to allow an efficient implementation over 64-bit chunks
+ *    using __builtin_popcountll. This is portable and much faster than per-byte loops.
  */
 
 #include "src/ai/simhash.h"
-#include "src/core/cpu_kernels.h" // use pomai_dot adaptive kernel
+#include "src/core/cpu_kernels.h"
 
 #include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <cassert>
 #include <stdexcept>
+#include <immintrin.h> // ok to include; used conditionally
 
 namespace pomai::ai
 {
@@ -47,7 +47,7 @@ namespace pomai::ai
 
     SimHash::~SimHash() = default;
 
-    // Vectorized dot-sign: use adaptive kernel via pomai_dot
+    // Helper: compute sign for one projection row (dot product)
     inline bool SimHash::dot_sign(const float *vec, const float *proj_row) const
     {
         // Call adaptive dot kernel from cpu_kernels.h (selects AVX2/AVX512/NEON/scalar at init)
@@ -102,6 +102,42 @@ namespace pomai::ai
                 out_words[word_idx] |= (1ULL << pos);
             }
         }
+    }
+
+    // Efficient hamming distance: operate on 64-bit chunks and use builtin popcount.
+    // This is fast and portable; for even more speed a platform-specific AVX2/AVX512
+    // vectorized popcount can be added later behind a runtime check.
+    uint32_t SimHash::hamming_dist(const uint8_t *a, const uint8_t *b, size_t bytes)
+    {
+        if (!a || !b || bytes == 0)
+            return 0;
+
+        size_t i = 0;
+        uint32_t dist = 0;
+
+        // process 8-byte blocks
+        const size_t BLOCK = sizeof(uint64_t);
+        size_t nblocks = bytes / BLOCK;
+        const uint64_t *pa = reinterpret_cast<const uint64_t *>(a);
+        const uint64_t *pb = reinterpret_cast<const uint64_t *>(b);
+
+        for (size_t k = 0; k < nblocks; ++k)
+        {
+            uint64_t xa = pa[k];
+            uint64_t xb = pb[k];
+            dist += POPCOUNT64(xa ^ xb);
+        }
+
+        // tail bytes
+        i = nblocks * BLOCK;
+        for (; i < bytes; ++i)
+        {
+            uint8_t xa = a[i];
+            uint8_t xb = b[i];
+            dist += POPCOUNT32(static_cast<unsigned>(xa ^ xb));
+        }
+
+        return dist;
     }
 
 } // namespace pomai::ai

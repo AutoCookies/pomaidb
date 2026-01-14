@@ -12,8 +12,11 @@
  *   - EternalEchoQuantizer(cfg, dim, seed)
  *   - EchoCode encode(const float* vec) const
  *   - void decode(const EchoCode&, float* out) const
- *   - float approx_dist(const float* query, const EchoCode&) const
+ *   - float approx_dist(const float* query, const EchoCode& code, float* scratch_buf) const  // exact (decode-based)
+ *   - float approx_dist(const float* query, const EchoCode& code) const                     // exact (thread-local scratch)
+ *   - float approx_dist_code(const float* query, const EchoCode& code) const                // ADC-style fast approx (no decode)
  *   - void project_query(const float* query, std::vector<std::vector<float>>& out) const
+ *   - const std::vector<float>& layer_col_energy() const noexcept
  *
  * Notes:
  *  - Implementation is standalone (does not rely on SimHash internals).
@@ -63,8 +66,16 @@ namespace pomai::ai
         void decode(const EchoCode &code, float *out_vec) const;
 
         // Approximate squared L2 distance between query and reconstructed code.
-        // Implementation reconstructs the candidate then computes l2sq(query, recon).
+        // Exact (decode-based) variant: caller provides scratch buffer (dim floats) to avoid heap allocs.
+        float approx_dist(const float *query, const EchoCode &code, float *scratch_buf) const;
+
+        // Backward-compatible exact variant: uses thread_local scratch on first call
         float approx_dist(const float *query, const EchoCode &code) const;
+
+        // ADC-style fast approximate distance computed directly on the EchoCode
+        // (no full decode). This is intended for ranking / prefilter. It allocates
+        // small temporary structures for projections.
+        float approx_dist_code_bytes(const std::vector<std::vector<float>> &qproj, float qnorm2, const uint8_t *data, size_t len) const;
 
         // Precompute projections of query onto each layer: out[k] is vector of length bits_per_layer[k],
         // i.e., p_k = R_k^T * query. Useful for optimized distance computations.
@@ -73,6 +84,9 @@ namespace pomai::ai
         // Accessors
         size_t dim() const noexcept { return dim_; }
         const EternalEchoConfig &config() const noexcept { return cfg_; }
+
+        // Per-layer column energy sums (sum_j ||col_j||^2), computed at construction.
+        const std::vector<float> &layer_col_energy() const noexcept { return layer_col_energy_; }
 
     private:
         size_t dim_;
@@ -85,11 +99,13 @@ namespace pomai::ai
         // Prefix sums of bits to locate layer offsets
         std::vector<uint32_t> layer_offsets_; // layer_offsets_[k] = starting column index for layer k
 
+        // Per-layer precomputed column energy sums
+        std::vector<float> layer_col_energy_; // length = layers
+
         // RNG seed used to generate proj_
         uint64_t seed_;
 
         // Helpers
-        float l2sq(const float *a, const float *b) const;
         void pack_signs_to_bytes(const std::vector<int8_t> &signs, std::vector<uint8_t> &out_bytes) const;
         void unpack_bytes_to_signs(const std::vector<uint8_t> &in_bytes, uint32_t bits, std::vector<int8_t> &out_signs) const;
         float compute_vector_norm(const float *v) const;

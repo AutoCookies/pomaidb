@@ -223,7 +223,29 @@ LOAD BINARY '/path/vectors.bin' INTO myspace;
 - Because crash-only design is unacceptable for real users.
 - Because you want a database that fights for you—not the other way around.
 
----
+## Benchmarks
+
+We run this benchmarks on Github Codespace, with 4 cores CPU, and 16Gb RAM. By inserting, searching, filtering, delete 512 dimensions vectors.
+
+<p align="center">
+  <img src="assets/baseline_cdf_last.png" alt="PomaiDB Logo" width="600">
+  <br>
+</p>
+
+<p align="center">
+  <img src="assets/latency_percentiles_vs_N.png" alt="PomaiDB Logo" width="600">
+  <br>
+</p>
+
+<p align="center">
+  <img src="assets/recall_vs_latency.png" alt="PomaiDB Logo" width="600">
+  <br>
+</p>
+
+<p align="center">
+  <img src="assets/throughput_vs_N.png" alt="PomaiDB Logo" width="600">
+  <br>
+</p>
 
 ## License
 
@@ -243,12 +265,10 @@ If you use PomaiDB in academic or research projects:
 @misc{pomai,
   author={Quan Van},
   title={PomaiDB: Vector Search for Every Machine},
-  url={https://github.com/quann/PomaiDB},
-  year={2024}
+  url={https://github.com/AutoCookies/pomai},
+  year={2026}
 }
 ```
-
----
 
 ## A Final Word
 

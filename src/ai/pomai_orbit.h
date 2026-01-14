@@ -114,6 +114,47 @@ namespace pomai::ai::orbit
             bool use_cortex = true;
         };
 
+        struct DeletedBloom
+        {
+            static constexpr uint32_t kBits = 1 << 16; // 65536 bits = 8KB
+            static constexpr uint32_t kMask = kBits - 1;
+
+            alignas(64) uint8_t bits[kBits / 8]{};
+
+            static inline uint32_t h1(uint64_t x)
+            {
+                x ^= x >> 33;
+                x *= 0xff51afd7ed558ccdULL;
+                return uint32_t(x);
+            }
+            static inline uint32_t h2(uint64_t x)
+            {
+                x ^= x >> 29;
+                x *= 0xc4ceb9fe1a85ec53ULL;
+                return uint32_t(x);
+            }
+
+            inline void add(uint64_t v)
+            {
+                uint32_t a = h1(v) & kMask;
+                uint32_t b = h2(v) & kMask;
+                uint32_t c = (a ^ b) & kMask;
+                bits[a >> 3] |= 1u << (a & 7);
+                bits[b >> 3] |= 1u << (b & 7);
+                bits[c >> 3] |= 1u << (c & 7);
+            }
+
+            inline bool maybe_contains(uint64_t v) const
+            {
+                uint32_t a = h1(v) & kMask;
+                uint32_t b = h2(v) & kMask;
+                uint32_t c = (a ^ b) & kMask;
+                return (bits[a >> 3] & (1u << (a & 7))) &&
+                       (bits[b >> 3] & (1u << (b & 7))) &&
+                       (bits[c >> 3] & (1u << (c & 7)));
+            }
+        };
+
         // Constructors: accept either arena flavor
         PomaiOrbit(const Config &cfg, pomai::memory::PomaiArena *arena);
         PomaiOrbit(const Config &cfg, pomai::memory::ShardArena *arena);
@@ -187,5 +228,11 @@ namespace pomai::ai::orbit
 
         // Helper: compute distance by decoding EEQ bytes for given id
         bool compute_distance_for_id(const float *query, uint64_t id, float &out_dist);
+
+        // NEW: helper that accepts precomputed projections to avoid recomputing per-id.
+        bool compute_distance_for_id_with_proj(const std::vector<std::vector<float>> &qproj, float qnorm2, uint64_t id, float &out_dist);
+
+        void decode_serialized(const uint8_t *ser, size_t len, float *out_vec, std::vector<int8_t> &sign_scratch) const;
+        std::unordered_map<uint64_t, uint32_t> label_to_slot_;
     };
 } // namespace pomai::ai::orbit

@@ -1,3 +1,4 @@
+#pragma once
 /*
  * src/ai/simhash.h
  *
@@ -7,7 +8,8 @@
  * - Default configuration: 512 bits (recommended for good prefilter selectivity).
  *
  * Updates:
- * - Added 'simhash' namespace with 'hamming_dist' helper for HolographicScanner.
+ * - Moved hamming_dist implementation to simhash.cc so we can provide
+ *   a tuned implementation (64-bit chunks + builtin popcount / optional SIMD).
  */
 
 #pragma once
@@ -35,7 +37,7 @@ namespace pomai::ai
     public:
         // Construct a SimHash object.
         // - dim: input vector dimensionality (number of floats per vector)
-        // - bits: number of sign-bits to produce (typical 256 or 512)
+        // - bits: number of sign-bits to produce (typical 256 or 512). If 0, factory may pick runtime default.
         // - seed: RNG seed for reproducible projection matrices
         SimHash(size_t dim, size_t bits = 512, uint64_t seed = 123456789ULL);
 
@@ -70,34 +72,14 @@ namespace pomai::ai
 
         // Helper: compute sign for one projection row (dot product)
         inline bool dot_sign(const float *vec, const float *proj_row) const;
+
+    public:
+        // Compute Hamming distance between two bit-packed fingerprints (a,b) of length `bytes`.
+        // Tuned implementation lives in simhash.cc (64-bit-chunk loop + builtin popcount).
+        static uint32_t hamming_dist(const uint8_t *a, const uint8_t *b, size_t bytes);
     };
 
     // --- Helper namespace for distance functions (Required by HolographicScanner) ---
-    namespace simhash
-    {
-        // Compute Hamming distance between two bit vectors of length 'bytes'.
-        // This is a hot-path function used during scanning.
-        static inline uint32_t hamming_dist(const uint8_t *a, const uint8_t *b, size_t bytes)
-        {
-            uint32_t dist = 0;
-            size_t i = 0;
-
-            // Process 64-bit chunks for speed (8 bytes at a time)
-            for (; i + 8 <= bytes; i += 8)
-            {
-                uint64_t va = *reinterpret_cast<const uint64_t *>(a + i);
-                uint64_t vb = *reinterpret_cast<const uint64_t *>(b + i);
-                dist += POPCOUNT64(va ^ vb);
-            }
-
-            // Process remaining bytes
-            for (; i < bytes; ++i)
-            {
-                uint8_t x = a[i] ^ b[i];
-                dist += POPCOUNT32(x);
-            }
-            return dist;
-        }
-    }
+    // hamming_dist declared above and implemented in simhash.cc
 
 } // namespace pomai::ai
