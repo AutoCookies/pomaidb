@@ -24,6 +24,16 @@ struct PomaiMetrics
     static std::atomic<uint64_t> blob_allocs;
     static std::atomic<uint64_t> blob_frees;
 
+    // Batch-insert performance metrics (ns)
+    // total nanoseconds spent in encode phase across all batches
+    static std::atomic<uint64_t> batch_encode_ns_total;
+    // total nanoseconds spent in sort phase across all batches
+    static std::atomic<uint64_t> batch_sort_ns_total;
+    // total nanoseconds spent in write phase across all batches
+    static std::atomic<uint64_t> batch_write_ns_total;
+    // number of logical sub-batches processed
+    static std::atomic<uint64_t> batch_subbatches_processed;
+
     static void reset()
     {
         hits.store(0);
@@ -36,6 +46,10 @@ struct PomaiMetrics
         seed_frees.store(0);
         blob_allocs.store(0);
         blob_frees.store(0);
+        batch_encode_ns_total.store(0);
+        batch_sort_ns_total.store(0);
+        batch_write_ns_total.store(0);
+        batch_subbatches_processed.store(0);
     }
 };
 
@@ -50,3 +64,8 @@ inline std::atomic<uint64_t> PomaiMetrics::seed_allocs{0};
 inline std::atomic<uint64_t> PomaiMetrics::seed_frees{0};
 inline std::atomic<uint64_t> PomaiMetrics::blob_allocs{0};
 inline std::atomic<uint64_t> PomaiMetrics::blob_frees{0};
+
+inline std::atomic<uint64_t> PomaiMetrics::batch_encode_ns_total{0};
+inline std::atomic<uint64_t> PomaiMetrics::batch_sort_ns_total{0};
+inline std::atomic<uint64_t> PomaiMetrics::batch_write_ns_total{0};
+inline std::atomic<uint64_t> PomaiMetrics::batch_subbatches_processed{0};

@@ -23,6 +23,7 @@
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <array>
 
 #include "src/ai/fingerprint.h"
 #include "src/core/config.h"
@@ -205,9 +206,30 @@ namespace pomai::ai::orbit
         uint32_t dynamic_bucket_capacity_ = 128;
         std::string schema_file_path_;
 
-        // Label -> bucket offset (points to bucket that contains code bytes)
-        std::unordered_map<uint64_t, uint64_t> label_to_bucket_;
-        mutable std::shared_mutex label_map_mu_;
+        // Label map: sharded maps to reduce global lock contention on label->bucket/slot updates.
+        static constexpr size_t kLabelShardBits = 6; // 2^6 = 64 shards
+        static constexpr size_t kLabelShardCount = 1u << kLabelShardBits;
+
+        struct LabelShard
+        {
+            mutable std::shared_mutex mu;
+            std::unordered_map<uint64_t, uint64_t> bucket;
+            std::unordered_map<uint64_t, uint32_t> slot;
+        };
+        std::array<LabelShard, kLabelShardCount> label_shards_;
+
+        // Helper: compute shard index for a label
+        static inline size_t label_shard_index(uint64_t label) noexcept
+        {
+            // 64-bit multiplicative hash, then take top bits
+            const uint64_t kMul = 11400714819323198485ull;
+            return static_cast<size_t>((label * kMul) >> (64 - kLabelShardBits));
+        }
+
+        // Helper accessors for the sharded label map
+        void set_label_map(uint64_t label, uint64_t bucket_off, uint32_t slot);
+        bool get_label_bucket(uint64_t label, uint64_t &out_bucket) const;
+        bool get_label_slot(uint64_t label, uint32_t &out_slot) const;
 
         std::unordered_set<uint64_t> deleted_labels_;
         mutable std::shared_mutex del_mu_;
@@ -233,6 +255,6 @@ namespace pomai::ai::orbit
         bool compute_distance_for_id_with_proj(const std::vector<std::vector<float>> &qproj, float qnorm2, uint64_t id, float &out_dist);
 
         void decode_serialized(const uint8_t *ser, size_t len, float *out_vec, std::vector<int8_t> &sign_scratch) const;
-        std::unordered_map<uint64_t, uint32_t> label_to_slot_;
+        std::unordered_map<uint64_t, uint32_t> label_to_slot_; // kept for compatibility in case of other code paths
     };
 } // namespace pomai::ai::orbit

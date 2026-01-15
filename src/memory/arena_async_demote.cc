@@ -1,13 +1,14 @@
-// src/memory/arena_async_demote.cc
-//
-// Async demote helper implementation for PomaiArena.
-// Schedules a background task that calls the synchronous demote_blob_data()
-// and stores the result in a PendingDemote object so callers can resolve it.
-//
-// Notes:
-//  - This implementation is intentionally simple: it detaches a thread per request.
-//    For production you'd replace this with a bounded thread-pool / task queue,
-//    retries/backoff, failure handling, and robust IO semantics.
+/*
+ * src/memory/arena_async_demote.cc
+ *
+ * Queue-based async demote implementation for PomaiArena.
+ *
+ * - Enqueues DemoteTask to the single background worker started by allocate_region().
+ * - Returns a placeholder id (MSB set) immediately. Callers can resolve the placeholder
+ *   with resolve_pending_remote(placeholder, timeout_ms).
+ * - If the demote queue is full, falls back to synchronous demote_blob_data (writes inline)
+ *   and returns the final remote id (non-placeholder) so caller still gets a usable id.
+ */
 
 #include "src/memory/arena.h"
 
@@ -25,58 +26,57 @@ namespace pomai::memory
         if (!data || len == 0)
             return 0;
 
-        // allocate monotonic placeholder id
+        // Copy payload to local buffer
+        std::vector<char> blob;
+        blob.resize(static_cast<size_t>(len));
+        std::memcpy(blob.data(), data, len);
+
+        // Reserve a concrete remote id now so worker can use deterministic filename
+        uint64_t encoded_remote_id = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            uint64_t id = next_remote_id_++;
+            encoded_remote_id = blob_region_bytes_ + id;
+            // publish placeholder remote_map_ entry (pending)
+            remote_map_[encoded_remote_id] = std::string();
+        }
+
+        // Create pending handle + placeholder id
         uint64_t ctr = pending_counter_.fetch_add(1, std::memory_order_acq_rel);
         uint64_t placeholder = make_placeholder(ctr);
-
-        // create pending entry
         auto pend = std::make_shared<PendingDemote>();
         {
             std::lock_guard<std::mutex> lk(pending_mu_);
             pending_map_.emplace(placeholder, pend);
         }
 
-        // copy blob (caller buffer may be transient)
-        std::vector<char> blob;
-        blob.resize(static_cast<size_t>(len));
-        std::memcpy(blob.data(), data, len);
+        // Prepare task
+        DemoteTask task;
+        task.remote_id = encoded_remote_id;
+        task.placeholder = placeholder;
+        task.payload = std::move(blob);
+        task.pend = pend;
 
-        // spawn background thread (detached) to perform synchronous demote and fulfill promise
-        std::thread([this, placeholder, pend, blob = std::move(blob), len]() mutable
-                    {
-                        uint64_t final_remote = 0;
-                        try
-                        {
-                            // call existing synchronous demote helper
-                            // demote_blob_data expects const char* and len; returns remote_id or 0 on error
-                            final_remote = this->demote_blob_data(blob.data(), len);
-                        }
-                        catch (const std::exception &e)
-                        {
-                            std::cerr << "[PomaiArena] async demote exception: " << e.what() << "\n";
-                            final_remote = 0;
-                        }
-                        catch (...)
-                        {
-                            std::cerr << "[PomaiArena] async demote unknown exception\n";
-                            final_remote = 0;
-                        }
+        // Try to enqueue to demote_queue_ (bounded)
+        {
+            std::lock_guard<std::mutex> qlk(demote_mu_);
+            if (demote_queue_.size() >= max_pending_demotes_)
+            {
+                // Queue full: fallback to synchronous demote
+                // Remove pending_map_ entry and perform inline demote
+                {
+                    std::lock_guard<std::mutex> plk(pending_mu_);
+                    pending_map_.erase(placeholder);
+                }
+                uint64_t final_remote = demote_blob_data(task.payload.data(), static_cast<uint32_t>(task.payload.size()));
+                // If succeeded, remote_map_ already set by demote_blob_data
+                return final_remote;
+            }
+            demote_queue_.push_back(std::move(task));
+            demote_cv_.notify_one();
+        }
 
-                        // publish result into pending entry and notify waiters
-                        {
-                            std::lock_guard<std::mutex> lk(pend->m);
-                            pend->final_remote_id = final_remote;
-                            pend->done = true;
-                        }
-                        pend->cv.notify_all();
-
-                        // cleanup entry from pending_map_
-                        {
-                            std::lock_guard<std::mutex> lk(this->pending_mu_);
-                            this->pending_map_.erase(placeholder);
-                        } })
-            .detach();
-
+        // Return placeholder to caller for later resolution
         return placeholder;
     }
 

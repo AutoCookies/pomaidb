@@ -1,3 +1,4 @@
+#pragma once
 // src/memory/arena.h
 //
 // PomaiArena -- a simple mmap-backed arena that provides:
@@ -22,8 +23,6 @@
 // Threading: Most mutable members are protected by `mu_`. The async/pending maps
 // use `pending_mu_`. The demote queue is protected by `demote_mu_`.
 
-#pragma once
-
 #include <cstdint>
 #include <cstddef>
 #include <string>
@@ -39,6 +38,7 @@
 #include <memory>
 #include <sstream>
 #include <iostream>
+#include <list>
 
 struct Seed; // forward-declare; concrete definition in src/core/seed.h
 
@@ -148,9 +148,9 @@ namespace pomai::memory
         uint64_t demote_blob_data(const char *data_with_header, uint32_t total_bytes);
 
         // Asynchronous demote: schedule data to be written to remote store by background worker.
-        // Returns a reserved remote_id (> blob_region_bytes_) on success immediately (file write happens asynchronously).
-        // If the internal demote queue is full the call will fall back to synchronous demote (writes inline) if
-        // config.demote_sync_fallback is true; otherwise returns 0 to signal demote not performed.
+        // Returns a placeholder id (MSB set) on success immediately (file write happens asynchronously).
+        // If the internal demote queue is full the call will fall back to synchronous demote (writes inline).
+        // Returns 0 on failure.
         uint64_t demote_blob_async(const char *data_with_header, uint32_t total_bytes);
 
         // New overload: accept void* (generic) for callers that already have packed blob bytes.
@@ -227,8 +227,11 @@ namespace pomai::memory
         // remote storage: remote_id -> filepath (empty string means pending)
         std::unordered_map<uint64_t, std::string> remote_map_;
 
-        // cached mmap of remote files (lazy mappings)
+        // cached mmap of remote files (lazy mappings) with LRU eviction
         mutable std::unordered_map<uint64_t, std::pair<const char *, size_t>> remote_mmaps_;
+        mutable std::list<uint64_t> remote_mmap_lru_; // front = most recent
+        mutable std::unordered_map<uint64_t, std::list<uint64_t>::iterator> remote_mmap_iter_;
+        size_t max_remote_mmaps_{256}; // cap for cached remote mmaps
 
         // remote id counter (starts at 1); remote_id = blob_region_bytes_ + next_remote_id_
         uint64_t next_remote_id_;
@@ -252,13 +255,16 @@ namespace pomai::memory
         mutable std::mutex pending_mu_;
         std::unordered_map<uint64_t, std::shared_ptr<PendingDemote>> pending_map_;
 
-        // ----------------- Async demote worker ------------------
+        // DemoteTask: now carries placeholder + pending ptr so worker can fulfill promise
         struct DemoteTask
         {
-            uint64_t remote_id;        // reserved remote id assigned at enqueue time
-            std::vector<char> payload; // copy of [uint32_t len][data...][\0]
+            uint64_t remote_id;                  // reserved remote id assigned at enqueue time (encoded)
+            uint64_t placeholder;                // placeholder id returned to caller (MSB set) or 0
+            std::vector<char> payload;           // copy of [uint32_t len][data...][\0]
+            std::shared_ptr<PendingDemote> pend; // optional pending handle (nullptr if sync fallback)
         };
 
+        // ----------------- Async demote worker ------------------
         mutable std::mutex demote_mu_; // protects demote_queue_ and worker condition
         std::condition_variable demote_cv_;
         std::deque<DemoteTask> demote_queue_;
