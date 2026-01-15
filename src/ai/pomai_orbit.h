@@ -1,5 +1,4 @@
 #pragma once
-
 /*
  * src/ai/pomai_orbit.h
  *
@@ -96,6 +95,20 @@ namespace pomai::ai::orbit
     private:
         pomai::memory::PomaiArena *pa;
         pomai::memory::ShardArena *sa;
+    };
+
+    // Lightweight introspection structure describing a membrance.
+    // Best-effort snapshot only (may be approximate for disk bytes).
+    struct MembranceInfo
+    {
+        size_t dim = 0;
+        size_t num_vectors = 0;
+        uint64_t disk_bytes = 0;
+
+        double disk_gb() const noexcept
+        {
+            return static_cast<double>(disk_bytes) / (1024.0 * 1024.0 * 1024.0);
+        }
     };
 
     class PomaiOrbit
@@ -195,6 +208,9 @@ namespace pomai::ai::orbit
 
         void set_metadata_index(std::shared_ptr<pomai::core::MetadataIndex> idx) { metadata_index_ = std::move(idx); }
         std::shared_ptr<pomai::core::MetadataIndex> metadata_index() const { return metadata_index_; }
+
+        // Introspection: best-effort snapshot info about this membrance
+        MembranceInfo get_info() const;
 
     private:
         Config cfg_;

@@ -1,4 +1,3 @@
-#pragma once
 /*
  * src/facade/server.h
  * PomaiServer (V3) - Turbo Parser + Batch INSERT support + WhisperGrain integration
@@ -11,7 +10,10 @@
  * Notes:
  *  - This file is a self-contained server header. It depends on pomai_db and orbit APIs
  *    including budget-aware search methods (search_with_budget / search_filtered_with_budget).
+ *  - Added support for: GET MEMBRANCE INFO <name>;  (returns dim, estimated num_vectors, disk size)
  */
+
+#pragma once
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -44,6 +46,8 @@
 #include <string>
 #include <fstream>
 #include <chrono>
+#include <filesystem>
+#include <iomanip>
 
 #include "src/core/map.h"
 #include "src/core/metrics.h"
@@ -493,6 +497,141 @@ private:
                 name.pop_back();
             bool ok = pomai_db_->drop_membrance(name);
             return ok ? std::string("OK: dropped ") + name + "\n" : std::string("ERR: drop failed\n");
+        }
+
+        // GET MEMBRANCE INFO [<name>];
+        // Supported forms:
+        //   GET MEMBRANCE INFO;            -> uses current membrance in conn (USE ...)
+        //   GET MEMBRANCE INFO <name>;
+        //   GET MEMBRANCE <name> INFO;
+        if (up.rfind("GET MEMBRANCE", 0) == 0)
+        {
+            auto parts = split_ws(cmd);
+            if (!parts.empty() && !parts.back().empty() && parts.back().back() == ';')
+            {
+                parts.back() = parts.back().substr(0, parts.back().size() - 1);
+            }
+
+            std::string name;
+            bool ok_parse = false;
+
+            // --- ĐOẠN SỬA: Đưa check có tên (size >= 4) lên trước ---
+
+            // 1. Dạng: GET MEMBRANCE INFO <name>
+            if (parts.size() >= 4 && to_upper(parts[2]) == "INFO")
+            {
+                name = parts[3];
+                ok_parse = true;
+            }
+            // 2. Dạng: GET MEMBRANCE <name> INFO
+            else if (parts.size() >= 4 && to_upper(parts[3]) == "INFO")
+            {
+                name = parts[2];
+                ok_parse = true;
+            }
+            // 3. Dạng: GET MEMBRANCE INFO (Lấy context hiện tại) - Check cuối cùng!
+            else if (parts.size() >= 3 && to_upper(parts[2]) == "INFO")
+            {
+                if (c.sql_current_membr.empty())
+                    return "ERR: no current membrance (USE <name>)\n";
+                name = c.sql_current_membr;
+                ok_parse = true;
+            }
+
+            if (!ok_parse)
+                return "ERR: expected 'GET MEMBRANCE INFO [<name>];' or 'GET MEMBRANCE <name> INFO;'\n";
+
+            auto *m = pomai_db_->get_membrance(name);
+            if (!m)
+                return std::string("ERR: membrance not found: ") + name + "\n";
+
+            // Gather info (best-effort)
+            size_t dim = m->dim;
+            size_t ram_mb = m->ram_mb;
+            uint64_t disk_bytes = 0;
+            uint64_t num_vectors = 0;
+
+            // 1) Disk footprint: walk membrance data directory
+            try
+            {
+                std::filesystem::path dp(m->data_path);
+                if (std::filesystem::exists(dp))
+                {
+                    for (auto const &entry : std::filesystem::recursive_directory_iterator(dp))
+                    {
+                        if (!entry.is_regular_file())
+                            continue;
+                        std::error_code ec;
+                        uint64_t sz = static_cast<uint64_t>(entry.file_size(ec));
+                        if (!ec)
+                            disk_bytes += sz;
+                    }
+                }
+            }
+            catch (...)
+            {
+                // ignore errors, keep disk_bytes as best-effort
+            }
+
+            // 2) Try to obtain count of vectors:
+            // Preferred path: PomaiOrbit may provide get_info() returning MembranceInfo (if declared).
+            // Otherwise fall back to heuristic: count entries in label shard maps (pomai_db tracks label shards inside orbit)
+            try
+            {
+                auto info = m->orbit->get_info();
+                std::ostringstream ss;
+                ss << "MEMBRANCE: " << name << "\n";
+                ss << "  dim: " << info.dim << "\n";
+                ss << "  num_vectors: " << info.num_vectors << "\n";
+                ss << "  disk_bytes: " << info.disk_bytes << " (" << (info.disk_bytes / (1024.0 * 1024.0 * 1024.0)) << " GB)\n";
+                ss << "  ram_mb_configured: " << ram_mb << "\n";
+                return ss.str();
+            }
+            catch (...)
+            {
+                // fallback to schema file heuristic
+            }
+
+            try
+            {
+                std::filesystem::path schemaf = std::filesystem::path(m->data_path) / "pomai_schema.bin";
+                if (std::filesystem::exists(schemaf))
+                {
+                    std::ifstream ifs(schemaf, std::ios::binary);
+                    if (ifs.good())
+                    {
+                        struct SchemaHeaderLocal
+                        {
+                            uint32_t magic_number;
+                            uint32_t version;
+                            uint64_t dim;
+                            uint64_t num_centroids;
+                            uint64_t total_vectors;
+                        };
+                        SchemaHeaderLocal sh{};
+                        ifs.read(reinterpret_cast<char *>(&sh), sizeof(sh));
+                        if (ifs && sh.magic_number == 0x504F4D41)
+                        {
+                            num_vectors = static_cast<uint64_t>(sh.total_vectors);
+                        }
+                    }
+                }
+            }
+            catch (...)
+            {
+                // ignore
+            }
+
+            std::ostringstream ss;
+            ss << "MEMBRANCE: " << name << "\n";
+            ss << "  dim: " << dim << "\n";
+            if (num_vectors != 0)
+                ss << "  num_vectors (approx): " << num_vectors << "\n";
+            else
+                ss << "  num_vectors: unknown\n";
+            ss << "  disk_bytes: " << disk_bytes << " (" << (disk_bytes / (1024.0 * 1024.0 * 1024.0)) << " GB)\n";
+            ss << "  ram_mb_configured: " << ram_mb << "\n";
+            return ss.str();
         }
 
         // INSERT INTO <name> VALUES (<label>, [f1,f2,...]) (,(<label2>,[...])... ) [TAGS (...)]

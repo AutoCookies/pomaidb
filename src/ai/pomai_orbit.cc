@@ -1,16 +1,23 @@
 /*
  * src/ai/pomai_orbit.cc
  *
- * PomaiOrbit implementation (complete).
+ * PomaiOrbit implementation (cleaned, clarified, and safe).
  *
- * This file provides full definitions for:
+ * Responsibilities:
  *  - insert / insert_batch
  *  - get / remove
  *  - search / search_with_budget / search_filtered_with_budget
- *  - helpers such as compute_distance_for_id_with_proj
+ *  - helpers: compute_distance_for_id_with_proj, compute_distance_for_id
+ *  - introspection: MembranceInfo + get_info() (best-effort)
  *
- * It consolidates the earlier partial implementations and includes metrics
- * accounting used in batch insert paths.
+ * Goals:
+ *  - Clear structure and comments.
+ *  - Conservative, thread-safe access to shared structures.
+ *  - Best-effort, I/O-safe disk accounting for the membrance data directory.
+ *
+ * Note: This translation keeps previous behavior but cleans up structure and error
+ * handling. Performance-critical loops left intact; micro-optimizations should
+ * be applied in targeted hot paths with profiling data.
  */
 
 #include "src/ai/pomai_orbit.h"
@@ -23,26 +30,29 @@
 #include "src/core/cpu_kernels.h"
 #include "src/core/metrics.h"
 
-#include <new>
 #include <algorithm>
-#include <random>
-#include <limits>
-#include <cstring>
-#include <iostream>
-#include <queue>
-#include <numeric>
-#include <stdexcept>
-#include <cstddef> // offsetof
-#include <thread>
-#include <optional>
+#include <atomic>
 #include <chrono>
-#include <vector>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <numeric>
+#include <optional>
+#include <queue>
+#include <random>
+#include <stdexcept>
+#include <system_error>
+#include <thread>
 #include <type_traits>
-#include <cstdlib> // getenv
+#include <vector>
 
 namespace pomai::ai::orbit
 {
 
+    // Constants
     static constexpr size_t MAX_ECHO_BYTES = 64;
     static constexpr uint32_t RESERVE_CHUNK = 16; // per-thread reservation
     static constexpr size_t DEFAULT_MAX_SUBBATCH = 4096;
@@ -54,6 +64,7 @@ namespace pomai::ai::orbit
         uint64_t bucket_off = 0;
     };
 
+    // Helper: thread-local reconstruction buffer
     static inline float *thread_local_recon(size_t dim)
     {
         static thread_local std::vector<float> recon_buf;
@@ -62,22 +73,27 @@ namespace pomai::ai::orbit
         return recon_buf.data();
     }
 
+    // Resolve a bucket offset to a stable pointer that points at the BucketHeader.
+    // If bucket is remote (demoted) and arena returns nullptr, attempt to read into a temporary
+    // buffer (read_remote_blob) and return pointer to temp memory + sizeof(uint32_t).
+    // Returns nullopt on failure.
     static std::optional<const char *> resolve_bucket_base(const ArenaView &arena, uint64_t bucket_off, std::vector<char> &temp_buffer)
     {
         if (bucket_off == 0)
             return std::nullopt;
+
         const char *ram_blob_ptr = arena.blob_ptr_from_offset_for_map(bucket_off);
-        if (!ram_blob_ptr)
-        {
-            temp_buffer = arena.read_remote_blob(bucket_off);
-            if (temp_buffer.empty())
-                return std::nullopt;
-            return temp_buffer.data() + sizeof(uint32_t);
-        }
-        return ram_blob_ptr + sizeof(uint32_t);
+        if (ram_blob_ptr)
+            return ram_blob_ptr + sizeof(uint32_t);
+
+        // fallback: read remote blob into temp buffer (one-shot)
+        temp_buffer = arena.read_remote_blob(bucket_off);
+        if (temp_buffer.empty())
+            return std::nullopt;
+        return temp_buffer.data() + sizeof(uint32_t);
     }
 
-    // ----------------- ArenaView dispatch impl -----------------
+    // ----------------- ArenaView dispatch impl (thin wrappers) -----------------
     char *ArenaView::alloc_blob(uint32_t len) const
     {
         if (pa)
@@ -86,6 +102,7 @@ namespace pomai::ai::orbit
             return sa->alloc_blob(len);
         return nullptr;
     }
+
     uint64_t ArenaView::offset_from_blob_ptr(const char *p) const noexcept
     {
         if (pa)
@@ -94,6 +111,7 @@ namespace pomai::ai::orbit
             return sa->offset_from_blob_ptr(p);
         return UINT64_MAX;
     }
+
     const char *ArenaView::blob_ptr_from_offset_for_map(uint64_t offset) const
     {
         if (pa)
@@ -102,6 +120,7 @@ namespace pomai::ai::orbit
             return sa->blob_ptr_from_offset_for_map(offset);
         return nullptr;
     }
+
     std::vector<char> ArenaView::read_remote_blob(uint64_t remote_id) const
     {
         if (pa)
@@ -148,6 +167,7 @@ namespace pomai::ai::orbit
             }
             catch (...)
             {
+                // non-fatal
             }
         }
     }
@@ -188,6 +208,7 @@ namespace pomai::ai::orbit
             }
             catch (...)
             {
+                // non-fatal
             }
         }
     }
@@ -204,6 +225,25 @@ namespace pomai::ai::orbit
         SchemaHeader header;
         header.dim = cfg_.dim;
         header.num_centroids = cfg_.num_centroids;
+
+        // compute approximate total_vectors from label shards (exclude deleted labels)
+        {
+            uint64_t total = 0;
+            for (size_t si = 0; si < kLabelShardCount; ++si)
+            {
+                const LabelShard &sh = label_shards_[si];
+                std::shared_lock<std::shared_mutex> lk(sh.mu);
+                total += sh.bucket.size();
+            }
+            {
+                std::shared_lock<std::shared_mutex> lk(del_mu_);
+                if (total > deleted_labels_.size())
+                    total -= deleted_labels_.size();
+                else
+                    total = 0;
+            }
+            header.total_vectors = static_cast<uint64_t>(total);
+        }
 
         std::ofstream out(schema_file_path_, std::ios::binary);
         if (out.is_open())
@@ -567,6 +607,7 @@ namespace pomai::ai::orbit
             for (uint8_t q : code.scales_q)
                 if (pos < MAX_ECHO_BYTES)
                     tmpbuf[pos++] = q;
+
             bool overflow = false;
             for (const auto &sb : code.sign_bytes)
             {
@@ -655,10 +696,7 @@ namespace pomai::ai::orbit
         code.scales_q.resize(depth);
         for (size_t k = 0; k < depth; ++k)
         {
-            if (pos < len)
-                code.scales_q[k] = ub[pos++];
-            else
-                code.scales_q[k] = 0;
+            code.scales_q[k] = (pos < len) ? ub[pos++] : 0;
         }
         code.bits_per_layer.resize(depth);
         code.sign_bytes.resize(depth);
@@ -799,7 +837,9 @@ namespace pomai::ai::orbit
         eeq_->project_query(query, qproj);
         float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
 
+        // --- FIX DELETE LOGIC ---
         std::optional<DeletedBloom> bloom;
+        std::vector<uint64_t> small_deleted; // Danh sách dự phòng khi ít item xóa
         {
             std::shared_lock<std::shared_mutex> dm(del_mu_);
             if (deleted_labels_.size() > 256)
@@ -808,7 +848,13 @@ namespace pomai::ai::orbit
                 for (uint64_t v : deleted_labels_)
                     bloom->add(v);
             }
+            else if (!deleted_labels_.empty())
+            {
+                // Copy ra local vector để check nhanh không cần lock
+                small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
+            }
         }
+        // ------------------------
 
         if (nprobe == 0)
         {
@@ -823,7 +869,6 @@ namespace pomai::ai::orbit
 
         const uint32_t cost_check = 1;
         const uint32_t cost_decode = 5;
-        const uint32_t cost_exact = 100;
 
         for (uint32_t cid : targets)
         {
@@ -863,8 +908,29 @@ namespace pomai::ai::orbit
                     }
 
                     uint64_t id = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
-                    if (bloom && bloom->maybe_contains(id))
-                        continue;
+
+                    // --- CHECK DELETED (FIXED) ---
+                    if (bloom)
+                    {
+                        if (bloom->maybe_contains(id))
+                            continue;
+                    }
+                    else if (!small_deleted.empty())
+                    {
+                        bool found = false;
+                        for (uint64_t d : small_deleted)
+                        {
+                            if (d == id)
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found)
+                            continue;
+                    }
+                    // -----------------------------
+
                     if (!pay_ops(ops_left, cost_decode))
                         continue;
 
@@ -884,8 +950,6 @@ namespace pomai::ai::orbit
                         topk.pop();
                         topk.push({dist, id});
                     }
-
-                    // optional refine skipped here
                 }
 
                 current_off = next_bucket_offset;
@@ -921,7 +985,9 @@ namespace pomai::ai::orbit
         eeq_->project_query(query, qproj);
         float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
 
+        // --- FIX DELETE LOGIC ---
         std::optional<DeletedBloom> bloom;
+        std::vector<uint64_t> small_deleted;
         {
             std::shared_lock<std::shared_mutex> dm(del_mu_);
             if (deleted_labels_.size() > 256)
@@ -930,14 +996,40 @@ namespace pomai::ai::orbit
                 for (uint64_t v : deleted_labels_)
                     bloom->add(v);
             }
+            else if (!deleted_labels_.empty())
+            {
+                small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
+            }
         }
+        // ------------------------
 
         for (uint64_t id : candidates)
         {
             if (ops_left == 0)
                 break;
-            if (bloom && bloom->maybe_contains(id))
-                continue;
+
+            // --- CHECK DELETED (FIXED) ---
+            if (bloom)
+            {
+                if (bloom->maybe_contains(id))
+                    continue;
+            }
+            else if (!small_deleted.empty())
+            {
+                bool found = false;
+                for (uint64_t d : small_deleted)
+                {
+                    if (d == id)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if (found)
+                    continue;
+            }
+            // -----------------------------
+
             if (ops_left < cost_check)
                 break;
             ops_left -= cost_check;
@@ -947,7 +1039,6 @@ namespace pomai::ai::orbit
                 continue;
             if (bucket_off == 0)
                 continue;
-
             if (ops_left < cost_decode)
                 continue;
             ops_left -= cost_decode;
@@ -1019,7 +1110,9 @@ namespace pomai::ai::orbit
         eeq_->project_query(query, qproj);
         float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
 
+        // --- FIX DELETE LOGIC ---
         std::optional<DeletedBloom> bloom;
+        std::vector<uint64_t> small_deleted;
         {
             std::shared_lock<std::shared_mutex> dm(del_mu_);
             if (deleted_labels_.size() > 256)
@@ -1028,7 +1121,12 @@ namespace pomai::ai::orbit
                 for (uint64_t v : deleted_labels_)
                     bloom->add(v);
             }
+            else if (!deleted_labels_.empty())
+            {
+                small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
+            }
         }
+        // ------------------------
 
         if (centroids_.empty())
             return {};
@@ -1071,8 +1169,28 @@ namespace pomai::ai::orbit
                 for (uint32_t i = 0; i < count; ++i)
                 {
                     uint64_t id = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
-                    if (bloom && bloom->maybe_contains(id))
-                        continue;
+
+                    // --- CHECK DELETED (FIXED) ---
+                    if (bloom)
+                    {
+                        if (bloom->maybe_contains(id))
+                            continue;
+                    }
+                    else if (!small_deleted.empty())
+                    {
+                        bool found = false;
+                        for (uint64_t d : small_deleted)
+                        {
+                            if (d == id)
+                            {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found)
+                            continue;
+                    }
+                    // -----------------------------
 
                     uint16_t len = __atomic_load_n(&len_base[i], __ATOMIC_ACQUIRE);
                     if (len == 0 || len > MAX_ECHO_BYTES)
@@ -1091,6 +1209,7 @@ namespace pomai::ai::orbit
                         topk.push({dist, id});
                     }
                 }
+
                 current_off = next_bucket_offset;
             }
         }
@@ -1107,12 +1226,63 @@ namespace pomai::ai::orbit
         return out;
     }
 
-    // ------------------- insert_batch (simple robust implementation) -------------------
+    // ------------------- insert_batch (with Auto-Train) -------------------
     bool PomaiOrbit::insert_batch(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
     {
-        if (!eeq_ || centroids_.empty() || batch.empty())
+        // 1. Kiểm tra Quantizer (bắt buộc phải có)
+        if (!eeq_)
             return false;
 
+        // ---------------------------------------------------------
+        // [NEW] AUTO-TRAIN LOGIC
+        // Nếu DB chưa có centroids (chưa train), dùng batch này để train ngay lập tức.
+        // ---------------------------------------------------------
+        if (centroids_.empty())
+        {
+            if (batch.empty())
+                return false;
+
+            std::clog << "[Orbit] Database is empty. Auto-training centroids using first batch (" << batch.size() << " vectors)...\n";
+
+            // Gom dữ liệu từ batch ra mảng liền kề (flat array) để train
+            std::vector<float> training_data;
+            training_data.reserve(batch.size() * cfg_.dim);
+
+            size_t valid_count = 0;
+            for (const auto &item : batch)
+            {
+                if (item.second.size() == cfg_.dim)
+                {
+                    training_data.insert(training_data.end(), item.second.begin(), item.second.end());
+                    valid_count++;
+                }
+            }
+
+            if (valid_count > 0)
+            {
+                // Tự động điều chỉnh số lượng centroid nếu batch quá nhỏ để tránh lỗi KMeans
+                // (Ví dụ: Batch 100 vector thì không thể chia 256 cụm)
+                size_t original_k = cfg_.num_centroids;
+                if (original_k == 0 || original_k > valid_count / 2)
+                {
+                    // Heuristic: K = sqrt(N)
+                    size_t suggest = static_cast<size_t>(std::sqrt(valid_count));
+                    // Hack const_cast để cập nhật config runtime
+                    const_cast<Config &>(cfg_).num_centroids = std::max<size_t>(1, suggest);
+                    std::clog << "[Orbit] Auto-adjusted num_centroids to " << const_cast<Config &>(cfg_).num_centroids << " based on batch size.\n";
+                }
+
+                // Gọi hàm train: tạo centroids, bucket và lưu schema xuống đĩa
+                this->train(training_data.data(), valid_count);
+            }
+        }
+        // ---------------------------------------------------------
+
+        // 2. Kiểm tra lại: Nếu train thất bại hoặc vẫn rỗng thì dừng
+        if (centroids_.empty() || batch.empty())
+            return false;
+
+        // 3. Chuẩn bị tham số Batch Insert
         size_t max_subbatch = DEFAULT_MAX_SUBBATCH;
         const char *env = std::getenv("POMAI_MAX_BATCH_INSERT");
         if (env)
@@ -1122,13 +1292,12 @@ namespace pomai::ai::orbit
                 max_subbatch = static_cast<size_t>(std::stoul(env));
             }
             catch (...)
-            {
+            { /* ignore */
             }
             if (max_subbatch == 0)
                 max_subbatch = DEFAULT_MAX_SUBBATCH;
         }
 
-        // Phase 1: pre-encode & group by centroid
         struct Item
         {
             uint64_t label;
@@ -1139,6 +1308,7 @@ namespace pomai::ai::orbit
         std::vector<Item> prepared;
         prepared.reserve(batch.size());
 
+        // 4. Encode toàn bộ vectors trong batch (Parallelizable nếu cần)
         for (const auto &p : batch)
         {
             uint64_t label = p.first;
@@ -1146,7 +1316,10 @@ namespace pomai::ai::orbit
             if (vec.size() != cfg_.dim)
                 continue;
 
+            // Tìm cụm gần nhất (Routing)
             uint32_t cid = find_nearest_centroid(vec.data());
+
+            // Nén vector (Quantization)
             pomai::ai::EchoCode code;
             try
             {
@@ -1160,10 +1333,13 @@ namespace pomai::ai::orbit
             Item it;
             it.label = label;
             size_t pos = 0;
+            // Pack metadata & scales
             it.bytes[pos++] = code.depth;
             for (uint8_t q : code.scales_q)
                 if (pos < MAX_ECHO_BYTES)
                     it.bytes[pos++] = q;
+
+            // Pack sign bits
             bool overflow = false;
             for (const auto &sb : code.sign_bytes)
             {
@@ -1185,26 +1361,26 @@ namespace pomai::ai::orbit
         if (prepared.empty())
             return true;
 
-        // sort by centroid to reduce locking
+        // 5. Sắp xếp theo Centroid ID để gom nhóm ghi (giảm lock contention)
         std::sort(prepared.begin(), prepared.end(), [](auto &a, auto &b)
                   { return a.cid < b.cid; });
 
-        // process per-centroid in sub-batches
+        // 6. Ghi vào buckets
         size_t idx = 0, total = prepared.size();
         while (idx < total)
         {
             size_t start = idx;
             uint32_t cid = prepared[idx].cid;
 
-            // determine group size for this centroid (bounded by max_subbatch and available items of this cid)
+            // Gom nhóm các item cùng CID (tối đa max_subbatch)
             size_t group_end = idx;
             while (group_end < total && prepared[group_end].cid == cid && (group_end - idx) < max_subbatch)
                 ++group_end;
 
-            // short critical section per centroid (allocate/reserve then write)
             OrbitNode &node = *centroids_[cid];
-            std::unique_lock<std::shared_mutex> lock(node.mu);
+            std::unique_lock<std::shared_mutex> lock(node.mu); // LOCK CENTROID
 
+            // Lấy bucket hiện tại hoặc tạo mới
             uint64_t current_off = node.bucket_offset.load(std::memory_order_acquire);
             if (current_off == 0)
             {
@@ -1214,26 +1390,37 @@ namespace pomai::ai::orbit
                 node.bucket_offset.store(current_off, std::memory_order_release);
             }
 
-            // try to write as many as fit into current bucket chain
             size_t write_idx = idx;
             while (write_idx < group_end)
             {
+                // Resolve pointer tới vùng nhớ bucket
                 std::vector<char> tmp;
                 auto base_opt = resolve_bucket_base(arena_, current_off, tmp);
+
+                // Nếu bucket lỗi (ví dụ file remote không đọc được), tạo bucket mới
                 if (!base_opt)
                 {
-                    // allocate next bucket and continue
                     uint64_t nb = alloc_new_bucket(cid);
                     if (nb == 0)
                         return false;
-                    BucketHeader *hdr_prev = reinterpret_cast<BucketHeader *>(const_cast<char *>(arena_.blob_ptr_from_offset_for_map(current_off)) + sizeof(uint32_t));
-                    hdr_prev->next_bucket_offset.store(nb, std::memory_order_release);
+
+                    // Cố gắng link từ bucket cũ (nếu nó còn trong RAM map)
+                    const char *prev_ptr = arena_.blob_ptr_from_offset_for_map(current_off);
+                    if (prev_ptr)
+                    {
+                        BucketHeader *hdr_prev = reinterpret_cast<BucketHeader *>(const_cast<char *>(prev_ptr) + sizeof(uint32_t));
+                        hdr_prev->next_bucket_offset.store(nb, std::memory_order_release);
+                    }
+
                     current_off = nb;
                     continue;
                 }
+
                 char *bucket_ptr = const_cast<char *>(*base_opt);
                 BucketHeader *hdr = reinterpret_cast<BucketHeader *>(bucket_ptr);
                 uint32_t cur_count = hdr->count.load(std::memory_order_relaxed);
+
+                // Nếu bucket đầy, nhảy sang bucket kế tiếp
                 if (cur_count >= dynamic_bucket_capacity_)
                 {
                     uint64_t nb = hdr->next_bucket_offset.load(std::memory_order_acquire);
@@ -1248,6 +1435,7 @@ namespace pomai::ai::orbit
                     continue;
                 }
 
+                // Tính số lượng ghi được vào bucket này
                 uint32_t remaining = dynamic_bucket_capacity_ - cur_count;
                 uint32_t fit = 0;
                 size_t probe = write_idx;
@@ -1256,6 +1444,8 @@ namespace pomai::ai::orbit
                     ++fit;
                     ++probe;
                 }
+
+                // Race condition check: nếu trong lúc tính toán bucket bị đầy bởi thread khác
                 if (fit == 0)
                 {
                     current_off = hdr->next_bucket_offset.load(std::memory_order_acquire);
@@ -1269,11 +1459,16 @@ namespace pomai::ai::orbit
                     continue;
                 }
 
+                // Reserve chỗ (Atomic fetch_add)
                 uint32_t slot_base = hdr->count.fetch_add(fit, std::memory_order_acq_rel);
+
+                // Double check overflow sau khi fetch_add
                 if (slot_base + fit > dynamic_bucket_capacity_)
                 {
-                    // rollback and try next bucket
+                    // Rollback (để đơn giản ta không rollback count mà chỉ chuyển bucket mới, count dư kệ nó)
+                    // Hoặc chính xác hơn:
                     hdr->count.fetch_sub(fit, std::memory_order_acq_rel);
+
                     uint64_t nb = hdr->next_bucket_offset.load(std::memory_order_acquire);
                     if (nb == 0)
                     {
@@ -1286,7 +1481,7 @@ namespace pomai::ai::orbit
                     continue;
                 }
 
-                // write reserved slots
+                // Ghi dữ liệu
                 char *vec_area = bucket_ptr + hdr->off_vectors;
                 uint16_t *len_base = reinterpret_cast<uint16_t *>(bucket_ptr + hdr->off_pq_codes);
                 uint64_t *id_base = reinterpret_cast<uint64_t *>(bucket_ptr + hdr->off_ids);
@@ -1295,13 +1490,19 @@ namespace pomai::ai::orbit
                 {
                     const Item &it = prepared[write_idx + j];
                     uint32_t slot = slot_base + j;
+
+                    // Copy Compressed Vector
                     char *slot_ptr = vec_area + static_cast<size_t>(slot) * MAX_ECHO_BYTES;
                     std::memset(slot_ptr, 0, MAX_ECHO_BYTES);
                     std::memcpy(slot_ptr, it.bytes, it.size);
 
+                    // Store ID
                     pomai::ai::atomic_utils::atomic_store_u64(id_base + slot, it.label);
+
+                    // Store Length (Commit write)
                     __atomic_store_n(&len_base[slot], static_cast<uint16_t>(it.size), __ATOMIC_RELEASE);
 
+                    // Update Label Map (Inverted Index for Get/Delete)
                     size_t si = label_shard_index(it.label);
                     LabelShard &sh = label_shards_[si];
                     std::unique_lock<std::shared_mutex> lm(sh.mu);
@@ -1312,17 +1513,66 @@ namespace pomai::ai::orbit
                 write_idx += fit;
             }
 
-            // update index and continue
             idx = group_end;
-
-            // politely yield between groups to reduce contention on heavy batches
+            // Nhường CPU một chút để các luồng Search chen vào
             std::this_thread::yield();
-
-            // metrics
             PomaiMetrics::batch_subbatches_processed.fetch_add(1, std::memory_order_relaxed);
         }
 
         return true;
+    }
+
+    // ------------------- Membrance introspection (best-effort snapshot) -------------------
+    MembranceInfo PomaiOrbit::get_info() const
+    {
+        MembranceInfo info;
+        info.dim = cfg_.dim;
+
+        // 1) Count labels present in in-memory label shards
+        uint64_t total_labels = 0;
+        for (size_t si = 0; si < kLabelShardCount; ++si)
+        {
+            const LabelShard &sh = label_shards_[si];
+            std::shared_lock<std::shared_mutex> lk(sh.mu);
+            total_labels += sh.bucket.size();
+        }
+
+        // 2) exclude soft-deleted labels
+        {
+            std::shared_lock<std::shared_mutex> lk(del_mu_);
+            if (total_labels > deleted_labels_.size())
+                total_labels -= deleted_labels_.size();
+            else
+                total_labels = 0;
+        }
+        info.num_vectors = static_cast<size_t>(total_labels);
+
+        // 3) Compute on-disk footprint for membrance directory (best-effort)
+        uint64_t bytes = 0;
+        try
+        {
+            std::filesystem::path p(cfg_.data_path);
+            if (std::filesystem::exists(p))
+            {
+                for (auto it = std::filesystem::recursive_directory_iterator(p, std::filesystem::directory_options::skip_permission_denied);
+                     it != std::filesystem::recursive_directory_iterator(); ++it)
+                {
+                    std::error_code ec;
+                    if (it->is_regular_file(ec))
+                    {
+                        uint64_t fsz = static_cast<uint64_t>(it->file_size(ec));
+                        if (!ec)
+                            bytes += fsz;
+                    }
+                }
+            }
+        }
+        catch (...)
+        { /* best-effort: swallow errors */
+        }
+
+        info.disk_bytes = bytes;
+        return info;
     }
 
 } // namespace pomai::ai::orbit

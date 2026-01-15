@@ -35,3 +35,4 @@ build
 ./build
 ./data
 ./.history
+venv
