@@ -247,6 +247,16 @@ We run this benchmarks on Github Codespace, with 4 cores CPU, and 16Gb RAM. By i
   <br>
 </p>
 
+<p align="center">
+  <img src="assets/sys_mem_time.png" alt="PomaiDB Memory through time" width="600">
+  <br>
+</p>
+
+<p align="center">
+  <img src="assets/sys_cpu_time.png" alt="PomaiDB Memory through time" width="600">
+  <br>
+</p>
+
 ## License
 
 PomaiDB is released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).  
