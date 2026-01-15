@@ -1,25 +1,13 @@
 #!/usr/bin/env python3
 """
 benchmarks/benchmark_q1_paper_v3.py
-----------------------------------
-Improved Pomai scientific benchmark (milestones preserved).
 
-Goals (what changed vs original):
- - Still uses milestone flow (insert up to a list of dataset sizes).
- - More metrics: p50/p90/p95/p99/p999/std/max/min/count.
- - More plots: latency CDF, latency percentiles vs N, throughput vs N,
-   recall vs latency scatter, filter selectivity heatmap (simple).
- - Better insertion progress reporting and resiliency (retries on transient errors).
- - Configurable via CLI: milestones, batch sizes, gen_pool_size, timeouts, skip micro-sweep.
- - Keeps existing SQL protocol and server usage (no server code changes).
- - Saves raw JSON + CSV summary + PNG plots.
+Robust Pomai scientific benchmark with enhanced monitoring and plots.
 
-Usage (example):
-  python3 benchmarks/benchmark_q1_paper_v3.py --only-milestones --milestones 10000 50000 100000 \
-      --gen-pool-size 10000 --output results_v3 --timeout 30
+Usage example:
+  python3 benchmarks/benchmark_q1_paper_v3.py --milestones 10000 50000 100000 200000 500000 1000000 2000000 5000000 10000000 20000000 50000000 100000000 --server-pid 3867
 
-Requirements:
-  python3, numpy, matplotlib, psutil
+Dependencies: numpy, matplotlib, psutil
 """
 
 from __future__ import annotations
@@ -32,10 +20,11 @@ import os
 import sys
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import random
 import math
 import statistics
+from collections import Counter
 
 try:
     import psutil
@@ -45,79 +34,118 @@ except Exception as e:
     print("Missing dependencies:", e)
     sys.exit(1)
 
-# -------------------------
-# Defaults / Config
-# -------------------------
+# ---- Defaults ----
 HOST = "127.0.0.1"
 PORT = 7777
 SERVER_BIN_NAME = "pomai_server"
 
 DEFAULT_DIM = 512
-DEFAULT_MILESTONES = [10000, 50000]
-DEFAULT_INSERT_BATCH = 2000
-DEFAULT_PIPELINED_BATCH = 500
+DEFAULT_MILESTONES = [10000, 50000, 100000, 200000, 500000, 1000000, 2000000, 5000000, 10000000, 20000000, 50000000, 100000000]
+DEFAULT_INSERT_BATCH = 5000
+DEFAULT_PIPELINED_BATCH = 5000
 DEFAULT_GEN_POOL = 10000
 DEFAULT_SEARCH_TRIALS = 2000
 DEFAULT_SEARCH_CONCURRENCY = 32
-OUTPUT_DIR_DEFAULT = "pomai_scientific_results_v3"
+OUTPUT_DIR_DEFAULT = "pomai_results"
 
-# -------------------------
-# CLI
-# -------------------------
+# ---- CLI ----
 def parse_args():
     p = argparse.ArgumentParser(description="PomaiDB Scientific Benchmark (v3)")
     p.add_argument("--host", default=HOST)
     p.add_argument("--port", default=PORT, type=int)
     p.add_argument("--dim", default=DEFAULT_DIM, type=int)
-    p.add_argument("--milestones", nargs="+", type=int, default=DEFAULT_MILESTONES,
-                   help="Dataset sizes to measure at (milestones)")
-    p.add_argument("--insert-batch", default=DEFAULT_INSERT_BATCH, type=int,
-                   help="Batch size for multi-tuple INSERT when tags are identical")
-    p.add_argument("--pipelined-batch", default=DEFAULT_PIPELINED_BATCH, type=int,
-                   help="Pipelined single-insert group size when tags vary")
-    p.add_argument("--gen-pool-size", default=DEFAULT_GEN_POOL, type=int,
-                   help="In-memory vector pool size (keep reasonable for mem)")
+    p.add_argument("--milestones", nargs="+", type=int, default=DEFAULT_MILESTONES)
+    p.add_argument("--insert-batch", default=DEFAULT_INSERT_BATCH, type=int)
+    p.add_argument("--pipelined-batch", default=DEFAULT_PIPELINED_BATCH, type=int)
+    p.add_argument("--gen-pool-size", default=DEFAULT_GEN_POOL, type=int)
     p.add_argument("--search-trials", default=DEFAULT_SEARCH_TRIALS, type=int)
     p.add_argument("--search-concurrency", default=DEFAULT_SEARCH_CONCURRENCY, type=int)
     p.add_argument("--timeout", default=30.0, type=float)
     p.add_argument("--output", default=OUTPUT_DIR_DEFAULT)
     p.add_argument("--seed", default=42, type=int)
-    p.add_argument("--only-milestones", action="store_true",
-                   help="Run only the milestone incremental experiment (skip optional micro-sweep)")
-    p.add_argument("--skip-micro", action="store_true", help="Skip micro-sweep insert profiling")
-    p.add_argument("--skip-plots", action="store_true", help="Skip writing plots (write JSON/CSV only)")
+    p.add_argument("--only-milestones", action="store_true")
+    p.add_argument("--skip-plots", action="store_true")
+    p.add_argument("--server-pid", default=None, type=int, help="Optional PID of the server to monitor")
     return p.parse_args()
 
-# -------------------------
-# Monitoring (server-side best-effort)
-# -------------------------
+# ---- Monitoring ----
 class SystemMonitor(threading.Thread):
-    def __init__(self, pid_hint=None, interval=0.1):
+    """
+    Best-effort monitor that attaches to server process (by PID, name/cmdline, or listening port).
+    Records timestamped cpu% and RSS (MB).
+    Notes:
+      - psutil.cpu_percent() needs a priming call; we call it once when attaching.
+      - If attach fails, monitor runs but will record zeros.
+    """
+    def __init__(self, pid_hint: Optional[int] = None, interval: float = 0.2, host: str = HOST, port: int = PORT):
         super().__init__(daemon=True)
         self.interval = interval
         self.history = {"ts": [], "cpu": [], "mem": [], "phase": []}
         self.phase = "init"
         self.stop_ev = threading.Event()
         self.pid_hint = pid_hint
-        self.proc = None
+        self.proc: Optional[psutil.Process] = None
+        self.host = host
+        self.port = port
         self._attach_proc()
 
     def _attach_proc(self):
+        # explicit PID
         if self.pid_hint:
             try:
                 self.proc = psutil.Process(int(self.pid_hint))
+                try:
+                    self.proc.cpu_percent(interval=None)
+                except Exception:
+                    pass
+                print(f"[Monitor] attached to PID {self.pid_hint}")
                 return
             except Exception:
                 self.proc = None
-        for p in psutil.process_iter(['pid','name']):
-            if SERVER_BIN_NAME in (p.info.get('name') or ""):
-                try:
-                    self.proc = psutil.Process(p.info['pid'])
-                    return
-                except Exception:
-                    self.proc = None
 
-    def set_phase(self, s):
+        # try by name or cmdline
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                name = (p.info.get('name') or "").lower()
+                cmd = " ".join(p.info.get('cmdline') or []).lower()
+                if SERVER_BIN_NAME in name or SERVER_BIN_NAME in cmd:
+                    try:
+                        self.proc = psutil.Process(p.info['pid'])
+                        try:
+                            self.proc.cpu_percent(interval=None)
+                        except Exception:
+                            pass
+                        print(f"[Monitor] attached to PID {p.info['pid']} (name/cmd detect)")
+                        return
+                    except Exception:
+                        self.proc = None
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        # try by listening socket on port
+        try:
+            # iterate network connections and match listening local port
+            for conn in psutil.net_connections(kind='inet'):
+                if conn.laddr and conn.laddr.port == self.port:
+                    pid = conn.pid
+                    if pid:
+                        try:
+                            self.proc = psutil.Process(pid)
+                            try:
+                                self.proc.cpu_percent(interval=None)
+                            except Exception:
+                                pass
+                            print(f"[Monitor] attached to PID {pid} via listening port {self.port}")
+                            return
+                        except Exception:
+                            continue
+        except Exception:
+            # net_connections might require privileges on some systems
+            pass
+
+        print("[Monitor] warning: could not auto-attach to server process; CPU/mem stats will be zeros")
+
+    def set_phase(self, s: str):
         self.phase = s
 
     def run(self):
@@ -128,9 +156,10 @@ class SystemMonitor(threading.Thread):
             if self.proc:
                 try:
                     cpu = self.proc.cpu_percent(interval=None)
-                    mem = self.proc.memory_info().rss / (1024*1024)
-                except Exception:
+                    mem = self.proc.memory_info().rss / (1024.0 * 1024.0)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
                     self.proc = None
+                    cpu, mem = 0.0, 0.0
             self.history["ts"].append(now)
             self.history["cpu"].append(cpu)
             self.history["mem"].append(mem)
@@ -140,14 +169,17 @@ class SystemMonitor(threading.Thread):
     def stop(self):
         self.stop_ev.set()
 
-# -------------------------
-# Networking client (thread-safe)
-# -------------------------
+# ---- Networking client ----
 class SimpleClient:
-    def __init__(self, host=HOST, port=PORT, timeout=30.0):
+    """
+    Minimal thread-safe TCP client with small recv buffer and marker-delimited responses.
+    Adjust 'marker' if your server uses a different response terminator.
+    """
+    def __init__(self, host=HOST, port=PORT, timeout=30.0, marker: bytes = b"<END>\n"):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.marker = marker
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.settimeout(self.timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -167,13 +199,13 @@ class SimpleClient:
         with self.lock:
             self.sock.sendall(data)
 
-    def recv_response_exact(self, marker=b"<END>\n") -> bytes:
+    def recv_response_exact(self) -> bytes:
         with self.lock:
             while True:
-                if marker in self.recv_buf:
-                    idx = self.recv_buf.find(marker)
+                if self.marker in self.recv_buf:
+                    idx = self.recv_buf.find(self.marker)
                     resp = bytes(self.recv_buf[:idx])
-                    del self.recv_buf[:idx+len(marker)]
+                    del self.recv_buf[:idx + len(self.marker)]
                     return resp
                 try:
                     chunk = self.sock.recv(65536)
@@ -183,7 +215,7 @@ class SimpleClient:
                     raise ConnectionError("socket closed")
                 self.recv_buf.extend(chunk)
 
-def make_client_pool(n, host, port, timeout):
+def make_client_pool(n: int, host: str, port: int, timeout: float):
     pool = []
     for _ in range(n):
         c = SimpleClient(host, port, timeout)
@@ -191,14 +223,14 @@ def make_client_pool(n, host, port, timeout):
         pool.append(c)
     return pool
 
-def close_client_pool(pool):
+def close_client_pool(pool: List[SimpleClient]):
     for c in pool:
-        try: c.close()
-        except: pass
+        try:
+            c.close()
+        except Exception:
+            pass
 
-# -------------------------
-# Vector/tag helpers
-# -------------------------
+# ---- Vector helpers ----
 def generate_vector_pool(size: int, dim: int, seed: int):
     rnd = np.random.RandomState(seed)
     data = rnd.rand(size, dim).astype(np.float32)
@@ -215,19 +247,13 @@ def deterministic_tags(idx: int) -> List[str]:
     return tags
 
 def tags_to_sql_paren(tags: List[str]) -> str:
-    if not tags: return ""
+    if not tags:
+        return ""
     return "(" + ", ".join(tags) + ")"
 
-# -------------------------
-# Inserts: batching + pipelining + retry
-# -------------------------
+# ---- Inserts ----
 def batch_insert_membrane(client: SimpleClient, membr: str, start_idx: int, vectors: List[str], tags_batch: List[str],
                           retries: int = 2) -> int:
-    """
-    Insert vectors into `membr` starting with label index start_idx.
-    Uses multi-tuple INSERT when tags identical; otherwise pipelined singles grouped.
-    Returns number of successful inserts (best-effort).
-    """
     n = len(vectors)
     if n == 0:
         return 0
@@ -249,7 +275,6 @@ def batch_insert_membrane(client: SimpleClient, membr: str, start_idx: int, vect
                 client.recv_response_exact()
                 success = n
             else:
-                # pipelined grouped singles
                 parts = []
                 for j in range(n):
                     idx = start_idx + j
@@ -267,7 +292,7 @@ def batch_insert_membrane(client: SimpleClient, membr: str, start_idx: int, vect
         except (TimeoutError, ConnectionError, OSError) as e:
             attempt += 1
             time.sleep(0.05 * attempt)
-            # try to reconnect client if needed
+            # reconnect best-effort
             try:
                 client.close()
                 client = SimpleClient(client.host, client.port, client.timeout)
@@ -279,9 +304,7 @@ def batch_insert_membrane(client: SimpleClient, membr: str, start_idx: int, vect
                 return success
     return success
 
-# -------------------------
-# GET / DELETE micro-test
-# -------------------------
+# ---- GET/DELETE micro bench ----
 def test_get_delete(client: SimpleClient, membr: str, label_indices: List[int]) -> Dict:
     get_lat = []; get_ok = 0; get_fail = 0
     for idx in label_indices:
@@ -330,20 +353,18 @@ def test_get_delete(client: SimpleClient, membr: str, label_indices: List[int]) 
         except Exception:
             get2_lat.append(1e4); get2_fail += 1
 
-    def stats(xs):
-        if not xs: return {"p50":0.0,"p90":0.0}
+    def s(xs):
+        if not xs:
+            return {"p50":0.0, "p90":0.0}
         a = np.array(xs)
         return {"p50": float(np.percentile(a, 50)), "p90": float(np.percentile(a, 90))}
-
     return {
-        "get_p50": stats(get_lat)["p50"], "get_succ": get_ok, "get_fail": get_fail,
-        "del_p50": stats(del_lat)["p50"], "del_succ": del_ok, "del_fail": del_fail,
-        "get2_p50": stats(get2_lat)["p50"], "get2_fail": get2_fail
+        "get_p50": s(get_lat)["p50"], "get_succ": get_ok, "get_fail": get_fail,
+        "del_p50": s(del_lat)["p50"], "del_succ": del_ok, "del_fail": del_fail,
+        "get2_p50": s(get2_lat)["p50"], "get2_fail": get2_fail
     }
 
-# -------------------------
-# Search helpers (concurrent)
-# -------------------------
+# ---- Search helpers ----
 def search_one(client: SimpleClient, membr: str, qcsv: str, where_clause: str = "", topk: int = 10) -> Tuple[float,int]:
     sql = f"SEARCH {membr} QUERY ([{qcsv}])"
     if where_clause:
@@ -383,9 +404,7 @@ def run_concurrent_searches(client_pool: List[SimpleClient], membr: str, qvecs: 
                 latencies.append(1e4); counts.append(0)
     return latencies, counts
 
-# -------------------------
-# Stats/plots/report helpers
-# -------------------------
+# ---- Stats & plotting ----
 def percentile_stats(latencies: List[float]) -> Dict:
     if not latencies:
         return {"n":0,"min":0,"max":0,"mean":0,"std":0,"p50":0,"p90":0,"p95":0,"p99":0,"p999":0}
@@ -404,8 +423,7 @@ def percentile_stats(latencies: List[float]) -> Dict:
     }
 
 def plot_cdf(latencies: List[float], title: str, outpath: str):
-    if not latencies:
-        return
+    if not latencies: return
     a = np.sort(np.array(latencies))
     p = np.arange(1, a.size+1) / a.size
     plt.figure(figsize=(6,4))
@@ -419,39 +437,88 @@ def plot_cdf(latencies: List[float], title: str, outpath: str):
     plt.savefig(outpath, dpi=150)
     plt.close()
 
-def plot_percentiles_vs_N(Ns, p50s, p99s, p999s, outpath):
-    plt.figure(figsize=(8,5))
+def plot_histogram(latencies: List[float], title: str, outpath: str):
+    if not latencies: return
+    plt.figure(figsize=(6,4))
+    a = np.array(latencies)
+    # log bins to show tail
+    bins = np.logspace(np.log10(max(0.001, a.min())), np.log10(max(1.0, a.max()+1e-6)), 80)
+    plt.hist(a + 1e-6, bins=bins, density=False, alpha=0.8)
+    plt.xscale('log')
+    plt.xlabel("Latency (ms)")
+    plt.ylabel("Counts")
+    plt.title(title)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
+
+def plot_percentiles_vs_N(Ns, p50s, p90s, p95s, p99s, p999s, outpath):
+    plt.figure(figsize=(9,5))
     plt.plot(Ns, p50s, 'o-', label='p50')
-    plt.plot(Ns, p99s, 's-', label='p99')
-    plt.plot(Ns, p999s, 'x-', label='p99.9')
+    plt.plot(Ns, p90s, 's-', label='p90')
+    plt.plot(Ns, p95s, 'd-', label='p95')
+    plt.plot(Ns, p99s, 'x-', label='p99')
+    plt.plot(Ns, p999s, '^--', label='p999')
     plt.xscale('log'); plt.yscale('log')
     plt.xlabel("Dataset size (N)"); plt.ylabel("Latency (ms)")
     plt.title("Search latency percentiles vs dataset size")
     plt.legend(); plt.grid(True, linestyle='--', alpha=0.6)
-    plt.savefig(outpath, dpi=150); plt.close()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
 
 def plot_throughput_vs_N(Ns, tps, outpath):
-    plt.figure(figsize=(8,5))
+    plt.figure(figsize=(8,4))
     plt.plot(Ns, tps, 'o-')
     plt.xscale('log'); plt.xlabel("Dataset size (N)"); plt.ylabel("Insert QPS")
     plt.title("Insertion throughput (per milestone)")
     plt.grid(True, linestyle='--', alpha=0.6)
-    plt.savefig(outpath, dpi=150); plt.close()
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
 
-def plot_recall_vs_latency(recalls, latencies, outpath):
+def plot_recall_vs_latency(recalls, med_latencies, outpath):
     plt.figure(figsize=(6,5))
-    plt.scatter(latencies, recalls, c='C2', alpha=0.7)
-    plt.xlabel("Median search latency (ms)"); plt.ylabel("Recall@10")
+    plt.scatter(med_latencies, recalls, c='C2', alpha=0.8)
+    plt.xlabel("Median search latency (ms)"); plt.ylabel("Recall proxy (@10)")
     plt.title("Recall vs latency (per milestone)")
     plt.grid(True, linestyle='--', alpha=0.6)
     plt.tight_layout()
-    plt.savefig(outpath, dpi=150); plt.close()
+    plt.savefig(outpath, dpi=150)
+    plt.close()
 
-# -------------------------
-# Main experiment (milestones) - core logic preserved, improved
-# -------------------------
-def run_scientific_suite(args):
-    monitor = SystemMonitor()
+def plot_sys_time_series(sys_hist: Dict, outdir: str):
+    if not sys_hist or not sys_hist.get("ts"):
+        return
+    ts = np.array(sys_hist["ts"])
+    cpu = np.array(sys_hist["cpu"])
+    mem = np.array(sys_hist["mem"])
+    phases = sys_hist.get("phase", [""] * len(ts))
+
+    plt.figure(figsize=(10,4))
+    plt.plot(ts, cpu, label="CPU%")
+    plt.xlabel("Time (s)")
+    plt.ylabel("CPU%")
+    plt.title("Server CPU over time")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "sys_cpu_time.png"), dpi=150)
+    plt.close()
+
+    plt.figure(figsize=(10,4))
+    plt.plot(ts, mem, label="RSS MiB", color='C1')
+    plt.xlabel("Time (s)")
+    plt.ylabel("RSS (MiB)")
+    plt.title("Server memory RSS over time")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "sys_mem_time.png"), dpi=150)
+    plt.close()
+
+# ---- Main experiment ----
+def run_scientific_suite(args) -> Tuple[List[Dict], Dict]:
+    monitor = SystemMonitor(pid_hint=args.server_pid, interval=0.2, host=args.host, port=args.port)
     monitor.start()
 
     ctl = SimpleClient(args.host, args.port, timeout=args.timeout)
@@ -480,31 +547,27 @@ def run_scientific_suite(args):
         current = 0
         gen_pool = generate_vector_pool(args.gen_pool_size, args.dim, args.seed)
 
-        # iterate milestones (respect safety cap)
         for target in args.milestones:
             monitor.set_phase(f"idle_{target}")
-            time.sleep(0.2)
+            time.sleep(0.15)
             need = target - current
+            insert_qps = 0.0
             if need > 0:
                 monitor.set_phase(f"insert_{target}")
                 t0 = time.time()
                 ptr = 0
                 printed_progress = 0
                 while ptr < need:
-                    # choose block
                     block = min(args.insert_batch, need - ptr)
                     vectors = [gen_pool[(current + ptr + i) % len(gen_pool)] for i in range(block)]
                     tags_batch = [tags_to_sql_paren(deterministic_tags(current + ptr + i)) for i in range(block)]
 
-                    # group if most tags same to use multi-tuple
-                    from collections import Counter
                     cnt = Counter(tags_batch)
                     top_tag, top_count = cnt.most_common(1)[0]
                     if top_count >= 0.9 * block:
                         inserted = batch_insert_membrane(ctl, MEMBR, current + ptr, vectors, [top_tag] * block)
                         ptr += inserted
                     else:
-                        # pipelined sub-blocks
                         sub_ptr = 0
                         while sub_ptr < block:
                             sub = min(args.pipelined_batch, block - sub_ptr)
@@ -514,48 +577,44 @@ def run_scientific_suite(args):
                             sub_ptr += sub
                         ptr += block
 
-                    # progress print every ~100k inserted or every few loops
                     if (current + ptr) // 50000 > printed_progress:
                         printed_progress = (current + ptr) // 50000
-                        print(f"  [progress] inserted {current+ptr:,} / {target:,}")
-
-                    if (current + ptr) // 500000 > printed_progress:
-                        printed_progress = (current + ptr) // 500000
                         print(f"  [progress] inserted {current+ptr:,} / {target:,}")
 
                 dur = time.time() - t0
                 insert_qps = need / dur if dur > 0 else 0.0
                 current = target
                 print(f"[+] Inserted up to {current:,} vectors (throughput {insert_qps:.0f} vec/s)")
-            else:
-                insert_qps = 0.0
 
             # sample labels for get/delete
             sample_size = min(200, max(10, current // 1000))
             label_samples = random.sample(range(max(0, current - need), current), sample_size) if current > 0 else []
 
-            # warmup searches
+            # warmup
             monitor.set_phase(f"warmup_{target}")
             warm_qs = [gen_pool[i % len(gen_pool)] for i in range(min(200, len(gen_pool)))]
             _ = run_concurrent_searches(pool_clients, MEMBR, warm_qs, "", trials=200, concurrency=min(8, args.search_concurrency))
 
-            # baseline search
+            # baseline searches
             monitor.set_phase(f"baseline_{target}")
             qpool = [gen_pool[i % len(gen_pool)] for i in range(min(args.search_trials, len(gen_pool)))]
-            lat_base, _ = run_concurrent_searches(pool_clients, MEMBR, qpool, "", trials=min(args.search_trials, len(qpool)), concurrency=args.search_concurrency)
+            lat_base, counts = run_concurrent_searches(pool_clients, MEMBR, qpool, "", trials=min(args.search_trials, len(qpool)), concurrency=args.search_concurrency)
             stats_base = percentile_stats(lat_base)
+            # use counts average as proxy for recall
+            recall_proxy = float(np.mean(counts)) if counts else 0.0
             print(f"[+] Baseline N={target}: p50={stats_base['p50']:.3f}ms p99={stats_base['p99']:.3f}ms mean={stats_base['mean']:.3f}ms")
 
             # filtered searches
             monitor.set_phase(f"filtered_{target}")
-            filters = [("common",50.0), ("medium",10.0), ("rare",1.0)]
+            filters = [("selectivity:common", "common"), ("selectivity:medium", "medium"), ("selectivity:rare", "rare")]
             filter_stats = {}
-            for sel, pct in filters:
-                where = f"selectivity='{sel}'"
-                lat_f, _ = run_concurrent_searches(pool_clients, MEMBR, qpool, where, trials=min(1000, len(qpool)), concurrency=args.search_concurrency)
+            for clause, name in filters:
+                where = f"{clause}"
+                lat_f, cnts = run_concurrent_searches(pool_clients, MEMBR, qpool, where, trials=min(1000, len(qpool)), concurrency=args.search_concurrency)
                 fs = percentile_stats(lat_f)
-                filter_stats[sel] = fs
-                print(f"    Filter {sel}: p50={fs['p50']:.3f}ms p99={fs['p99']:.3f}ms")
+                fs["mean_count"] = float(np.mean(cnts)) if cnts else 0.0
+                filter_stats[name] = fs
+                print(f"    Filter {name}: p50={fs['p50']:.3f}ms p99={fs['p99']:.3f}ms mean_count={fs['mean_count']:.2f}")
 
             # get/delete tests
             monitor.set_phase(f"getdel_{target}")
@@ -565,9 +624,8 @@ def run_scientific_suite(args):
                 print(f"    GET p50={getdel_stats['get_p50']:.3f}ms succ={getdel_stats['get_succ']} fail={getdel_stats['get_fail']}")
                 print(f"    DEL p50={getdel_stats['del_p50']:.3f}ms succ={getdel_stats['del_succ']} fail={getdel_stats['del_fail']}")
             else:
-                getdel_stats = {"get_p50":0,"get_succ":0,"get_fail":0,"del_p50":0,"del_succ":0,"del_fail":0,"get2_p50":0,"get2_fail":0}
+                getdel_stats = {"get_p50":0,"get_succ":0,"get_fail":0,"del_p50":0,"del_succ":0,"del_fail":0}
 
-            # snapshot monitor
             last_cpu = monitor.history["cpu"][-1] if monitor.history["cpu"] else 0.0
             last_mem = monitor.history["mem"][-1] if monitor.history["mem"] else 0.0
 
@@ -575,6 +633,7 @@ def run_scientific_suite(args):
                 "vectors": target,
                 "insert_qps": insert_qps,
                 "baseline": stats_base,
+                "recall_proxy": recall_proxy,
                 "filtered": filter_stats,
                 "cpu": last_cpu,
                 "mem": last_mem,
@@ -593,59 +652,46 @@ def run_scientific_suite(args):
 
     return results, monitor.history
 
-# -------------------------
-# Reporting
-# -------------------------
-def generate_report(results, sys_hist, outdir, skip_plots=False):
+# ---- Reporting ----
+def generate_report(results: List[Dict], sys_hist: Dict, outdir: str, skip_plots: bool = False):
     if not results:
         print("No results to report")
         return
-
     os.makedirs(outdir, exist_ok=True)
-    # Build arrays for summary plots
+
     Ns = [r['vectors'] for r in results]
     p50s = [r['baseline']['p50'] for r in results]
+    p90s = [r['baseline']['p90'] for r in results]
+    p95s = [r['baseline']['p95'] for r in results]
     p99s = [r['baseline']['p99'] for r in results]
     p999s = [r['baseline']['p999'] for r in results]
     tps = [r['insert_qps'] for r in results]
-    recalls = [r['filtered']['common']['p50'] if 'common' in r['filtered'] else 0.0 for r in results]  # proxy
+    recalls = [r['recall_proxy'] for r in results]
+    med_lat = [r['baseline']['p50'] for r in results]
 
-    # CDF for last baseline
     last = results[-1]
     if not skip_plots:
         plot_cdf(last['raw_base_lat'], f"Baseline CDF (N={last['vectors']})", os.path.join(outdir, "baseline_cdf_last.png"))
-        plot_percentiles_vs_N(Ns, p50s, p99s, p999s, os.path.join(outdir, "latency_percentiles_vs_N.png"))
+        plot_histogram(last['raw_base_lat'], f"Latency histogram (N={last['vectors']})", os.path.join(outdir, "latency_hist_last.png"))
+        plot_percentiles_vs_N(Ns, p50s, p90s, p95s, p99s, p999s, os.path.join(outdir, "latency_percentiles_vs_N.png"))
         plot_throughput_vs_N(Ns, tps, os.path.join(outdir, "throughput_vs_N.png"))
-        # recall vs median-latency
-        med_lat = [r['baseline']['p50'] for r in results]
         plot_recall_vs_latency(recalls, med_lat, os.path.join(outdir, "recall_vs_latency.png"))
+        plot_sys_time_series(sys_hist, outdir)
 
     # CSV summary
     csvfile = os.path.join(outdir, "results_summary_v3.csv")
     with open(csvfile, "w", newline="") as f:
         w = csv.writer(f)
-        hdr = ["vectors","insert_qps","base_p50","base_p90","base_p95","base_p99","base_p999","base_mean","base_std","cpu_pct","mem_mb",
-               "filter_common_p50","filter_common_p99","filter_medium_p50","filter_medium_p99","filter_rare_p50","filter_rare_p99",
-               "get_p50","get_succ","get_fail","del_p50","del_succ","del_fail"]
+        hdr = ["vectors","insert_qps","p50","p90","p95","p99","p999","mean","std","cpu_pct","mem_mb","recall_proxy"]
         w.writerow(hdr)
         for r in results:
-            fc = r['filtered'].get('common', {})
-            fm = r['filtered'].get('medium', {})
-            fr = r['filtered'].get('rare', {})
-            row = [
-                r['vectors'], f"{r['insert_qps']:.1f}",
-                f"{r['baseline']['p50']:.3f}", f"{r['baseline']['p90']:.3f}", f"{r['baseline']['p95']:.3f}",
-                f"{r['baseline']['p99']:.3f}", f"{r['baseline']['p999']:.3f}", f"{r['baseline']['mean']:.3f}", f"{r['baseline']['std']:.3f}",
-                f"{r['cpu']:.2f}", f"{r['mem']:.1f}",
-                f"{fc.get('p50',0):.3f}", f"{fc.get('p99',0):.3f}",
-                f"{fm.get('p50',0):.3f}", f"{fm.get('p99',0):.3f}",
-                f"{fr.get('p50',0):.3f}", f"{fr.get('p99',0):.3f}",
-                f"{r.get('get_p50',0):.3f}", r.get('get_succ',0), r.get('get_fail',0),
-                f"{r.get('del_p50',0):.3f}", r.get('del_succ',0), r.get('del_fail',0)
-            ]
+            b = r['baseline']
+            row = [r['vectors'], f"{r['insert_qps']:.1f}", f"{b['p50']:.3f}", f"{b['p90']:.3f}",
+                   f"{b['p95']:.3f}", f"{b['p99']:.3f}", f"{b['p999']:.3f}", f"{b['mean']:.3f}", f"{b['std']:.3f}",
+                   f"{r['cpu']:.2f}", f"{r['mem']:.1f}", f"{r.get('recall_proxy',0):.3f}"]
             w.writerow(row)
 
-    # Save raw JSON
+    # JSON raw
     jsonfile = os.path.join(outdir, "results_raw_v3.json")
     with open(jsonfile, "w") as f:
         json.dump({"results": results, "system": sys_hist}, f, indent=2, default=lambda o: (list(o) if isinstance(o, np.ndarray) else str(o)))
@@ -655,16 +701,13 @@ def generate_report(results, sys_hist, outdir, skip_plots=False):
     if not skip_plots:
         print("[+] Saved plots to", outdir)
 
-# -------------------------
-# Entrypoint
-# -------------------------
+# ---- Entrypoint ----
 def main():
     args = parse_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
     print("=== POMAI SCIENTIFIC BENCHMARK v3 ===")
     print(f"Milestones: {args.milestones}, dim={args.dim}, gen_pool={args.gen_pool_size}, insert_batch={args.insert_batch}")
-
     res, sys_hist = run_scientific_suite(args)
     if res:
         generate_report(res, sys_hist, args.output, skip_plots=args.skip_plots)
