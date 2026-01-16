@@ -57,6 +57,12 @@ namespace pomai::ai::orbit
     static constexpr uint32_t RESERVE_CHUNK = 16; // per-thread reservation
     static constexpr size_t DEFAULT_MAX_SUBBATCH = 4096;
 
+    static constexpr uint32_t kCostSetup  = 200; // Matrix proj + norm
+    static constexpr uint32_t kCostRoute  = 50;  // Per probe routing step
+    static constexpr uint32_t kCostBucket = 20;  // Bucket lookup + IO overhead check
+    static constexpr uint32_t kCostItem   = 5;   // Decode + Distance calc (AVX optimized)
+    static constexpr uint32_t kCostCheck  = 2;   // Filter check (Bloom/Set)
+
     struct ThreadReserve
     {
         uint32_t base = 0;
@@ -570,6 +576,8 @@ namespace pomai::ai::orbit
     {
         size_t si = label_shard_index(label);
         LabelShard &sh = label_shards_[si];
+
+        // Dùng unique_lock để ghi an toàn
         std::unique_lock<std::shared_mutex> lk(sh.mu);
         sh.bucket[label] = bucket_off;
         sh.slot[label] = slot;
@@ -938,25 +946,22 @@ namespace pomai::ai::orbit
     std::vector<std::pair<uint64_t, float>> PomaiOrbit::search_with_budget(
         const float *query, size_t k, const pomai::ai::Budget &budget, size_t nprobe)
     {
-        if (!query || k == 0)
-            return {};
+        if (!query || k == 0) return {};
 
         // 1. Setup Budget Tracker
         uint32_t ops_left = budget.ops_budget;
-        auto pay_ops = [&](uint32_t cost) -> bool
-        {
-            if (ops_left < cost)
-                return false;
+        auto pay_ops = [&](uint32_t cost) -> bool {
+            if (ops_left < cost) return false;
             ops_left -= cost;
             return true;
         };
 
-        if (!pay_ops(1))
-            return {};
-        if (centroids_.empty())
-            return {};
+        // [COST] Trừ phí khởi tạo (Setup Cost)
+        if (!pay_ops(kCostSetup)) return {};
+        
+        if (centroids_.empty()) return {};
 
-        // 2. Prepare Query Projection (EEQ)
+        // 2. Prepare Query Projection
         std::vector<std::vector<float>> qproj;
         eeq_->project_query(query, qproj);
         float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
@@ -966,75 +971,64 @@ namespace pomai::ai::orbit
         std::vector<uint64_t> small_deleted;
         {
             std::shared_lock<std::shared_mutex> dm(del_mu_);
-            if (deleted_labels_.size() > 256)
-            {
+            if (deleted_labels_.size() > 256) {
                 bloom.emplace();
-                for (uint64_t v : deleted_labels_)
-                    bloom->add(v);
-            }
-            else if (!deleted_labels_.empty())
-            {
+                for (uint64_t v : deleted_labels_) bloom->add(v);
+            } else if (!deleted_labels_.empty()) {
                 small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
             }
         }
 
         // 4. Routing
-        if (nprobe == 0)
-        {
+        if (nprobe == 0) {
             nprobe = std::max(1UL, cfg_.num_centroids / 50);
-            if (k > 50)
-                nprobe *= 2;
+            if (k > 50) nprobe *= 2;
         }
+
+        // [COST] Trừ phí tìm đường (Routing Cost)
+        // Ước lượng: số bước probe * chi phí mỗi bước
+        if (!pay_ops(nprobe * kCostRoute)) return {}; 
+
         auto targets = find_routing_centroids(query, nprobe);
 
-        // [THERMAL] Sorting: Prioritize HOT centroids (resident in RAM)
-        // This puts the most "awake" data at the front of the queue.
-        std::sort(targets.begin(), targets.end(), [&](uint32_t a, uint32_t b)
-                  { return get_temperature(a) > get_temperature(b); });
+        // Sorting by temperature (Thermal Optimization)
+        std::sort(targets.begin(), targets.end(), [&](uint32_t a, uint32_t b) {
+            return get_temperature(a) > get_temperature(b);
+        });
 
         using ResPair = std::pair<float, uint64_t>;
         std::priority_queue<ResPair> topk;
 
-        const uint32_t cost_check = 1;
-        const uint32_t cost_decode = 5;
-
         for (uint32_t cid : targets)
         {
-            if (ops_left == 0)
-                break;
+            // Kiểm tra budget vòng ngoài
+            if (ops_left == 0) break;
 
-            // [THERMAL] Gating: The "Sleeping Giant" Rule
-            // If a centroid is frozen (Temp < 10) AND we are low on budget (< 2000 ops),
-            // we SKIP it. We do not wake up disk data for low-budget/marginal queries.
+            // Thermal Gating
             uint8_t temp = get_temperature(cid);
-            if (temp < 10 && ops_left < 2000)
-            {
-                continue;
-            }
+            if (temp < 10 && ops_left < 2000) continue; // Skip cold data if low budget
 
-            // [THERMAL] Touch: We are accessing this centroid, so heat it up.
             touch_centroid(cid);
 
             uint64_t current_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
             while (current_off != 0)
             {
-                if (ops_left == 0)
-                    break;
+                if (ops_left == 0) break;
 
-                // Resolve bucket pointer (might trigger IO if not mapped)
+                // [COST] Trừ phí truy cập Bucket (Bucket Access Cost)
+                // Nếu không đủ tiền mở bucket -> Dừng ngay
+                if (!pay_ops(kCostBucket)) { ops_left = 0; break; }
+
                 std::vector<char> tmp;
                 auto base_opt = resolve_bucket_base(arena_, current_off, tmp);
-                if (!base_opt)
-                    break;
+                if (!base_opt) break;
 
                 const char *bucket_base = *base_opt;
                 const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(bucket_base);
-
                 uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
                 uint64_t next_bucket_offset = hdr_ptr->next_bucket_offset.load(std::memory_order_acquire);
 
-                if (count == 0)
-                {
+                if (count == 0) {
                     current_off = next_bucket_offset;
                     continue;
                 }
@@ -1045,76 +1039,47 @@ namespace pomai::ai::orbit
 
                 for (uint32_t i = 0; i < count; ++i)
                 {
-                    if (ops_left == 0)
-                        break;
+                    if (ops_left == 0) break;
 
-                    if (!pay_ops(cost_check))
-                    {
-                        ops_left = 0;
-                        break;
-                    }
+                    // [COST] Trừ phí xử lý Item (Item Cost)
+                    // Đây là vòng lặp tốn kém nhất, cần check chặt chẽ
+                    if (!pay_ops(kCostItem)) { ops_left = 0; break; }
 
                     uint64_t id = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
 
-                    // --- CHECK DELETED ---
-                    if (bloom)
-                    {
-                        if (bloom->maybe_contains(id))
-                            continue;
-                    }
-                    else if (!small_deleted.empty())
-                    {
+                    // Check filter cost is implicitly covered by kCostItem/kCostCheck overhead
+                    if (bloom) {
+                        if (bloom->maybe_contains(id)) continue;
+                    } else if (!small_deleted.empty()) {
                         bool found = false;
-                        for (uint64_t d : small_deleted)
-                        {
-                            if (d == id)
-                            {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (found)
-                            continue;
-                    }
-                    // ---------------------
-
-                    if (!pay_ops(cost_decode))
-                    {
-                        ops_left = 0;
-                        break;
+                        for (uint64_t d : small_deleted) if (d == id) { found = true; break; }
+                        if (found) continue;
                     }
 
                     uint16_t len = __atomic_load_n(&len_base[i], __ATOMIC_ACQUIRE);
-                    if (len == 0 || len > MAX_ECHO_BYTES)
-                        continue;
+                    if (len == 0 || len > MAX_ECHO_BYTES) continue;
 
                     const char *slot_ptr = vec_area + static_cast<size_t>(i) * MAX_ECHO_BYTES;
                     const uint8_t *ub = reinterpret_cast<const uint8_t *>(slot_ptr);
 
                     float dist = eeq_->approx_dist_code_bytes(qproj, qnorm2, ub, len);
 
-                    if (topk.size() < k)
-                    {
+                    if (topk.size() < k) {
                         topk.push({dist, id});
-                    }
-                    else if (dist < topk.top().first)
-                    {
+                    } else if (dist < topk.top().first) {
                         topk.pop();
                         topk.push({dist, id});
                     }
                 }
-
                 current_off = next_bucket_offset;
             }
         }
 
         std::vector<std::pair<uint64_t, float>> out;
         out.reserve(topk.size());
-        while (!topk.empty())
-        {
-            auto p = topk.top();
+        while (!topk.empty()) {
+            out.emplace_back(topk.top().second, topk.top().first);
             topk.pop();
-            out.emplace_back(p.second, p.first);
         }
         std::reverse(out.begin(), out.end());
         return out;
@@ -1123,127 +1088,79 @@ namespace pomai::ai::orbit
     std::vector<std::pair<uint64_t, float>> PomaiOrbit::search_filtered_with_budget(
         const float *query, size_t k, const std::vector<uint64_t> &candidates, const pomai::ai::Budget &budget)
     {
-        if (!query || k == 0 || candidates.empty())
-            return {};
+        if (!query || k == 0 || candidates.empty()) return {};
 
-        // 1. Budget & State Setup
         uint32_t ops_left = budget.ops_budget;
+        auto pay_ops = [&](uint32_t cost) -> bool {
+            if (ops_left < cost) return false;
+            ops_left -= cost;
+            return true;
+        };
+
+        // [COST] Trừ phí Setup
+        if (!pay_ops(kCostSetup)) return {};
 
         using ResPair = std::pair<float, uint64_t>;
         std::priority_queue<ResPair> topk;
 
-        const uint32_t cost_check = 1;  // Cost to lookup & check existence
-        const uint32_t cost_decode = 5; // Cost to decode & compute distance
-
-        // 2. Prepare Query Projection
         std::vector<std::vector<float>> qproj;
         eeq_->project_query(query, qproj);
         float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
 
-        // 3. Prepare Deletion Filter (Consistent with other search paths)
         std::optional<DeletedBloom> bloom;
         std::vector<uint64_t> small_deleted;
         {
             std::shared_lock<std::shared_mutex> dm(del_mu_);
-            if (deleted_labels_.size() > 256)
-            {
+            if (deleted_labels_.size() > 256) {
                 bloom.emplace();
-                for (uint64_t v : deleted_labels_)
-                    bloom->add(v);
-            }
-            else if (!deleted_labels_.empty())
-            {
+                for (uint64_t v : deleted_labels_) bloom->add(v);
+            } else if (!deleted_labels_.empty()) {
                 small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
             }
         }
 
-        // 4. Execution Loop
         for (uint64_t id : candidates)
         {
-            // --- Budget Check ---
-            if (ops_left == 0)
-                break;
+            if (ops_left == 0) break;
 
-            // --- Deletion Check ---
-            if (bloom && bloom->maybe_contains(id))
-                continue;
-            else if (!small_deleted.empty())
-            {
+            if (bloom && bloom->maybe_contains(id)) continue;
+            else if (!small_deleted.empty()) {
                 bool found = false;
-                for (uint64_t d : small_deleted)
-                    if (d == id)
-                    {
-                        found = true;
-                        break;
-                    }
-                if (found)
-                    continue;
+                for (uint64_t d : small_deleted) if (d == id) { found = true; break; }
+                if (found) continue;
             }
 
-            // Pay lookup cost
-            if (ops_left < cost_check)
-            {
-                ops_left = 0;
-                break;
-            }
-            ops_left -= cost_check;
+            // [COST] Trừ phí Truy cập ngẫu nhiên (Random Access Cost)
+            // Filtered search nhảy cóc (random access) nên tốn kém hơn search thường.
+            // Ta tính gộp: Check + Bucket + Decode
+            if (!pay_ops(kCostCheck + kCostBucket + kCostItem)) { ops_left = 0; break; }
 
-            // --- Locate Bucket ---
             uint64_t bucket_off = 0;
-            // Note: We don't need the exact slot hint here because we scan the bucket anyway
-            if (!get_label_bucket(id, bucket_off) || bucket_off == 0)
-                continue;
+            if (!get_label_bucket(id, bucket_off) || bucket_off == 0) continue;
 
-            // Pay decode cost (optimistic payment before potential IO)
-            if (ops_left < cost_decode)
-            {
-                ops_left = 0;
-                break;
-            }
-            ops_left -= cost_decode;
-
-            // --- Resolve Data Pointer ---
-            // This step is crucial. If the bucket is COLD (on disk), this will trigger IO.
             std::vector<char> tmp;
             auto base_opt = resolve_bucket_base(arena_, bucket_off, tmp);
-            if (!base_opt)
-                continue;
+            if (!base_opt) continue;
             const char *data_base_ptr = *base_opt;
-
+            
             const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(data_base_ptr);
-
-            // [THERMAL CONSISTENCY - CRITICAL]
-            // Dù truy cập qua Filter (ID), ta vẫn phải báo cho hệ thống biết Centroid này đang được dùng.
-            // Điều này giữ cho Page này ở trạng thái "Nóng" (Pinned/Cached in RAM).
-            // Nếu thiếu dòng này, Filtered Search nhiều sẽ không ngăn được data bị Evict.
+            // Thermal logic: Keep filtered items hot
             touch_centroid(hdr_ptr->centroid_id);
 
-            // --- In-Bucket Linear Scan ---
             uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
-            if (count == 0)
-                continue;
+            if (count == 0) continue;
 
             const uint64_t *id_base = reinterpret_cast<const uint64_t *>(data_base_ptr + hdr_ptr->off_ids);
-
-            // Tìm chính xác slot chứa ID này trong bucket
             int32_t found = -1;
-            for (uint32_t j = 0; j < count; ++j)
-            {
+            for (uint32_t j = 0; j < count; ++j) {
                 uint64_t v = pomai::ai::atomic_utils::atomic_load_u64(id_base + j);
-                if (v == id)
-                {
-                    found = static_cast<int32_t>(j);
-                    break;
-                }
+                if (v == id) { found = static_cast<int32_t>(j); break; }
             }
-            if (found < 0)
-                continue; // Should not happen if label map is consistent, but safe to skip
+            if (found < 0) continue;
 
-            // --- Decode & Compute ---
             const uint16_t *len_base = reinterpret_cast<const uint16_t *>(data_base_ptr + hdr_ptr->off_pq_codes);
             uint16_t len = __atomic_load_n(&len_base[found], __ATOMIC_ACQUIRE);
-            if (len == 0 || len > MAX_ECHO_BYTES)
-                continue;
+            if (len == 0 || len > MAX_ECHO_BYTES) continue;
 
             const char *vec_area = data_base_ptr + hdr_ptr->off_vectors;
             const char *slot_ptr = vec_area + static_cast<size_t>(found) * MAX_ECHO_BYTES;
@@ -1251,154 +1168,23 @@ namespace pomai::ai::orbit
 
             float dist = eeq_->approx_dist_code_bytes(qproj, qnorm2, ub, len);
 
-            // --- Heap Maintenance ---
-            if (topk.size() < k)
-            {
+            if (topk.size() < k) {
                 topk.push({dist, id});
-            }
-            else if (dist < topk.top().first)
-            {
+            } else if (dist < topk.top().first) {
                 topk.pop();
                 topk.push({dist, id});
             }
         }
 
-        // 5. Finalize Results
         std::vector<std::pair<uint64_t, float>> out;
         out.reserve(topk.size());
-        while (!topk.empty())
-        {
+        while (!topk.empty()) {
             out.emplace_back(topk.top().second, topk.top().first);
             topk.pop();
         }
         std::reverse(out.begin(), out.end());
         return out;
     }
-
-    // std::vector<std::pair<uint64_t, float>> PomaiOrbit::search(const float *query, size_t k, size_t nprobe)
-    // {
-    //     if (!query || k == 0)
-    //         return {};
-
-    //     std::vector<std::vector<float>> qproj;
-    //     eeq_->project_query(query, qproj);
-    //     float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
-
-    //     // --- FIX DELETE LOGIC ---
-    //     std::optional<DeletedBloom> bloom;
-    //     std::vector<uint64_t> small_deleted;
-    //     {
-    //         std::shared_lock<std::shared_mutex> dm(del_mu_);
-    //         if (deleted_labels_.size() > 256)
-    //         {
-    //             bloom.emplace();
-    //             for (uint64_t v : deleted_labels_)
-    //                 bloom->add(v);
-    //         }
-    //         else if (!deleted_labels_.empty())
-    //         {
-    //             small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
-    //         }
-    //     }
-    //     // ------------------------
-
-    //     if (centroids_.empty())
-    //         return {};
-
-    //     if (nprobe == 0)
-    //     {
-    //         nprobe = std::max(1UL, cfg_.num_centroids / 50);
-    //         if (k > 50)
-    //             nprobe *= 2;
-    //     }
-    //     auto targets = find_routing_centroids(query, nprobe);
-
-    //     using ResPair = std::pair<float, uint64_t>;
-    //     std::priority_queue<ResPair> topk;
-
-    //     for (uint32_t cid : targets)
-    //     {
-    //         uint64_t current_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
-    //         while (current_off != 0)
-    //         {
-    //             std::vector<char> tmp;
-    //             auto base_opt = resolve_bucket_base(arena_, current_off, tmp);
-    //             if (!base_opt)
-    //                 break;
-    //             const char *bucket_base = *base_opt;
-    //             const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(bucket_base);
-
-    //             uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
-    //             uint64_t next_bucket_offset = hdr_ptr->next_bucket_offset.load(std::memory_order_acquire);
-    //             if (count == 0)
-    //             {
-    //                 current_off = next_bucket_offset;
-    //                 continue;
-    //             }
-
-    //             const uint16_t *len_base = reinterpret_cast<const uint16_t *>(bucket_base + hdr_ptr->off_pq_codes);
-    //             const char *vec_area = bucket_base + hdr_ptr->off_vectors;
-    //             const uint64_t *id_base = reinterpret_cast<const uint64_t *>(bucket_base + hdr_ptr->off_ids);
-
-    //             for (uint32_t i = 0; i < count; ++i)
-    //             {
-    //                 uint64_t id = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
-
-    //                 // --- CHECK DELETED (FIXED) ---
-    //                 if (bloom)
-    //                 {
-    //                     if (bloom->maybe_contains(id))
-    //                         continue;
-    //                 }
-    //                 else if (!small_deleted.empty())
-    //                 {
-    //                     bool found = false;
-    //                     for (uint64_t d : small_deleted)
-    //                     {
-    //                         if (d == id)
-    //                         {
-    //                             found = true;
-    //                             break;
-    //                         }
-    //                     }
-    //                     if (found)
-    //                         continue;
-    //                 }
-    //                 // -----------------------------
-
-    //                 uint16_t len = __atomic_load_n(&len_base[i], __ATOMIC_ACQUIRE);
-    //                 if (len == 0 || len > MAX_ECHO_BYTES)
-    //                     continue;
-
-    //                 const char *slot_ptr = vec_area + static_cast<size_t>(i) * MAX_ECHO_BYTES;
-    //                 const uint8_t *ub = reinterpret_cast<const uint8_t *>(slot_ptr);
-
-    //                 float dist = eeq_->approx_dist_code_bytes(qproj, qnorm2, ub, len);
-
-    //                 if (topk.size() < k)
-    //                     topk.push({dist, id});
-    //                 else if (dist < topk.top().first)
-    //                 {
-    //                     topk.pop();
-    //                     topk.push({dist, id});
-    //                 }
-    //             }
-
-    //             current_off = next_bucket_offset;
-    //         }
-    //     }
-
-    //     std::vector<std::pair<uint64_t, float>> out;
-    //     out.reserve(topk.size());
-    //     while (!topk.empty())
-    //     {
-    //         auto p = topk.top();
-    //         topk.pop();
-    //         out.emplace_back(p.second, p.first);
-    //     }
-    //     std::reverse(out.begin(), out.end());
-    //     return out;
-    // }
 
     // ------------------- insert_batch (with Auto-Train) -------------------
     bool PomaiOrbit::insert_batch(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
@@ -1411,43 +1197,44 @@ namespace pomai::ai::orbit
         // [NEW] AUTO-TRAIN LOGIC
         // Nếu DB chưa có centroids (chưa train), dùng batch này để train ngay lập tức.
         // ---------------------------------------------------------
-        if (centroids_.empty())
+        if (centroids_.empty()) // Check 1: Optimistic (Không lock để nhanh)
         {
-            if (batch.empty())
-                return false;
+            // Lock lại để chỉ 1 thằng được vào train
+            std::lock_guard<std::mutex> lk(train_mu_);
 
-            std::clog << "[Orbit] Database is empty. Auto-training centroids using first batch (" << batch.size() << " vectors)...\n";
-
-            // Gom dữ liệu từ batch ra mảng liền kề (flat array) để train
-            std::vector<float> training_data;
-            training_data.reserve(batch.size() * cfg_.dim);
-
-            size_t valid_count = 0;
-            for (const auto &item : batch)
+            if (centroids_.empty()) // Check 2: Authoritative (Sau khi lock)
             {
-                if (item.second.size() == cfg_.dim)
-                {
-                    training_data.insert(training_data.end(), item.second.begin(), item.second.end());
-                    valid_count++;
-                }
-            }
+                if (batch.empty())
+                    return false;
 
-            if (valid_count > 0)
-            {
-                // Tự động điều chỉnh số lượng centroid nếu batch quá nhỏ để tránh lỗi KMeans
-                // (Ví dụ: Batch 100 vector thì không thể chia 256 cụm)
-                size_t original_k = cfg_.num_centroids;
-                if (original_k == 0 || original_k > valid_count / 2)
+                std::clog << "[Orbit] Database is empty. Auto-training centroids using first batch (" << batch.size() << " vectors)...\n";
+
+                // Gom dữ liệu từ batch ra mảng liền kề
+                std::vector<float> training_data;
+                training_data.reserve(batch.size() * cfg_.dim);
+
+                size_t valid_count = 0;
+                for (const auto &item : batch)
                 {
-                    // Heuristic: K = sqrt(N)
-                    size_t suggest = static_cast<size_t>(std::sqrt(valid_count));
-                    // Hack const_cast để cập nhật config runtime
-                    const_cast<Config &>(cfg_).num_centroids = std::max<size_t>(1, suggest);
-                    std::clog << "[Orbit] Auto-adjusted num_centroids to " << const_cast<Config &>(cfg_).num_centroids << " based on batch size.\n";
+                    if (item.second.size() == cfg_.dim)
+                    {
+                        training_data.insert(training_data.end(), item.second.begin(), item.second.end());
+                        valid_count++;
+                    }
                 }
 
-                // Gọi hàm train: tạo centroids, bucket và lưu schema xuống đĩa
-                this->train(training_data.data(), valid_count);
+                if (valid_count > 0)
+                {
+                    size_t original_k = cfg_.num_centroids;
+                    if (original_k == 0 || original_k > valid_count / 2)
+                    {
+                        size_t suggest = static_cast<size_t>(std::sqrt(valid_count));
+                        const_cast<Config &>(cfg_).num_centroids = std::max<size_t>(1, suggest);
+                        std::clog << "[Orbit] Auto-adjusted num_centroids to " << const_cast<Config &>(cfg_).num_centroids << " based on batch size.\n";
+                    }
+
+                    this->train(training_data.data(), valid_count);
+                }
             }
         }
         // ---------------------------------------------------------

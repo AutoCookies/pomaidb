@@ -5,11 +5,10 @@
  * The "Shock Absorber" for PomaiDB.
  * A dense, write-optimized buffer for incoming vectors.
  *
- * Philosophy:
- * - Insert is O(1) memory copy (amortized).
- * - Search is Brute-force (fast for small N < 10k).
- * - Structure of Arrays (SoA) layout for cache locality.
- * - Spinlock protection (expected hold time < 500us).
+ * Performance Tuning:
+ * - Adaptive Hybrid Spinlock: Spins on CPU for short waits, yields to OS for long waits.
+ * - Structure of Arrays (SoA): Perfect for cache locality & SIMD auto-vectorization.
+ * - Pre-allocation: Minimizes resizing overhead.
  */
 
 #include <vector>
@@ -17,11 +16,64 @@
 #include <cmath>
 #include <algorithm>
 #include <queue>
-#include <cstring> // memcpy
-#include <utility> // std::pair
+#include <cstring> 
+#include <utility> 
+#include <thread> 
+
+// Intrinsics for CPU pause
+#if defined(_MSC_VER)
+    #include <intrin.h>
+#elif defined(__GNUC__) || defined(__clang__)
+    #include <immintrin.h>
+#endif
 
 namespace pomai::core
 {
+    // --- Helper: Adaptive Spinlock ---
+    // Đây là "vũ khí bí mật" cho high-concurrency.
+    // Nó không busy-wait đần độn mà biết backoff thông minh.
+    class AdaptiveSpinLock {
+        std::atomic_flag flag = ATOMIC_FLAG_INIT;
+
+    public:
+        void lock() {
+            // Fast path: Thử lấy lock ngay lập tức
+            if (!flag.test_and_set(std::memory_order_acquire)) {
+                return;
+            }
+
+            // Slow path: Contention detected
+            int spin_count = 0;
+            while (flag.test_and_set(std::memory_order_acquire)) {
+                if (spin_count < 16) {
+                    // Phase 1: Micro-sleep (CPU hint). 
+                    // Giúp CPU pipeline không bị flush, tiết kiệm điện và giảm latency bus RAM.
+                    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+                        _mm_pause(); 
+                    #elif defined(__aarch64__)
+                        asm volatile("isb"); // ARM barrier equivalent hint
+                    #endif
+                    spin_count++;
+                } else {
+                    // Phase 2: Yield to OS.
+                    // Nếu chờ quá lâu, nhường CPU cho thread khác (tránh 100% CPU deadlock).
+                    std::this_thread::yield();
+                    spin_count = 0; // Reset backoff check
+                }
+            }
+        }
+
+        void unlock() {
+            flag.clear(std::memory_order_release);
+        }
+    };
+
+    // RAII Wrapper
+    struct ScopedSpinLock {
+        AdaptiveSpinLock& sl;
+        ScopedSpinLock(AdaptiveSpinLock& l) : sl(l) { sl.lock(); }
+        ~ScopedSpinLock() { sl.unlock(); }
+    };
 
     // Data carrier for the background merger
     struct HotBatch
@@ -40,7 +92,7 @@ namespace pomai::core
         explicit HotTier(size_t dim, size_t capacity_hint = 4096)
             : dim_(dim), capacity_hint_(capacity_hint)
         {
-            // Reserve to avoid immediate reallocations on first inserts
+            // Reserve to avoid immediate reallocations
             labels_.reserve(capacity_hint_);
             data_.reserve(capacity_hint_ * dim_);
         }
@@ -49,42 +101,43 @@ namespace pomai::core
         HotTier &operator=(const HotTier &) = delete;
 
         // ----------------------------------------------------------------
-        // Insert Path: Critical Hot Path
+        // Insert Path: Write (Thread-Safe & Fast)
         // ----------------------------------------------------------------
-        // Thread-safe O(1) push.
         void push(uint64_t label, const float *vec)
         {
-            LockGuard g(flag_);
+            ScopedSpinLock g(lock_);
+            
+            // Check capacity guard (optional simple protection)
+            // Nếu vector grow quá lớn sẽ gây delay lock, nên giữ capacity hợp lý.
             labels_.push_back(label);
 
-            // Append vector data
+            // Manual copy is often faster/safer than std::copy for simple float arrays
             size_t current_size = data_.size();
             data_.resize(current_size + dim_);
             std::memcpy(data_.data() + current_size, vec, dim_ * sizeof(float));
         }
 
         // ----------------------------------------------------------------
-        // Drain Path: Background Worker
+        // Drain Path: Background Worker (Zero-Copy Handoff)
         // ----------------------------------------------------------------
-        // Atomically swaps the current buffer out to return to caller.
-        // This is a "destructive read" - the HotTier is empty after this.
         HotBatch swap_and_flush()
         {
             HotBatch batch;
             batch.dim = dim_;
 
-            LockGuard g(flag_);
+            ScopedSpinLock g(lock_);
             if (labels_.empty())
             {
                 return batch;
             }
 
-            // Move internals to batch (zero-copy handoff)
+            // Move semantics: Chuyển quyền sở hữu data sang batch cực nhanh (pointer swap)
             batch.labels = std::move(labels_);
             batch.data = std::move(data_);
 
-            // Reset internals (clean slate)
-            // Re-reserve to keep subsequent inserts fast
+            // Re-initialize buffers for next batch
+            // Không dùng .clear() vì vector đã bị moved (trạng thái rỗng).
+            // Ta tạo vector mới và reserve lại để đảm bảo hiệu năng insert tiếp theo.
             labels_ = std::vector<uint64_t>();
             data_ = std::vector<float>();
             labels_.reserve(capacity_hint_);
@@ -94,32 +147,38 @@ namespace pomai::core
         }
 
         // ----------------------------------------------------------------
-        // Search Path: Read
+        // Search Path: Brute-Force (Vectorized)
         // ----------------------------------------------------------------
-        // Brute-force L2 search.
-        // Blocks inserts for the duration of the scan.
-        // [Perf Note]: Keep HotTier small (< 10k items) to keep this < 1ms.
         std::vector<std::pair<uint64_t, float>> search(const float *query, size_t k) const
         {
             std::vector<std::pair<uint64_t, float>> results;
 
-            LockGuard g(flag_);
+            ScopedSpinLock g(lock_);
             size_t n = labels_.size();
             if (n == 0)
                 return results;
 
-            // Maintain top-k smallest distances.
-            // std::priority_queue is a max-heap, so popping removes the largest distance.
-            // This is exactly what we want (keep k smallest).
-            using Entry = std::pair<float, uint64_t>; // <dist, label>
+            // Use min-heap to keep top-k smallest distances
+            // Pair: <distance, label>
+            using Entry = std::pair<float, uint64_t>;
             std::priority_queue<Entry> pq;
 
             const float *dptr = data_.data();
+            const size_t d = dim_;
 
-            // Simple loop - easy for compiler to auto-vectorize
+            // Linear Scan
             for (size_t i = 0; i < n; ++i)
             {
-                float dist = compute_l2_sqr(query, dptr + (i * dim_), dim_);
+                // Compute L2 Squared inline
+                // Compiler (GCC/Clang -O3) will auto-vectorize (AVX2/AVX512) this loop heavily
+                // because data is contiguous (SoA layout).
+                float dist = 0.0f;
+                const float* vec_i = dptr + (i * d);
+                
+                for (size_t j = 0; j < d; ++j) {
+                    float diff = query[j] - vec_i[j];
+                    dist += diff * diff;
+                }
 
                 if (pq.size() < k)
                 {
@@ -132,15 +191,14 @@ namespace pomai::core
                 }
             }
 
-            // Drain PQ into vector
+            // Finalize results
             results.reserve(pq.size());
             while (!pq.empty())
             {
                 results.emplace_back(pq.top().second, pq.top().first);
                 pq.pop();
             }
-
-            // Sort ascending by distance (PQ pop order is descending)
+            // Reverse to return sorted by distance (ASC)
             std::reverse(results.begin(), results.end());
 
             return results;
@@ -148,24 +206,11 @@ namespace pomai::core
 
         size_t size() const
         {
-            LockGuard g(flag_);
+            ScopedSpinLock g(lock_);
             return labels_.size();
         }
 
     private:
-        // Local helper for L2 Squared
-        static inline float compute_l2_sqr(const float *a, const float *b, size_t d)
-        {
-            float sum = 0.0f;
-            for (size_t i = 0; i < d; ++i)
-            {
-                float diff = a[i] - b[i];
-                sum += diff * diff;
-            }
-            return sum;
-        }
-
-        // Members
         size_t dim_;
         size_t capacity_hint_;
 
@@ -173,33 +218,8 @@ namespace pomai::core
         std::vector<uint64_t> labels_;
         std::vector<float> data_;
 
-        // Spinlock
-        mutable std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
-
-        // RAII wrapper for atomic_flag
-        struct LockGuard
-        {
-            std::atomic_flag &f;
-            LockGuard(std::atomic_flag &flag) : f(flag)
-            {
-                while (f.test_and_set(std::memory_order_acquire))
-                {
-                    // Busy wait (spin)
-                    // In C++20 we would use f.wait(true), but strict C++17 compat:
-                    // just spin.
-#if defined(__cpp_lib_atomic_wait)
-                    f.wait(true, std::memory_order_relaxed);
-#endif
-                }
-            }
-            ~LockGuard()
-            {
-                f.clear(std::memory_order_release);
-#if defined(__cpp_lib_atomic_wait)
-                f.notify_one();
-#endif
-            }
-        };
+        // Optimized Lock
+        mutable AdaptiveSpinLock lock_;
     };
 
 } // namespace pomai::core

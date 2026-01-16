@@ -4,11 +4,12 @@
  * Implementation of WalManager.
  *
  * Notes:
- *  - Uses POSIX file descriptor I/O (open/write/pread/ftruncate/fsync) for precise control.
- *  - Implements crc32 for record validation.
- *  - Replay is robust to partial trailing records: it truncates WAL to last valid offset.
- *  - Append/fsync/replay/truncate are serialized in-process using append_mu_ to make
- *    append_record thread-safe for multiple threads in the same process.
+ * - Uses POSIX file descriptor I/O (open/write/pread/ftruncate/fsync) for precise control.
+ * - Implements crc32 for record validation.
+ * - Replay is robust to partial trailing records: it truncates WAL to last valid offset.
+ * - Append/fsync/replay/truncate are serialized in-process using append_mu_ to make
+ * append_record thread-safe for multiple threads in the same process.
+ * - [FIXED] Added Magic Marker per record to detect corruption/partial writes accurately.
  */
 
 #include "src/memory/wal_manager.h"
@@ -31,6 +32,7 @@ namespace pomai::memory
 
     // On-disk file header layout helper values
     static constexpr char WAL_MAGIC[8] = {'P', 'O', 'M', 'A', 'I', 'W', 'A', 'L'};
+    static constexpr uint32_t WAL_RECORD_MAGIC = 0xCAFEBABE; // [NEW] Magic per record
 
 #pragma pack(push, 1)
     struct WalFileHeader
@@ -43,6 +45,7 @@ namespace pomai::memory
 
     struct WalRecordHeader
     {
+        uint32_t magic;   // [NEW] 4 bytes magic to identify valid start of record
         uint32_t rec_len; // payload length
         uint16_t rec_type;
         uint16_t flags;
@@ -51,7 +54,8 @@ namespace pomai::memory
 #pragma pack(pop)
 
     static_assert(sizeof(WalFileHeader) == WalManager::WAL_FILE_HEADER_SIZE, "WalFileHeader size mismatch");
-    static_assert(sizeof(WalRecordHeader) == 16, "WalRecordHeader expected 16 bytes");
+    // [UPDATED] Size tăng từ 16 lên 20 bytes do thêm magic (uint32_t)
+    static_assert(sizeof(WalRecordHeader) == 20, "WalRecordHeader expected 20 bytes");
 
     // CRC32 implementation (table)
     static uint32_t crc32_table[256];
@@ -261,6 +265,7 @@ namespace pomai::memory
 
         // Build header and buffer. We'll serialize actual write under append_mu_.
         WalRecordHeader rh{};
+        rh.magic = WAL_RECORD_MAGIC; // [FIX] Set Magic
         rh.rec_len = payload_len;
         rh.rec_type = type;
         rh.flags = 0;
@@ -372,6 +377,14 @@ namespace pomai::memory
                 // partial header -> truncate
                 break;
             }
+
+            // [FIX] Validate Magic Marker
+            if (rh.magic != WAL_RECORD_MAGIC)
+            {
+                std::cerr << "[WAL] Corruption detected (Bad Magic at offset " << read_off << "). Truncating...\n";
+                break; // Stop replay and truncate here
+            }
+
             // boundary checks
             off_t payload_off = read_off + static_cast<off_t>(sizeof(WalRecordHeader));
             off_t crc_off = payload_off + static_cast<off_t>(rh.rec_len);

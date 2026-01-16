@@ -13,6 +13,10 @@
 #include <cassert>
 #include <sys/types.h>
 
+#ifndef MREMAP_MAYMOVE
+#define MREMAP_MAYMOVE 1
+#endif
+
 namespace pomai::memory
 {
 
@@ -115,8 +119,19 @@ namespace pomai::memory
             size_t new_size = std::max(mapped_size_ * 2, round_up_to_page(cur_offset + total_aligned, page_size_));
             if (new_size < mapped_size_ + page_size_)
                 new_size = mapped_size_ + page_size_;
-            if (!grow_to(new_size))
-                throw std::runtime_error("AppendOnlyArena::alloc_blob: grow_to failed");
+                
+            // [FIXED] Retry logic if disk full
+            if (!remap_locked(new_size)) {
+                // First retry: try smaller increment (just enough for this alloc)
+                size_t min_needed = round_up_to_page(cur_offset + total_aligned + page_size_, page_size_);
+                if (min_needed < new_size) {
+                    if (!remap_locked(min_needed)) {
+                        throw std::runtime_error("AppendOnlyArena::alloc_blob: disk full (grow failed)");
+                    }
+                } else {
+                    throw std::runtime_error("AppendOnlyArena::alloc_blob: disk full (grow failed)");
+                }
+            }
         }
 
         // allocate
@@ -186,26 +201,40 @@ namespace pomai::memory
         if (posix_fallocate(fd_, 0, static_cast<off_t>(new_size)) != 0)
         {
             if (ftruncate(fd_, static_cast<off_t>(new_size)) != 0)
-                return false;
+                return false; // [FIX] Graceful fail without unmap
         }
 #else
         if (ftruncate(fd_, static_cast<off_t>(new_size)) != 0)
-            return false;
+            return false; // [FIX] Graceful fail without unmap
 #endif
 
-        // unmap old
-        if (map_base_ && mapped_size_ > 0)
-        {
-            ::munmap(map_base_, mapped_size_);
-            map_base_ = nullptr;
+#ifdef __linux__
+        // [FIX] Try MREMAP first (fastest & safest)
+        void *new_addr = mremap(map_base_, mapped_size_, new_size, MREMAP_MAYMOVE);
+        if (new_addr != MAP_FAILED) {
+            map_base_ = new_addr;
+            mapped_size_ = new_size;
+            return true;
         }
+        // If mremap fails, fall back to mmap
+#endif
 
+        // [FIX] Traditional mmap fallback: MAP NEW before UNMAP OLD
+        // This prevents data loss if new mmap fails (e.g. out of V-Memory)
         void *newmap = mmap(nullptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         if (newmap == MAP_FAILED)
         {
-            map_base_ = nullptr;
+            // Revert file size if possible (best effort)
+            ftruncate(fd_, static_cast<off_t>(mapped_size_));
             return false;
         }
+
+        // Only unmap old after new is successful
+        if (map_base_ && mapped_size_ > 0)
+        {
+            ::munmap(map_base_, mapped_size_);
+        }
+
         map_base_ = newmap;
         mapped_size_ = new_size;
         return true;

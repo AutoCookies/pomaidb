@@ -4,6 +4,7 @@
 // - Uses mmap(MAP_ANONYMOUS) and attempts MAP_HUGETLB if available.
 // - Atomic bump allocator with 64-byte alignment for cache friendliness.
 // - Lazy mmap and caching for remote files; remote ids encoded with MSB set.
+// - [FIXED] Added Cache Eviction (Cap 100 files) to prevent OOM.
 //
 // Build notes: compile with -std=c++20 -O3 -march=native for best performance.
 
@@ -21,6 +22,7 @@
 #include <sstream>
 #include <fstream>
 #include <filesystem>
+#include <unistd.h>
 
 namespace pomai::memory
 {
@@ -166,6 +168,21 @@ namespace pomai::memory
             if (it != remote_mmaps_.end())
                 return it->second.first;
 
+            // [FIX HIGH] Cap Open Files: Prevent OOM by evicting old maps
+            // Giới hạn 100 file mmap đồng thời. Nếu đầy, đóng bớt 1 cái.
+            // (Dùng chiến thuật Random Eviction đơn giản: xóa phần tử đầu tiên của map)
+            if (remote_mmaps_.size() >= 100)
+            {
+                auto victim = remote_mmaps_.begin();
+                const char *v_addr = victim->second.first;
+                size_t v_sz = victim->second.second;
+                if (v_addr && v_sz > 0)
+                {
+                    munmap(const_cast<char *>(v_addr), v_sz);
+                }
+                remote_mmaps_.erase(victim);
+            }
+
             // Map file corresponding to offset
             std::string fname = generate_remote_filename(offset);
             int fd = open(fname.c_str(), O_RDONLY);
@@ -304,25 +321,32 @@ namespace pomai::memory
         next_remote_id_.store(1);
     }
 
+    // [FIX CRITICAL #1] Madvise Alignment Safe
     void ShardArena::demote_range(uint64_t offset, size_t len)
     {
-        // 1. Resolve offset sang pointer thực tế
         const char *ptr = blob_ptr_from_offset_for_map(offset);
         if (!ptr)
             return;
 
-        // 2. Align pointer về trang bộ nhớ (Page Size = 4096)
+        // 1. Lấy Page Size thực tế
+        static const long page_size = sysconf(_SC_PAGESIZE);
+        const uintptr_t page_mask = ~(static_cast<uintptr_t>(page_size - 1));
+
+        // 2. Tính toán Alignment an toàn
         uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-        uintptr_t aligned_addr = addr & ~(4095UL);
+        uintptr_t aligned_addr = addr & page_mask; // Round down
+
+        // Tính offset dư ra để cộng vào length
         size_t diff = addr - aligned_addr;
         size_t aligned_len = len + diff;
 
-        // 3. Gọi madvise MADV_DONTNEED
-        // Lệnh này bảo OS: "Tao không cần vùng RAM này nữa, mày có thể drop cache của nó".
-        // Nếu data đã được sync xuống đĩa (mmap file), nó sẽ bị drop khỏi RAM sạch sẽ.
-        // Lần sau truy cập lại, OS sẽ tự load từ đĩa lên (Page Fault).
+        // 3. Gọi madvise
         int ret = madvise(reinterpret_cast<void *>(aligned_addr), aligned_len, MADV_DONTNEED);
-        // (Có thể log ret nếu cần debug)
+
+        if (ret != 0)
+        {
+            // log error if needed
+        }
     }
 
 } // namespace pomai::memory

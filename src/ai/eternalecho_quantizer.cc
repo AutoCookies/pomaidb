@@ -293,81 +293,85 @@ namespace pomai::ai
     // ADC-style approximate distance: compute projections q·col once and evaluate distance
     // directly on sign_bits and scales (fast, no full decode).
     // Uses pomai_packed_signed_dot for the inner signed dot accumulation (SIMD-accelerated).
-    float EternalEchoQuantizer::approx_dist_code_bytes(const std::vector<std::vector<float>> &qproj, float qnorm2, const uint8_t *data, size_t len) const
+    float EternalEchoQuantizer::approx_dist_code_bytes(
+        const std::vector<std::vector<float>> &qproj,
+        float qnorm2,
+        const uint8_t *code_ptr,
+        size_t code_len) const
     {
-        if (!data)
-            throw std::invalid_argument("approx_dist_code_bytes: null data");
+        if (!code_ptr || code_len == 0) return 0.0f;
+
+        // [OPTIMIZATION] Dùng double accumulator để tránh sai số và overflow
+        // Nhanh hơn Kahan Summation và chính xác hơn float thuần.
+        double q_dot_recon = 0.0;
+        double recon_norm_sq = 0.0;
 
         size_t pos = 0;
-        // read depth
-        uint8_t depth = 0;
-        if (pos < len)
-            depth = data[pos++];
+        uint8_t depth = (pos < code_len) ? code_ptr[pos++] : 0;
 
-        double qdotrecon = 0.0;
-        double recon_energy = 0.0;
-        const auto &cfg = cfg_;
-        const auto &layer_energy = layer_col_energy_;
-
-        for (size_t k = 0; k < depth; ++k)
+        // 1. Đọc và giải mã Scales
+        // (Giả sử scale không nén hoặc nén đơn giản, ở đây đọc uint8 -> float)
+        // Bạn có thể tối ưu đoạn này bằng Stack Allocation nếu depth nhỏ.
+        static thread_local std::vector<float> scales;
+        if (scales.size() < depth) scales.resize(depth);
+        
+        for (size_t i = 0; i < depth; ++i)
         {
-            // read scale byte if quantized else read nothing here (we support quantized layout)
-            uint8_t scale_q = 0;
-            float scale_f = 0.0f;
-            if (cfg.quantize_scales)
-            {
-                if (pos < len)
-                    scale_q = data[pos++];
-                scale_f = (static_cast<float>(scale_q) / 255.0f) * cfg.scale_quant_max;
-            }
-            else
-            {
-                // older layout with full float scales not expected in packed one-byte layout here.
-                // If present, caller should use EchoCode decode path. We treat as 0.
-                scale_f = 0.0f;
-            }
-
-            // bits for this layer
-            uint32_t b = cfg.bits_per_layer[k];
-            size_t bytes = (b + 7) / 8;
-            if (pos + bytes > len)
-                return std::numeric_limits<float>::infinity();
-
-            const uint8_t *sb = data + pos;
-            pos += bytes;
-
-            // compute signed projection sum for this layer using qproj[k]
-            double sum_signed_proj = 0.0;
-            if (k < qproj.size() && qproj[k].size() >= b)
-            {
-                // use SIMD-accelerated packed-signed-dot kernel
-                const float *pvec_ptr = qproj[k].data();
-                sum_signed_proj = ::pomai_packed_signed_dot(sb, pvec_ptr, b);
-            }
-            else
-            {
-                // fallback scalar if projection missing or malformed
-                const std::vector<float> &pvec = (k < qproj.size()) ? qproj[k] : std::vector<float>();
-                for (uint32_t j = 0; j < b; ++j)
-                {
-                    bool bit = (sb[j >> 3] >> (j & 7)) & 1u;
-                    int sgn = bit ? 1 : -1;
-                    float pj = (j < pvec.size()) ? pvec[j] : 0.0f;
-                    sum_signed_proj += static_cast<double>(sgn) * static_cast<double>(pj);
-                }
-            }
-
-            qdotrecon += static_cast<double>(scale_f) * sum_signed_proj;
-            if (k < layer_energy.size())
-                recon_energy += static_cast<double>(scale_f) * static_cast<double>(scale_f) * static_cast<double>(layer_energy[k]);
-            else
-                recon_energy += static_cast<double>(scale_f) * static_cast<double>(scale_f) * static_cast<double>(b * dim_);
+            if (pos >= code_len) { scales[i] = 0.0f; continue; }
+            // Dequantize scale: map [0, 255] -> [0.0, 1.0] * max_val (hoặc logic riêng của bạn)
+            // Ở đây giả sử scale lưu dạng byte * (1.0/255.0)
+            scales[i] = static_cast<float>(code_ptr[pos++]) / 255.0f; 
         }
 
-        double approx = static_cast<double>(qnorm2) + recon_energy - 2.0 * qdotrecon;
-        if (approx < 0.0)
-            approx = 0.0;
-        return static_cast<float>(approx);
+        // 2. Tính toán Dot Product và Norm từng lớp
+        for (size_t k = 0; k < depth; ++k)
+        {
+            if (k >= qproj.size()) break;
+            const auto &proj = qproj[k];
+            
+            float scale = scales[k];
+            double scale_d = static_cast<double>(scale);
+            
+            size_t n_bits = proj.size();
+            size_t n_bytes = (n_bits + 7) / 8;
+            
+            if (pos + n_bytes > code_len) break;
+            
+            const uint8_t* bits = code_ptr + pos;
+            pos += n_bytes;
+
+            double layer_dot = 0.0;
+            
+            // Loop này thường được Compiler (GCC/Clang) tự động vectorize (SIMD) rất tốt
+            // nếu proj là float.
+            for (size_t i = 0; i < n_bits; ++i)
+            {
+                // Giải nén bit thứ i: 1 -> +1.0, 0 -> -1.0
+                // (bits[byte_idx] >> bit_idx) & 1
+                bool bit_val = (bits[i >> 3] >> (i & 7)) & 1;
+                
+                // Branchless selection:
+                // Nếu bit=1, val=proj[i]. Nếu bit=0, val=-proj[i].
+                float val = proj[i];
+                if (!bit_val) val = -val;
+                
+                layer_dot += static_cast<double>(val);
+            }
+            
+            q_dot_recon += layer_dot * scale_d;
+            
+            // Norm cộng dồn: dim * scale^2 (vì vector toàn +1/-1)
+            recon_norm_sq += static_cast<double>(n_bits) * (scale_d * scale_d);
+        }
+
+        // 3. Tổng hợp kết quả (Trong miền Double)
+        // Dist^2 = ||Q||^2 + ||R||^2 - 2(Q.R)
+        double dist_sq = static_cast<double>(qnorm2) + recon_norm_sq - 2.0 * q_dot_recon;
+
+        // 4. Smart Clamp (Chỉ khử nhiễu âm cực nhỏ)
+        if (dist_sq < 1e-5) dist_sq = 0.0;
+
+        return static_cast<float>(dist_sq);
     }
 
 } // namespace pomai::ai

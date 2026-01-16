@@ -8,11 +8,13 @@
  * - Added Thermal Gating logic: Centroids now have temperature.
  * - Added apply_thermal_policy() for background memory management (madvise).
  * - This enables the "Active Working Set" architecture where cold data is implicitly demoted.
+ * - [NEW] Added train_mu_ mutex to fix Race Condition in Auto-Train.
  */
 
 #include <vector>
 #include <atomic>
 #include <shared_mutex>
+#include <mutex> // [CRITICAL] Required for std::mutex
 #include <memory>
 #include <string>
 #include <filesystem>
@@ -28,8 +30,8 @@
 #include "src/core/config.h"
 #include "src/ai/network_cortex.h"
 #include "src/core/metadata_index.h"
-#include "src/ai/eternalecho_quantizer.h" // <- Pomai proprietary quantizer
-#include "src/ai/whispergrain.h"          // <- WhisperGrain controller
+#include "src/ai/eternalecho_quantizer.h" 
+#include "src/ai/whispergrain.h"         
 
 // Forward-declare both arena flavors to avoid heavy includes here.
 namespace pomai::memory
@@ -222,6 +224,10 @@ namespace pomai::ai::orbit
     private:
         Config cfg_;
         ArenaView arena_;
+        
+        // [FIXED] Mutex for Thread-Safe Auto-Train (Double-Checked Locking)
+        std::mutex train_mu_;
+
         std::unique_ptr<NetworkCortex> cortex_;
 
         std::vector<std::unique_ptr<OrbitNode>> centroids_;
@@ -287,19 +293,13 @@ namespace pomai::ai::orbit
         uint8_t get_temperature(uint32_t cid) const;
 
         // --------------------------------------------------------------------------
-
         uint32_t find_nearest_centroid(const float *vec);
         std::vector<uint32_t> find_routing_centroids(const float *vec, size_t n);
         uint64_t alloc_new_bucket(uint32_t centroid_id);
-        void init_centroids_kmeans_pp(const float *data, size_t n, size_t k, std::vector<size_t> &indices, std::mt19937 &rng);
-
         // Helper: compute distance by decoding EEQ bytes for given id
         bool compute_distance_for_id(const float *query, uint64_t id, float &out_dist);
 
         // NEW: helper that accepts precomputed projections to avoid recomputing per-id.
         bool compute_distance_for_id_with_proj(const std::vector<std::vector<float>> &qproj, float qnorm2, uint64_t id, float &out_dist);
-
-        void decode_serialized(const uint8_t *ser, size_t len, float *out_vec, std::vector<int8_t> &sign_scratch) const;
-        std::unordered_map<uint64_t, uint32_t> label_to_slot_; // kept for compatibility in case of other code paths
     };
 } // namespace pomai::ai::orbit

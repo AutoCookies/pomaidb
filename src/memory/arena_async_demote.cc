@@ -5,9 +5,9 @@
  *
  * - Enqueues DemoteTask to the single background worker started by allocate_region().
  * - Returns a placeholder id (MSB set) immediately. Callers can resolve the placeholder
- *   with resolve_pending_remote(placeholder, timeout_ms).
+ * with resolve_pending_remote(placeholder, timeout_ms).
  * - If the demote queue is full, falls back to synchronous demote_blob_data (writes inline)
- *   and returns the final remote id (non-placeholder) so caller still gets a usable id.
+ * and returns the final remote id (non-placeholder) so caller still gets a usable id.
  */
 
 #include "src/memory/arena.h"
@@ -25,6 +25,16 @@ namespace pomai::memory
     {
         if (!data || len == 0)
             return 0;
+
+        // [FIX CRITICAL] Backpressure & OOM Protection
+        {
+            std::lock_guard<std::mutex> lk(pending_mu_);
+            if (pending_map_.size() >= max_pending_demotes_)
+            {
+                // [FIXED] Cast void* -> const char* để sửa lỗi biên dịch
+                return demote_blob_data(static_cast<const char*>(data), len);
+            }
+        }
 
         // Copy payload to local buffer
         std::vector<char> blob;
@@ -45,6 +55,7 @@ namespace pomai::memory
         uint64_t ctr = pending_counter_.fetch_add(1, std::memory_order_acq_rel);
         uint64_t placeholder = make_placeholder(ctr);
         auto pend = std::make_shared<PendingDemote>();
+        
         {
             std::lock_guard<std::mutex> lk(pending_mu_);
             pending_map_.emplace(placeholder, pend);
@@ -63,13 +74,11 @@ namespace pomai::memory
             if (demote_queue_.size() >= max_pending_demotes_)
             {
                 // Queue full: fallback to synchronous demote
-                // Remove pending_map_ entry and perform inline demote
                 {
                     std::lock_guard<std::mutex> plk(pending_mu_);
                     pending_map_.erase(placeholder);
                 }
                 uint64_t final_remote = demote_blob_data(task.payload.data(), static_cast<uint32_t>(task.payload.size()));
-                // If succeeded, remote_map_ already set by demote_blob_data
                 return final_remote;
             }
             demote_queue_.push_back(std::move(task));
