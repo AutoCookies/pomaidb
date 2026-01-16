@@ -103,6 +103,12 @@ namespace pomai::ai::orbit
         return nullptr;
     }
 
+    void ArenaView::demote_range(uint64_t offset, size_t len) const
+    {
+        if (sa)
+            sa->demote_range(offset, len);
+    }
+
     uint64_t ArenaView::offset_from_blob_ptr(const char *p) const noexcept
     {
         if (pa)
@@ -170,6 +176,11 @@ namespace pomai::ai::orbit
                 // non-fatal
             }
         }
+
+        if (!centroids_.empty())
+        {
+            init_thermal_map(centroids_.size());
+        }
     }
 
     PomaiOrbit::PomaiOrbit(const Config &cfg, pomai::memory::ShardArena *arena)
@@ -211,12 +222,110 @@ namespace pomai::ai::orbit
                 // non-fatal
             }
         }
+
+        if (!centroids_.empty())
+        {
+            init_thermal_map(centroids_.size());
+        }
     }
 
     PomaiOrbit::~PomaiOrbit()
     {
         if (cortex_)
             cortex_->stop();
+    }
+
+    // ------------------- Thermal Thermodynamics Core -------------------
+
+    void PomaiOrbit::init_thermal_map(size_t num_centroids)
+    {
+        if (num_centroids == 0)
+            return;
+        // Resize atomic vectors (lưu ý: atomic không copy được, phải resize rồi init từng cái hoặc loop)
+        // std::vector::resize mặc định sẽ gọi default constructor của atomic (value 0).
+        if (thermal_map_.size() != num_centroids)
+        {
+            thermal_map_ = std::vector<std::atomic<uint8_t>>(num_centroids);
+            last_access_epoch_ = std::vector<std::atomic<uint32_t>>(num_centroids);
+        }
+
+        uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+        for (size_t i = 0; i < num_centroids; ++i)
+        {
+            // Mặc định "Warm" (100) để không bị evicted ngay khi khởi động
+            thermal_map_[i].store(100, std::memory_order_relaxed);
+            last_access_epoch_[i].store(now, std::memory_order_relaxed);
+        }
+    }
+
+    void PomaiOrbit::touch_centroid(uint32_t cid)
+    {
+        if (cid >= thermal_map_.size())
+            return;
+
+        // 1. Heat up
+        uint8_t old_temp = thermal_map_[cid].load(std::memory_order_relaxed);
+        if (old_temp < 255)
+        {
+            // Boost mạnh nếu đang lạnh để "rã đông", boost nhẹ nếu đang nóng
+            uint8_t boost = (old_temp < 50) ? 50 : 5;
+            int new_val = old_temp + boost;
+            thermal_map_[cid].store((new_val > 255) ? 255 : static_cast<uint8_t>(new_val), std::memory_order_relaxed);
+        }
+
+        // 2. Mark timestamp
+        uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+        last_access_epoch_[cid].store(now, std::memory_order_relaxed);
+    }
+
+    uint8_t PomaiOrbit::get_temperature(uint32_t cid) const
+    {
+        if (cid >= thermal_map_.size())
+            return 0;
+
+        uint8_t temp = thermal_map_[cid].load(std::memory_order_relaxed);
+        if (temp == 0)
+            return 0;
+
+        // Lazy Decay: Tính toán độ nguội dựa trên thời gian trôi qua
+        uint32_t last = last_access_epoch_[cid].load(std::memory_order_relaxed);
+        uint32_t now = static_cast<uint32_t>(std::time(nullptr));
+
+        if (now > last)
+        {
+            uint32_t delta = now - last;
+            // Config: 60s giảm 10 độ
+            uint32_t cooldown = (delta / 60) * 10;
+            if (cooldown >= temp)
+                return 0;
+            return temp - cooldown;
+        }
+        return temp;
+    }
+
+    void PomaiOrbit::apply_thermal_policy()
+    {
+        // Chỉ áp dụng với ShardArena (Disk-backed)
+        if (!arena_.is_shard_arena())
+            return;
+
+        for (size_t i = 0; i < centroids_.size(); ++i)
+        {
+            uint8_t temp = get_temperature(static_cast<uint32_t>(i));
+
+            // Policy: Quá lạnh (< 5) -> Đá ra khỏi RAM (Free Memory)
+            if (temp < 5)
+            {
+                uint64_t off = centroids_[i]->bucket_offset.load(std::memory_order_relaxed);
+                // Demote bucket header & content.
+                // Size hint 4KB hoặc dynamic_bucket_capacity * size
+                if (off != 0)
+                {
+                    // Ước lượng size bucket (đơn giản hoá 4KB page)
+                    arena_.demote_range(off, 4096);
+                }
+            }
+        }
     }
 
     // ------------------- Persistence (schema) -------------------
@@ -285,12 +394,14 @@ namespace pomai::ai::orbit
         if (!data || n == 0)
             return false;
 
+        // 1. Autopilot: Calculate optimal number of centroids if not set
         if (cfg_.num_centroids == 0)
         {
             cfg_.num_centroids = static_cast<size_t>(std::sqrt(static_cast<double>(n)));
             cfg_.num_centroids = std::clamp(cfg_.num_centroids, static_cast<size_t>(64), static_cast<size_t>(4096));
         }
 
+        // 2. Autopilot: Calculate dynamic bucket capacity based on density
         size_t avg_density = (n / cfg_.num_centroids) + 1;
         dynamic_bucket_capacity_ = static_cast<uint32_t>(avg_density * 1.5);
         dynamic_bucket_capacity_ = std::clamp(dynamic_bucket_capacity_, static_cast<uint32_t>(32), static_cast<uint32_t>(512));
@@ -299,11 +410,13 @@ namespace pomai::ai::orbit
                   << ", BucketCap=" << dynamic_bucket_capacity_
                   << " (N=" << n << ")\n";
 
+        // 3. Initialize Centroids (Skeleton)
         size_t num_c = std::min(n, cfg_.num_centroids);
         centroids_.resize(num_c);
         for (size_t i = 0; i < num_c; ++i)
             centroids_[i] = std::make_unique<OrbitNode>();
 
+        // 4. KMeans++ Initialization (Simplified: Random Shuffle)
         std::mt19937 rng(42);
         std::vector<size_t> indices(n);
         std::iota(indices.begin(), indices.end(), 0);
@@ -317,7 +430,7 @@ namespace pomai::ai::orbit
             centroids_[i]->neighbors.reserve(cfg_.m_neighbors * 2);
         }
 
-        // Build neighbor lists
+        // 5. Build Routing Graph (HNSW/NGT style neighbors)
         {
             L2Func kern = get_pomai_l2sq_kernel();
             for (size_t i = 0; i < num_c; ++i)
@@ -336,13 +449,20 @@ namespace pomai::ai::orbit
             }
         }
 
+        // 6. Allocate Initial Buckets (Flesh)
         for (size_t i = 0; i < num_c; ++i)
         {
             uint64_t off = alloc_new_bucket(static_cast<uint32_t>(i));
             centroids_[i]->bucket_offset.store(off, std::memory_order_release);
         }
 
+        // 7. Persist Schema
         save_schema();
+
+        // 8. [THERMAL ACTIVATION] Initialize the thermal map for the new centroids.
+        // This sets their initial temperature to "Warm" (100) so they are ready for action.
+        init_thermal_map(centroids_.size());
+
         return true;
     }
 
@@ -820,26 +940,30 @@ namespace pomai::ai::orbit
     {
         if (!query || k == 0)
             return {};
+
+        // 1. Setup Budget Tracker
         uint32_t ops_left = budget.ops_budget;
-        auto pay_ops = [](uint32_t &ops_left, uint32_t cost) -> bool
+        auto pay_ops = [&](uint32_t cost) -> bool
         {
             if (ops_left < cost)
                 return false;
             ops_left -= cost;
             return true;
         };
-        if (!pay_ops(ops_left, 1))
+
+        if (!pay_ops(1))
             return {};
         if (centroids_.empty())
             return {};
 
+        // 2. Prepare Query Projection (EEQ)
         std::vector<std::vector<float>> qproj;
         eeq_->project_query(query, qproj);
         float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
 
-        // --- FIX DELETE LOGIC ---
+        // 3. Prepare Deleted Filter
         std::optional<DeletedBloom> bloom;
-        std::vector<uint64_t> small_deleted; // Danh sách dự phòng khi ít item xóa
+        std::vector<uint64_t> small_deleted;
         {
             std::shared_lock<std::shared_mutex> dm(del_mu_);
             if (deleted_labels_.size() > 256)
@@ -850,12 +974,11 @@ namespace pomai::ai::orbit
             }
             else if (!deleted_labels_.empty())
             {
-                // Copy ra local vector để check nhanh không cần lock
                 small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
             }
         }
-        // ------------------------
 
+        // 4. Routing
         if (nprobe == 0)
         {
             nprobe = std::max(1UL, cfg_.num_centroids / 50);
@@ -863,6 +986,11 @@ namespace pomai::ai::orbit
                 nprobe *= 2;
         }
         auto targets = find_routing_centroids(query, nprobe);
+
+        // [THERMAL] Sorting: Prioritize HOT centroids (resident in RAM)
+        // This puts the most "awake" data at the front of the queue.
+        std::sort(targets.begin(), targets.end(), [&](uint32_t a, uint32_t b)
+                  { return get_temperature(a) > get_temperature(b); });
 
         using ResPair = std::pair<float, uint64_t>;
         std::priority_queue<ResPair> topk;
@@ -874,19 +1002,37 @@ namespace pomai::ai::orbit
         {
             if (ops_left == 0)
                 break;
+
+            // [THERMAL] Gating: The "Sleeping Giant" Rule
+            // If a centroid is frozen (Temp < 10) AND we are low on budget (< 2000 ops),
+            // we SKIP it. We do not wake up disk data for low-budget/marginal queries.
+            uint8_t temp = get_temperature(cid);
+            if (temp < 10 && ops_left < 2000)
+            {
+                continue;
+            }
+
+            // [THERMAL] Touch: We are accessing this centroid, so heat it up.
+            touch_centroid(cid);
+
             uint64_t current_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
             while (current_off != 0)
             {
                 if (ops_left == 0)
                     break;
-                const char *ram_blob_ptr = arena_.blob_ptr_from_offset_for_map(current_off);
-                if (!ram_blob_ptr)
+
+                // Resolve bucket pointer (might trigger IO if not mapped)
+                std::vector<char> tmp;
+                auto base_opt = resolve_bucket_base(arena_, current_off, tmp);
+                if (!base_opt)
                     break;
-                const char *bucket_base = ram_blob_ptr + sizeof(uint32_t);
+
+                const char *bucket_base = *base_opt;
                 const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(bucket_base);
 
                 uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
                 uint64_t next_bucket_offset = hdr_ptr->next_bucket_offset.load(std::memory_order_acquire);
+
                 if (count == 0)
                 {
                     current_off = next_bucket_offset;
@@ -901,7 +1047,8 @@ namespace pomai::ai::orbit
                 {
                     if (ops_left == 0)
                         break;
-                    if (!pay_ops(ops_left, cost_check))
+
+                    if (!pay_ops(cost_check))
                     {
                         ops_left = 0;
                         break;
@@ -909,7 +1056,7 @@ namespace pomai::ai::orbit
 
                     uint64_t id = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
 
-                    // --- CHECK DELETED (FIXED) ---
+                    // --- CHECK DELETED ---
                     if (bloom)
                     {
                         if (bloom->maybe_contains(id))
@@ -929,10 +1076,13 @@ namespace pomai::ai::orbit
                         if (found)
                             continue;
                     }
-                    // -----------------------------
+                    // ---------------------
 
-                    if (!pay_ops(ops_left, cost_decode))
-                        continue;
+                    if (!pay_ops(cost_decode))
+                    {
+                        ops_left = 0;
+                        break;
+                    }
 
                     uint16_t len = __atomic_load_n(&len_base[i], __ATOMIC_ACQUIRE);
                     if (len == 0 || len > MAX_ECHO_BYTES)
@@ -944,7 +1094,9 @@ namespace pomai::ai::orbit
                     float dist = eeq_->approx_dist_code_bytes(qproj, qnorm2, ub, len);
 
                     if (topk.size() < k)
+                    {
                         topk.push({dist, id});
+                    }
                     else if (dist < topk.top().first)
                     {
                         topk.pop();
@@ -974,18 +1126,21 @@ namespace pomai::ai::orbit
         if (!query || k == 0 || candidates.empty())
             return {};
 
+        // 1. Budget & State Setup
         uint32_t ops_left = budget.ops_budget;
+
         using ResPair = std::pair<float, uint64_t>;
         std::priority_queue<ResPair> topk;
 
-        const uint32_t cost_check = 1;
-        const uint32_t cost_decode = 5;
+        const uint32_t cost_check = 1;  // Cost to lookup & check existence
+        const uint32_t cost_decode = 5; // Cost to decode & compute distance
 
+        // 2. Prepare Query Projection
         std::vector<std::vector<float>> qproj;
         eeq_->project_query(query, qproj);
         float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
 
-        // --- FIX DELETE LOGIC ---
+        // 3. Prepare Deletion Filter (Consistent with other search paths)
         std::optional<DeletedBloom> bloom;
         std::vector<uint64_t> small_deleted;
         {
@@ -1001,48 +1156,54 @@ namespace pomai::ai::orbit
                 small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
             }
         }
-        // ------------------------
 
+        // 4. Execution Loop
         for (uint64_t id : candidates)
         {
+            // --- Budget Check ---
             if (ops_left == 0)
                 break;
 
-            // --- CHECK DELETED (FIXED) ---
-            if (bloom)
-            {
-                if (bloom->maybe_contains(id))
-                    continue;
-            }
+            // --- Deletion Check ---
+            if (bloom && bloom->maybe_contains(id))
+                continue;
             else if (!small_deleted.empty())
             {
                 bool found = false;
                 for (uint64_t d : small_deleted)
-                {
                     if (d == id)
                     {
                         found = true;
                         break;
                     }
-                }
                 if (found)
                     continue;
             }
-            // -----------------------------
 
+            // Pay lookup cost
             if (ops_left < cost_check)
+            {
+                ops_left = 0;
                 break;
+            }
             ops_left -= cost_check;
 
+            // --- Locate Bucket ---
             uint64_t bucket_off = 0;
-            if (!get_label_bucket(id, bucket_off))
+            // Note: We don't need the exact slot hint here because we scan the bucket anyway
+            if (!get_label_bucket(id, bucket_off) || bucket_off == 0)
                 continue;
-            if (bucket_off == 0)
-                continue;
+
+            // Pay decode cost (optimistic payment before potential IO)
             if (ops_left < cost_decode)
-                continue;
+            {
+                ops_left = 0;
+                break;
+            }
             ops_left -= cost_decode;
 
+            // --- Resolve Data Pointer ---
+            // This step is crucial. If the bucket is COLD (on disk), this will trigger IO.
             std::vector<char> tmp;
             auto base_opt = resolve_bucket_base(arena_, bucket_off, tmp);
             if (!base_opt)
@@ -1050,14 +1211,21 @@ namespace pomai::ai::orbit
             const char *data_base_ptr = *base_opt;
 
             const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(data_base_ptr);
+
+            // [THERMAL CONSISTENCY - CRITICAL]
+            // Dù truy cập qua Filter (ID), ta vẫn phải báo cho hệ thống biết Centroid này đang được dùng.
+            // Điều này giữ cho Page này ở trạng thái "Nóng" (Pinned/Cached in RAM).
+            // Nếu thiếu dòng này, Filtered Search nhiều sẽ không ngăn được data bị Evict.
+            touch_centroid(hdr_ptr->centroid_id);
+
+            // --- In-Bucket Linear Scan ---
             uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
             if (count == 0)
                 continue;
 
             const uint64_t *id_base = reinterpret_cast<const uint64_t *>(data_base_ptr + hdr_ptr->off_ids);
-            const uint16_t *len_base = reinterpret_cast<const uint16_t *>(data_base_ptr + hdr_ptr->off_pq_codes);
-            const char *vec_area = data_base_ptr + hdr_ptr->off_vectors;
 
+            // Tìm chính xác slot chứa ID này trong bucket
             int32_t found = -1;
             for (uint32_t j = 0; j < count; ++j)
             {
@@ -1069,19 +1237,25 @@ namespace pomai::ai::orbit
                 }
             }
             if (found < 0)
-                continue;
+                continue; // Should not happen if label map is consistent, but safe to skip
 
+            // --- Decode & Compute ---
+            const uint16_t *len_base = reinterpret_cast<const uint16_t *>(data_base_ptr + hdr_ptr->off_pq_codes);
             uint16_t len = __atomic_load_n(&len_base[found], __ATOMIC_ACQUIRE);
             if (len == 0 || len > MAX_ECHO_BYTES)
                 continue;
 
+            const char *vec_area = data_base_ptr + hdr_ptr->off_vectors;
             const char *slot_ptr = vec_area + static_cast<size_t>(found) * MAX_ECHO_BYTES;
             const uint8_t *ub = reinterpret_cast<const uint8_t *>(slot_ptr);
 
             float dist = eeq_->approx_dist_code_bytes(qproj, qnorm2, ub, len);
 
+            // --- Heap Maintenance ---
             if (topk.size() < k)
+            {
                 topk.push({dist, id});
+            }
             else if (dist < topk.top().first)
             {
                 topk.pop();
@@ -1089,142 +1263,142 @@ namespace pomai::ai::orbit
             }
         }
 
+        // 5. Finalize Results
         std::vector<std::pair<uint64_t, float>> out;
         out.reserve(topk.size());
         while (!topk.empty())
         {
-            auto p = topk.top();
+            out.emplace_back(topk.top().second, topk.top().first);
             topk.pop();
-            out.emplace_back(p.second, p.first);
         }
         std::reverse(out.begin(), out.end());
         return out;
     }
 
-    std::vector<std::pair<uint64_t, float>> PomaiOrbit::search(const float *query, size_t k, size_t nprobe)
-    {
-        if (!query || k == 0)
-            return {};
+    // std::vector<std::pair<uint64_t, float>> PomaiOrbit::search(const float *query, size_t k, size_t nprobe)
+    // {
+    //     if (!query || k == 0)
+    //         return {};
 
-        std::vector<std::vector<float>> qproj;
-        eeq_->project_query(query, qproj);
-        float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
+    //     std::vector<std::vector<float>> qproj;
+    //     eeq_->project_query(query, qproj);
+    //     float qnorm2 = ::pomai_dot(query, query, cfg_.dim);
 
-        // --- FIX DELETE LOGIC ---
-        std::optional<DeletedBloom> bloom;
-        std::vector<uint64_t> small_deleted;
-        {
-            std::shared_lock<std::shared_mutex> dm(del_mu_);
-            if (deleted_labels_.size() > 256)
-            {
-                bloom.emplace();
-                for (uint64_t v : deleted_labels_)
-                    bloom->add(v);
-            }
-            else if (!deleted_labels_.empty())
-            {
-                small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
-            }
-        }
-        // ------------------------
+    //     // --- FIX DELETE LOGIC ---
+    //     std::optional<DeletedBloom> bloom;
+    //     std::vector<uint64_t> small_deleted;
+    //     {
+    //         std::shared_lock<std::shared_mutex> dm(del_mu_);
+    //         if (deleted_labels_.size() > 256)
+    //         {
+    //             bloom.emplace();
+    //             for (uint64_t v : deleted_labels_)
+    //                 bloom->add(v);
+    //         }
+    //         else if (!deleted_labels_.empty())
+    //         {
+    //             small_deleted.assign(deleted_labels_.begin(), deleted_labels_.end());
+    //         }
+    //     }
+    //     // ------------------------
 
-        if (centroids_.empty())
-            return {};
+    //     if (centroids_.empty())
+    //         return {};
 
-        if (nprobe == 0)
-        {
-            nprobe = std::max(1UL, cfg_.num_centroids / 50);
-            if (k > 50)
-                nprobe *= 2;
-        }
-        auto targets = find_routing_centroids(query, nprobe);
+    //     if (nprobe == 0)
+    //     {
+    //         nprobe = std::max(1UL, cfg_.num_centroids / 50);
+    //         if (k > 50)
+    //             nprobe *= 2;
+    //     }
+    //     auto targets = find_routing_centroids(query, nprobe);
 
-        using ResPair = std::pair<float, uint64_t>;
-        std::priority_queue<ResPair> topk;
+    //     using ResPair = std::pair<float, uint64_t>;
+    //     std::priority_queue<ResPair> topk;
 
-        for (uint32_t cid : targets)
-        {
-            uint64_t current_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
-            while (current_off != 0)
-            {
-                std::vector<char> tmp;
-                auto base_opt = resolve_bucket_base(arena_, current_off, tmp);
-                if (!base_opt)
-                    break;
-                const char *bucket_base = *base_opt;
-                const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(bucket_base);
+    //     for (uint32_t cid : targets)
+    //     {
+    //         uint64_t current_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
+    //         while (current_off != 0)
+    //         {
+    //             std::vector<char> tmp;
+    //             auto base_opt = resolve_bucket_base(arena_, current_off, tmp);
+    //             if (!base_opt)
+    //                 break;
+    //             const char *bucket_base = *base_opt;
+    //             const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(bucket_base);
 
-                uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
-                uint64_t next_bucket_offset = hdr_ptr->next_bucket_offset.load(std::memory_order_acquire);
-                if (count == 0)
-                {
-                    current_off = next_bucket_offset;
-                    continue;
-                }
+    //             uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
+    //             uint64_t next_bucket_offset = hdr_ptr->next_bucket_offset.load(std::memory_order_acquire);
+    //             if (count == 0)
+    //             {
+    //                 current_off = next_bucket_offset;
+    //                 continue;
+    //             }
 
-                const uint16_t *len_base = reinterpret_cast<const uint16_t *>(bucket_base + hdr_ptr->off_pq_codes);
-                const char *vec_area = bucket_base + hdr_ptr->off_vectors;
-                const uint64_t *id_base = reinterpret_cast<const uint64_t *>(bucket_base + hdr_ptr->off_ids);
+    //             const uint16_t *len_base = reinterpret_cast<const uint16_t *>(bucket_base + hdr_ptr->off_pq_codes);
+    //             const char *vec_area = bucket_base + hdr_ptr->off_vectors;
+    //             const uint64_t *id_base = reinterpret_cast<const uint64_t *>(bucket_base + hdr_ptr->off_ids);
 
-                for (uint32_t i = 0; i < count; ++i)
-                {
-                    uint64_t id = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
+    //             for (uint32_t i = 0; i < count; ++i)
+    //             {
+    //                 uint64_t id = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
 
-                    // --- CHECK DELETED (FIXED) ---
-                    if (bloom)
-                    {
-                        if (bloom->maybe_contains(id))
-                            continue;
-                    }
-                    else if (!small_deleted.empty())
-                    {
-                        bool found = false;
-                        for (uint64_t d : small_deleted)
-                        {
-                            if (d == id)
-                            {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (found)
-                            continue;
-                    }
-                    // -----------------------------
+    //                 // --- CHECK DELETED (FIXED) ---
+    //                 if (bloom)
+    //                 {
+    //                     if (bloom->maybe_contains(id))
+    //                         continue;
+    //                 }
+    //                 else if (!small_deleted.empty())
+    //                 {
+    //                     bool found = false;
+    //                     for (uint64_t d : small_deleted)
+    //                     {
+    //                         if (d == id)
+    //                         {
+    //                             found = true;
+    //                             break;
+    //                         }
+    //                     }
+    //                     if (found)
+    //                         continue;
+    //                 }
+    //                 // -----------------------------
 
-                    uint16_t len = __atomic_load_n(&len_base[i], __ATOMIC_ACQUIRE);
-                    if (len == 0 || len > MAX_ECHO_BYTES)
-                        continue;
+    //                 uint16_t len = __atomic_load_n(&len_base[i], __ATOMIC_ACQUIRE);
+    //                 if (len == 0 || len > MAX_ECHO_BYTES)
+    //                     continue;
 
-                    const char *slot_ptr = vec_area + static_cast<size_t>(i) * MAX_ECHO_BYTES;
-                    const uint8_t *ub = reinterpret_cast<const uint8_t *>(slot_ptr);
+    //                 const char *slot_ptr = vec_area + static_cast<size_t>(i) * MAX_ECHO_BYTES;
+    //                 const uint8_t *ub = reinterpret_cast<const uint8_t *>(slot_ptr);
 
-                    float dist = eeq_->approx_dist_code_bytes(qproj, qnorm2, ub, len);
+    //                 float dist = eeq_->approx_dist_code_bytes(qproj, qnorm2, ub, len);
 
-                    if (topk.size() < k)
-                        topk.push({dist, id});
-                    else if (dist < topk.top().first)
-                    {
-                        topk.pop();
-                        topk.push({dist, id});
-                    }
-                }
+    //                 if (topk.size() < k)
+    //                     topk.push({dist, id});
+    //                 else if (dist < topk.top().first)
+    //                 {
+    //                     topk.pop();
+    //                     topk.push({dist, id});
+    //                 }
+    //             }
 
-                current_off = next_bucket_offset;
-            }
-        }
+    //             current_off = next_bucket_offset;
+    //         }
+    //     }
 
-        std::vector<std::pair<uint64_t, float>> out;
-        out.reserve(topk.size());
-        while (!topk.empty())
-        {
-            auto p = topk.top();
-            topk.pop();
-            out.emplace_back(p.second, p.first);
-        }
-        std::reverse(out.begin(), out.end());
-        return out;
-    }
+    //     std::vector<std::pair<uint64_t, float>> out;
+    //     out.reserve(topk.size());
+    //     while (!topk.empty())
+    //     {
+    //         auto p = topk.top();
+    //         topk.pop();
+    //         out.emplace_back(p.second, p.first);
+    //     }
+    //     std::reverse(out.begin(), out.end());
+    //     return out;
+    // }
 
     // ------------------- insert_batch (with Auto-Train) -------------------
     bool PomaiOrbit::insert_batch(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
@@ -1369,7 +1543,7 @@ namespace pomai::ai::orbit
         size_t idx = 0, total = prepared.size();
         while (idx < total)
         {
-            size_t start = idx;
+            // size_t start = idx;
             uint32_t cid = prepared[idx].cid;
 
             // Gom nhóm các item cùng CID (tối đa max_subbatch)
@@ -1573,6 +1747,26 @@ namespace pomai::ai::orbit
 
         info.disk_bytes = bytes;
         return info;
+    }
+
+    std::vector<std::pair<uint64_t, float>> PomaiOrbit::search(const float *query, size_t k, size_t nprobe)
+    {
+        // Search thường = Search với ngân sách "Vô cực" (100 triệu ops)
+        // Lợi ích: Vẫn được hưởng Thermal Sorting (ưu tiên data nóng) và Thermal Touch.
+        pomai::ai::Budget unlimited;
+        unlimited.ops_budget = 100'000'000;
+
+        return search_with_budget(query, k, unlimited, nprobe);
+    }
+
+    std::vector<std::pair<uint64_t, float>> PomaiOrbit::search_filtered(const float *query, size_t k, const std::vector<uint64_t> &candidates)
+    {
+        // Filter search thường = Filter search với ngân sách "Vô cực"
+        // Quan trọng: Nó sẽ kích hoạt touch_centroid() bên dưới để giữ data nóng.
+        pomai::ai::Budget unlimited;
+        unlimited.ops_budget = 100'000'000;
+
+        return search_filtered_with_budget(query, k, candidates, unlimited);
     }
 
 } // namespace pomai::ai::orbit

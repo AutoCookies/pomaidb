@@ -847,7 +847,7 @@ namespace pomai::memory
             return 0;
         }
 
-        ssize_t w = 0;
+        // ssize_t w = 0;
         const char *ptr = data_with_header;
         size_t left = static_cast<size_t>(total_bytes);
         while (left > 0)

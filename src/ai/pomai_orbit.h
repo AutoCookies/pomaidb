@@ -2,12 +2,12 @@
 /*
  * src/ai/pomai_orbit.h
  *
- * PomaiOrbit public header (updated to integrate WhisperGrain controller).
+ * PomaiOrbit public header (updated to integrate WhisperGrain controller + Thermal Thermodynamics).
  *
  * Notes:
- *  - This header adds the ability to attach a WhisperGrain controller to an orbit
- *    and exposes budget-aware search APIs that accept a pomai::ai::Budget object.
- *  - The rest of the PomaiOrbit API remains backwards-compatible.
+ * - Added Thermal Gating logic: Centroids now have temperature.
+ * - Added apply_thermal_policy() for background memory management (madvise).
+ * - This enables the "Active Working Set" architecture where cold data is implicitly demoted.
  */
 
 #include <vector>
@@ -88,6 +88,9 @@ namespace pomai::ai::orbit
         uint64_t offset_from_blob_ptr(const char *p) const noexcept;
         const char *blob_ptr_from_offset_for_map(uint64_t offset) const;
         std::vector<char> read_remote_blob(uint64_t remote_id) const;
+
+        // [New] Support for demoting pages (madvise DONTNEED)
+        void demote_range(uint64_t offset, size_t len) const;
 
         bool is_pomai_arena() const { return pa != nullptr; }
         bool is_shard_arena() const { return sa != nullptr; }
@@ -212,6 +215,10 @@ namespace pomai::ai::orbit
         // Introspection: best-effort snapshot info about this membrance
         MembranceInfo get_info() const;
 
+        // ------------------ [NEW] Thermal Thermodynamics API ------------------
+        // Called by background worker to scan thermal map and evict cold pages (madvise DONTNEED).
+        void apply_thermal_policy();
+
     private:
         Config cfg_;
         ArenaView arena_;
@@ -258,6 +265,28 @@ namespace pomai::ai::orbit
 
         // Optional WhisperGrain controller (shared across orbits/DB)
         std::shared_ptr<pomai::ai::WhisperGrain> whisper_ctrl_;
+
+        // ------------------ [NEW] Thermal Thermodynamics Engine ------------------
+
+        // Thermal Map: Structure of Arrays (SoA).
+        // Index i corresponds to centroids_[i].
+        // Value: 0 (Frozen/Cold) -> 255 (Red Hot).
+        // Fits in L2 Cache for instant checks.
+        std::vector<std::atomic<uint8_t>> thermal_map_;
+
+        // Epoch (Seconds) of last access. Used for lazy decay calculation.
+        std::vector<std::atomic<uint32_t>> last_access_epoch_;
+
+        // Helper: Initialize thermal maps when centroids are created/loaded
+        void init_thermal_map(size_t num_centroids);
+
+        // Helper: Touch a centroid -> Increases temperature, updates timestamp
+        void touch_centroid(uint32_t cid);
+
+        // Helper: Get current temperature (calculates lazy decay based on time elapsed)
+        uint8_t get_temperature(uint32_t cid) const;
+
+        // --------------------------------------------------------------------------
 
         uint32_t find_nearest_centroid(const float *vec);
         std::vector<uint32_t> find_routing_centroids(const float *vec, size_t n);
