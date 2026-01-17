@@ -27,12 +27,10 @@ namespace pomai::memory
 {
 
     // Helper: round up to page size
-    static inline size_t round_up_to_page(size_t v)
+    static inline size_t round_up_to_page(size_t v, size_t fallback_ps)
     {
         long ps = sysconf(_SC_PAGESIZE);
-        if (ps <= 0)
-            ps = 4096;
-        size_t page = static_cast<size_t>(ps);
+        size_t page = (ps > 0) ? static_cast<size_t>(ps) : fallback_ps;
         return (v + page - 1) & ~(page - 1);
     }
 
@@ -41,10 +39,11 @@ namespace pomai::memory
     {
     }
 
-    MmapFileManager::MmapFileManager(const std::string &path, size_t size_bytes, bool create)
+    MmapFileManager::MmapFileManager(const std::string &path, size_t size_bytes,
+                                     const pomai::config::PomaiConfig &cfg, bool create)
         : MmapFileManager()
     {
-        open(path, size_bytes, create);
+        open(path, size_bytes, cfg, create);
     }
 
     MmapFileManager::~MmapFileManager()
@@ -92,19 +91,21 @@ namespace pomai::memory
         return *this;
     }
 
-    bool MmapFileManager::open(const std::string &path, size_t size_bytes, bool create)
+    bool MmapFileManager::open(const std::string &path, size_t size_bytes,
+                               const pomai::config::PomaiConfig &cfg, bool create)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
 
         if (base_addr_ != nullptr || fd_ != -1)
             return true; // already open
 
+        cfg_ = cfg;
         path_ = path;
         int flags = O_RDWR;
         if (create)
             flags |= O_CREAT;
 
-        int fd = ::open(path.c_str(), flags, 0600);
+        int fd = ::open(path.c_str(), flags, cfg_.storage.default_file_permissions);
         if (fd < 0)
         {
             std::cerr << "MmapFileManager::open: open(" << path << ") failed: " << strerror(errno) << "\n";
@@ -135,7 +136,7 @@ namespace pomai::memory
             return true;
         }
 
-        size_t map_size = round_up_to_page(target_size);
+        size_t map_size = round_up_to_page(target_size, cfg_.storage.fallback_page_size);
 
         if (ftruncate(fd, static_cast<off_t>(map_size)) != 0)
         {
@@ -217,9 +218,11 @@ namespace pomai::memory
 
     bool MmapFileManager::read_at(size_t offset, void *dst, size_t len) const
     {
-        if (!dst || len == 0) return true;
+        if (!dst || len == 0)
+            return true;
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || offset + len > mapped_size_) return false;
+        if (!base_addr_ || offset + len > mapped_size_)
+            return false;
 
         // [FIX] Always use atomic load for 8-byte, even if unaligned (best effort safe)
         if (len == sizeof(uint64_t))
@@ -229,11 +232,12 @@ namespace pomai::memory
             // Using memcpy is safer for pure unaligned, but we want atomic semantics.
             // Compromise: Use memcpy because std::atomic requires alignment for correctness standard-wise.
             // But for high-perf concurrency on x64, we rely on cache coherence.
-            
+
             // Revert to strict atomic load if aligned, otherwise memcpy.
             // (Atomic load on unaligned address is UB in C++).
-            if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0) {
-                uint64_t v = pomai::ai::atomic_utils::atomic_load_u64(reinterpret_cast<const uint64_t*>(base_addr_ + offset));
+            if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0)
+            {
+                uint64_t v = pomai::ai::atomic_utils::atomic_load_u64(reinterpret_cast<const uint64_t *>(base_addr_ + offset));
                 std::memcpy(dst, &v, sizeof(v));
                 return true;
             }
@@ -245,25 +249,30 @@ namespace pomai::memory
 
     bool MmapFileManager::write_at(size_t offset, const void *src, size_t len)
     {
-        if (!src || len == 0) return true;
+        if (!src || len == 0)
+            return true;
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || offset + len > mapped_size_) return false;
+        if (!base_addr_ || offset + len > mapped_size_)
+            return false;
 
         // [FIX] Atomic Store Logic
         if (len == sizeof(uint64_t))
         {
-            if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0) {
+            if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0)
+            {
                 uint64_t val;
                 std::memcpy(&val, src, sizeof(val));
-                pomai::ai::atomic_utils::atomic_store_u64(reinterpret_cast<uint64_t*>(base_addr_ + offset), val);
+                pomai::ai::atomic_utils::atomic_store_u64(reinterpret_cast<uint64_t *>(base_addr_ + offset), val);
                 return true;
-            } else {
+            }
+            else
+            {
                 // Warning: Unaligned atomic store is risky.
                 // We use __atomic_store with relaxed ordering to force compiler to try its best.
                 uint64_t val;
                 std::memcpy(&val, src, sizeof(val));
                 // Using GCC builtin that handles unaligned (slowly) or hardware support
-                __atomic_store_n(reinterpret_cast<uint64_t*>(base_addr_ + offset), val, __ATOMIC_RELEASE);
+                __atomic_store_n(reinterpret_cast<uint64_t *>(base_addr_ + offset), val, __ATOMIC_RELEASE);
                 return true;
             }
         }
@@ -274,21 +283,24 @@ namespace pomai::memory
 
     size_t MmapFileManager::append(const void *src, size_t len)
     {
-        if (!src || len == 0) return SIZE_MAX;
+        if (!src || len == 0)
+            return SIZE_MAX;
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_) return SIZE_MAX;
+        if (!base_addr_)
+            return SIZE_MAX;
 
         size_t off = append_offset_.load();
-        if (off + len > mapped_size_) return SIZE_MAX;
+        if (off + len > mapped_size_)
+            return SIZE_MAX;
 
         if (len == sizeof(uint64_t))
         {
-             uint64_t val;
-             std::memcpy(&val, src, sizeof(val));
-             // Force atomic store to prevent torn writes
-             __atomic_store_n(reinterpret_cast<uint64_t*>(base_addr_ + off), val, __ATOMIC_RELEASE);
-             append_offset_.store(off + len);
-             return off;
+            uint64_t val;
+            std::memcpy(&val, src, sizeof(val));
+            // Force atomic store to prevent torn writes
+            __atomic_store_n(reinterpret_cast<uint64_t *>(base_addr_ + off), val, __ATOMIC_RELEASE);
+            append_offset_.store(off + len);
+            return off;
         }
 
         std::memcpy(base_addr_ + off, src, len);
@@ -299,18 +311,22 @@ namespace pomai::memory
     bool MmapFileManager::flush(size_t offset, size_t len, bool sync)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || mapped_size_ == 0) return false;
+        if (!base_addr_ || mapped_size_ == 0)
+            return false;
 
         size_t flush_off = offset;
         size_t flush_len = len;
-        if (flush_len == 0) {
+        if (flush_len == 0)
+        {
             flush_off = 0;
             flush_len = mapped_size_;
         }
-        if (flush_off + flush_len > mapped_size_) return false;
+        if (flush_off + flush_len > mapped_size_)
+            return false;
 
         long ps = sysconf(_SC_PAGESIZE);
-        if (ps <= 0) ps = 4096;
+        if (ps <= 0)
+            ps = 4096;
         size_t page = static_cast<size_t>(ps);
 
         size_t page_off = (flush_off / page) * page;
@@ -318,7 +334,8 @@ namespace pomai::memory
         size_t page_end = ((end + page - 1) / page) * page;
         size_t msync_len = page_end - page_off;
 
-        if (msync(base_addr_ + page_off, msync_len, sync ? MS_SYNC : MS_ASYNC) != 0) {
+        if (msync(base_addr_ + page_off, msync_len, sync ? MS_SYNC : MS_ASYNC) != 0)
+        {
             std::cerr << "MmapFileManager::flush: msync failed: " << strerror(errno) << "\n";
             return false;
         }
@@ -328,25 +345,40 @@ namespace pomai::memory
     bool MmapFileManager::advise_willneed(size_t offset, size_t len)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || mapped_size_ == 0) return false;
-        if (offset + len > mapped_size_) len = (offset >= mapped_size_) ? 0 : (mapped_size_ - offset);
-        if (len == 0) return false;
+        if (!base_addr_ || mapped_size_ == 0)
+            return false;
+        if (offset + len > mapped_size_)
+            len = (offset >= mapped_size_) ? 0 : (mapped_size_ - offset);
+        if (len == 0)
+            return false;
         return madvise(base_addr_ + offset, len, MADV_WILLNEED) == 0;
     }
 
     bool MmapFileManager::advise_mode(size_t offset, size_t len, AdviseMode mode)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || mapped_size_ == 0) return false;
-        if (offset + len > mapped_size_) len = (offset >= mapped_size_) ? 0 : (mapped_size_ - offset);
-        if (len == 0) return false;
+        if (!base_addr_ || mapped_size_ == 0)
+            return false;
+        if (offset + len > mapped_size_)
+            len = (offset >= mapped_size_) ? 0 : (mapped_size_ - offset);
+        if (len == 0)
+            return false;
 
         int how = MADV_NORMAL;
-        switch (mode) {
-            case AdviseMode::NORMAL: how = MADV_NORMAL; break;
-            case AdviseMode::SEQUENTIAL: how = MADV_SEQUENTIAL; break;
-            case AdviseMode::RANDOM: how = MADV_RANDOM; break;
-            default: how = MADV_NORMAL; break;
+        switch (mode)
+        {
+        case AdviseMode::NORMAL:
+            how = MADV_NORMAL;
+            break;
+        case AdviseMode::SEQUENTIAL:
+            how = MADV_SEQUENTIAL;
+            break;
+        case AdviseMode::RANDOM:
+            how = MADV_RANDOM;
+            break;
+        default:
+            how = MADV_NORMAL;
+            break;
         }
         return madvise(base_addr_ + offset, len, how) == 0;
     }
@@ -354,11 +386,14 @@ namespace pomai::memory
     bool MmapFileManager::mlock_range(size_t offset, size_t len)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || mapped_size_ == 0 || len == 0) return false;
-        if (offset + len > mapped_size_) return false;
+        if (!base_addr_ || mapped_size_ == 0 || len == 0)
+            return false;
+        if (offset + len > mapped_size_)
+            return false;
 
         long ps = sysconf(_SC_PAGESIZE);
-        if (ps <= 0) ps = 4096;
+        if (ps <= 0)
+            ps = 4096;
         size_t page = static_cast<size_t>(ps);
         size_t page_off = (offset / page) * page;
         size_t end = offset + len;
@@ -369,11 +404,14 @@ namespace pomai::memory
     bool MmapFileManager::munlock_range(size_t offset, size_t len)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || mapped_size_ == 0 || len == 0) return false;
-        if (offset + len > mapped_size_) return false;
+        if (!base_addr_ || mapped_size_ == 0 || len == 0)
+            return false;
+        if (offset + len > mapped_size_)
+            return false;
 
         long ps = sysconf(_SC_PAGESIZE);
-        if (ps <= 0) ps = 4096;
+        if (ps <= 0)
+            ps = 4096;
         size_t page = static_cast<size_t>(ps);
         size_t page_off = (offset / page) * page;
         size_t end = offset + len;
@@ -384,13 +422,17 @@ namespace pomai::memory
     bool MmapFileManager::atomic_load_u64_at(size_t offset, uint64_t &out) const
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || mapped_size_ == 0 || offset + sizeof(uint64_t) > mapped_size_) return false;
+        if (!base_addr_ || mapped_size_ == 0 || offset + sizeof(uint64_t) > mapped_size_)
+            return false;
 
-        if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0) {
-            out = pomai::ai::atomic_utils::atomic_load_u64(reinterpret_cast<const uint64_t*>(base_addr_ + offset));
-        } else {
+        if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0)
+        {
+            out = pomai::ai::atomic_utils::atomic_load_u64(reinterpret_cast<const uint64_t *>(base_addr_ + offset));
+        }
+        else
+        {
             // [FIX] Unaligned atomic load (Best effort)
-            out = __atomic_load_n(reinterpret_cast<const uint64_t*>(base_addr_ + offset), __ATOMIC_ACQUIRE);
+            out = __atomic_load_n(reinterpret_cast<const uint64_t *>(base_addr_ + offset), __ATOMIC_ACQUIRE);
         }
         return true;
     }
@@ -398,13 +440,17 @@ namespace pomai::memory
     bool MmapFileManager::atomic_store_u64_at(size_t offset, uint64_t value)
     {
         std::lock_guard<std::mutex> lk(io_mu_);
-        if (!base_addr_ || mapped_size_ == 0 || offset + sizeof(uint64_t) > mapped_size_) return false;
+        if (!base_addr_ || mapped_size_ == 0 || offset + sizeof(uint64_t) > mapped_size_)
+            return false;
 
-        if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0) {
-            pomai::ai::atomic_utils::atomic_store_u64(reinterpret_cast<uint64_t*>(base_addr_ + offset), value);
-        } else {
+        if (reinterpret_cast<uintptr_t>(base_addr_ + offset) % alignof(uint64_t) == 0)
+        {
+            pomai::ai::atomic_utils::atomic_store_u64(reinterpret_cast<uint64_t *>(base_addr_ + offset), value);
+        }
+        else
+        {
             // [FIX] Unaligned atomic store (Best effort)
-            __atomic_store_n(reinterpret_cast<uint64_t*>(base_addr_ + offset), value, __ATOMIC_RELEASE);
+            __atomic_store_n(reinterpret_cast<uint64_t *>(base_addr_ + offset), value, __ATOMIC_RELEASE);
         }
         return true;
     }

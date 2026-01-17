@@ -2,14 +2,7 @@
  * src/memory/wal_manager.cc
  *
  * Implementation of WalManager.
- *
- * Notes:
- * - Uses POSIX file descriptor I/O (open/write/pread/ftruncate/fsync) for precise control.
- * - Implements crc32 for record validation.
- * - Replay is robust to partial trailing records: it truncates WAL to last valid offset.
- * - Append/fsync/replay/truncate are serialized in-process using append_mu_ to make
- * append_record thread-safe for multiple threads in the same process.
- * - [FIXED] Added Magic Marker per record to detect corruption/partial writes accurately.
+ * [UPDATED] Uses centralized configuration via Dependency Injection.
  */
 
 #include "src/memory/wal_manager.h"
@@ -32,7 +25,7 @@ namespace pomai::memory
 
     // On-disk file header layout helper values
     static constexpr char WAL_MAGIC[8] = {'P', 'O', 'M', 'A', 'I', 'W', 'A', 'L'};
-    static constexpr uint32_t WAL_RECORD_MAGIC = 0xCAFEBABE; // [NEW] Magic per record
+    static constexpr uint32_t WAL_RECORD_MAGIC = 0xCAFEBABE;
 
 #pragma pack(push, 1)
     struct WalFileHeader
@@ -45,7 +38,7 @@ namespace pomai::memory
 
     struct WalRecordHeader
     {
-        uint32_t magic;   // [NEW] 4 bytes magic to identify valid start of record
+        uint32_t magic;   // 4 bytes magic to identify valid start of record
         uint32_t rec_len; // payload length
         uint16_t rec_type;
         uint16_t flags;
@@ -54,7 +47,6 @@ namespace pomai::memory
 #pragma pack(pop)
 
     static_assert(sizeof(WalFileHeader) == WalManager::WAL_FILE_HEADER_SIZE, "WalFileHeader size mismatch");
-    // [UPDATED] Size tăng từ 16 lên 20 bytes do thêm magic (uint32_t)
     static_assert(sizeof(WalRecordHeader) == 20, "WalRecordHeader expected 20 bytes");
 
     // CRC32 implementation (table)
@@ -107,12 +99,13 @@ namespace pomai::memory
             return true;
         }
 
-        cfg_ = cfg;
+        cfg_ = cfg; // [UPDATED] Store the injected config
         path_ = path;
 
         int flags = O_RDWR;
         if (create_if_missing)
             flags |= O_CREAT;
+        
         // use 0600 mode
         fd_ = ::open(path_.c_str(), flags, 0600);
         if (fd_ < 0)
@@ -150,8 +143,7 @@ namespace pomai::memory
             }
         }
 
-        // Initialize counters and seq_no_ by scanning the WAL for the last sequence number.
-        // We call replay(...) which will be protected by append_mu_ to ensure no concurrent append.
+        // Initialize counters
         uint64_t max_seq = 0;
         auto cb = [&max_seq](uint16_t /*type*/, const void * /*payload*/, uint32_t /*len*/, uint64_t seq) -> bool
         {
@@ -195,7 +187,6 @@ namespace pomai::memory
         h.header_size = static_cast<uint32_t>(sizeof(WalFileHeader));
         std::fill(std::begin(h.reserved), std::end(h.reserved), 0);
 
-        // write at offset 0
         if (lseek(fd_, 0, SEEK_SET) < 0)
         {
             std::cerr << "WalManager::write_file_header_if_missing: lseek failed: " << strerror(errno) << "\n";
@@ -209,6 +200,7 @@ namespace pomai::memory
             return false;
         }
 
+        // [UPDATED] Use centralized config
         if (cfg_.sync_on_append)
         {
             if (::fsync(fd_) != 0)
@@ -247,7 +239,7 @@ namespace pomai::memory
         }
         if (h.version != WAL_VERSION)
         {
-            std::cerr << "WalManager::read_file_header_and_validate: version mismatch (got " << h.version << " expected " << WAL_VERSION << ")\n";
+            std::cerr << "WalManager::read_file_header_and_validate: version mismatch\n";
             return false;
         }
         if (h.header_size != sizeof(WalFileHeader))
@@ -263,9 +255,8 @@ namespace pomai::memory
         if (fd_ < 0)
             return std::nullopt;
 
-        // Build header and buffer. We'll serialize actual write under append_mu_.
         WalRecordHeader rh{};
-        rh.magic = WAL_RECORD_MAGIC; // [FIX] Set Magic
+        rh.magic = WAL_RECORD_MAGIC;
         rh.rec_len = payload_len;
         rh.rec_type = type;
         rh.flags = 0;
@@ -274,27 +265,22 @@ namespace pomai::memory
         std::vector<uint8_t> buf;
         buf.resize(rec_size);
 
-        // We will fill the header (including seq) inside the critical section to avoid races.
         {
             std::lock_guard<std::mutex> lk(append_mu_);
 
-            // Acquire a fresh seq number
             uint64_t seq = seq_no_.fetch_add(1) + 1;
             rh.seq_no = seq;
 
-            // Copy header + payload into buffer
             std::memcpy(buf.data(), &rh, sizeof(WalRecordHeader));
             if (payload_len > 0 && payload)
                 std::memcpy(buf.data() + sizeof(WalRecordHeader), payload, payload_len);
 
-            // Compute crc over header + payload (including seq)
             uint32_t c = crc32(buf.data(), sizeof(WalRecordHeader) + payload_len);
             std::memcpy(buf.data() + sizeof(WalRecordHeader) + payload_len, &c, sizeof(c));
 
-            // Seek to end and write (serialized by mutex)
             if (lseek(fd_, 0, SEEK_END) < 0)
             {
-                std::cerr << "WalManager::append_record: lseek(SEEK_END) failed: " << strerror(errno) << "\n";
+                std::cerr << "WalManager::append_record: lseek failed: " << strerror(errno) << "\n";
                 return std::nullopt;
             }
             ssize_t w = write(fd_, buf.data(), buf.size());
@@ -304,6 +290,7 @@ namespace pomai::memory
                 return std::nullopt;
             }
 
+            // [UPDATED] Use centralized config
             if (cfg_.sync_on_append)
             {
                 if (::fsync(fd_) != 0)
@@ -316,7 +303,6 @@ namespace pomai::memory
             total_bytes_written_.fetch_add(static_cast<uint64_t>(buf.size()));
             total_records_written_.fetch_add(1);
 
-            // Return the sequence number we assigned
             return rh.seq_no;
         }
     }
@@ -339,17 +325,14 @@ namespace pomai::memory
         if (fd_ < 0)
             return false;
 
-        // Prevent concurrent appends/truncate while replaying
         std::lock_guard<std::mutex> lk(append_mu_);
 
-        // Read entire file sequentially
         if (lseek(fd_, 0, SEEK_SET) < 0)
         {
             std::cerr << "WalManager::replay: lseek failed: " << strerror(errno) << "\n";
             return false;
         }
 
-        // Determine file size
         struct stat st;
         if (fstat(fd_, &st) != 0)
         {
@@ -359,67 +342,46 @@ namespace pomai::memory
         off_t file_size = st.st_size;
 
         off_t read_off = 0;
-        // skip file header
         if (file_size < static_cast<off_t>(sizeof(WalFileHeader)))
-            return true; // nothing to replay
+            return true;
         read_off += sizeof(WalFileHeader);
 
-        // keep offset of last good record end; start at header
         off_t last_good_end = read_off;
 
         while (read_off + static_cast<off_t>(sizeof(WalRecordHeader)) <= file_size)
         {
-            // read record header
             WalRecordHeader rh;
             ssize_t rr = pread(fd_, &rh, sizeof(rh), read_off);
             if (rr != static_cast<ssize_t>(sizeof(rh)))
-            {
-                // partial header -> truncate
                 break;
-            }
 
-            // [FIX] Validate Magic Marker
             if (rh.magic != WAL_RECORD_MAGIC)
             {
                 std::cerr << "[WAL] Corruption detected (Bad Magic at offset " << read_off << "). Truncating...\n";
-                break; // Stop replay and truncate here
+                break;
             }
 
-            // boundary checks
             off_t payload_off = read_off + static_cast<off_t>(sizeof(WalRecordHeader));
             off_t crc_off = payload_off + static_cast<off_t>(rh.rec_len);
             off_t end_off = crc_off + static_cast<off_t>(sizeof(uint32_t));
 
             if (crc_off < 0 || end_off < 0 || end_off > file_size)
-            {
-                // partial/truncated payload -> break and truncate
                 break;
-            }
 
-            // read payload
             std::vector<uint8_t> payload;
             if (rh.rec_len > 0)
             {
                 payload.resize(rh.rec_len);
                 ssize_t rp = pread(fd_, payload.data(), rh.rec_len, payload_off);
                 if (rp != static_cast<ssize_t>(rh.rec_len))
-                {
-                    // truncated
                     break;
-                }
             }
 
-            // read crc
             uint32_t stored_crc = 0;
             ssize_t rc = pread(fd_, &stored_crc, sizeof(stored_crc), crc_off);
             if (rc != static_cast<ssize_t>(sizeof(stored_crc)))
-            {
-                // truncated
                 break;
-            }
 
-            // validate crc
-            // compute crc over header + payload
             std::vector<uint8_t> tmp;
             tmp.resize(sizeof(WalRecordHeader) + rh.rec_len);
             std::memcpy(tmp.data(), &rh, sizeof(WalRecordHeader));
@@ -428,24 +390,18 @@ namespace pomai::memory
             uint32_t computed = crc32(tmp.data(), tmp.size());
             if (computed != stored_crc)
             {
-                std::cerr << "WalManager::replay: crc mismatch at offset " << read_off << " (stored=" << stored_crc << " computed=" << computed << "), truncating\n";
-                // corrupted trailing record -> truncate it
+                std::cerr << "WalManager::replay: crc mismatch at offset " << read_off << ", truncating\n";
                 break;
             }
 
-            // Call apply callback
             bool cont = apply_cb(rh.rec_type, (rh.rec_len > 0) ? payload.data() : nullptr, rh.rec_len, rh.seq_no);
             if (!cont)
-            {
-                // callback requested abort; leave WAL as-is
                 return true;
-            }
 
             last_good_end = end_off;
             read_off = end_off;
         }
 
-        // Truncate file to last_good_end (if not already)
         if (last_good_end < file_size)
         {
             if (ftruncate(fd_, last_good_end) != 0)
@@ -453,7 +409,6 @@ namespace pomai::memory
                 std::cerr << "WalManager::replay: ftruncate failed: " << strerror(errno) << "\n";
                 return false;
             }
-            // ensure truncation durable
             if (::fsync(fd_) != 0)
             {
                 std::cerr << "WalManager::replay: fsync after truncate failed: " << strerror(errno) << "\n";
@@ -475,13 +430,10 @@ namespace pomai::memory
             std::cerr << "WalManager::truncate_to_zero: ftruncate failed: " << strerror(errno) << "\n";
             return false;
         }
-        // Recreate header: write header at offset 0
         if (!write_file_header_if_missing())
             return false;
 
-        // reset seq counter
         seq_no_.store(0);
-
         return true;
     }
 

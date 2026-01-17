@@ -15,6 +15,7 @@
 #include <atomic>
 #include <optional>
 #include <mutex>
+#include "src/core/config.h"
 
 namespace pomai::memory
 {
@@ -39,7 +40,7 @@ namespace pomai::memory
     {
     public:
         // Provide nested alias so callers/tests can refer to WalManager::WalConfig
-        using WalConfig = ::pomai::memory::WalConfig;
+        using WalConfig = pomai::config::WalConfig;
 
         WalManager() noexcept;
         ~WalManager();
@@ -50,7 +51,7 @@ namespace pomai::memory
 
         // Open/create WAL file at path. If create_if_missing==true, file will be created.
         // Returns true on success.
-        bool open(const std::string &path, bool create_if_missing = true, const WalConfig &cfg = {});
+        bool open(const std::string &path, bool create_if_missing, const WalConfig &cfg);
 
         // Close the WAL file.
         void close();

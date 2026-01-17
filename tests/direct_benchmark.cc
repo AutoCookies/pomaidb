@@ -2,6 +2,7 @@
  * src/tools/direct_benchmark.cc
  *
  * PomaiDB Direct API Benchmark - HIGH PERFORMANCE EDITION
+ * [UPDATED] Synced with Centralized Config Architecture.
  *
  * Optimizations:
  * 1. Multi-threaded Inserts (Auto-detect CPU cores).
@@ -11,6 +12,8 @@
 
 #include "src/core/pomai_db.h"
 #include "src/core/cpu_kernels.h"
+#include "src/core/config.h" // [ADDED] Include config
+
 #include <iostream>
 #include <vector>
 #include <random>
@@ -114,15 +117,32 @@ int main() {
     // 1. Setup Data
     init_data_pool();
 
-    // 2. Setup DB
+    // 2. Setup DB with Config [FIXED]
     try { std::filesystem::remove_all(DB_PATH); } catch(...) {}
-    PomaiDB db(DB_PATH);
-    MembranceConfig cfg;
-    cfg.dim = DIM;
-    cfg.ram_mb = RAM_LIMIT_MB;
-    cfg.engine = "orbit";
     
-    if (!db.create_membrance(MEMBR_NAME, cfg)) return 1;
+    // [FIXED] Initialize Config
+    pomai::config::PomaiConfig config;
+    config.res.data_root = DB_PATH;
+    
+    // Optimize for Benchmark: Disable WAL sync for raw insert speed testing if applicable
+    // (Though PomaiDB WAL mainly tracks metadata, it's good practice)
+    config.wal.sync_on_append = false; 
+    
+    // Disable metrics printing during benchmark to avoid clutter
+    config.metrics.enabled = false;
+
+    // Initialize DB with Config
+    PomaiDB db(config);
+
+    MembranceConfig m_cfg;
+    m_cfg.dim = DIM;
+    m_cfg.ram_mb = RAM_LIMIT_MB;
+    m_cfg.engine = "orbit"; // Explicitly set engine
+    
+    if (!db.create_membrance(MEMBR_NAME, m_cfg)) {
+        std::cerr << "Failed to create membrance!\n";
+        return 1;
+    }
 
     // 3. Execution State
     uint64_t current_vectors = 0;

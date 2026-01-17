@@ -21,6 +21,7 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include "src/core/config.h"
 
 namespace pomai::memory
 {
@@ -29,7 +30,8 @@ namespace pomai::memory
     {
     public:
         MmapFileManager() noexcept;
-        MmapFileManager(const std::string &path, size_t size_bytes, bool create = true);
+        MmapFileManager(const std::string &path, size_t size_bytes, 
+                        const pomai::config::PomaiConfig& cfg, bool create = true);
         ~MmapFileManager();
 
         MmapFileManager(const MmapFileManager &) = delete;
@@ -38,7 +40,8 @@ namespace pomai::memory
         MmapFileManager(MmapFileManager &&other) noexcept;
         MmapFileManager &operator=(MmapFileManager &&other) noexcept;
 
-        bool open(const std::string &path, size_t size_bytes, bool create = true);
+        bool open(const std::string &path, size_t size_bytes, 
+                  const pomai::config::PomaiConfig& cfg, bool create = true);
         void close();
         bool is_valid() const noexcept;
         int fd() const noexcept;
@@ -83,6 +86,7 @@ namespace pomai::memory
         size_t mapped_size_;
         std::string path_;
         std::atomic<size_t> append_offset_;
+        pomai::config::PomaiConfig cfg_;
     };
 
 } // namespace pomai::memory

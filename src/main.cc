@@ -1,6 +1,10 @@
 /*
  * src/main.cc
  * Pomai Orbit Server - Fully Refactored with Centralized Config
+ *
+ * Updates:
+ * [FIXED] Force "C" Locale to ensure float parsing works correctly (dot vs comma).
+ * [UI] Enhanced startup banner.
  */
 
 #include "src/core/config.h"
@@ -21,6 +25,7 @@
 #include <condition_variable>
 #include <iomanip>
 #include <cstdlib>
+#include <clocale> // [ADDED] For setlocale
 
 std::mutex g_exit_mutex;
 std::condition_variable g_exit_cv;
@@ -39,23 +44,40 @@ static void on_signal(int /*signum*/)
 #define ANSI_GREEN "\033[32m"
 #define ANSI_RED "\033[31m"
 #define ANSI_CYAN "\033[36m"
+#define ANSI_YELLOW "\033[33m"
+#define ANSI_BOLD "\033[1m"
 
 void print_banner(int port)
 {
-    std::cout << ANSI_CYAN << "POMAI MEMBRANCE SERVER" << ANSI_RESET << "\n";
-    std::cout << "PORT: " << port << " | PID: " << getpid() << "\n";
-    std::cout << "-------------------------------------\n";
+    std::cout << ANSI_CYAN << ANSI_BOLD;
+    std::cout << R"(
+  ____  ___  __  __    _    ___ 
+ |  _ \/ _ \|  \/  |  / \  |_ _|
+ | |_) | | | | |\/| | / _ \  | | 
+ |  __/| |_| | |  | |/ ___ \ | | 
+ |_|    \___/|_|  |_/_/   \_\___|
+                                 
+)" << ANSI_RESET;
+    std::cout << ANSI_GREEN << " :: Pomai Orbit Server ::" << ANSI_RESET << "   (v0.3.0 - AI Data Engine)\n";
+    std::cout << " ------------------------------------------------\n";
+    std::cout << "  Port:   " << port << "\n";
+    std::cout << "  PID:    " << getpid() << "\n";
+    std::cout << "  Locale: " << ANSI_YELLOW << "C (Standard)" << ANSI_RESET << "\n";
+    std::cout << " ------------------------------------------------\n";
 }
 
 int main(int argc, char **argv)
 {
+    // [CRITICAL FIX] Force standard C locale.
+    // This ensures strtof/stof parses "3.14" as 3.14, not 3 (if system locale expects comma).
+    std::setlocale(LC_ALL, "C");
+
     // 1. Load Config (Duy nhất 1 lần từ CLI/Env)
     auto config = pomai::config::load_from_args(argc, argv);
 
     // 2. Init CPU Kernels
     pomai_init_cpu_kernels();
-    std::clog << "[Init] CPU kernel selected: " << kernel_name_from_ptr(get_pomai_l2sq_kernel()) << "\n";
-
+    
     // 3. System tuning
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
@@ -104,6 +126,7 @@ int main(int argc, char **argv)
     }
 
     print_banner(config.net.port);
+    std::clog << "[Init] CPU kernel selected: " << kernel_name_from_ptr(get_pomai_l2sq_kernel()) << "\n";
 
     try
     {

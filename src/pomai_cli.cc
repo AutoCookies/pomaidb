@@ -1,16 +1,10 @@
 /*
  * src/pomai_cli.cc
- * Pomai-CLI: PomaiDB interactive shell, PostgreSQL-like, user-friendly 10/10.
+ * Pomai-CLI: PomaiDB interactive shell.
  *
- * Features:
- * - Kết nối tới PomaiDB server thông qua TCP (text protocol chuẩn SQL-like).
- * - Cú pháp: CREATE MEMBRANCE, USE, INSERT INTO, SEARCH, GET, SHOW, DROP, EXIT,...
- * - Tự động lưu màng đang chọn (CURRENT membrance).
- * - Hỗ trợ tất cả thao tác vector chuẩn (CLI/PomaiSQL).
- * - [NEW] Hỗ trợ Metadata: INSERT ... TAGS(...) và SEARCH ... WHERE ...
- * - Dễ mở rộng UI (support history, highlight...).
- *
- * 2024 - Lựu CLI cho Pomai vector database.
+ * Updates:
+ * - [NEW] Added ITERATE command support (Binary Protocol Handler).
+ * Prevents CLI freezing when receiving raw binary data.
  */
 
 #include <iostream>
@@ -24,7 +18,6 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <cstdint>
 
 #ifdef _WIN32
@@ -40,11 +33,12 @@ typedef int socklen_t;
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 7777
 
-// ANSI Colors for CLI
+// ANSI Colors
 #define ANSI_RESET "\033[0m"
 #define ANSI_GREEN "\033[32m"
 #define ANSI_YELLOW "\033[33m"
 #define ANSI_CYAN "\033[36m"
+#define ANSI_RED "\033[31m"
 
 class PomaiSocket
 {
@@ -99,7 +93,8 @@ public:
         }
     }
 
-    std::string recv_until_prompt(char prompt = '\n')
+    // Read until specific char
+    std::string recv_until(char delimiter)
     {
         std::string out;
         char c;
@@ -109,18 +104,19 @@ public:
             if (n <= 0)
                 break;
             out += c;
-            if (c == prompt)
+            if (c == delimiter)
                 break;
         }
         return out;
     }
 
+    // Standard text response reader
     std::string recv_multiline(int maxlines = 100)
-    { // for listing
+    {
         std::stringstream ss;
         for (int i = 0; i < maxlines; ++i)
         {
-            std::string l = recv_until_prompt('\n');
+            std::string l = recv_until('\n');
             if (l.empty())
                 break;
             ss << l;
@@ -129,9 +125,48 @@ public:
         }
         return ss.str();
     }
+
+    // [NEW] Special handler for ITERATE command
+    // Protocol: OK BINARY <count> <dim> <bytes>\n[RAW BYTES]
+    void recv_binary_iterate()
+    {
+        // 1. Read Header
+        std::string header = recv_until('\n');
+        std::cout << header; // Print header
+
+        if (header.find("OK BINARY") != 0) {
+            // Error or unknown format, maybe text error
+            if (header.find("<END>") == std::string::npos) {
+                 std::cout << recv_multiline(); // Flush rest if error
+            }
+            return;
+        }
+
+        // 2. Parse Header
+        std::stringstream ss(header);
+        std::string tag;
+        size_t count, dim, total_bytes;
+        ss >> tag >> tag >> count >> dim >> total_bytes;
+
+        std::cout << ANSI_CYAN << ">> Receiving " << total_bytes << " bytes of binary data..." << ANSI_RESET << "\n";
+
+        // 3. Consume Binary Payload (Discard or Count)
+        // CLI shouldn't print binary to TTY. We just drain the socket.
+        size_t received = 0;
+        char buf[4096];
+        while (received < total_bytes) {
+            size_t want = total_bytes - received;
+            if (want > sizeof(buf)) want = sizeof(buf);
+            
+            int n = recv(sockfd_, buf, want, 0);
+            if (n <= 0) throw std::runtime_error("Socket closed during binary read");
+            received += n;
+        }
+
+        std::cout << ANSI_GREEN << ">> Successfully received " << count << " vectors (" << dim << "-dim)." << ANSI_RESET << "\n";
+    }
 };
 
-/** Trim and uppercase utils */
 static std::string trim(const std::string &s)
 {
     size_t l = s.find_first_not_of(" \t\r\n");
@@ -145,7 +180,6 @@ static std::string uc(const std::string &s)
     return t;
 }
 
-/** CLI app */
 class PomaiCLI
 {
     std::string host_;
@@ -165,7 +199,7 @@ public:
         }
         catch (const std::exception &e)
         {
-            std::cerr << "Connect error: " << e.what() << "\n";
+            std::cerr << ANSI_RED << "Connect error: " << e.what() << ANSI_RESET << "\n";
         }
     }
 
@@ -174,10 +208,9 @@ private:
     {
         std::cout
             << "\n============================================\n"
-            << ANSI_YELLOW << "  PomaiDB CLI — PomaiSQL Mode (Metadata V2)" << ANSI_RESET << "\n"
+            << ANSI_YELLOW << "  PomaiDB CLI — AI Data Engine Mode" << ANSI_RESET << "\n"
             << "  Type 'help;' for syntax, '\\q' to exit.\n"
-            << "============================================\n"
-            << "(Tip: End command with ;)\n";
+            << "============================================\n";
     }
     void prompt()
     {
@@ -186,263 +219,76 @@ private:
         {
             std::cout << (current_membr_.empty() ? ANSI_CYAN "[pomai]> " ANSI_RESET : (ANSI_CYAN "[pomai/" + current_membr_ + "]> " ANSI_RESET));
             std::getline(std::cin, inbuf);
-            if (std::cin.eof())
-                break;
+            if (std::cin.eof()) break;
             std::string cmd = trim(inbuf);
-            if (cmd.empty())
-                continue;
+            if (cmd.empty()) continue;
             std::string up = uc(cmd);
 
-            if (up == "EXIT;" || up == "\\Q" || up == "QUIT;")
-                break;
-            if (up == "HELP;")
-            {
+            if (up == "EXIT;" || up == "\\Q" || up == "QUIT;") break;
+            
+            if (up == "HELP;") {
                 print_help();
                 continue;
             }
 
-            // Local expand for USE
-            if (up.rfind("USE ", 0) == 0 && up.back() == ';')
-            {
-                std::istringstream iss(cmd);
-                std::string u, name;
-                iss >> u >> name;
-                current_membr_ = name.substr(0, name.length() - 1); // remove ;
-                std::cout << "Switched to membrance: " << ANSI_GREEN << current_membr_ << ANSI_RESET << "\n";
+            // USE <name>
+            if (up.rfind("USE ", 0) == 0 && up.back() == ';') {
+                std::stringstream ss(cmd);
+                std::string tmp, name;
+                ss >> tmp >> name;
+                if (name.back() == ';') name.pop_back();
+                current_membr_ = name;
+                std::cout << "Switched to: " << ANSI_GREEN << current_membr_ << ANSI_RESET << "\n";
                 continue;
             }
 
-            // For commands affecting membrance, highlight info for user
-            if (up.rfind("CREATE ", 0) == 0 && up.back() == ';')
-            {
-                // Forward to server
-                sock_->sendln(cmd);
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-            if (up.rfind("DROP ", 0) == 0 && up.back() == ';')
-            {
-                sock_->sendln(cmd);
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-            if (up == "SHOW MEMBRANCES;")
-            {
-                sock_->sendln(cmd);
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-
-            // Insert: INSERT INTO <membr> VALUES (<label>, [f,f,...]);
-            if (up.rfind("INSERT INTO ", 0) == 0 && up.back() == ';')
-            {
-                sock_->sendln(cmd);
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-
-            // Search: SEARCH <membr> QUERY ([f,...]) TOP k;
-            if (up.rfind("SEARCH ", 0) == 0 && up.back() == ';')
-            {
-                sock_->sendln(cmd);
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-
-            // --- NEW: GET MEMBRANCE INFO support in CLI ---
-            // Supported client forms:
-            //   GET MEMBRANCE INFO;
-            //   GET MEMBRANCE INFO <name>;
-            //   GET MEMBRANCE <name> INFO;
-            if (up.rfind("GET MEMBRANCE", 0) == 0 && up.back() == ';')
-            {
-                // If user supplied "GET MEMBRANCE INFO;" and no current membrance chosen -> prompt error locally
-                // but server can also handle it; we just forward and pretty-print the response.
-                try
-                {
+            // [NEW] ITERATE Command Handler
+            if (up.rfind("ITERATE ", 0) == 0 && up.back() == ';') {
+                try {
                     sock_->sendln(cmd);
-                    std::string raw = sock_->recv_multiline();
-
-                    // Try to parse key fields for nicer display
-                    std::istringstream iss(raw);
-                    std::string line;
-                    std::string name;
-                    long long dim = -1;
-                    long long num_vectors = -1;
-                    unsigned long long disk_bytes = 0;
-                    double disk_gb = 0.0;
-                    long long ram_mb = -1;
-
-                    while (std::getline(iss, line))
-                    {
-                        std::string t = trim(line);
-                        if (t.empty())
-                            continue;
-                        // Accept both "MEMBRANCE:" and "MEMBRANCE_INFO" prefixes used by different server versions
-                        if (t.rfind("MEMBRANCE:", 0) == 0)
-                        {
-                            name = trim(t.substr(strlen("MEMBRANCE:")));
-                        }
-                        else if (t.rfind("MEMBRANCE_INFO", 0) == 0)
-                        {
-                            // some legacy test output used "MEMBRANCE_INFO <name>"
-                            std::istringstream ls(t);
-                            std::string hdr;
-                            ls >> hdr >> name;
-                        }
-                        else if (t.rfind("dim:", 0) == 0)
-                        {
-                            std::istringstream ls(t.substr(4));
-                            ls >> dim;
-                        }
-                        else if (t.rfind("num_vectors:", 0) == 0)
-                        {
-                            std::istringstream ls(t.substr(strlen("num_vectors:")));
-                            ls >> num_vectors;
-                        }
-                        else if (t.rfind("num_vectors (approx):", 0) == 0)
-                        {
-                            std::istringstream ls(t.substr(strlen("num_vectors (approx):")));
-                            ls >> num_vectors;
-                        }
-                        else if (t.rfind("disk_bytes:", 0) == 0)
-                        {
-                            // "disk_bytes: <n> (<n GB>)"
-                            size_t pos = t.find(':');
-                            if (pos != std::string::npos)
-                            {
-                                std::string rest = trim(t.substr(pos + 1));
-                                std::istringstream ls(rest);
-                                ls >> disk_bytes;
-                                // optionally compute disk_gb
-                                disk_gb = static_cast<double>(disk_bytes) / (1024.0 * 1024.0 * 1024.0);
-                            }
-                        }
-                        else if (t.rfind("disk_gb:", 0) == 0)
-                        {
-                            std::istringstream ls(t.substr(strlen("disk_gb:")));
-                            ls >> disk_gb;
-                        }
-                        else if (t.rfind("ram_mb_configured:", 0) == 0)
-                        {
-                            std::istringstream ls(t.substr(strlen("ram_mb_configured:")));
-                            ls >> ram_mb;
-                        }
-                    }
-
-                    // Print parsed summary if we found something recognizable, else print raw
-                    if (!name.empty() || dim >= 0 || num_vectors >= 0 || disk_bytes > 0)
-                    {
-                        std::cout << "Membrance info:\n";
-                        if (!name.empty())
-                            std::cout << "  name: " << name << "\n";
-                        if (dim >= 0)
-                            std::cout << "  dim: " << dim << "\n";
-                        if (num_vectors >= 0)
-                            std::cout << "  num_vectors: " << num_vectors << "\n";
-                        else
-                            std::cout << "  num_vectors: unknown\n";
-                        std::cout << "  disk_bytes: " << disk_bytes << " (" << std::fixed << std::setprecision(3) << disk_gb << " GB)\n";
-                        if (ram_mb >= 0)
-                            std::cout << "  ram_mb_configured: " << ram_mb << "\n";
-                        // also keep raw for debugging
-                        std::cout << "(raw):\n"
-                                  << raw;
-                    }
-                    else
-                    {
-                        // fallback: print raw server response
-                        std::cout << raw;
-                    }
-                }
-                catch (const std::exception &e)
-                {
-                    std::cerr << "Error sending GET MEMBRANCE INFO: " << e.what() << "\n";
+                    sock_->recv_binary_iterate();
+                } catch (const std::exception &e) {
+                    std::cerr << ANSI_RED << "Error: " << e.what() << ANSI_RESET << "\n";
                 }
                 continue;
             }
 
-            // Get: GET <membr> LABEL <label>;
-            if (up.rfind("GET ", 0) == 0 && up.back() == ';')
-            {
+            // Default Text Command Handler
+            try {
+                // Prepend current membrance for shortcuts
+                if (!current_membr_.empty()) {
+                    if (up.rfind("INSERT VALUES", 0) == 0) cmd = "INSERT INTO " + current_membr_ + " " + cmd.substr(6);
+                    else if (up.rfind("SEARCH QUERY", 0) == 0) cmd = "SEARCH " + current_membr_ + " " + cmd.substr(6);
+                    else if (up.rfind("GET LABEL", 0) == 0) cmd = "GET " + current_membr_ + " " + cmd.substr(3);
+                }
+
                 sock_->sendln(cmd);
                 std::cout << sock_->recv_multiline();
-                continue;
+            } catch (const std::exception &e) {
+                std::cerr << ANSI_RED << "Network Error: " << e.what() << ANSI_RESET << "\n";
+                break; // Exit on network fail
             }
-
-            // --- SHORT SYNTAX SUPPORT (Prepend current_membr_) ---
-
-            // Support: INSERT VALUES (...) [TAGS (...)]
-            if (current_membr_ != "" && up.rfind("INSERT VALUES", 0) == 0 && up.back() == ';')
-            {
-                std::ostringstream oss;
-                // substr(6) removes "INSERT", keeps " VALUES..."
-                // Result: "INSERT INTO <membr> VALUES..."
-                oss << "INSERT INTO " << current_membr_ << " " << cmd.substr(6);
-                sock_->sendln(oss.str());
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-
-            // Support: SEARCH QUERY (...) [WHERE ...]
-            if (current_membr_ != "" && up.rfind("SEARCH QUERY", 0) == 0 && up.back() == ';')
-            {
-                std::ostringstream oss;
-                // substr(6) removes "SEARCH", keeps " QUERY..."
-                // Result: "SEARCH <membr> QUERY..."
-                oss << "SEARCH " << current_membr_ << " " << cmd.substr(6);
-                sock_->sendln(oss.str());
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-
-            if (current_membr_ != "" && up.rfind("GET LABEL", 0) == 0 && up.back() == ';')
-            {
-                std::ostringstream oss;
-                oss << "GET " << current_membr_ << " " << cmd.substr(3);
-                sock_->sendln(oss.str());
-                std::cout << sock_->recv_multiline();
-                continue;
-            }
-
-            // Forward any other command as raw text
-            sock_->sendln(cmd);
-            std::cout << sock_->recv_multiline();
         }
-        std::cout << "Bye Pomai!\n";
+        std::cout << "Bye!\n";
     }
 
     void print_help()
     {
         std::cout << ANSI_YELLOW << R"(
-Available PomaiSQL commands:
+Commands:
   DDL:
-    - CREATE MEMBRANCE <name> DIM <n> [RAM <mb>];
-    - DROP MEMBRANCE <name>;
-    - SHOW MEMBRANCES;
-    - USE <name>;
+    CREATE MEMBRANCE <name> DIM <n> [RAM <mb>];
+    DROP MEMBRANCE <name>;
+    EXEC SPLIT <name> <train> <val> <test>;  -- Split dataset indices
 
   DML:
-    - INSERT INTO <name> VALUES (<label>, [...]) [TAGS (key:val, ...)];
-    - SEARCH <name> QUERY ([...]) [WHERE key='val'] TOP k;
-    - GET <name> LABEL <label>;
-    - GET MEMBRANCE INFO [<name>];
-    - DELETE <name> LABEL <label>;
-
-  Shortcuts (when USE <name> is active):
-    - INSERT VALUES (...) [TAGS (...)];
-    - SEARCH QUERY ([...]) [WHERE ...] TOP k;
-    - GET LABEL <label>;
-
-  Examples:
-    > CREATE MEMBRANCE products DIM 128 RAM 256;
-    > USE products;
-    > INSERT VALUES (shoe_1, [0.1, 0.2...]) TAGS (type:shoe, color:red);
-    > SEARCH QUERY ([0.1, 0.2...]) WHERE color='red' TOP 5;
-    > GET MEMBRANCE INFO tests;
+    INSERT INTO <name> VALUES (<lbl>,[v...]);
+    SEARCH <name> QUERY ([v...]) TOP k;
+    ITERATE <name> <TRAIN|TEST> <off> <lim>; -- Stream binary data
 
   Misc:
-    - Type \q or EXIT; to quit.
+    USE <name>;
+    GET MEMBRANCE INFO [<name>];
 )" << ANSI_RESET << "\n";
     }
 };
@@ -451,16 +297,10 @@ int main(int argc, char **argv)
 {
     std::string host = DEFAULT_HOST;
     int port = DEFAULT_PORT;
-
-    // Parse args - Pomai style: pomai-cli -h host -p port
-    for (int i = 1; i < argc; ++i)
-    {
-        if (std::string(argv[i]) == "-h" && i + 1 < argc)
-            host = argv[++i];
-        else if (std::string(argv[i]) == "-p" && i + 1 < argc)
-            port = std::stoi(argv[++i]);
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "-h" && i + 1 < argc) host = argv[++i];
+        if (std::string(argv[i]) == "-p" && i + 1 < argc) port = std::stoi(argv[++i]);
     }
-
     PomaiCLI cli(host, port);
     cli.run();
     return 0;

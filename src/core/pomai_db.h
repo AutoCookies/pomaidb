@@ -1,8 +1,4 @@
 #pragma once
-/*
- * src/core/pomai_db.h
- * ... (Copyright/Intro)
- */
 
 #include <unordered_map>
 #include <memory>
@@ -20,6 +16,7 @@
 #include "src/core/metadata_index.h"
 #include "src/core/hot_tier.h"
 #include "src/core/config.h"
+#include "src/core/split_manager.h"
 
 namespace pomai::core
 {
@@ -37,15 +34,21 @@ namespace pomai::core
         size_t dim;
         size_t ram_mb;
         std::string data_path;
+        
         std::unique_ptr<pomai::memory::ShardArena> arena;
         std::unique_ptr<pomai::ai::orbit::PomaiOrbit> orbit;
         std::unique_ptr<HotTier> hot_tier;
-        std::unique_ptr<MetadataIndex> meta_index;
+        
+        // [FIXED] Changed to shared_ptr to allow sharing with Orbit
+        std::shared_ptr<MetadataIndex> meta_index;
+        
+        std::unique_ptr<SplitManager> split_mgr;
 
         // Constructor takes Global Config
-        Membrance(const std::string &name, const MembranceConfig &cfg,
-                  const std::string &data_root, const pomai::config::PomaiConfig &global_cfg);
+        Membrance(const std::string& nm, const MembranceConfig& cfg, 
+                  const std::string& data_root, const pomai::config::PomaiConfig& global_cfg);
 
+        // Disable copy
         Membrance(const Membrance &) = delete;
         Membrance &operator=(const Membrance &) = delete;
     };
@@ -81,13 +84,11 @@ namespace pomai::core
 
         std::unordered_map<std::string, std::unique_ptr<Membrance>> membrances_;
         mutable std::shared_mutex mu_;
-
-        pomai::config::PomaiConfig config_;
-
-        // [FIXED] Added missing WAL manager
+        
+        const pomai::config::PomaiConfig& config_;
         pomai::memory::WalManager wal_;
 
-        std::atomic<bool> bg_running_;
         std::thread bg_thread_;
+        std::atomic<bool> bg_running_;
     };
 }

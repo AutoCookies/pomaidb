@@ -56,6 +56,7 @@
 #include "src/core/metadata_index.h" // for Tag
 #include "src/ai/whispergrain.h"
 #include "src/core/config.h"
+#include "src/core/metrics.h"
 
 class PomaiServer
 {
@@ -228,6 +229,17 @@ private:
         return h;
     }
 
+    static inline uint64_t hash_label(const std::string &s)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        for (char c : s)
+        {
+            h ^= static_cast<uint64_t>(c);
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+
     static inline uint64_t hash_key(const std::string &k) { return fnv1a_hash(k.data(), k.size()); }
 
     static inline void append_end_marker(std::string &s)
@@ -364,7 +376,7 @@ private:
             return;
         }
 
-        const std::chrono::milliseconds sample_interval(200);
+        const std::chrono::milliseconds sample_interval(config_.server.cpu_sample_interval_ms);
         while (cpu_sampler_running_.load())
         {
             std::this_thread::sleep_for(sample_interval);
@@ -454,6 +466,233 @@ private:
                 return std::string("OK: switched to membrance ") + name + "\n";
             }
             return "ERR: USE <name>;\n";
+        }
+
+        if (up.rfind("EXEC SPLIT", 0) == 0)
+        {
+            auto parts = split_ws(cmd);
+            if (parts.size() < 6)
+                return "ERR: Usage: EXEC SPLIT <name> <train> <val> <test>\n";
+
+            std::string name = parts[2];
+            float train = 0.0f, val = 0.0f, test = 0.0f;
+
+            try
+            {
+                train = std::stof(parts[3]);
+                val = std::stof(parts[4]);
+                test = std::stof(parts[5]);
+            }
+            catch (...)
+            {
+                return "ERR: Invalid ratio format (must be float)\n";
+            }
+
+            // Validate tổng <= 1.0 (cho phép sai số nhỏ do float)
+            if (train + val + test > 1.001f)
+                return "ERR: Ratios sum must be <= 1.0\n";
+
+            auto *m = pomai_db_->get_membrance(name);
+            if (!m)
+                return "ERR: Membrance not found\n";
+
+            if (!m->split_mgr)
+                return "ERR: SplitManager not initialized for this membrance\n";
+
+            // Lấy tổng số vector hiện có để chia
+            size_t total_vectors = 0;
+            try
+            {
+                // Orbit là nơi giữ thông tin chính xác nhất về số lượng vector đã insert
+                auto info = m->orbit->get_info();
+                total_vectors = info.num_vectors;
+            }
+            catch (...)
+            {
+                return "ERR: Could not retrieve vector count from engine\n";
+            }
+
+            if (total_vectors == 0)
+                return "ERR: Membrance is empty, nothing to split\n";
+
+            // Thực hiện chia
+            std::clog << "[Server] Splitting " << name << " (" << total_vectors << " vecs) "
+                      << " T:" << train << " V:" << val << " T:" << test << "\n";
+
+            m->split_mgr->execute_random_split(total_vectors, train, val, test);
+
+            // Lưu ngay xuống đĩa
+            if (m->split_mgr->save(m->data_path))
+            {
+                std::ostringstream ss;
+                ss << "OK: Split " << total_vectors << " vectors into "
+                   << m->split_mgr->train_indices.size() << " train, "
+                   << m->split_mgr->val_indices.size() << " val, "
+                   << m->split_mgr->test_indices.size() << " test\n";
+                return ss.str();
+            }
+            else
+            {
+                return "ERR: Failed to save split file to disk\n";
+            }
+        }
+
+        if (up.rfind("EXEC SPLIT", 0) == 0)
+        {
+            auto parts = split_ws(cmd);
+            if (parts.size() < 6) return "ERR: Usage: EXEC SPLIT <name> <tr%> <val%> <te%> [STRATIFIED <key>]\n";
+
+            std::string name = parts[2];
+            float tr = 0, val = 0, te = 0;
+            try {
+                tr = std::stof(parts[3]);
+                val = std::stof(parts[4]);
+                te = std::stof(parts[5]);
+            } catch(...) { return "ERR: Invalid split percentages\n"; }
+
+            if (tr + val + te > 1.001f)
+                return "ERR: Ratios sum must be <= 1.0\n";
+
+            auto *m = pomai_db_->get_membrance(name);
+            if (!m) return "ERR: Membrance not found\n";
+            if (!m->split_mgr) return "ERR: Split manager not initialized\n";
+
+            // [NEW] Check for Stratified Strategy
+            std::string strategy = "RANDOM";
+            std::string strat_key = "";
+            if (parts.size() >= 8 && to_upper(parts[6]) == "STRATIFIED") {
+                strategy = "STRATIFIED";
+                strat_key = parts[7];
+            }
+
+            // Check Empty (fallback to 0 if info fails)
+            size_t total_vectors = 0;
+            try {
+                total_vectors = m->orbit->get_info().num_vectors;
+            } catch (...) {}
+
+            // Strategy Dispatch
+            if (strategy == "STRATIFIED") {
+                if (!m->meta_index) return "ERR: Metadata Index not enabled for this membrance\n";
+                
+                // 1. Get Groups from Metadata
+                auto groups = m->meta_index->get_groups(strat_key);
+                if (groups.empty()) return "ERR: No metadata found for key '" + strat_key + "'\n";
+
+                // 2. Flatten for SplitManager
+                std::vector<uint64_t> items;
+                std::vector<uint64_t> labels;
+                size_t total_items = 0;
+                
+                for(const auto& kv : groups) {
+                    // Hash the tag value to use as a numeric label for stratification
+                    uint64_t label_hash = hash_label(kv.first);
+                    for(uint64_t id : kv.second) {
+                        items.push_back(id);
+                        labels.push_back(label_hash);
+                    }
+                    total_items += kv.second.size();
+                }
+
+                // 3. Execute
+                m->split_mgr->execute_stratified_split(items, labels, tr, val, te);
+                total_vectors = total_items; // Update total for reporting
+            } 
+            else {
+                // DEFAULT: Random Split
+                if (total_vectors == 0) return "ERR: Membrance is empty (0 vectors)\n";
+                
+                // Note: execute_random_split assumes indices [0..N]. 
+                // If IDs are hashes, this creates virtual indices. 
+                // For exact ID handling in Random mode, future upgrade to execute_split_with_items is needed.
+                m->split_mgr->execute_random_split(total_vectors, tr, val, te);
+            }
+
+            // Save to disk
+            if (m->split_mgr->save(m->data_path)) {
+                std::stringstream ss;
+                ss << "OK: Split " << total_vectors << " vectors into "
+                   << m->split_mgr->train_indices.size() << " train, "
+                   << m->split_mgr->val_indices.size() << " val, "
+                   << m->split_mgr->test_indices.size() << " test";
+                return ss.str() + "\n";
+            } else {
+                return "ERR: Failed to save split file to disk\n";
+            }
+        }
+
+        // ---------------------------------------------------------
+        // 2. NEW: ITERATE COMMAND (Binary Stream)
+        // Syntax: ITERATE <name> <TRAIN|VAL|TEST> <offset> <limit>
+        // ---------------------------------------------------------
+        if (up.rfind("ITERATE", 0) == 0)
+        {
+            auto parts = split_ws(cmd);
+            if (parts.size() < 5)
+                return "ERR: Usage: ITERATE <name> <split> <off> <lim>\n";
+
+            std::string name = parts[1];
+            std::string type = to_upper(parts[2]);
+            size_t off = 0, lim = 0;
+            try
+            {
+                off = std::stoul(parts[3]);
+                lim = std::stoul(parts[4]);
+            }
+            catch (...)
+            {
+            }
+
+            auto *m = pomai_db_->get_membrance(name);
+            if (!m || !m->split_mgr)
+                return "ERR: Invalid membrance or no split\n";
+
+            const std::vector<uint64_t> *indices = nullptr;
+            if (type == "TRAIN")
+                indices = &m->split_mgr->train_indices;
+            else if (type == "VAL")
+                indices = &m->split_mgr->val_indices;
+            else if (type == "TEST")
+                indices = &m->split_mgr->test_indices;
+            else
+                return "ERR: Invalid split type\n";
+
+            if (off >= indices->size())
+                return "ERR: Offset out of range\n";
+            size_t end = std::min(off + lim, indices->size());
+            size_t count = end - off;
+
+            // Protocol: OK BINARY <count> <dim> <bytes>\n[RAW BYTES]
+            size_t dim = m->dim;
+            size_t bytes_per_vec = dim * sizeof(float);
+            size_t total_bytes = count * bytes_per_vec;
+
+            std::string header = "OK BINARY " + std::to_string(count) + " " +
+                                 std::to_string(dim) + " " + std::to_string(total_bytes) + "\n";
+
+            std::string response;
+            response.reserve(header.size() + total_bytes + 16);
+            response += header;
+
+            // Bulk Copy Data
+            for (size_t i = 0; i < count; ++i)
+            {
+                uint64_t offset = (*indices)[off + i];
+                const char *ptr = m->arena->blob_ptr_from_offset_for_map(offset);
+
+                if (ptr)
+                {
+                    // Skip 4 bytes length header, copy float array
+                    response.append(ptr + sizeof(uint32_t), bytes_per_vec);
+                }
+                else
+                {
+                    // Padding nếu lỗi (Zero vector)
+                    response.append(bytes_per_vec, 0);
+                }
+            }
+            // Không thêm \n hay <END> ở cuối phần binary để giữ tốc độ và sự đơn giản
+            return response;
         }
 
         // CREATE MEMBRANCE <name> DIM <n> [RAM <mb>];
@@ -1077,7 +1316,7 @@ private:
         if (bind(listen_fd_, (struct sockaddr *)&addr, sizeof(addr)) < 0)
             throw std::runtime_error("bind failed");
 
-        if (listen(listen_fd_, 1024) < 0)
+        if (listen(listen_fd_, config_.server.backlog) < 0)
             throw std::runtime_error("listen failed");
 
         set_nonblocking(listen_fd_);
@@ -1104,11 +1343,11 @@ private:
 
     void loop()
     {
-        std::vector<struct epoll_event> events(1024);
+        std::vector<struct epoll_event> events(config_.server.max_events);
 
         while (running_)
         {
-            int n = epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), 100);
+            int n = epoll_wait(epoll_fd_, events.data(), static_cast<int>(events.size()), config_.server.epoll_timeout_ms);
             if (n < 0)
             {
                 if (errno == EINTR)
@@ -1140,7 +1379,7 @@ private:
                 {
                     if (events[i].events & EPOLLIN)
                     {
-                        char buf[4096];
+                        char buf[pomai::config::SERVER_READ_BUFFER];
                         ssize_t rb = read(fd, buf, sizeof(buf));
                         if (rb > 0)
                         {

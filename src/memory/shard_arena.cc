@@ -37,12 +37,13 @@ namespace pomai::memory
         return (v >> 63) != 0;
     }
 
-    ShardArena::ShardArena(uint32_t shard_id, size_t capacity_bytes, const std::string &remote_dir)
+    ShardArena::ShardArena(uint32_t shard_id, size_t capacity_bytes, const pomai::config::PomaiConfig& cfg)
         : id_(shard_id),
           capacity_(capacity_bytes),
           base_addr_(nullptr),
           write_head_(0),
-          remote_dir_(remote_dir.empty() ? std::string("/tmp/pomai_shard_") + std::to_string(shard_id) : remote_dir),
+          remote_dir_(cfg.arena.remote_dir.empty() ? "/tmp" : cfg.arena.remote_dir),
+          max_remote_mmaps_(cfg.arena.max_remote_mmaps), 
           next_remote_id_(1),
           page_size_(static_cast<size_t>(sysconf(_SC_PAGESIZE)))
     {
@@ -171,15 +172,13 @@ namespace pomai::memory
             // [FIX HIGH] Cap Open Files: Prevent OOM by evicting old maps
             // Giới hạn 100 file mmap đồng thời. Nếu đầy, đóng bớt 1 cái.
             // (Dùng chiến thuật Random Eviction đơn giản: xóa phần tử đầu tiên của map)
-            if (remote_mmaps_.size() >= 100)
+            if (remote_mmaps_.size() >= max_remote_mmaps_)
             {
+                // Eviction logic
                 auto victim = remote_mmaps_.begin();
                 const char *v_addr = victim->second.first;
                 size_t v_sz = victim->second.second;
-                if (v_addr && v_sz > 0)
-                {
-                    munmap(const_cast<char *>(v_addr), v_sz);
-                }
+                if (v_addr && v_sz > 0) munmap(const_cast<char *>(v_addr), v_sz);
                 remote_mmaps_.erase(victim);
             }
 
