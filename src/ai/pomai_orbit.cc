@@ -1639,4 +1639,40 @@ namespace pomai::ai::orbit
         return search_filtered_with_budget(query, k, candidates, unlimited);
     }
 
+    std::vector<uint64_t> PomaiOrbit::get_centroid_ids(uint32_t cid) const
+    {
+        if (cid >= centroids_.size()) return {};
+
+        std::vector<uint64_t> ids;
+        const OrbitNode &node = *centroids_[cid];
+        
+        // Duyệt Linked List các Bucket của Centroid này
+        uint64_t curr = node.bucket_offset.load(std::memory_order_acquire);
+        std::vector<char> temp_buf; // Buffer tạm cho bucket remote (nếu có)
+
+        while (curr != 0)
+        {
+            auto base_opt = resolve_bucket_base(arena_, curr, temp_buf);
+            if (!base_opt) break;
+
+            const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(*base_opt);
+            uint32_t count = hdr->count.load(std::memory_order_acquire);
+
+            if (count > 0)
+            {
+                // Con trỏ tới vùng chứa IDs
+                const uint64_t *id_ptr = reinterpret_cast<const uint64_t *>(
+                    *base_opt + sizeof(BucketHeader) + hdr->off_ids
+                );
+                
+                // Copy ID ra ngoài
+                ids.insert(ids.end(), id_ptr, id_ptr + count);
+            }
+
+            // Move to next bucket
+            curr = hdr->next_bucket_offset.load(std::memory_order_acquire);
+        }
+        return ids;
+    }
+
 } // namespace pomai::ai::orbit

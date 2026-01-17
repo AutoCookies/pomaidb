@@ -337,6 +337,15 @@ private:
         return out;
     }
 
+    // Helper: format bytes -> GB string with 2 decimals
+    static std::string bytes_human(uint64_t bytes)
+    {
+        std::ostringstream ss;
+        double gb = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+        ss << bytes << " (" << std::fixed << std::setprecision(2) << gb << " GB)";
+        return ss.str();
+    }
+
     // ---------- /proc/stat CPU sampling helpers ----------
     // Read first line of /proc/stat and parse cpu times
     static bool read_proc_stat(uint64_t &idle, uint64_t &total)
@@ -540,83 +549,226 @@ private:
         if (up.rfind("EXEC SPLIT", 0) == 0)
         {
             auto parts = split_ws(cmd);
-            if (parts.size() < 6) return "ERR: Usage: EXEC SPLIT <name> <tr%> <val%> <te%> [STRATIFIED <key>]\n";
+            if (parts.size() < 6)
+                return "ERR: Usage: EXEC SPLIT <name> <tr%> <val%> <te%> [STRATIFIED <key> | CLUSTER]\n";
 
             std::string name = parts[2];
             float tr = 0, val = 0, te = 0;
-            try {
+            try
+            {
                 tr = std::stof(parts[3]);
                 val = std::stof(parts[4]);
                 te = std::stof(parts[5]);
-            } catch(...) { return "ERR: Invalid split percentages\n"; }
+            }
+            catch (...)
+            {
+                return "ERR: Invalid split percentages\n";
+            }
 
             if (tr + val + te > 1.001f)
                 return "ERR: Ratios sum must be <= 1.0\n";
 
             auto *m = pomai_db_->get_membrance(name);
-            if (!m) return "ERR: Membrance not found\n";
-            if (!m->split_mgr) return "ERR: Split manager not initialized\n";
+            if (!m)
+                return "ERR: Membrance not found\n";
+            if (!m->split_mgr)
+                return "ERR: Split manager not initialized\n";
 
-            // [NEW] Check for Stratified Strategy
+            // --- Detect Strategy ---
             std::string strategy = "RANDOM";
             std::string strat_key = "";
-            if (parts.size() >= 8 && to_upper(parts[6]) == "STRATIFIED") {
-                strategy = "STRATIFIED";
-                strat_key = parts[7];
+
+            if (parts.size() >= 7)
+            {
+                std::string type = to_upper(parts[6]);
+                if (type == "STRATIFIED")
+                {
+                    strategy = "STRATIFIED";
+                    if (parts.size() >= 8)
+                        strat_key = parts[7];
+                    else
+                        return "ERR: STRATIFIED requires a key (e.g. STRATIFIED class)\n";
+                }
+                else if (type == "CLUSTER")
+                {
+                    strategy = "CLUSTER";
+                }
             }
 
             // Check Empty (fallback to 0 if info fails)
             size_t total_vectors = 0;
-            try {
+            try
+            {
                 total_vectors = m->orbit->get_info().num_vectors;
-            } catch (...) {}
+            }
+            catch (...)
+            {
+            }
 
-            // Strategy Dispatch
-            if (strategy == "STRATIFIED") {
-                if (!m->meta_index) return "ERR: Metadata Index not enabled for this membrance\n";
-                
-                // 1. Get Groups from Metadata
+            // --- Strategy Dispatch ---
+
+            // 1. STRATIFIED SPLIT (Chia đều theo nhãn)
+            if (strategy == "STRATIFIED")
+            {
+                if (!m->meta_index)
+                    return "ERR: Metadata Index not enabled for this membrance\n";
+
                 auto groups = m->meta_index->get_groups(strat_key);
-                if (groups.empty()) return "ERR: No metadata found for key '" + strat_key + "'\n";
+                if (groups.empty())
+                    return "ERR: No metadata found for key '" + strat_key + "'\n";
 
-                // 2. Flatten for SplitManager
+                // Flatten map -> vector for manager
                 std::vector<uint64_t> items;
                 std::vector<uint64_t> labels;
-                size_t total_items = 0;
-                
-                for(const auto& kv : groups) {
-                    // Hash the tag value to use as a numeric label for stratification
+                for (const auto &kv : groups)
+                {
                     uint64_t label_hash = hash_label(kv.first);
-                    for(uint64_t id : kv.second) {
+                    for (uint64_t id : kv.second)
+                    {
                         items.push_back(id);
                         labels.push_back(label_hash);
                     }
-                    total_items += kv.second.size();
                 }
 
-                // 3. Execute
                 m->split_mgr->execute_stratified_split(items, labels, tr, val, te);
-                total_vectors = total_items; // Update total for reporting
-            } 
-            else {
-                // DEFAULT: Random Split
-                if (total_vectors == 0) return "ERR: Membrance is empty (0 vectors)\n";
-                
-                // Note: execute_random_split assumes indices [0..N]. 
-                // If IDs are hashes, this creates virtual indices. 
-                // For exact ID handling in Random mode, future upgrade to execute_split_with_items is needed.
+                total_vectors = items.size();
+            }
+            // 2. CLUSTER SPLIT (Chia theo cụm không gian)
+            else if (strategy == "CLUSTER")
+            {
+                if (!m->orbit)
+                    return "ERR: Orbit engine required for Cluster split\n";
+
+                size_t num_c = m->orbit->num_centroids();
+                if (num_c == 0)
+                    return "ERR: No centroids found (Train model first)\n";
+
+                // Danh sách ID của các cụm [0...N-1]
+                std::vector<uint32_t> cids(num_c);
+                std::iota(cids.begin(), cids.end(), 0);
+
+                // Trộn ngẫu nhiên thứ tự các cụm
+                std::mt19937 g(std::random_device{}());
+                std::shuffle(cids.begin(), cids.end(), g);
+
+                // Tính điểm cắt trên danh sách cụm
+                size_t n_train_c = static_cast<size_t>(num_c * tr);
+                size_t n_val_c = static_cast<size_t>(num_c * val);
+
+                std::vector<uint64_t> train_items, val_items, test_items;
+                size_t idx = 0;
+
+                // Gom ID từ từng cụm vào các tập
+                for (; idx < n_train_c; ++idx)
+                {
+                    auto vec_ids = m->orbit->get_centroid_ids(cids[idx]);
+                    train_items.insert(train_items.end(), vec_ids.begin(), vec_ids.end());
+                }
+                for (; idx < n_train_c + n_val_c; ++idx)
+                {
+                    auto vec_ids = m->orbit->get_centroid_ids(cids[idx]);
+                    val_items.insert(val_items.end(), vec_ids.begin(), vec_ids.end());
+                }
+                for (; idx < num_c; ++idx)
+                {
+                    auto vec_ids = m->orbit->get_centroid_ids(cids[idx]);
+                    test_items.insert(test_items.end(), vec_ids.begin(), vec_ids.end());
+                }
+
+                // Gán trực tiếp vào SplitManager
+                m->split_mgr->reset();
+                m->split_mgr->train_indices = std::move(train_items);
+                m->split_mgr->val_indices = std::move(val_items);
+                m->split_mgr->test_indices = std::move(test_items);
+
+                total_vectors = m->split_mgr->train_indices.size() +
+                                m->split_mgr->val_indices.size() +
+                                m->split_mgr->test_indices.size();
+            } else if (strategy == "TEMPORAL")
+            {
+                if (!m->meta_index)
+                    return "ERR: Metadata Index not enabled\n";
+                if (strat_key.empty())
+                    return "ERR: TEMPORAL requires a key (e.g. TEMPORAL date)\n";
+
+                // std::map tự động sắp xếp theo Key (thời gian) tăng dần
+                auto groups = m->meta_index->get_groups(strat_key);
+                if (groups.empty())
+                    return "ERR: No metadata found for key\n";
+
+                // 1. Flatten dữ liệu theo đúng thứ tự thời gian
+                std::vector<uint64_t> all_ordered_items;
+                for (const auto &kv : groups)
+                {
+                    // kv.first là mốc thời gian (đã sort)
+                    // kv.second là danh sách ID trong mốc đó
+                    all_ordered_items.insert(all_ordered_items.end(), kv.second.begin(), kv.second.end());
+                }
+
+                if (all_ordered_items.empty())
+                    return "ERR: No items found\n";
+
+                // 2. Cắt tuyến tính (Linear Cut)
+                size_t n = all_ordered_items.size();
+                size_t n_train = static_cast<size_t>(n * tr);
+                size_t n_val = static_cast<size_t>(n * val);
+
+                std::vector<uint64_t> train_items, val_items, test_items;
+
+                auto it = all_ordered_items.begin();
+
+                // Train: Lấy đoạn đầu (Quá khứ)
+                if (n_train > 0)
+                {
+                    train_items.assign(it, it + n_train);
+                    it += n_train;
+                }
+
+                // Val: Lấy đoạn giữa
+                if (n_val > 0)
+                {
+                    val_items.assign(it, it + n_val);
+                    it += n_val;
+                }
+
+                // Test: Lấy đoạn cuối (Tương lai)
+                if (it != all_ordered_items.end())
+                {
+                    test_items.assign(it, all_ordered_items.end());
+                }
+
+                // 3. Gán vào SplitManager
+                m->split_mgr->reset();
+                m->split_mgr->train_indices = std::move(train_items);
+                m->split_mgr->val_indices = std::move(val_items);
+                m->split_mgr->test_indices = std::move(test_items);
+
+                total_vectors = n;
+            }
+            // 3. RANDOM SPLIT (Mặc định)
+            else
+            {
+                if (total_vectors == 0)
+                    return "ERR: Membrance is empty (0 vectors)\n";
+
+                // Lưu ý: Random split mặc định dùng chỉ số ảo 0..N.
+                // Nếu muốn chính xác ID, cần dùng item-based split nhưng chậm hơn.
+                // Hiện tại giữ nguyên random index-based cho tốc độ.
                 m->split_mgr->execute_random_split(total_vectors, tr, val, te);
             }
 
-            // Save to disk
-            if (m->split_mgr->save(m->data_path)) {
+            // Save result to disk
+            if (m->split_mgr->save(m->data_path))
+            {
                 std::stringstream ss;
                 ss << "OK: Split " << total_vectors << " vectors into "
                    << m->split_mgr->train_indices.size() << " train, "
                    << m->split_mgr->val_indices.size() << " val, "
                    << m->split_mgr->test_indices.size() << " test";
                 return ss.str() + "\n";
-            } else {
+            }
+            else
+            {
                 return "ERR: Failed to save split file to disk\n";
             }
         }
@@ -761,122 +913,79 @@ private:
             std::string name;
             bool ok_parse = false;
 
-            // --- ĐOẠN SỬA: Đưa check có tên (size >= 4) lên trước ---
-
-            // 1. Dạng: GET MEMBRANCE INFO <name>
-            if (parts.size() >= 4 && to_upper(parts[2]) == "INFO")
-            {
-                name = parts[3];
-                ok_parse = true;
-            }
-            // 2. Dạng: GET MEMBRANCE <name> INFO
-            else if (parts.size() >= 4 && to_upper(parts[3]) == "INFO")
-            {
-                name = parts[2];
-                ok_parse = true;
-            }
-            // 3. Dạng: GET MEMBRANCE INFO (Lấy context hiện tại) - Check cuối cùng!
-            else if (parts.size() >= 3 && to_upper(parts[2]) == "INFO")
-            {
-                if (c.sql_current_membr.empty())
-                    return "ERR: no current membrance (USE <name>)\n";
-                name = c.sql_current_membr;
-                ok_parse = true;
+            // Parsing logic (giữ nguyên logic ưu tiên của bạn)
+            if (parts.size() >= 4 && to_upper(parts[2]) == "INFO") {
+                name = parts[3]; ok_parse = true;
+            } else if (parts.size() >= 4 && to_upper(parts[3]) == "INFO") {
+                name = parts[2]; ok_parse = true;
+            } else if (parts.size() >= 3 && to_upper(parts[2]) == "INFO") {
+                if (c.sql_current_membr.empty()) return "ERR: no current membrance (USE <name>)\n";
+                name = c.sql_current_membr; ok_parse = true;
             }
 
-            if (!ok_parse)
-                return "ERR: expected 'GET MEMBRANCE INFO [<name>];' or 'GET MEMBRANCE <name> INFO;'\n";
+            if (!ok_parse) return "ERR: expected 'GET MEMBRANCE INFO ...'\n";
 
             auto *m = pomai_db_->get_membrance(name);
-            if (!m)
-                return std::string("ERR: membrance not found: ") + name + "\n";
+            if (!m) return std::string("ERR: membrance not found: ") + name + "\n";
 
-            // Gather info (best-effort)
-            size_t dim = m->dim;
-            size_t ram_mb = m->ram_mb;
-            uint64_t disk_bytes = 0;
-            uint64_t num_vectors = 0;
-
-            // 1) Disk footprint: walk membrance data directory
-            try
-            {
-                std::filesystem::path dp(m->data_path);
-                if (std::filesystem::exists(dp))
-                {
-                    for (auto const &entry : std::filesystem::recursive_directory_iterator(dp))
-                    {
-                        if (!entry.is_regular_file())
-                            continue;
-                        std::error_code ec;
-                        uint64_t sz = static_cast<uint64_t>(entry.file_size(ec));
-                        if (!ec)
-                            disk_bytes += sz;
-                    }
-                }
-            }
-            catch (...)
-            {
-                // ignore errors, keep disk_bytes as best-effort
+            // 1. Gather Storage Info (Physical)
+            pomai::ai::orbit::MembranceInfo info;
+            try {
+                info = m->orbit->get_info();
+            } catch (...) {
+                // fallback: use available membrance fields
+                info.dim = m->dim;
+                info.num_vectors = 0;
+                info.disk_bytes = 0;
             }
 
-            // 2) Try to obtain count of vectors:
-            // Preferred path: PomaiOrbit may provide get_info() returning MembranceInfo (if declared).
-            // Otherwise fall back to heuristic: count entries in label shard maps (pomai_db tracks label shards inside orbit)
-            try
-            {
-                auto info = m->orbit->get_info();
-                std::ostringstream ss;
-                ss << "MEMBRANCE: " << name << "\n";
-                ss << "  dim: " << info.dim << "\n";
-                ss << "  num_vectors: " << info.num_vectors << "\n";
-                ss << "  disk_bytes: " << info.disk_bytes << " (" << (info.disk_bytes / (1024.0 * 1024.0 * 1024.0)) << " GB)\n";
-                ss << "  ram_mb_configured: " << ram_mb << "\n";
-                return ss.str();
-            }
-            catch (...)
-            {
-                // fallback to schema file heuristic
-            }
-
-            try
-            {
-                std::filesystem::path schemaf = std::filesystem::path(m->data_path) / "pomai_schema.bin";
-                if (std::filesystem::exists(schemaf))
-                {
-                    std::ifstream ifs(schemaf, std::ios::binary);
-                    if (ifs.good())
-                    {
-                        struct SchemaHeaderLocal
-                        {
-                            uint32_t magic_number;
-                            uint32_t version;
-                            uint64_t dim;
-                            uint64_t num_centroids;
-                            uint64_t total_vectors;
-                        };
-                        SchemaHeaderLocal sh{};
-                        ifs.read(reinterpret_cast<char *>(&sh), sizeof(sh));
-                        if (ifs && sh.magic_number == 0x504F4D41)
-                        {
-                            num_vectors = static_cast<uint64_t>(sh.total_vectors);
+            // Disk calc fallback (if orbit returned 0)
+            if (info.disk_bytes == 0) {
+                try {
+                    std::filesystem::path dp(m->data_path);
+                    if (std::filesystem::exists(dp)) {
+                        for (auto const &entry : std::filesystem::recursive_directory_iterator(dp)) {
+                            if (!entry.is_regular_file()) continue;
+                            std::error_code ec;
+                            uint64_t fsz = static_cast<uint64_t>(entry.file_size(ec));
+                            if (!ec) info.disk_bytes += fsz;
                         }
                     }
-                }
-            }
-            catch (...)
-            {
-                // ignore
+                } catch (...) {}
             }
 
+            // 2. Gather AI Contract Info (Logical Split) -> ĐÂY LÀ PHẦN MỚI
+            size_t n_train = 0, n_val = 0, n_test = 0;
+            if (m->split_mgr) {
+                n_train = m->split_mgr->train_indices.size();
+                n_val = m->split_mgr->val_indices.size();
+                n_test = m->split_mgr->test_indices.size();
+            }
+
+            // Determine feature dim (prefer explicit membrance dim)
+            size_t feature_dim = (m->dim > 0) ? m->dim : info.dim;
+
+            // Determine total vectors: prefer Orbit info, fallback to splits sum
+            size_t total_vectors = info.num_vectors;
+            if (total_vectors == 0) {
+                total_vectors = n_train + n_val + n_test;
+            }
+
+            // 3. Construct Unified Report (match your requested format)
             std::ostringstream ss;
             ss << "MEMBRANCE: " << name << "\n";
-            ss << "  dim: " << dim << "\n";
-            if (num_vectors != 0)
-                ss << "  num_vectors (approx): " << num_vectors << "\n";
-            else
-                ss << "  num_vectors: unknown\n";
-            ss << "  disk_bytes: " << disk_bytes << " (" << (disk_bytes / (1024.0 * 1024.0 * 1024.0)) << " GB)\n";
-            ss << "  ram_mb_configured: " << ram_mb << "\n";
+            ss << "--- AI Contract ---\n";
+            ss << " feature_dim: " << feature_dim << "\n";
+            ss << " metric: L2\n";
+            ss << " data_type: float32\n";
+            ss << " total_vectors: " << total_vectors << "\n";
+            ss << " split_train: " << n_train << "\n";
+            ss << " split_val: " << n_val << "\n";
+            ss << " split_test: " << n_test << "\n";
+            ss << "--- Storage Stats ---\n";
+            ss << " disk_bytes: " << bytes_human(info.disk_bytes) << "\n";
+            ss << " ram_mb_configured: " << m->ram_mb << "\n";
+
             return ss.str();
         }
 

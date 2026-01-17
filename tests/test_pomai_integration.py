@@ -7,7 +7,7 @@ End-to-end integration test for Pomai server (text SQL-like protocol).
 This version includes:
 - Batch Insert with TAGS support
 - GET MEMBRANCE INFO query
-- [NEW] EXEC SPLIT test (Random & Stratified)
+- [NEW] EXEC SPLIT test (Random, Stratified, & Cluster)
 - [NEW] ITERATE Binary Stream test
 - [FIXED] Robust Protocol Handling (Binary Footer Sync) & Hash Verification
 """
@@ -361,7 +361,7 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
         print(client.send_and_get_response(random_split_cmd))
 
         # ---------------------------------------------------------
-        # TEST 2: STRATIFIED SPLIT (New)
+        # TEST 2: STRATIFIED SPLIT (By Label)
         # ---------------------------------------------------------
         print("-" * 50)
         print("[TEST 2] Executing STRATIFIED Split by 'class' (50/25/25)...")
@@ -378,6 +378,43 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
             nums = re.findall(r'(\d+)', resp)
             if len(nums) >= 4:
                 print(f"  -> Total: {nums[0]} | Train: {nums[1]} | Val: {nums[2]} | Test: {nums[3]}")
+
+        # ---------------------------------------------------------
+        # [NEW] TEST 3: CLUSTER SPLIT (Spatial)
+        # ---------------------------------------------------------
+        print("-" * 50)
+        print("[TEST 3] Executing CLUSTER Split (50/50)...")
+        # Syntax: EXEC SPLIT <name> <tr%> <val%> <te%> CLUSTER
+        cluster_cmd = "EXEC SPLIT tests 0.5 0.0 0.5 CLUSTER;"
+        resp = client.send_and_get_response(cluster_cmd)
+        print(f"Cluster Split Response: {resp.strip()}")
+        
+        if "ERR" in resp:
+            print("[FAILED] Cluster split failed (likely due to insufficient centroids with small data).")
+        else:
+            print("[SUCCESS] Cluster split executed.")
+            nums = re.findall(r'(\d+)', resp)
+            if len(nums) >= 4:
+                print(f"  -> Total: {nums[0]} | Train: {nums[1]} | Val: {nums[2]} | Test: {nums[3]}")
+
+        # ---------------------------------------------------------
+        # [NEW] TEST 4: TEMPORAL SPLIT (By Date)
+        print("-" * 50)
+        print("[TEST 4] Executing TEMPORAL Split by 'date' (50/0/50)...")
+        # Syntax: EXEC SPLIT <name> <tr%> <val%> <te%> TEMPORAL <key>
+        # Should put Jan data (past) into Train, Feb data (future) into Test
+        temporal_cmd = "EXEC SPLIT tests 0.5 0.0 0.5 TEMPORAL date;"
+        resp = client.send_and_get_response(temporal_cmd)
+        print(f"Temporal Split Response: {resp.strip()}")
+        
+        if "ERR" in resp:
+            print("[FAILED] Temporal split failed.")
+        else:
+            print("[SUCCESS] Temporal split executed.")
+            nums = re.findall(r'(\d+)', resp)
+            if len(nums) >= 4:
+                print(f"  -> Total: {nums[0]} | Train: {nums[1]} | Test: {nums[3]}")
+                # Expect Train ~ 4 (Jan), Test ~ 4 (Feb) for 8 items
 
         # ---------------------------------------------------------
         # [NEW] Step 6.6: Test ITERATE (Binary Streaming)

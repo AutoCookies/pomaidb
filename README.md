@@ -36,8 +36,7 @@ We know that **data lives everywhere**, including the edge, developing markets, 
 PomaiDB is a **high-performance, embedded-ready vector database** written in modern C++20.  
 It is designed for **low-latency similarity search on commodity hardware**, using a custom "Pomegranate" architecture that combines multi-schema support, lock-free indexing, WAL, and SIMD-accelerated quantization—all with **zero external dependencies**.
 
-> **PomaiDB treats the OS as a collaborator, not an enemy:**  
-> It leverages the page cache, mmap, and atomic file semantics, refusing to "fight" Linux.
+> **PomaiDB treats the OS as a collaborator, not an enemy:** > It leverages the page cache, mmap, and atomic file semantics, refusing to "fight" Linux.
 
 ## Who PomaiDB Is For
 
@@ -104,16 +103,14 @@ Custom bump-pointer allocator with...
 - **Zero-Copy Persistence:** “Freezing” a bucket to disk is just a remapping—no serialization ceremony.
 - **Atomic Offsets, Lock-Free Readers:** Massive throughput, even under light contention.
 
-**Design Philosophy:**  
-PomaiDB relies on the OS, trusting page cache and atomic renames, not reinventing "mini-filesystems" inside a user process.
+**Design Philosophy:** PomaiDB relies on the OS, trusting page cache and atomic renames, not reinventing "mini-filesystems" inside a user process.
 
 ---
 
 ### 6. **Write-Ahead Log (WAL) and Crash Recovery**
 Not “just for show.” WAL is implemented with:
 
-- **Simple, CRC32-checksummed logs.**  
-- **Atomic file operations** (rename patterns).
+- **Simple, CRC32-checksummed logs.** - **Atomic file operations** (rename patterns).
 - **Crash resilience:** DB is consistent after power loss (we replay the WAL until successful).
 
 Why?  
@@ -137,6 +134,28 @@ Why?
 
 ---
 
+### 8. **Dataset Engine & Split Strategies (New in V3)**
+PomaiDB is now a full-fledged **AI Data Engine**, capable of understanding your data's semantics to prepare training sets automatically. It supports 4 powerful splitting strategies:
+
+- **Random Split:** Standard shuffle for general purpose data.
+- **Stratified Split:** Balances class distribution (e.g., maintain 80/20 ratio for rare classes).
+- **Cluster Split (Spatial):** Splits data by geometric clusters (e.g., Train on Day/Night, Test on Rain) to test model generalization.
+- **Temporal Split:** Splits data by time (e.g., Train on Jan-Oct, Test on Nov-Dec) to prevent data leakage in time-series tasks.
+
+Why?
+**Because a Vector DB should help you build better models, not just store numbers.**
+
+---
+
+### 9. **AI Contract & Streaming (New in V3)**
+- **AI Contract:** `GET MEMBRANCE INFO` now returns a semantic contract (dimension, metric, split sizes) so ML frameworks (PyTorch/TensorFlow) can auto-configure without manual hard-coding.
+- **Binary Streaming:** The `ITERATE` command pumps training data directly from disk to GPU via a high-performance binary protocol, bypassing slow Python loops.
+
+Why?
+**Because MLOps should be automated and standardized.**
+
+---
+
 ## Performance Benchmarks
 
 Tested on Dell Latitude E5440 (2 Cores, 8GB RAM):
@@ -147,45 +166,41 @@ Tested on Dell Latitude E5440 (2 Cores, 8GB RAM):
 
 > **Note:** These figures are averages under controlled load, with recall and nprobe adaptively traded for latency. See WhisperGrain for details.
 
----
 
 ## Building from Source
 
-**Prerequisites:**  
-- GCC/Clang with C++20
+**Prerequisites:** - GCC/Clang with C++20
 - Linux/macOS (Windows via WSL)
 - CMake ≥ 3.10, Make
 
 ```bash
-# 1. Create and enter build directory
-mkdir build && cd build
-# 2. Configure
-cmake ..
-# 3. Build
-make -j$(nproc)
+chmod +x ./build.sh
+./build.sh
 ```
 
 Binaries:
-- `pomai-server` — main server
-- `pomai-cli` — SQL client
 
+* `pomai_server` — main server
+* `pomai_cli` — SQL client
 ---
 
 ## Running the Server
 
 ```bash
-./pomai-server
+./build/pomai_server
 ```
+
 **Env vars:**
-- `POMAI_DB_DIR` = data root (`./data/pomai_db` default)
-- `POMAI_PORT`   = override listen port (default: 7777)
+
+* `POMAI_DB_DIR` = data root (`./data/pomai_db` default)
+* `POMAI_PORT`   = override listen port (default: 7777)
 
 ---
 
 ## Using the CLI
 
 ```bash
-./pomai-cli -h 127.0.0.1 -p 7777
+./pomai_cli -h 127.0.0.1 -p 7777
 ```
 
 ---
@@ -195,71 +210,116 @@ Binaries:
 Custom, SQL-inspired. Commands end with `;`.
 
 **Create Schema:**
+
 ```sql
 CREATE MEMBRANCE name DIM N RAM MB;
 SHOW MEMBRANCES;
 ```
+
 **Insert/Select Context:**
+
 ```sql
 USE myspace;
 INSERT VALUES (photo_001, [0.12, 0.45, ...]);
+-- Batch Insert with Tags
+INSERT INTO myspace VALUES (p1, [...]), (p2, [...]) TAGS (class:dog, date:2024-01-01);
 SEARCH QUERY ([0.12, 0.45, ...]) TOP 5;
 ```
+
 **Retrieve or Delete:**
+
 ```sql
 GET LABEL photo_001;
 DELETE LABEL photo_001;
 ```
+
+**Dataset Management (New):**
+
+```sql
+-- View AI Contract
+GET MEMBRANCE INFO myspace; 
+
+-- Split Dataset
+EXEC SPLIT myspace 0.8 0.1 0.1;               -- Random
+EXEC SPLIT myspace 0.8 0.1 0.1 STRATIFIED class; -- Balanced by class
+EXEC SPLIT myspace 0.8 0.1 0.1 TEMPORAL date;    -- Time-ordered
+```
+
 **Bulk Ingest:**
+
 ```sql
 LOAD BINARY '/path/vectors.bin' INTO myspace;
 ```
 
----
-
 ## Why Use PomaiDB?
-- Because your data is _not_ always in the cloud.
-- Because not everyone has a 128GB server.
-- Because crash-only design is unacceptable for real users.
-- Because you want a database that fights for you—not the other way around.
+
+* Because your data is *not* always in the cloud.
+* Because not everyone has a 128GB server.
+* Because crash-only design is unacceptable for real users.
+* Because you want a database that fights for you—not the other way around.
 
 ## Benchmarks
 
 We run this benchmarks on Github Codespace, with 4 cores CPU, and 16Gb RAM. By inserting, searching, filtering, delete 512 dimensions vectors.
 
 <p align="center">
-  <img src="assets/baseline_cdf_last.png" alt="PomaiDB Logo" width="600">
-  <br>
+<img src="assets/baseline_cdf_last.png" alt="PomaiDB Logo" width="600">
+
+
+
+
+
 </p>
 
 <p align="center">
-  <img src="assets/latency_percentiles_vs_N.png" alt="PomaiDB Logo" width="600">
-  <br>
+<img src="assets/latency_percentiles_vs_N.png" alt="PomaiDB Logo" width="600">
+
+
+
+
+
 </p>
 
 <p align="center">
-  <img src="assets/recall_vs_latency.png" alt="PomaiDB Logo" width="600">
-  <br>
+<img src="assets/recall_vs_latency.png" alt="PomaiDB Logo" width="600">
+
+
+
+
+
 </p>
 
 <p align="center">
-  <img src="assets/throughput_vs_N.png" alt="PomaiDB Logo" width="600">
-  <br>
+<img src="assets/throughput_vs_N.png" alt="PomaiDB Logo" width="600">
+
+
+
+
+
 </p>
 
 <p align="center">
-  <img src="assets/sys_mem_time.png" alt="PomaiDB Memory through time" width="600">
-  <br>
+<img src="assets/sys_mem_time.png" alt="PomaiDB Memory through time" width="600">
+
+
+
+
+
 </p>
 
 <p align="center">
-  <img src="assets/sys_cpu_time.png" alt="PomaiDB Memory through time" width="600">
-  <br>
+<img src="assets/sys_cpu_time.png" alt="PomaiDB Memory through time" width="600">
+
+
+
+
+
 </p>
 
 ## License
 
-PomaiDB is released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).  
+PomaiDB is released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
 See `LICENSE` for details.
 
 > We deeply encourage both academic and practical use,
@@ -275,20 +335,18 @@ If you use PomaiDB in academic or research projects:
 @misc{pomai,
   author={Quan Van},
   title={PomaiDB: Vector Search for Every Machine},
-  url={https://github.com/AutoCookies/pomai},
+  url={[https://github.com/AutoCookies/pomai](https://github.com/AutoCookies/pomai)},
   year={2026}
 }
+
 ```
 
 ## A Final Word
 
-**PomaiDB is not just code.**  
-It is a manifesto:
+**PomaiDB is not just code.** It is a manifesto:
 
-- That _state-of-the-art_ belongs to everyone.
-- That _robustness_ is possible, even on weak hardware.
-- That a database can be proud of what it doesn’t demand.
+* That *state-of-the-art* belongs to everyone.
+* That *robustness* is possible, even on weak hardware.
+* That a database can be proud of what it doesn’t demand.
 
 Welcome to the new edge of AI.
-
----

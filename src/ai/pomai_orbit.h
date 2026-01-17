@@ -221,6 +221,8 @@ namespace pomai::ai::orbit
         // ------------------ [NEW] Thermal Thermodynamics API ------------------
         // Called by background worker to scan thermal map and evict cold pages (madvise DONTNEED).
         void apply_thermal_policy();
+        std::vector<uint64_t> get_centroid_ids(uint32_t cid) const;
+        size_t num_centroids() const { return centroids_.size(); }
 
     private:
         Config cfg_;
