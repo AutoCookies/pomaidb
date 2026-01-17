@@ -1,8 +1,12 @@
 /*
  * src/core/pomai_db.cc
  *
- * Implementation for PomaiDB and Membrance persistence (manifest + per-membrance schema).
- * Implements the Hot-Warm-Cold Vector Stratification (HWC-VS) architecture.
+ * Implementation for PomaiDB and Membrance persistence.
+ *
+ * Updates:
+ * - Refactored to use centralized PomaiConfig injection.
+ * - Membrance initialization now pulls algorithm/network settings from global config.
+ * - [Fix] WAL replay now correctly handles config propagation.
  */
 
 #include "src/core/pomai_db.h"
@@ -11,12 +15,12 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <cstdlib> // getenv
+#include <cstdlib>
 #include <system_error>
 #include <cstring>
 #include <thread>
 #include <chrono>
-#include <algorithm> // for merge
+#include <algorithm>
 
 namespace pomai::core
 {
@@ -34,7 +38,9 @@ namespace pomai::core
 
     // ---------------------------- Membrance ------------------------------------
 
-    Membrance::Membrance(const std::string &nm, const MembranceConfig &cfg, const std::string &data_root)
+    // [CHANGED] Constructor now takes Global Config
+    Membrance::Membrance(const std::string &nm, const MembranceConfig &cfg,
+                         const std::string &data_root, const pomai::config::PomaiConfig &global_cfg)
         : name(nm), dim(cfg.dim), ram_mb(cfg.ram_mb)
     {
         // Build data path: data_root/name
@@ -42,97 +48,107 @@ namespace pomai::core
         {
             std::filesystem::path base(data_root);
             std::filesystem::path p = base / name;
-            data_path = p.string();
-            std::error_code ec;
-            std::filesystem::create_directories(p, ec);
-            if (ec)
+            // Note: data_root is guaranteed to exist by PomaiDB ctor, but subfolder might not.
+            if (!std::filesystem::exists(p))
             {
-                std::clog << "[PomaiDB] Warning: failed to create membrance directory " << data_path << ": " << ec.message() << "\n";
-                // proceed — Orbit will use path anyway (may fail to write)
+                std::error_code ec;
+                std::filesystem::create_directories(p, ec);
+                if (ec)
+                    std::clog << "[PomaiDB] Warning: create_directories failed: " << ec.message() << "\n";
             }
+            data_path = p.string();
         }
-        catch (const std::exception &e)
+        catch (...)
         {
-            std::clog << "[PomaiDB] Warning: exception creating membrance directory: " << e.what() << "\n";
-            data_path = data_root + "/" + name;
+            data_path = "./data/" + name;
         }
 
-        // Create ShardArena and Orbit
-        // For per-membrance arenas we use ShardArena; shard id 0 is fine here (single arena per membrance)
+        // 1. Create ShardArena (Memory Backend)
+        // shard_id=0 because currently one arena per membrance
         arena = std::make_unique<pomai::memory::ShardArena>(0, ram_mb * 1024 * 1024);
 
-        pomai::ai::orbit::PomaiOrbit::Config cfg_orbit;
-        cfg_orbit.dim = dim;
-        cfg_orbit.data_path = data_path;
-        // Let first membrance optionally run cortex; keep default behavior.
-        orbit = std::make_unique<pomai::ai::orbit::PomaiOrbit>(cfg_orbit, arena.get());
+        // 2. Create Orbit (Indexing Engine)
+        // [FIXED] Construct Orbit Config from Global Config + Local Params
+        pomai::ai::orbit::PomaiOrbit::Config ocfg;
+        ocfg.dim = dim;
+        ocfg.data_path = data_path;
 
-        // [HWC-VS] Initialize Hot Tier (Shock Absorber)
-        // Default capacity hint 4096. It grows if needed.
-        hot_tier = std::make_unique<HotTier>(dim);
+        // Inject Algorithm Params (Centroids, Neighbors, BucketCap)
+        ocfg.algo = global_cfg.orbit;
 
-        // Initialize metadata index if requested (best-effort).
+        // Inject Network Params (Cortex Port/P2P)
+        // Note: Cortex usually shares port/config with main server or uses offset.
+        // Here we pass the network config directly.
+        ocfg.cortex_cfg = global_cfg.network;
+
+        // Inject EEQ Params (Optional: if we add eeq to global config later, copy here)
+        // ocfg.eeq_cfg = global_cfg.eeq; // (Future proofing)
+
+        orbit = std::make_unique<pomai::ai::orbit::PomaiOrbit>(ocfg, arena.get());
+
+        // 3. Initialize Hot Tier (Shock Absorber / Write Buffer)
+        hot_tier = std::make_unique<HotTier>(dim, global_cfg.hot_tier);
+
+        // 4. Initialize Metadata Index (Optional)
         try
         {
             if (cfg.enable_metadata_index)
             {
-                meta_index = std::make_unique<MetadataIndex>();
+                // Vẫn tạo thư mục nếu cần cho tương lai, nhưng không truyền vào constructor
+                std::string meta_path = data_path + "/metadata";
+                if (!std::filesystem::exists(meta_path))
+                    std::filesystem::create_directories(meta_path);
+
+                // THAY ĐỔI TẠI ĐÂY: Truyền global_cfg.metadata thay vì meta_path
+                meta_index = std::make_unique<MetadataIndex>(global_cfg.metadata);
+
+                // Link to Orbit (View only)
+                orbit->set_metadata_index(std::shared_ptr<MetadataIndex>(meta_index.get(), [](MetadataIndex *) {}));
             }
         }
-        catch (...)
+        catch (const std::exception &e)
         {
-            // non-fatal: leave meta_index null if allocation fails
-            meta_index.reset();
-            std::clog << "[PomaiDB] Warning: could not allocate MetadataIndex for membrance " << name << "\n";
+            std::clog << "[PomaiDB] MetadataIndex init failed: " << e.what() << "\n";
         }
     }
 
     // ---------------------------- PomaiDB -------------------------------------
 
-    static inline std::string get_env_or_default(const char *env, const char *def)
+    // [CHANGED] Constructor takes Global Config
+    PomaiDB::PomaiDB(const pomai::config::PomaiConfig &config)
+        : config_(config), bg_running_(false)
     {
-        const char *v = std::getenv(env);
-        return v ? std::string(v) : std::string(def);
-    }
-
-    PomaiDB::PomaiDB(const std::string &data_root)
-    {
-        // Determine data root: prefer constructor arg, else env var, else default
-        if (!data_root.empty())
+        // 1. Ensure Data Root Exists
+        std::filesystem::path root(config_.res.data_root);
+        try
         {
-            data_root_ = data_root;
+            if (!std::filesystem::exists(root))
+                std::filesystem::create_directories(root);
         }
-        else
+        catch (...)
         {
-            data_root_ = get_env_or_default("POMAI_DB_DIR", "./data/pomai_db");
+            std::clog << "[PomaiDB] Critical Warning: Could not create data root " << config_.res.data_root << "\n";
         }
 
-        // Ensure directory exists
-        std::error_code ec;
-        std::filesystem::create_directories(data_root_, ec);
-        if (ec)
-        {
-            std::clog << "[PomaiDB] Warning: could not create data root " << data_root_ << ": " << ec.message() << "\n";
-        }
+        // 2. Setup Paths
+        std::string manifest_path = (root / "membrances.manifest").string();
+        std::string wal_path = (root / "wal.log").string();
 
-        manifest_path_ = (std::filesystem::path(data_root_) / "membrances.manifest").string();
-        std::string wal_path = (std::filesystem::path(data_root_) / "wal.log").string();
-
-        // Open WAL early
+        // 3. Open WAL
         pomai::memory::WalManager::WalConfig wcfg;
         wcfg.sync_on_append = true;
         if (!wal_.open(wal_path, true, wcfg))
         {
-            std::clog << "[PomaiDB] Warning: failed to open WAL at " << wal_path << " (will continue without WAL)\n";
+            std::clog << "[PomaiDB] Warning: failed to open WAL (running without persistence safety)\n";
         }
 
-        // Load manifest (if any)
+        // 4. Load Snapshot (Manifest)
         if (!load_manifest())
         {
-            std::clog << "[PomaiDB] No existing manifest or load failed; starting empty DB\n";
+            std::clog << "[PomaiDB] Clean start (no manifest found).\n";
         }
 
-        // Replay WAL (apply create/drop records to bring DB to latest)
+        // 5. Replay WAL (Crash Recovery)
         auto apply_cb = [this](uint16_t type, const void *payload, uint32_t len, uint64_t /*seq*/) -> bool
         {
             try
@@ -142,12 +158,12 @@ namespace pomai::core
                     if (!payload || len == 0)
                         return true;
                     std::string s(reinterpret_cast<const char *>(payload), len);
-                    // parse name|dim|ram_mb
                     std::istringstream iss(s);
                     std::string t;
                     std::vector<std::string> parts;
                     while (std::getline(iss, t, '|'))
                         parts.push_back(t);
+
                     if (parts.size() >= 2)
                     {
                         std::string name = trim_str(parts[0]);
@@ -174,12 +190,12 @@ namespace pomai::core
 
                         if (!name.empty() && dim != 0)
                         {
-                            MembranceConfig cfg;
-                            cfg.dim = dim;
-                            cfg.ram_mb = ram_mb;
+                            MembranceConfig c;
+                            c.dim = dim;
+                            c.ram_mb = ram_mb;
                             std::unique_lock<std::shared_mutex> lk(mu_);
                             if (membrances_.count(name) == 0)
-                                create_membrance_internal(name, cfg);
+                                create_membrance_internal(name, c);
                         }
                     }
                 }
@@ -196,9 +212,10 @@ namespace pomai::core
                         if (it != membrances_.end())
                         {
                             membrances_.erase(it);
+                            // Best-effort cleanup
                             try
                             {
-                                std::filesystem::remove_all(std::filesystem::path(data_root_) / name);
+                                std::filesystem::remove_all(std::filesystem::path(config_.res.data_root) / name);
                             }
                             catch (...)
                             {
@@ -208,93 +225,34 @@ namespace pomai::core
                 }
             }
             catch (...)
-            { /* keep replaying */
+            {
             }
             return true;
         };
 
-        if (!wal_.replay(apply_cb))
-        {
-            std::clog << "[PomaiDB] Warning: WAL replay failed or truncated (continuing)\n";
-        }
+        wal_.replay(apply_cb);
 
-        // [HWC-VS] Start the Background Merger Thread
-        running_ = true;
-        merger_thread_ = std::thread(&PomaiDB::background_worker, this);
-        std::clog << "[PomaiDB] Background merger thread started.\n";
+        // 6. Start Background Worker (Hot->Warm Merger)
+        bg_running_ = true;
+        bg_thread_ = std::thread(&PomaiDB::background_worker, this);
     }
 
     PomaiDB::~PomaiDB()
     {
-        // [HWC-VS] Stop the Background Thread gracefully
-        running_ = false;
-        if (merger_thread_.joinable())
-        {
-            merger_thread_.join();
-        }
+        // Stop worker
+        bg_running_ = false;
+        if (bg_thread_.joinable())
+            bg_thread_.join();
 
-        // Save ephemeral state: persist all membrance schemas and manifest
-        bool ok = save_all_membrances();
-        if (!ok)
-        {
-            std::clog << "[PomaiDB] Warning: failed to save some membrance schemas on shutdown\n";
-        }
-        if (!save_manifest())
-        {
-            std::clog << "[PomaiDB] Warning: failed to persist manifest on shutdown\n";
-        }
-
-        // Close WAL
+        // Save State
+        save_all_membrances();
+        save_manifest();
         wal_.close();
-    }
-
-    void PomaiDB::background_worker()
-    {
-        while (running_)
-        {
-            // Tunable: Sleep to act as a shock absorber.
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-
-            // Snapshot lock: We need read access to the map of membrances.
-            std::shared_lock<std::shared_mutex> lock(mu_);
-
-            for (auto &kv : membrances_)
-            {
-                Membrance *m = kv.second.get();
-                if (!m || !m->hot_tier)
-                    continue;
-
-                // 1. Drain the Hot Tier (Atomic swap)
-                auto hot_batch = m->hot_tier->swap_and_flush();
-
-                if (hot_batch.empty())
-                    continue;
-
-                // 2. Transform HotBatch (SoA) -> Orbit Batch (AoS)
-                std::vector<std::pair<uint64_t, std::vector<float>>> orbit_batch;
-                orbit_batch.reserve(hot_batch.count());
-
-                const size_t dim = hot_batch.dim;
-                const float *data_ptr = hot_batch.data.data();
-
-                for (size_t i = 0; i < hot_batch.labels.size(); ++i)
-                {
-                    std::vector<float> vec(dim);
-                    // Copy raw floats for this vector
-                    std::memcpy(vec.data(), data_ptr + (i * dim), dim * sizeof(float));
-
-                    orbit_batch.emplace_back(hot_batch.labels[i], std::move(vec));
-                }
-
-                // 3. Insert into WARM layer (Orbit)
-                m->orbit->insert_batch(orbit_batch);
-            }
-        }
     }
 
     bool PomaiDB::create_membrance_internal(const std::string &name, const MembranceConfig &cfg)
     {
-        // Assumes mu_ locked by caller
+        // Assumes mu_ is locked
         if (membrances_.count(name))
             return false;
         if (cfg.dim == 0)
@@ -302,82 +260,94 @@ namespace pomai::core
 
         try
         {
-            auto m = std::make_unique<Membrance>(name, cfg, data_root_);
-            // Let orbit save its schema immediately
+            // [FIXED] Pass global config_ to Membrance constructor
+            auto m = std::make_unique<Membrance>(name, cfg, config_.res.data_root, config_);
+
+            // Initial save to disk
             try
             {
                 m->orbit->save_schema();
             }
             catch (...)
-            { /* ignore */
+            {
             }
 
             membrances_.emplace(name, std::move(m));
-            std::clog << "[PomaiDB] Membrance created: " << name << " dim=" << cfg.dim << "\n";
             return true;
         }
         catch (const std::exception &e)
         {
-            std::clog << "[PomaiDB] create_membrance_internal exception: " << e.what() << "\n";
-            return false;
-        }
-        catch (...)
-        {
+            std::clog << "[PomaiDB] Error creating membrance " << name << ": " << e.what() << "\n";
             return false;
         }
     }
 
     bool PomaiDB::create_membrance(const std::string &name, const MembranceConfig &cfg)
     {
-        // Write-ahead: append WAL first
+        // [QUAN TRỌNG] Tạo một bản sao config cục bộ để áp dụng Defaults
+        MembranceConfig final_cfg = cfg;
+
+        // 1. Áp dụng engine mặc định nếu người dùng không nhập
+        if (final_cfg.engine.empty())
+        {
+            final_cfg.engine = config_.db.engine_type; // Sử dụng "orbit" từ config
+        }
+
+        // 2. Áp dụng RAM mặc định nếu giá trị truyền vào là 0
+        if (final_cfg.ram_mb == 0)
+        {
+            final_cfg.ram_mb = config_.db.default_membrance_ram_mb; // Sử dụng 256 từ config
+        }
+
+        // --- Bắt đầu logic WAL với final_cfg đã được cập nhật ---
         try
         {
-            std::string payload = name + "|" + std::to_string(cfg.dim) + "|" + std::to_string(cfg.ram_mb);
-            auto seq = wal_.append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_CREATE_MEMBRANCE), payload.data(), static_cast<uint32_t>(payload.size()));
-            if (!seq.has_value())
-                return false;
+            // Ghi vào WAL các giá trị ĐÃ áp dụng default để khi replay không bị sai dim/ram
+            std::string payload = name + "|" + std::to_string(final_cfg.dim) + "|" + std::to_string(final_cfg.ram_mb);
+            wal_.append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_CREATE_MEMBRANCE),
+                               payload.data(), static_cast<uint32_t>(payload.size()));
         }
         catch (...)
         {
             return false;
         }
 
+        // 2. Apply In-Memory (Truyền final_cfg thay vì cfg gốc)
         {
             std::unique_lock<std::shared_mutex> lock(mu_);
-            if (!create_membrance_internal(name, cfg))
+            if (!create_membrance_internal(name, final_cfg))
                 return false;
         }
 
-        save_manifest();
+        // 3. Snapshot Manifest & Truncate WAL
+        save_manifest(); // Hàm này bên trong cũng phải dùng config_.db.manifest_file
         wal_.truncate_to_zero();
         return true;
     }
 
     bool PomaiDB::drop_membrance(const std::string &name)
     {
-        // Write-ahead: append WAL drop record
+        // 1. WAL Log
         try
         {
-            std::string payload = name;
-            auto seq = wal_.append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_DROP_MEMBRANCE), payload.data(), static_cast<uint32_t>(payload.size()));
-            if (!seq.has_value())
-                return false;
+            wal_.append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_DROP_MEMBRANCE),
+                               name.data(), static_cast<uint32_t>(name.size()));
         }
         catch (...)
         {
             return false;
         }
 
+        // 2. Apply In-Memory
         {
             std::unique_lock<std::shared_mutex> lock(mu_);
             auto it = membrances_.find(name);
             if (it == membrances_.end())
                 return false;
 
-            // Attempt to remove on-disk directory
             try
             {
-                std::filesystem::remove_all(std::filesystem::path(data_root_) / name);
+                std::filesystem::remove_all(std::filesystem::path(config_.res.data_root) / name);
             }
             catch (...)
             {
@@ -385,9 +355,9 @@ namespace pomai::core
             membrances_.erase(it);
         }
 
+        // 3. Checkpoint
         save_manifest();
         wal_.truncate_to_zero();
-        std::clog << "[PomaiDB] Membrance dropped: " << name << "\n";
         return true;
     }
 
@@ -407,79 +377,65 @@ namespace pomai::core
 
     std::vector<std::string> PomaiDB::list_membrances() const
     {
-        std::vector<std::string> res;
         std::shared_lock<std::shared_mutex> lock(mu_);
+        std::vector<std::string> names;
         for (const auto &kv : membrances_)
-            res.push_back(kv.first);
-        return res;
+            names.push_back(kv.first);
+        return names;
     }
 
-    // Vector API forwarding
+    // --- Vector Operations Forwarding ---
+
     bool PomaiDB::insert(const std::string &membr, const float *vec, uint64_t label)
     {
         Membrance *m = get_membrance(membr);
-        if (!m || !vec)
+        if (!m)
             return false;
 
-        // [HWC-VS] Fast Path: Insert into Hot Tier
+        // Hot Tier First
         if (m->hot_tier)
         {
             m->hot_tier->push(label, vec);
             return true;
         }
-
         return m->orbit->insert(vec, label);
+    }
+
+    bool PomaiDB::insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
+    {
+        Membrance *m = get_membrance(membr);
+        if (!m)
+            return false;
+        return m->orbit->insert_batch(batch);
     }
 
     std::vector<std::pair<uint64_t, float>> PomaiDB::search(const std::string &membr, const float *query, size_t k)
     {
         Membrance *m = get_membrance(membr);
-        if (!m || !query)
+        if (!m)
             return {};
 
-        // 1. Search HOT (if available)
-        std::vector<std::pair<uint64_t, float>> hot_res;
-        if (m->hot_tier)
-        {
-            hot_res = m->hot_tier->search(query, k);
-        }
+        // 1. Hot Search
+        auto hot = m->hot_tier ? m->hot_tier->search(query, k) : std::vector<std::pair<uint64_t, float>>{};
 
-        // 2. Search WARM
-        auto warm_res = m->orbit->search(query, k);
+        // 2. Warm Search (Orbit)
+        auto warm = m->orbit->search(query, k);
 
-        // 3. Merge Top-K
-        // Both are sorted by distance ascending. We merge and take top k.
-        if (hot_res.empty())
-            return warm_res;
-        if (warm_res.empty())
-            return hot_res;
+        // 3. Merge (Simplified merge-sort top-k)
+        if (hot.empty())
+            return warm;
+        if (warm.empty())
+            return hot;
 
         std::vector<std::pair<uint64_t, float>> merged;
         merged.reserve(k);
-
         size_t i = 0, j = 0;
-        // Merge loop
-        while (merged.size() < k && (i < hot_res.size() || j < warm_res.size()))
+        while (merged.size() < k && (i < hot.size() || j < warm.size()))
         {
-            if (i < hot_res.size() && j < warm_res.size())
-            {
-                if (hot_res[i].second < warm_res[j].second)
-                {
-                    merged.push_back(hot_res[i++]);
-                }
-                else
-                {
-                    merged.push_back(warm_res[j++]);
-                }
-            }
-            else if (i < hot_res.size())
-            {
-                merged.push_back(hot_res[i++]);
-            }
+            if (i < hot.size() && (j >= warm.size() || hot[i].second < warm[j].second))
+                merged.push_back(hot[i++]);
             else
-            {
-                merged.push_back(warm_res[j++]);
-            }
+                merged.push_back(warm[j++]);
         }
         return merged;
     }
@@ -489,8 +445,7 @@ namespace pomai::core
         Membrance *m = get_membrance(membr);
         if (!m)
             return false;
-        // Note: For now, we only get from Orbit (WARM).
-        // Data in HOT is transient and will be available in WARM shortly.
+        // Check Hot Tier? Not implemented yet for GET, assumed ephemeral.
         return m->orbit->get(label, out);
     }
 
@@ -508,46 +463,34 @@ namespace pomai::core
         return m ? m->dim : 0;
     }
 
-    // ---------------------------- Persistence ---------------------------------
+    // --- Persistence IO ---
 
     bool PomaiDB::save_manifest()
     {
-        std::shared_lock<std::shared_mutex> lock(mu_); // snapshot under shared lock
-        std::string tmp = manifest_path_ + ".tmp";
+        std::shared_lock<std::shared_mutex> lock(mu_);
+        std::string path = config_.res.data_root + "/" + config_.db.manifest_file;
+        std::string tmp = path + ".tmp";
 
         std::ofstream ofs(tmp, std::ios::trunc);
         if (!ofs.is_open())
             return false;
 
-        ofs << "# PomaiDB membrances manifest\n";
+        ofs << "# PomaiDB Manifest\n";
         for (const auto &kv : membrances_)
         {
-            const Membrance *m = kv.second.get();
+            const auto *m = kv.second.get();
             ofs << m->name << '|' << m->dim << '|' << m->ram_mb << '\n';
         }
         ofs.close();
-
-        std::error_code ec;
-        std::filesystem::rename(tmp, manifest_path_, ec);
-        if (ec)
-        {
-            try
-            {
-                std::filesystem::copy_file(tmp, manifest_path_, std::filesystem::copy_options::overwrite_existing);
-                std::filesystem::remove(tmp);
-            }
-            catch (...)
-            {
-                return false;
-            }
-        }
+        std::filesystem::rename(tmp, path);
         return true;
     }
 
     bool PomaiDB::load_manifest()
     {
         std::unique_lock<std::shared_mutex> lock(mu_);
-        std::ifstream ifs(manifest_path_);
+        std::string path = config_.res.data_root + "/" + config_.db.manifest_file;
+        std::ifstream ifs(path);
         if (!ifs.is_open())
             return false;
 
@@ -555,48 +498,44 @@ namespace pomai::core
         size_t loaded = 0;
         while (std::getline(ifs, line))
         {
-            line = trim_str(line);
             if (line.empty() || line[0] == '#')
                 continue;
-
             std::istringstream iss(line);
-            std::string token;
+            std::string t;
             std::vector<std::string> parts;
-            while (std::getline(iss, token, '|'))
-                parts.push_back(token);
-            if (parts.size() < 2)
-                continue;
+            while (std::getline(iss, t, '|'))
+                parts.push_back(trim_str(t));
 
-            std::string name = trim_str(parts[0]);
-            size_t dim = 0, ram_mb = 256;
-            try
+            if (parts.size() >= 2)
             {
-                dim = static_cast<size_t>(std::stoul(parts[1]));
-            }
-            catch (...)
-            {
-                dim = 0;
-            }
-            if (parts.size() >= 3)
-            {
+                std::string name = parts[0];
+                size_t dim = 0, ram = 256;
                 try
                 {
-                    ram_mb = static_cast<size_t>(std::stoul(parts[2]));
+                    dim = std::stoul(parts[1]);
                 }
                 catch (...)
                 {
-                    ram_mb = 256;
+                }
+                if (parts.size() >= 3)
+                    try
+                    {
+                        ram = std::stoul(parts[2]);
+                    }
+                    catch (...)
+                    {
+                    }
+
+                if (!name.empty() && dim > 0)
+                {
+                    MembranceConfig c;
+                    c.dim = dim;
+                    c.ram_mb = ram;
+                    // Internal create bypassing WAL
+                    if (create_membrance_internal(name, c))
+                        loaded++;
                 }
             }
-
-            if (name.empty() || dim == 0)
-                continue;
-
-            MembranceConfig cfg;
-            cfg.dim = dim;
-            cfg.ram_mb = ram_mb;
-            if (create_membrance_internal(name, cfg))
-                ++loaded;
         }
         return loaded > 0;
     }
@@ -607,10 +546,9 @@ namespace pomai::core
         bool ok = true;
         for (const auto &kv : membrances_)
         {
-            Membrance *m = kv.second.get();
             try
             {
-                m->orbit->save_schema();
+                kv.second->orbit->save_schema();
             }
             catch (...)
             {
@@ -620,12 +558,43 @@ namespace pomai::core
         return ok;
     }
 
-    bool PomaiDB::insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
+    void PomaiDB::background_worker()
     {
-        Membrance *m = get_membrance(membr);
-        if (!m)
-            return false;
-        return m->orbit->insert_batch(batch);
+        while (bg_running_)
+        {
+            // Flush interval (shock absorber)
+            std::this_thread::sleep_for(std::chrono::milliseconds(config_.db.bg_worker_interval_ms));
+
+            // Snapshot lock for reading membrance list
+            std::shared_lock<std::shared_mutex> lock(mu_);
+
+            for (auto &kv : membrances_)
+            {
+                Membrance *m = kv.second.get();
+                if (!m || !m->hot_tier)
+                    continue;
+
+                // 1. Drain Hot Tier
+                auto batch = m->hot_tier->swap_and_flush();
+                if (batch.empty())
+                    continue;
+
+                // 2. Convert to Orbit Batch
+                std::vector<std::pair<uint64_t, std::vector<float>>> vec_batch;
+                vec_batch.reserve(batch.count());
+                const size_t dim = batch.dim;
+
+                for (size_t i = 0; i < batch.labels.size(); ++i)
+                {
+                    std::vector<float> v(dim);
+                    std::memcpy(v.data(), batch.data.data() + i * dim, dim * sizeof(float));
+                    vec_batch.emplace_back(batch.labels[i], std::move(v));
+                }
+
+                // 3. Insert to Warm (Orbit)
+                m->orbit->insert_batch(vec_batch);
+            }
+        }
     }
 
 } // namespace pomai::core

@@ -16,15 +16,15 @@
 #include <cmath>
 #include <algorithm>
 #include <queue>
-#include <cstring> 
-#include <utility> 
-#include <thread> 
+#include <cstring>
+#include <utility>
+#include <thread>
 
 // Intrinsics for CPU pause
 #if defined(_MSC_VER)
-    #include <intrin.h>
+#include <intrin.h>
 #elif defined(__GNUC__) || defined(__clang__)
-    #include <immintrin.h>
+#include <immintrin.h>
 #endif
 
 namespace pomai::core
@@ -32,29 +32,36 @@ namespace pomai::core
     // --- Helper: Adaptive Spinlock ---
     // Đây là "vũ khí bí mật" cho high-concurrency.
     // Nó không busy-wait đần độn mà biết backoff thông minh.
-    class AdaptiveSpinLock {
+    class AdaptiveSpinLock
+    {
         std::atomic_flag flag = ATOMIC_FLAG_INIT;
 
     public:
-        void lock() {
+        void lock()
+        {
             // Fast path: Thử lấy lock ngay lập tức
-            if (!flag.test_and_set(std::memory_order_acquire)) {
+            if (!flag.test_and_set(std::memory_order_acquire))
+            {
                 return;
             }
 
             // Slow path: Contention detected
             int spin_count = 0;
-            while (flag.test_and_set(std::memory_order_acquire)) {
-                if (spin_count < 16) {
-                    // Phase 1: Micro-sleep (CPU hint). 
-                    // Giúp CPU pipeline không bị flush, tiết kiệm điện và giảm latency bus RAM.
-                    #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
-                        _mm_pause(); 
-                    #elif defined(__aarch64__)
-                        asm volatile("isb"); // ARM barrier equivalent hint
-                    #endif
+            while (flag.test_and_set(std::memory_order_acquire))
+            {
+                if (spin_count < 16)
+                {
+// Phase 1: Micro-sleep (CPU hint).
+// Giúp CPU pipeline không bị flush, tiết kiệm điện và giảm latency bus RAM.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+                    _mm_pause();
+#elif defined(__aarch64__)
+                    asm volatile("isb"); // ARM barrier equivalent hint
+#endif
                     spin_count++;
-                } else {
+                }
+                else
+                {
                     // Phase 2: Yield to OS.
                     // Nếu chờ quá lâu, nhường CPU cho thread khác (tránh 100% CPU deadlock).
                     std::this_thread::yield();
@@ -63,15 +70,17 @@ namespace pomai::core
             }
         }
 
-        void unlock() {
+        void unlock()
+        {
             flag.clear(std::memory_order_release);
         }
     };
 
     // RAII Wrapper
-    struct ScopedSpinLock {
-        AdaptiveSpinLock& sl;
-        ScopedSpinLock(AdaptiveSpinLock& l) : sl(l) { sl.lock(); }
+    struct ScopedSpinLock
+    {
+        AdaptiveSpinLock &sl;
+        ScopedSpinLock(AdaptiveSpinLock &l) : sl(l) { sl.lock(); }
         ~ScopedSpinLock() { sl.unlock(); }
     };
 
@@ -89,10 +98,10 @@ namespace pomai::core
     class HotTier
     {
     public:
-        explicit HotTier(size_t dim, size_t capacity_hint = 4096)
-            : dim_(dim), capacity_hint_(capacity_hint)
+        HotTier(size_t dim, const pomai::config::HotTierConfig &cfg)
+            : dim_(dim),
+              capacity_hint_(cfg.initial_capacity)
         {
-            // Reserve to avoid immediate reallocations
             labels_.reserve(capacity_hint_);
             data_.reserve(capacity_hint_ * dim_);
         }
@@ -106,7 +115,7 @@ namespace pomai::core
         void push(uint64_t label, const float *vec)
         {
             ScopedSpinLock g(lock_);
-            
+
             // Check capacity guard (optional simple protection)
             // Nếu vector grow quá lớn sẽ gây delay lock, nên giữ capacity hợp lý.
             labels_.push_back(label);
@@ -173,9 +182,10 @@ namespace pomai::core
                 // Compiler (GCC/Clang -O3) will auto-vectorize (AVX2/AVX512) this loop heavily
                 // because data is contiguous (SoA layout).
                 float dist = 0.0f;
-                const float* vec_i = dptr + (i * d);
-                
-                for (size_t j = 0; j < d; ++j) {
+                const float *vec_i = dptr + (i * d);
+
+                for (size_t j = 0; j < d; ++j)
+                {
                     float diff = query[j] - vec_i[j];
                     dist += diff * diff;
                 }

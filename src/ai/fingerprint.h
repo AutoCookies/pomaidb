@@ -2,32 +2,32 @@
  * src/ai/fingerprint.h
  *
  * High-level fingerprint encoder interface and concrete implementations:
- *  - SimHashEncoder: uses dense random projections (SimHash) to produce
- *    bitpacked fingerprints (reuses SimHash class).
- *  - OPQSignEncoder: optional orthogonal rotation (OPQ-like) followed by
- *    SimHash sign projection (helps improve PQ / binary-filter selectivity).
+ * - SimHashEncoder: uses dense random projections (SimHash) to produce
+ * bitpacked fingerprints (reuses SimHash class).
+ * - OPQSignEncoder: optional orthogonal rotation (OPQ-like) followed by
+ * SimHash sign projection (helps improve PQ / binary-filter selectivity).
  *
  * Design goals (10/10):
- *  - Small, clear public interface (FingerprintEncoder) suitable for runtime
- *    selection and dependency injection.
- *  - Thread-safe for concurrent reads after construction. No internal mutable
- *    state is modified during compute().
- *  - Clean, well-documented C++ with simple file-based persistence helpers
- *    for rotation matrices (plain binary row-major floats).
+ * - Small, clear public interface (FingerprintEncoder) suitable for runtime
+ * selection and dependency injection.
+ * - Thread-safe for concurrent reads after construction. No internal mutable
+ * state is modified during compute().
+ * - Clean, well-documented C++ with simple file-based persistence helpers
+ * for rotation matrices (plain binary row-major floats).
  *
  * Usage:
- *   // create SimHash encoder directly
- *   auto enc = FingerprintEncoder::createSimHash(dim, bits, seed);
- *   std::vector<uint8_t> out(enc->bytes());
- *   enc->compute(vec, out.data());
+ * // create SimHash encoder directly
+ * auto enc = FingerprintEncoder::createSimHash(dim, cfg, seed);
+ * std::vector<uint8_t> out(enc->bytes());
+ * enc->compute(vec, out.data());
  *
- *   // create OPQ+SimHash encoder (rotation loaded or identity)
- *   auto enc2 = FingerprintEncoder::createOPQSign(dim, bits, rotation_path, seed);
+ * // create OPQ+SimHash encoder (rotation loaded or identity)
+ * auto enc2 = FingerprintEncoder::createOPQSign(dim, cfg, rotation_path, seed);
  *
  * Notes:
- *  - OPQSignEncoder stores the rotation matrix as floats in row-major order.
- *    If rotation file is not found/invalid, it falls back to identity rotation.
- *  - The heavy lifting of projection/sign computation is delegated to SimHash.
+ * - OPQSignEncoder stores the rotation matrix as floats in row-major order.
+ * If rotation file is not found/invalid, it falls back to identity rotation.
+ * - The heavy lifting of projection/sign computation is delegated to SimHash.
  */
 
 #pragma once
@@ -37,6 +37,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "src/core/config.h" // [CHANGED] Include for config types
 
 namespace pomai::ai
 {
@@ -71,18 +72,24 @@ namespace pomai::ai
 
         // Create a plain SimHash encoder.
         // - dim: dimensionality of input vectors
-        // - bits: number of sign-bits to produce (typical 256/512). If 0, runtime config value is used.
+        // - cfg: Fingerprint configuration (contains bits)
         // - seed: RNG seed used by SimHash to initialize projection matrix
-        static std::unique_ptr<FingerprintEncoder> createSimHash(size_t dim, size_t bits = 0, uint64_t seed = 123456789ULL);
+        // [CHANGED] Signature to take config object
+        static std::unique_ptr<FingerprintEncoder> createSimHash(
+            size_t dim,
+            const pomai::config::FingerprintConfig &cfg,
+            uint64_t seed = 123456789ULL);
 
         // Create an OPQ-sign encoder: applies rotation (dim x dim) then SimHash.
         // - rotation_path: optional path to a binary rotation matrix file (row-major floats).
         //   If empty or load fails, identity rotation is used.
-        // - dim/bits/seed as above.
-        static std::unique_ptr<FingerprintEncoder> createOPQSign(size_t dim,
-                                                                 size_t bits = 0,
-                                                                 const std::string &rotation_path = std::string(),
-                                                                 uint64_t seed = 123456789ULL);
+        // - dim/cfg/seed as above.
+        // [CHANGED] Signature to take config object
+        static std::unique_ptr<FingerprintEncoder> createOPQSign(
+            size_t dim,
+            const pomai::config::FingerprintConfig &cfg,
+            const std::string &rotation_path = std::string(),
+            uint64_t seed = 123456789ULL);
     };
 
 } // namespace pomai::ai

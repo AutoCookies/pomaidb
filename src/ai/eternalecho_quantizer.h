@@ -4,23 +4,9 @@
  *
  * Pomai EternalEcho Quantizer (EESQ) - header
  *
- * - Novel, proprietary "EternalEcho Sign-Scale Quantization" (EESQ).
- * - Recursive residual sign-projection with dynamic per-layer scale.
- * - Variable-depth, early-termination; lightweight projection matrices.
- *
- * Public API:
- *   - EternalEchoQuantizer(cfg, dim, seed)
- *   - EchoCode encode(const float* vec) const
- *   - void decode(const EchoCode&, float* out) const
- *   - float approx_dist(const float* query, const EchoCode& code, float* scratch_buf) const  // exact (decode-based)
- *   - float approx_dist(const float* query, const EchoCode& code) const                     // exact (thread-local scratch)
- *   - float approx_dist_code(const float* query, const EchoCode& code) const                // ADC-style fast approx (no decode)
- *   - void project_query(const float* query, std::vector<std::vector<float>>& out) const
- *   - const std::vector<float>& layer_col_energy() const noexcept
- *
- * Notes:
- *  - Implementation is standalone (does not rely on SimHash internals).
- *  - Projection matrix is generated deterministically from seed (Gaussian entries).
+ * - Public API remains the same for callers in pomai::ai namespace.
+ * - The canonical config struct now lives in pomai::config::EternalEchoConfig
+ *   and we bring a local alias (pomai::ai::EternalEchoConfig) for backwards-compatibility.
  */
 
 #include <cstdint>
@@ -29,18 +15,15 @@
 #include <random>
 #include <cstddef>
 
+// include central config so we use single canonical config definition
+#include "src/core/config.h"
+
 namespace pomai::ai
 {
 
-    struct EternalEchoConfig
-    {
-        // Default layer bits (sum ~256)
-        std::vector<uint32_t> bits_per_layer = {96, 64, 48, 32, 16};
-        uint32_t max_depth = 5;       // safety (should match bits_per_layer.size())
-        float stop_threshold = 1e-2f; // early stop: ||residual||2 < threshold * ||original||
-        bool quantize_scales = true;  // if true scale stored as uint8 (0..255)
-        float scale_quant_max = 4.0f; // max scale mapped to 255 (heuristic)
-    };
+    // Keep API stability: alias the central config into pomai::ai namespace.
+    // Other code that refers to pomai::ai::EternalEchoConfig continues to compile.
+    using EternalEchoConfig = ::pomai::config::EternalEchoConfig;
 
     struct EchoCode
     {

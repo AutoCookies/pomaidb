@@ -55,12 +55,18 @@
 #include "src/core/pomai_db.h"
 #include "src/core/metadata_index.h" // for Tag
 #include "src/ai/whispergrain.h"
+#include "src/core/config.h"
 
 class PomaiServer
 {
 public:
-    PomaiServer(PomaiMap *kv_map, pomai::core::PomaiDB *pomai_db, int port)
-        : kv_map_(kv_map), pomai_db_(pomai_db), port_(port), whisper_(), cpu_sampler_running_(false)
+    PomaiServer(pomai::core::PomaiMap *kv_map, pomai::core::PomaiDB *pomai_db, const pomai::config::PomaiConfig &config)
+        : kv_map_(kv_map),
+          pomai_db_(pomai_db),
+          config_(config),
+          port_(config.net.port),
+          whisper_(config.whisper),
+          cpu_sampler_running_(false)
     {
         start();
     }
@@ -136,8 +142,9 @@ public:
     }
 
 private:
-    PomaiMap *kv_map_;
+    pomai::core::PomaiMap *kv_map_;
     pomai::core::PomaiDB *pomai_db_;
+    pomai::config::PomaiConfig config_;
     int port_;
     int listen_fd_ = -1;
     int epoll_fd_ = -1;

@@ -19,10 +19,10 @@
 #include "src/memory/wal_manager.h"
 #include "src/core/metadata_index.h"
 #include "src/core/hot_tier.h"
+#include "src/core/config.h"
 
 namespace pomai::core
 {
-    // ... (MembranceConfig and Membrance structs remain unchanged)
     struct MembranceConfig
     {
         size_t dim = 0;
@@ -42,7 +42,9 @@ namespace pomai::core
         std::unique_ptr<HotTier> hot_tier;
         std::unique_ptr<MetadataIndex> meta_index;
 
-        Membrance(const std::string &name, const MembranceConfig &cfg, const std::string &data_root);
+        // Constructor takes Global Config
+        Membrance(const std::string &name, const MembranceConfig &cfg,
+                  const std::string &data_root, const pomai::config::PomaiConfig &global_cfg);
 
         Membrance(const Membrance &) = delete;
         Membrance &operator=(const Membrance &) = delete;
@@ -51,12 +53,8 @@ namespace pomai::core
     class PomaiDB
     {
     public:
-        explicit PomaiDB(const std::string &data_root = std::string());
+        explicit PomaiDB(const pomai::config::PomaiConfig &config);
         ~PomaiDB();
-
-        // ... (Public API remains unchanged)
-        PomaiDB(const PomaiDB &) = delete;
-        PomaiDB &operator=(const PomaiDB &) = delete;
 
         bool create_membrance(const std::string &name, const MembranceConfig &cfg);
         bool drop_membrance(const std::string &name);
@@ -79,21 +77,17 @@ namespace pomai::core
     private:
         bool load_manifest();
         bool create_membrance_internal(const std::string &name, const MembranceConfig &cfg);
-
-        // [Added] Background Worker: Drains HotTier -> Orbit
         void background_worker();
 
         std::unordered_map<std::string, std::unique_ptr<Membrance>> membrances_;
         mutable std::shared_mutex mu_;
 
-        std::string data_root_;
-        std::string manifest_path_;
+        pomai::config::PomaiConfig config_;
 
+        // [FIXED] Added missing WAL manager
         pomai::memory::WalManager wal_;
 
-        // [Added] Thread management
-        std::atomic<bool> running_{false};
-        std::thread merger_thread_;
+        std::atomic<bool> bg_running_;
+        std::thread bg_thread_;
     };
-
-} // namespace pomai::core
+}

@@ -2,6 +2,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <iomanip>
 
 /*
  * Very small metrics aggregator for core events.
@@ -34,6 +35,8 @@ struct PomaiMetrics
     // number of logical sub-batches processed
     static std::atomic<uint64_t> batch_subbatches_processed;
 
+    static inline uint64_t last_total_ops = 0;
+
     static void reset()
     {
         hits.store(0);
@@ -50,6 +53,34 @@ struct PomaiMetrics
         batch_sort_ns_total.store(0);
         batch_write_ns_total.store(0);
         batch_subbatches_processed.store(0);
+    }
+
+    static void print_summary()
+    {
+        uint64_t h = hits.load();
+        uint64_t m = misses.load();
+        uint64_t p = puts.load();
+        uint64_t e = evictions.load();
+        uint64_t current_total = h + m + p + e;
+
+        if (current_total == last_total_ops)
+            return;
+        last_total_ops = current_total;
+
+        uint64_t total_queries = h + m;
+        double hit_rate = (total_queries > 0) ? (double)h / total_queries * 100.0 : 0.0;
+
+        std::clog << "[Metrics] "
+                  << "Puts: " << p
+                  << " | Hits: " << h
+                  << " | Misses: " << m
+                  << " | HitRate: " << std::fixed << std::setprecision(2) << hit_rate << "%"
+                  << " | Evictions: " << e << "\n";
+
+        if (arena_alloc_fails.load() > 0)
+        {
+            std::clog << "[Metrics] WARNING: Arena allocation failures: " << arena_alloc_fails.load() << "\n";
+        }
     }
 };
 

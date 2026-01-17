@@ -25,15 +25,21 @@ namespace pomai::core
         std::unique_ptr<PomaiMap> map;
 
         // Constructor expects arena size in GB and the number of map slots (power of two).
-        Shard(double size_gb, uint64_t map_slots)
+        Shard(const pomai::config::PomaiConfig &cfg)
         {
-            auto a = pomai::memory::PomaiArena::FromGB(size_gb);
+            // Sử dụng MB để chính xác hơn GB và khớp với config.res
+            auto a = pomai::memory::PomaiArena::FromMB(cfg.res.arena_mb_per_shard);
             if (!a.is_valid())
             {
-                throw std::runtime_error("Shard: PomaiArena allocation failed (is_valid == false)");
+                throw std::runtime_error("Shard: PomaiArena allocation failed");
             }
             arena = std::make_unique<pomai::memory::PomaiArena>(std::move(a));
-            map = std::make_unique<PomaiMap>(arena.get(), map_slots);
+
+            // [FIXED] Truyền đúng 3 tham số theo định nghĩa mới của PomaiMap
+            map = std::make_unique<pomai::core::PomaiMap>(
+                arena.get(),
+                cfg.map_tuning.default_slots,
+                cfg);
         }
 
         ~Shard() = default;

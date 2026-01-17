@@ -4,12 +4,12 @@
 // Simple quantized L2 space that expects payloads composed of quantized bytes
 // (uint8 per-dimension or packed 4-bit values).
 //
-// This is intentionally simple and not optimized: it dequantizes per-dimension to
-// float and computes squared L2. For production you can implement integer SSE/AVX
-// kernels for speed.
+// Refactored to use centralized pomai::config::QuantizedSpaceConfig.
 
 #include "src/ai/hnswlib/hnswlib.h"
 #include "src/ai/quantize.h"
+#include "src/core/config.h" // [ADDED]
+
 #include <cstdint>
 #include <cstddef>
 #include <stdexcept>
@@ -30,17 +30,23 @@ namespace pomai::ai
     class QuantizedL2Space : public hnswlib::SpaceInterface<dist_t>, public QuantizedL2SpaceBase
     {
         size_t dim_;
-        int bits_; // 8 or 4
+        int bits_;                                // 8 or 4
+        pomai::config::QuantizedSpaceConfig cfg_; // Store config
 
     public:
-        QuantizedL2Space(size_t dim, int bits = 8) : dim_(dim), bits_(bits)
+        // [CHANGED] Constructor takes Config
+        QuantizedL2Space(size_t dim, const pomai::config::QuantizedSpaceConfig &cfg)
+            : dim_(dim), cfg_(cfg)
         {
+            bits_ = static_cast<int>(cfg_.precision_bits);
+
             if (bits_ != 8 && bits_ != 4)
                 throw std::invalid_argument("QuantizedL2Space: only 8 or 4 bits supported");
         }
 
         size_t dim() const override { return dim_; }
         int precision_bits() const override { return bits_; }
+        const pomai::config::QuantizedSpaceConfig &config() const noexcept { return cfg_; }
 
         // size of payload (without PPEHeader)
         size_t get_data_size() override
@@ -63,7 +69,7 @@ namespace pomai::ai
         // However HNSW expects a pointer to a function of signature DISTFUNC<dist_t>.
         // We return QuantizedDist as placeholder — real logic handled via PomaiSpace.
         hnswlib::DISTFUNC<dist_t> get_dist_func() override { return &QuantizedDist; }
-        void *get_dist_func_param() override { return nullptr; }
-    };
 
-} // namespace pomai::ai
+        void *get_dist_func_param() override { return this; }
+    };
+}

@@ -51,9 +51,12 @@ struct alignas(pomai::config::SEED_ALIGNMENT) Seed
     // Preserve expiry bits when updating meta
     void set_meta(uint16_t klen, uint16_t vlen)
     {
+        using L = pomai::config::SeedLayout; //
         uint64_t old = header.load(std::memory_order_relaxed);
-        uint64_t expiry = old & 0xFFFFFFFFULL;
-        uint64_t new_hdr = expiry | (static_cast<uint64_t>(klen) << 32) | (static_cast<uint64_t>(vlen) << 48);
+        uint64_t expiry = old & L::EXPIRY_MASK; //
+        uint64_t new_hdr = expiry |
+                           (static_cast<uint64_t>(klen) << L::KLEN_SHIFT) |
+                           (static_cast<uint64_t>(vlen) << L::VLEN_SHIFT);
         header.store(new_hdr, std::memory_order_release);
     }
 

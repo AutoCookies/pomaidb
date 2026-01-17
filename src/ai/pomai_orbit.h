@@ -14,7 +14,7 @@
 #include <vector>
 #include <atomic>
 #include <shared_mutex>
-#include <mutex> // [CRITICAL] Required for std::mutex
+#include <mutex>
 #include <memory>
 #include <string>
 #include <filesystem>
@@ -30,8 +30,8 @@
 #include "src/core/config.h"
 #include "src/ai/network_cortex.h"
 #include "src/core/metadata_index.h"
-#include "src/ai/eternalecho_quantizer.h" 
-#include "src/ai/whispergrain.h"         
+#include "src/ai/eternalecho_quantizer.h"
+#include "src/ai/whispergrain.h"
 
 // Forward-declare both arena flavors to avoid heavy includes here.
 namespace pomai::memory
@@ -124,12 +124,13 @@ namespace pomai::ai::orbit
             size_t dim = 0;
             std::string data_path = "./data";
 
-            size_t num_centroids = 0;
-            size_t m_neighbors = 16;
+            pomai::config::OrbitConfig algo;
 
             // EternalEcho quantizer config will be used exclusively
             pomai::ai::EternalEchoConfig eeq_cfg;
 
+            // Network Config
+            pomai::config::NetworkCortexConfig cortex_cfg;
             bool use_cortex = true;
         };
 
@@ -224,7 +225,7 @@ namespace pomai::ai::orbit
     private:
         Config cfg_;
         ArenaView arena_;
-        
+
         // [FIXED] Mutex for Thread-Safe Auto-Train (Double-Checked Locking)
         std::mutex train_mu_;
 

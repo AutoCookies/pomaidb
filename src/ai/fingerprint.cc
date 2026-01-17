@@ -14,8 +14,8 @@
 
 #include "src/ai/fingerprint.h"
 #include "src/ai/simhash.h"
-#include "src/core/cpu_kernels.h" // <-- use pomai_dot kernel for rotation
-#include "src/core/config.h"      // for runtime.fingerprint_bits
+#include "src/core/cpu_kernels.h"
+#include "src/core/config.h"
 
 #include <fstream>
 #include <cstring>
@@ -27,6 +27,13 @@
 
 namespace pomai::ai
 {
+    // [ADDED] Helper to bridge legacy 'bits' param to Config struct
+    static inline pomai::config::FingerprintConfig make_fp_config(size_t bits)
+    {
+        pomai::config::FingerprintConfig c;
+        c.fingerprint_bits = static_cast<uint32_t>(bits);
+        return c;
+    }
 
     // -------------------- SimHashEncoder (thin wrapper) --------------------
 
@@ -34,7 +41,8 @@ namespace pomai::ai
     {
     public:
         SimHashEncoder(size_t dim, size_t bits, uint64_t seed)
-            : simhash_(dim, bits, seed)
+            // [FIXED] Construct config on the fly
+            : simhash_(dim, make_fp_config(bits), seed)
         {
         }
 
@@ -60,7 +68,8 @@ namespace pomai::ai
     public:
         // rotation: empty => identity
         OPQSignEncoder(size_t dim, size_t bits, uint64_t seed, std::vector<float> &&rotation)
-            : dim_(dim), simhash_(dim, bits, seed), rotation_(std::move(rotation))
+            // [FIXED] Construct config on the fly
+            : dim_(dim), simhash_(dim, make_fp_config(bits), seed), rotation_(std::move(rotation))
         {
             // If rotation supplied, its size must be dim*dim. Otherwise rotation_ is empty.
             if (!rotation_.empty() && rotation_.size() != dim_ * dim_)
@@ -191,55 +200,49 @@ namespace pomai::ai
         // read floats
         std::vector<float> mat;
         // [FIX] Validate size before allocation to prevent OOM DOS
-        if (dim > 16384) { // Arbitrary sanity limit (16384^2 floats = 1GB)
-             std::cerr << "[Fingerprint] rotation dimension too large: " << dim << "\n";
-             return {};
+        if (dim > 16384)
+        { // Arbitrary sanity limit (16384^2 floats = 1GB)
+            std::cerr << "[Fingerprint] rotation dimension too large: " << dim << "\n";
+            return {};
         }
 
         mat.resize(dim * dim);
         f.read(reinterpret_cast<char *>(mat.data()), static_cast<std::streamsize>(sizeof(float) * mat.size()));
-        
+
         // [FIX] Critical: Check if we actually read enough bytes
         if (!f)
         {
             std::cerr << "[Fingerprint] rotation file corrupted (EOF/Short read): " << path << ", using identity\n";
             return {};
         }
-        
-        // [FIX] Double check file size matches exactly (no trailing garbage) - Optional but good
-        // f.peek(); if (!f.eof()) ... 
 
         return mat;
     }
 
     // -------------------- Factory implementations --------------------
 
-    std::unique_ptr<FingerprintEncoder> FingerprintEncoder::createSimHash(size_t dim, size_t bits, uint64_t seed)
+    std::unique_ptr<FingerprintEncoder> FingerprintEncoder::createSimHash(
+        size_t dim,
+        const pomai::config::FingerprintConfig &cfg,
+        uint64_t seed)
     {
-        // If caller passes bits==0, use runtime config default (centralized)
-        size_t use_bits = bits;
+        size_t use_bits = cfg.fingerprint_bits;
         if (use_bits == 0)
-        {
-            use_bits = static_cast<size_t>(pomai::config::runtime.fingerprint_bits);
-            if (use_bits == 0)
-                use_bits = 512; // final fallback
-        }
+            use_bits = 512;
+
         return std::unique_ptr<FingerprintEncoder>(new SimHashEncoder(dim, use_bits, seed));
     }
 
-    std::unique_ptr<FingerprintEncoder> FingerprintEncoder::createOPQSign(size_t dim,
-                                                                          size_t bits,
-                                                                          const std::string &rotation_path,
-                                                                          uint64_t seed)
+    std::unique_ptr<FingerprintEncoder> FingerprintEncoder::createOPQSign(
+        size_t dim,
+        const pomai::config::FingerprintConfig &cfg,
+        const std::string &rotation_path,
+        uint64_t seed)
     {
-        // If bits==0 use runtime default
-        size_t use_bits = bits;
+        size_t use_bits = cfg.fingerprint_bits;
         if (use_bits == 0)
-        {
-            use_bits = static_cast<size_t>(pomai::config::runtime.fingerprint_bits);
-            if (use_bits == 0)
-                use_bits = 512;
-        }
+            use_bits = 512;
+
         std::vector<float> rotation = load_rotation_matrix(rotation_path, dim);
         // If rotation empty -> identity (internal handling)
         return std::unique_ptr<FingerprintEncoder>(new OPQSignEncoder(dim, use_bits, seed, std::move(rotation)));

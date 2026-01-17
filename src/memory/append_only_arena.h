@@ -18,6 +18,7 @@
 #include <mutex>
 #include <cstdint>
 #include <cstddef>
+#include "src/core/config.h"
 
 namespace pomai::memory
 {
@@ -27,7 +28,9 @@ namespace pomai::memory
     public:
         // Create or open an arena file. initial_size_bytes must be > 0 (rounded up to page size).
         // Throws std::runtime_error on failure.
-        static AppendOnlyArena *OpenOrCreate(const std::string &path, size_t initial_size_bytes);
+        static AppendOnlyArena *OpenOrCreate(const std::string &path,
+                                             size_t initial_size_bytes,
+                                             const pomai::config::StorageConfig &cfg);
 
         // Close and destroy object (unmaps and closes file).
         ~AppendOnlyArena();
@@ -65,7 +68,9 @@ namespace pomai::memory
 
     private:
         // Private constructor; use OpenOrCreate
-        AppendOnlyArena(int fd, void *map_base, size_t mapped_size, const std::string &path, size_t page_size);
+        AppendOnlyArena(int fd, void *map_base, size_t mapped_size,
+                        const std::string &path, size_t page_size,
+                        const pomai::config::StorageConfig &cfg);
 
         // internal remap (requires lock)
         bool remap_locked(size_t new_size);
@@ -77,6 +82,7 @@ namespace pomai::memory
         mutable std::mutex grow_mu_;         // protects grow/remap and alloc path when remapping
         std::string path_;
         size_t page_size_;
+        pomai::config::StorageConfig cfg_;
     };
 
 } // namespace pomai::memory

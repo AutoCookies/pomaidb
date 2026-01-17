@@ -39,6 +39,7 @@
 #include <sstream>
 #include <iostream>
 #include <list>
+#include "src/core/config.h"
 
 struct Seed; // forward-declare; concrete definition in src/core/seed.h
 
@@ -78,7 +79,7 @@ namespace pomai::memory
         PomaiArena();
 
         // Construct and allocate `bytes` bytes immediately (mmap).
-        explicit PomaiArena(uint64_t bytes);
+        explicit PomaiArena(const pomai::config::PomaiConfig& cfg);
 
         ~PomaiArena();
 
@@ -193,11 +194,18 @@ namespace pomai::memory
         // Create arena sized according to runtime configuration (POMAI_ARENA_MB).
         // Reads pomai::config::runtime.arena_mb_per_shard and returns an arena sized to that value
         // (or a sensible default if it is zero).
-        static PomaiArena FromConfig();
+        static PomaiArena FromConfig(const pomai::config::PomaiConfig &cfg);
 
     private:
+        pomai::config::ArenaConfig cfg_;
+
+        size_t max_remote_mmaps_;
+        size_t max_pending_demotes_;
+        size_t demote_batch_bytes_;
+        std::string remote_dir_;
+
         // Internal helpers
-        static uint64_t block_size_for(uint64_t bytes); // round up to power-of-two bucket (>= min)
+        uint64_t block_size_for(uint64_t bytes); // round up to power-of-two bucket (>= min)
         std::string generate_remote_filename(uint64_t id) const;
         void cleanup();
 
@@ -231,7 +239,6 @@ namespace pomai::memory
         mutable std::unordered_map<uint64_t, std::pair<const char *, size_t>> remote_mmaps_;
         mutable std::list<uint64_t> remote_mmap_lru_; // front = most recent
         mutable std::unordered_map<uint64_t, std::list<uint64_t>::iterator> remote_mmap_iter_;
-        size_t max_remote_mmaps_{256}; // cap for cached remote mmaps
 
         // remote id counter (starts at 1); remote_id = blob_region_bytes_ + next_remote_id_
         uint64_t next_remote_id_;
@@ -270,14 +277,8 @@ namespace pomai::memory
         std::deque<DemoteTask> demote_queue_;
         std::thread demote_worker_;
         std::atomic<bool> demote_worker_running_{false};
-        size_t max_pending_demotes_{10000};             // bounded queue capacity (configurable)
-        size_t demote_batch_bytes_{4 * 1024 * 1024};    // batch bytes hint for worker
-        size_t demote_segment_size_{512 * 1024 * 1024}; // not used yet; reserved
 
-        // directory where demoted blobs are written (can be changed if necessary)
-        std::string remote_dir_ = "/tmp";
-        static constexpr uint64_t MIN_BLOB_BLOCK = 64;
-        static constexpr size_t MAX_FREELIST_PER_BUCKET = 4096;
+        size_t demote_segment_size_{512 * 1024 * 1024}; // not used yet; reserved
     };
 
 } // namespace pomai::memory

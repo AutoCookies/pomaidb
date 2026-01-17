@@ -11,6 +11,7 @@
 
 #include "src/ai/eternalecho_quantizer.h"
 #include "src/core/cpu_kernels.h"
+#include "src/core/config.h"
 
 #include <random>
 #include <cmath>
@@ -21,7 +22,6 @@
 
 namespace pomai::ai
 {
-
     // -------------------- Helpers --------------------
 
     EternalEchoQuantizer::EternalEchoQuantizer(size_t dim, const EternalEchoConfig &cfg, uint64_t seed)
@@ -269,8 +269,10 @@ namespace pomai::ai
     // Exact distance (decode into caller-provided scratch_buf and compute l2sq)
     float EternalEchoQuantizer::approx_dist(const float *query, const EchoCode &code, float *scratch_buf) const
     {
-        if (!query) throw std::invalid_argument("approx_dist: null query");
-        if (!scratch_buf) throw std::invalid_argument("approx_dist: scratch_buf required");
+        if (!query)
+            throw std::invalid_argument("approx_dist: null query");
+        if (!scratch_buf)
+            throw std::invalid_argument("approx_dist: scratch_buf required");
 
         decode(code, scratch_buf);
         return ::l2sq(query, scratch_buf, dim_);
@@ -295,7 +297,8 @@ namespace pomai::ai
         const uint8_t *code_ptr,
         size_t code_len) const
     {
-        if (!code_ptr || code_len == 0) return 0.0f;
+        if (!code_ptr || code_len == 0)
+            return 0.0f;
 
         // [PRECISION] Use double accumulators to prevent cancellation errors
         double q_dot_recon = 0.0;
@@ -306,50 +309,58 @@ namespace pomai::ai
 
         // 1. Unpack Scales (Zero-alloc thread_local)
         static thread_local std::vector<float> scales;
-        if (scales.size() < depth) scales.resize(depth);
-        
+        if (scales.size() < depth)
+            scales.resize(depth);
+
         for (size_t i = 0; i < depth; ++i)
         {
-            if (pos >= code_len) { scales[i] = 0.0f; continue; }
+            if (pos >= code_len)
+            {
+                scales[i] = 0.0f;
+                continue;
+            }
             scales[i] = static_cast<float>(code_ptr[pos++]) / 255.0f; // Scale is [0..1] normalized here
-            // If scale_quant_max is involved, it should be applied. 
+            // If scale_quant_max is involved, it should be applied.
             // Assuming simplified model here or scale_quant_max=1 for ranking logic.
-            // If using real values: scales[i] *= cfg_.scale_quant_max; 
+            // If using real values: scales[i] *= cfg_.scale_quant_max;
         }
 
         // 2. Compute Dist Components Per Layer
         // Formula: Dist^2 = ||Q||^2 + ||Recon||^2 - 2(Q . Recon)
         for (size_t k = 0; k < depth; ++k)
         {
-            if (k >= qproj.size()) break;
-            
+            if (k >= qproj.size())
+                break;
+
             // Query projections for this layer: <q, col_j>
-            const auto &layer_qproj = qproj[k]; 
-            
+            const auto &layer_qproj = qproj[k];
+
             float scale = scales[k];
-            if (cfg_.quantize_scales) scale *= cfg_.scale_quant_max; // Restore magnitude
+            if (cfg_.quantize_scales)
+                scale *= cfg_.scale_quant_max; // Restore magnitude
             double scale_d = static_cast<double>(scale);
-            
+
             uint32_t n_bits = static_cast<uint32_t>(layer_qproj.size());
             size_t n_bytes = (n_bits + 7) / 8;
-            
-            if (pos + n_bytes > code_len) break;
-            const uint8_t* sign_bytes = code_ptr + pos;
+
+            if (pos + n_bytes > code_len)
+                break;
+            const uint8_t *sign_bytes = code_ptr + pos;
             pos += n_bytes;
 
             // [OPTIMIZATION] SIMD Kernel Call
             // Computes: sum(layer_qproj[j] * sign[j])
             double layer_dot = ::pomai_packed_signed_dot(sign_bytes, layer_qproj.data(), n_bits);
-            
+
             q_dot_recon += layer_dot * scale_d;
-            
+
             // [CORRECTION] Use precomputed layer energy for norm
             // ||Recon_layer||^2 = scale^2 * || sum(sign * col) ||^2
             // Approx orthogonal columns: || sum(sign * col) ||^2 ~= sum ||col||^2
-            double layer_energy_factor = (k < layer_col_energy_.size()) 
-                                         ? static_cast<double>(layer_col_energy_[k]) 
-                                         : static_cast<double>(n_bits); // Fallback
-                                         
+            double layer_energy_factor = (k < layer_col_energy_.size())
+                                             ? static_cast<double>(layer_col_energy_[k])
+                                             : static_cast<double>(n_bits); // Fallback
+
             recon_norm_sq += (scale_d * scale_d) * layer_energy_factor;
         }
 
@@ -357,7 +368,8 @@ namespace pomai::ai
         double dist_sq = static_cast<double>(qnorm2) + recon_norm_sq - 2.0 * q_dot_recon;
 
         // 4. Sanity Clamp
-        if (dist_sq < 1e-5) dist_sq = 0.0;
+        if (dist_sq < 1e-5)
+            dist_sq = 0.0;
 
         return static_cast<float>(dist_sq);
     }

@@ -1,60 +1,67 @@
 #pragma once
+/*
+ * src/core/metadata_index.h
+ *
+ * Inverted index for metadata filtering (tag-based search).
+ * [FIXED] Integrated with PomaiConfig for capacity & delimiter control.
+ */
 
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <shared_mutex>
-#include <mutex>
 #include <algorithm>
+#include "src/core/config.h"
 
 namespace pomai::core
 {
-
     struct Tag
     {
         std::string key;
-        std::string value;
-        std::string to_string() const { return key + ":" + value; }
+        std::string val;
     };
 
     class MetadataIndex
     {
     public:
-        MetadataIndex() = default;
+        // Constructor nhận config tập trung
+        explicit MetadataIndex(const pomai::config::MetadataConfig &cfg)
+            : cfg_(cfg)
+        {
+            // Cấp phát trước bộ nhớ dựa trên cấu hình để tối ưu Hot Path
+            index_.reserve(cfg_.initial_capacity);
+        }
 
-        // Thêm metadata cho một vector
         void add_tags(uint64_t label, const std::vector<Tag> &tags)
         {
             std::unique_lock<std::shared_mutex> lock(mu_);
-            for (const auto &tag : tags)
+            for (const auto &t : tags)
             {
-                // Key format: "category:shoes"
-                inverted_index_[tag.to_string()].push_back(label);
+                // Sử dụng delimiter từ config (mặc định là "=")
+                std::string composite = t.key + cfg_.delimiter + t.val;
+                index_[composite].push_back(label);
             }
         }
 
-        // Lọc: Trả về danh sách Label ID thỏa mãn điều kiện
-        // Trả về copy để đảm bảo thread-safety cho người gọi (Orbit) dùng thoải mái
-        std::vector<uint64_t> filter(const std::string &key, const std::string &value) const
+        std::vector<uint64_t> filter(const std::string &key, const std::string &val) const
         {
             std::shared_lock<std::shared_mutex> lock(mu_);
-            std::string token = key + ":" + value;
-
-            auto it = inverted_index_.find(token);
-            if (it != inverted_index_.end())
-            {
+            std::string composite = key + cfg_.delimiter + val;
+            auto it = index_.find(composite);
+            if (it != index_.end())
                 return it->second;
-            }
-            return {}; // Không tìm thấy
+            return {};
         }
 
-        // Xóa (Optional - Soft delete chỉ cần xóa trong Orbit,
-        // Metadata cứ để đó cũng được, vì search ra ID mà Orbit thấy đã xóa thì sẽ bỏ qua)
-        // Tuy nhiên, để sạch sẽ thì nên implement lazy cleanup sau.
+        size_t size() const
+        {
+            std::shared_lock<std::shared_mutex> lock(mu_);
+            return index_.size();
+        }
 
     private:
-        // Cấu trúc: "color:red" -> [1, 5, 10, ...]
-        std::unordered_map<std::string, std::vector<uint64_t>> inverted_index_;
+        pomai::config::MetadataConfig cfg_; // Lưu trữ config cục bộ
+        std::unordered_map<std::string, std::vector<uint64_t>> index_;
         mutable std::shared_mutex mu_;
     };
 }

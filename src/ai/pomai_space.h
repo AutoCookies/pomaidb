@@ -2,10 +2,7 @@
  * src/ai/pomai_space.h
  *
  * PomaiSpace: Unified distance evaluation with Atomic Membrane protection.
- *
- * Updates:
- * - FIX: Allow Lazy Promotion/Mapping of Remote Data (Fixes search recall failures).
- * - RESTORED: Full hybrid resolution logic (RAM + Disk).
+ * Refactored to use pomai::config::StorageLayout for explicit memory offsets.
  */
 
 #pragma once
@@ -15,6 +12,7 @@
 #include "src/ai/pppq.h"
 #include "src/memory/arena.h"
 #include "src/ai/atomic_utils.h"
+#include "src/core/config.h" // [ADDED] Include config for StorageLayout
 
 #include <memory>
 #include <cstring>
@@ -25,6 +23,8 @@
 
 namespace pomai::ai
 {
+    // [ADDED] Alias for clean access
+    using StoreLayout = pomai::config::StorageLayout;
 
     template <typename dist_t>
     class PomaiSpace : public hnswlib::SpaceInterface<dist_t>
@@ -131,7 +131,8 @@ namespace pomai::ai
                 const char *blob_hdr = arena_->blob_ptr_from_offset_for_map(off_or_remote);
                 if (blob_hdr)
                 {
-                    return reinterpret_cast<const float *>(blob_hdr + sizeof(uint32_t));
+                    // [CHANGED] Use constant from config
+                    return reinterpret_cast<const float *>(blob_hdr + StoreLayout::BLOB_HEADER_BYTES);
                 }
 
                 // 4. Fallback: Pending Demote Resolution
@@ -140,7 +141,8 @@ namespace pomai::ai
                 {
                     blob_hdr = arena_->blob_ptr_from_offset_for_map(resolved);
                     if (blob_hdr)
-                        return reinterpret_cast<const float *>(blob_hdr + sizeof(uint32_t));
+                        // [CHANGED] Use constant from config
+                        return reinterpret_cast<const float *>(blob_hdr + StoreLayout::BLOB_HEADER_BYTES);
                     off_or_remote = resolved;
                 }
 
@@ -150,7 +152,8 @@ namespace pomai::ai
                 {
                     blob_hdr = arena_->blob_ptr_from_offset_for_map(new_local);
                     if (blob_hdr)
-                        return reinterpret_cast<const float *>(blob_hdr + sizeof(uint32_t));
+                        // [CHANGED] Use constant from config
+                        return reinterpret_cast<const float *>(blob_hdr + StoreLayout::BLOB_HEADER_BYTES);
                 }
 
                 return nullptr;

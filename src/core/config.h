@@ -4,69 +4,240 @@
 #include <string>
 #include <atomic>
 #include <optional>
+#include <vector>
 
 namespace pomai::config
 {
-    // --- Compile-time Constants (Immutable) ---
-
-    constexpr size_t SEED_PAYLOAD_BYTES = 48;
-    constexpr size_t SEED_ALIGNMENT = 64;
-
-    // Server Limits
-    constexpr size_t SERVER_MAX_EVENTS = 1024;
-    constexpr size_t SERVER_READ_BUFFER = 4096;
-    constexpr size_t SERVER_MAX_COMMAND_BYTES = 4 << 20; // 4 MiB max
-
-    // PWP Protocol
-    constexpr uint8_t PWP_MAGIC = 0x50; // 'P'
-
-    // Map Tuning
     constexpr size_t MAP_MAX_INLINE_KEY = 40;
     constexpr size_t MAP_PTR_BYTES = sizeof(uint64_t);
 
-    // Restore missing Seed constants required by src/core/seed.h
+    // --- Sub-module Configurations ---
+
+    struct MapTuning
+    {
+        uint32_t initial_entropy = 8;
+        uint32_t max_entropy = 1024;
+        uint32_t harvest_sample = 5;
+        uint32_t harvest_max_attempts = 20;
+        uint64_t default_slots = 1048576;
+        size_t max_key_inline = 40;
+    };
+
+    struct EternalEchoConfig
+    {
+        std::vector<uint32_t> bits_per_layer = {96, 64, 48, 32, 16};
+        uint32_t max_depth = 5;
+        float stop_threshold = 1e-2f;
+        bool quantize_scales = true;
+        float scale_quant_max = 4.0f;
+    };
+
+    struct FingerprintConfig
+    {
+        std::uint32_t fingerprint_bits = 512;
+    };
+
+    struct IdsBlockLayout
+    {
+        static constexpr uint64_t TOTAL_BITS = 64;
+        static constexpr uint64_t TAG_BITS = 2;
+        static constexpr uint64_t PAYLOAD_BITS = 62;
+        static constexpr uint64_t TAG_SHIFT = PAYLOAD_BITS;
+        static constexpr uint64_t TAG_MASK = (uint64_t)0x3ULL << TAG_SHIFT;
+        static constexpr uint64_t PAYLOAD_MASK = (1ULL << PAYLOAD_BITS) - 1ULL;
+    };
+
+    struct StorageLayout
+    {
+        static constexpr size_t BLOB_HEADER_BYTES = sizeof(uint32_t);
+    };
+
+    struct NetworkCortexConstants
+    {
+        static constexpr size_t RECV_BUF_SZ = 4096;
+        static constexpr size_t SAFE_UDP_PAYLOAD = 1200;
+    };
+
+    struct NetworkCortexConfig
+    {
+        uint16_t udp_port = 7777;
+        uint64_t neighbor_ttl_ms = 5000;
+        uint64_t pulse_interval_ms = 1000;
+        bool enable_broadcast = true;
+    };
+
+    struct OrbitConfig
+    {
+        uint32_t num_centroids = 0;
+        uint32_t m_neighbors = 16;
+        uint32_t initial_bucket_cap = 128;
+    };
+
+    struct PQConfig
+    {
+        uint32_t m_subquantizers = 16;
+        uint32_t k_centroids = 256;
+        uint32_t train_iters = 15;
+        uint64_t seed = 0x12345678ULL;
+    };
+
+    struct QuantizedSpaceConfig
+    {
+        uint32_t precision_bits = 8;
+    };
+
+    struct WhisperConfig
+    {
+        uint32_t cost_check = 1;
+        uint32_t cost_echo_decode = 5;
+        uint32_t cost_exact = 100;
+        uint32_t base_budget_ops = 5000;
+        uint32_t min_budget_ops = 250;
+        uint32_t hot_query_floor = 2000;
+        float budget_headroom = 1.2f;
+        float latency_target_ms = 50.0f;
+        float latency_ema_alpha = 0.15f;
+        float cpu_soft_threshold = 75.0f;
+        float cpu_hard_threshold = 90.0f;
+        uint32_t refine_enable_margin_ms = 20;
+    };
+
+    struct HotTierConfig
+    {
+        size_t initial_capacity = 4096;
+        uint32_t flush_interval_ms = 20;
+    };
+
+    struct IngestorConfig
+    {
+        size_t batch_size = 4096;
+        size_t max_free_batches = 100;
+        uint32_t num_workers = 1;
+    };
+
+    struct MetadataConfig
+    {
+        size_t initial_capacity = 65536;
+        std::string delimiter = "=";
+        bool enable_persistence = true;
+    };
+
+    struct MetricsConfig
+    {
+        bool enabled = true;                // Có thu thập metrics hay không
+        uint32_t report_interval_ms = 5000; // Tần suất in báo cáo tóm tắt ra console/log
+        bool verbose_arena_metrics = false; // Có in chi tiết các chỉ số của Arena không
+    };
+
+    struct OrchestratorConfig
+    {
+        uint32_t shard_count = 0;                 // 0 = auto (hardware concurrency)
+        std::string shard_path_prefix = "shard_"; // Tiền tố tên thư mục shard
+        bool use_parallel_merging = true;         // Có sử dụng async futures không
+    };
+
+    struct DBConfig
+    {
+        uint32_t bg_worker_interval_ms = 20;   //
+        size_t default_membrance_ram_mb = 256; //
+        std::string engine_type = "orbit";     //
+        std::string manifest_file = "manifest.json";
+    };
+
+    struct SeedLayout
+    {
+        static constexpr uint64_t EXPIRY_MASK = 0xFFFFFFFFULL;
+        static constexpr int KLEN_SHIFT = 32;
+        static constexpr int VLEN_SHIFT = 48;
+    };
+
+    struct ShardConfig
+    {
+        // Chuyển từ GB sang MB để đồng bộ với config.res.arena_mb_per_shard
+        uint64_t arena_size_mb = 2048;
+        uint64_t map_slots = 1048576; // 1M slots mặc định
+    };
+
+    struct ShardManagerConfig
+    {
+        bool enable_cpu_pinning = true;
+        uint64_t fallback_arena_mb = 512;
+        size_t estimated_object_size = 64;
+    };
+
+    struct StorageConfig
+    {
+        size_t initial_arena_size_mb = 64;
+        float growth_factor = 2.0f;
+        size_t alignment = 8;
+    };
+
+    struct ArenaConfig {
+        float seed_region_ratio = 0.25f;       // Tỷ lệ vùng Seed trong Arena
+        size_t max_remote_mmaps = 256;         // Số lượng file mmap tối đa được cache
+        size_t demote_batch_bytes = 4*1024*1024; // 4MB per batch cho worker
+        uint64_t min_blob_block = 64;          // Kích thước block tối thiểu
+        size_t max_freelist_per_bucket = 4096; // Tránh freelist phình quá to
+        std::string remote_dir = "/tmp";       // Thư mục lưu blob demote
+    };
+
+    // --- Compile-time Constants ---
+    constexpr size_t SERVER_READ_BUFFER = 4096;
+
+    // [RESTORED] Essential constants for Seed/Arena
+    constexpr size_t SEED_PAYLOAD_BYTES = 48;
+    constexpr size_t SEED_ALIGNMENT = 64;
     constexpr uint8_t SEED_OBJ_STRING = 0;
     constexpr uint8_t SEED_FLAG_INLINE = 0;
     constexpr uint8_t SEED_FLAG_INDIRECT = 0x1;
 
-    // --- Runtime Configuration (Tunable via CLI flags or ENV) ---
-    struct Runtime
+    // --- Main Configuration Struct (Nested) ---
+    struct PomaiConfig
     {
-        // 1. Server Basics
-        std::uint16_t default_port = 7777;
-        std::optional<uint64_t> rng_seed{};
+        // Network Settings
+        struct Net
+        {
+            uint16_t port = 7777;
+        } net;
 
-        // 2. Memory & Storage
-        std::uint64_t arena_mb_per_shard = 2048; // 2 GiB
+        // Resources & Storage
+        struct Res
+        {
+            uint64_t arena_mb_per_shard = 2048;
+            std::string data_root = "./data/pomai_db";
+            uint64_t demote_async_max_pending = 1000; // Added for compatibility
+        } res;
 
-        // Async IO Settings
-        std::uint64_t demote_async_max_pending = 1000;
-        bool demote_sync_fallback = true;
+        // Core settings
+        std::optional<uint64_t> rng_seed;
 
-        // 3. Sharding & Scaling
-        std::uint32_t shard_count = 0;
-        std::uint64_t max_elements_total = 0;
+        // Sub-modules
+        MapTuning map_tuning;
+        WhisperConfig whisper;
+        QuantizedSpaceConfig quantized_space;
+        PQConfig pq;
+        OrbitConfig orbit;
+        FingerprintConfig fingerprint;
+        NetworkCortexConfig network;
+        NetworkCortexConfig cortex_cfg;
+        HotTierConfig hot_tier;
+        IngestorConfig ingestor;
+        MetadataConfig metadata;
+        MetricsConfig metrics;
+        OrchestratorConfig orchestrator;
+        DBConfig db;
+        ShardConfig shard;
+        ShardManagerConfig shard_manager;
+        StorageConfig storage;
+        ArenaConfig arena;
 
-        // 4. Algorithm Tuning (Orbit/SimHash)
-        std::uint32_t fingerprint_bits = 512;
-        std::uint32_t prefilter_hamming_threshold = 128;
-
-        // NEW: vector dimensionality
-        std::uint32_t dim = 0;
-
-        // NEW: disable synapse codec via flag (no env needed)
-        bool disable_synapse = false;
-
-        // [FIX] Restore Map tuning parameters required by src/core/map.h
-        std::uint32_t harvest_sample = 5;
-        std::uint32_t harvest_max_attempts = 20;
-        std::uint32_t initial_entropy = 8;
-        std::uint32_t max_entropy = 1024;
+        PomaiConfig()
+        {
+            cortex_cfg = network;
+        }
     };
 
-    extern Runtime runtime;
-
-    void init_from_env();
-    void init_from_args(int argc, char **argv);
+    // Factory Function
+    PomaiConfig load_from_args(int argc, char **argv);
 
 } // namespace pomai::config

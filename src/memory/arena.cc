@@ -16,8 +16,8 @@
  */
 
 #include "src/memory/arena.h"
-#include "src/core/seed.h"
 #include "src/core/config.h"
+#include "src/core/seed.h"
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -55,13 +55,11 @@ namespace pomai::memory
         return ++v;
     }
 
-    uint64_t PomaiArena::block_size_for(uint64_t bytes)
-    {
-        uint64_t need = bytes;
-        if (need < MIN_BLOB_BLOCK)
-            need = MIN_BLOB_BLOCK;
-        return roundup_pow2(need);
-    }
+    uint64_t PomaiArena::block_size_for(uint64_t bytes) {
+    uint64_t need = bytes;
+    if (need < cfg_.min_blob_block) need = cfg_.min_blob_block;
+    return roundup_pow2(need);
+}
 
     // ---------------- Constructors / Destructor ----------------
 
@@ -81,11 +79,6 @@ namespace pomai::memory
     {
         // seed RNG
         rng_.seed(std::random_device{}());
-    }
-
-    PomaiArena::PomaiArena(uint64_t bytes) : PomaiArena()
-    {
-        allocate_region(bytes);
     }
 
     PomaiArena::~PomaiArena()
@@ -219,13 +212,19 @@ namespace pomai::memory
         return a;
     }
 
-    PomaiArena PomaiArena::FromConfig()
-    {
-        uint64_t mb = pomai::config::runtime.arena_mb_per_shard;
-        if (mb == 0)
-            mb = 512;
-        return FromMB(mb);
-    }
+    PomaiArena::PomaiArena(const pomai::config::PomaiConfig& global_cfg)
+    : PomaiArena() 
+{
+    cfg_ = global_cfg.arena; 
+ 
+    remote_dir_ = cfg_.remote_dir;
+    max_remote_mmaps_ = cfg_.max_remote_mmaps;
+    demote_batch_bytes_ = cfg_.demote_batch_bytes;
+    max_pending_demotes_ = global_cfg.res.demote_async_max_pending;
+
+    // Tiến hành cấp phát
+    allocate_region(global_cfg.res.arena_mb_per_shard * 1024ULL * 1024ULL);
+}
 
     // ---------------- allocate_region / grow / remap ----------------
 
@@ -275,7 +274,7 @@ namespace pomai::memory
         capacity_bytes_ = map_bytes;
 
         // Partition: 25% seeds, rest blobs
-        seed_region_bytes_ = static_cast<uint64_t>(static_cast<double>(capacity_bytes_) * 0.25);
+        seed_region_bytes_ = static_cast<uint64_t>(static_cast<double>(capacity_bytes_) * cfg_.seed_region_ratio);
         if (seed_region_bytes_ < sizeof(Seed))
             seed_region_bytes_ = sizeof(Seed);
         seed_region_bytes_ = (seed_region_bytes_ / sizeof(Seed)) * sizeof(Seed);
@@ -306,8 +305,7 @@ namespace pomai::memory
         next_remote_id_ = 1;
         pending_counter_.store(1, std::memory_order_relaxed);
 
-        if (pomai::config::runtime.demote_async_max_pending > 0)
-            max_pending_demotes_ = static_cast<size_t>(pomai::config::runtime.demote_async_max_pending);
+        max_pending_demotes_ = 1000;
 
         // configure remote mmap cap via env or default
         {
@@ -463,8 +461,7 @@ namespace pomai::memory
                                                          std::cerr << "[PomaiArena] Unknown critical error in demote worker\n";
                                                          // Continue loop
                                                      }
-                                                 }
-                                             });
+                                                 } });
             }
         }
 
@@ -669,8 +666,9 @@ namespace pomai::memory
         const uint64_t block = block_size_for(total);
 
         auto &vec = free_lists_[block];
-        if (vec.size() < MAX_FREELIST_PER_BUCKET)
+        if (vec.size() < cfg_.max_freelist_per_bucket) {
             vec.push_back(offset);
+        }
     }
 
     uint64_t PomaiArena::offset_from_blob_ptr(const char *p) const noexcept
@@ -837,7 +835,7 @@ namespace pomai::memory
 
         uint64_t block = block_size_for(total);
         auto &vec = free_lists_[block];
-        if (local_offset != 0 && vec.size() < MAX_FREELIST_PER_BUCKET)
+        if (local_offset != 0 && vec.size() < cfg_.max_freelist_per_bucket)
             vec.push_back(local_offset);
 
         uint64_t remote_id = blob_region_bytes_ + id;
