@@ -17,13 +17,13 @@ Hiện tại Pomai chỉ hỗ trợ vector 1 chiều (float32). Mục tiêu road
 - [x] Khi INSERT/SEARCH, kiểm tra kiếu dữ liệu đúng type, từ chối khác schema.
 
 ### 2.2. Serialization + Storage
-- [ ] Thay đổi blob lưu vector: ghi đúng kiểu dữ liệu, không fix sizeof(float).
-- [ ] Tối ưu truy xuất, tính toán kernel theo type (float32 dùng SIMD, float64 fallback, int32 ...)
+- [x] Thay đổi blob lưu vector: ghi đúng kiểu dữ liệu, không fix sizeof(float).
+- [x] Tối ưu truy xuất, tính toán kernel theo type (float32 dùng SIMD, float64 fallback, int32 ...)
 
 ### 2.3. Core API
-- [ ] Kernel: viết hàm l2sq/dot/support cho float64/int32.
-- [ ] Thêm test cho từng loại type.
-- [ ] CLI và API trả về type & báo lỗi hợp lý.
+- [x] Kernel: viết hàm l2sq/dot/support cho float64/int32.
+- [x] Thêm test cho từng loại type.
+- [x] CLI và API trả về type & báo lỗi hợp lý.
 
 ---
 
