@@ -314,9 +314,8 @@ namespace pomai::server
                 return "ERR: Membrance not found\n";
 
             size_t dim = m->dim;
-            size_t vec_bytes = dim * sizeof(float);
 
-            // parse optional split token and off/lim
+            // parse optional split token and off/lim (unchanged)
             size_t off = 0;
             size_t lim = 1000000;
             const std::vector<uint64_t> *idxs = nullptr;
@@ -333,7 +332,6 @@ namespace pomai::server
                 return nullptr;
             };
 
-            // Look for optional split token at parts[3]
             size_t cur_tok = 3;
             if (parts.size() > 3)
             {
@@ -345,11 +343,9 @@ namespace pomai::server
                     cur_tok = 4;
                 }
             }
-            // default to TRAIN if available
             if (!idxs && m->split_mgr)
                 idxs = &m->split_mgr->train_indices;
 
-            // parse numeric off/lim from remaining tokens
             if (parts.size() > cur_tok)
             {
                 try
@@ -373,11 +369,26 @@ namespace pomai::server
                 }
             }
 
-            // MODE: TRIPLET (produce 3 vectors per record)
+            // Helper: get dtype string & elem_size for this membrance/hot_tier
+            auto get_membrance_dtype = [&](std::string &out_dtype_str, uint32_t &out_elem_size)
+            {
+                if (m->hot_tier)
+                {
+                    out_elem_size = m->hot_tier->element_size();
+                    out_dtype_str = m->hot_tier->data_type_string();
+                }
+                else
+                {
+                    out_elem_size = static_cast<uint32_t>(pomai::core::dtype_size(m->data_type));
+                    out_dtype_str = pomai::core::dtype_name(m->data_type);
+                }
+            };
+
+            // MODE: TRIPLET (produce 3 vectors per record) - now returns raw dtype bytes
             if (mode == "TRIPLET")
             {
                 if (!m->meta_index || !m->orbit)
-                    return "OK BINARY 0 " + std::to_string(dim) + " 0\n";
+                    return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
 
                 if (parts.size() < 5)
                     return "ERR: ITERATE <name> TRIPLET <key> <limit> [HARD]\n";
@@ -398,10 +409,17 @@ namespace pomai::server
                     if (kv.second.size() >= 2)
                         cls.push_back(kv.first);
                 if (cls.size() < 2)
-                    return "OK BINARY 0 " + std::to_string(dim) + " 0\n";
+                    return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
 
-                size_t total_bytes = limit * 3 * vec_bytes;
-                std::string out = supplier::make_header("OK BINARY", limit, dim, total_bytes);
+                // determine dtype & element size
+                std::string dtype_str;
+                uint32_t elem_size;
+                get_membrance_dtype(dtype_str, elem_size);
+
+                size_t per_vec = static_cast<size_t>(elem_size) * dim;
+                size_t total_bytes = limit * 3 * per_vec;
+                std::string out = supplier::make_header("OK BINARY", dtype_str, limit, dim, total_bytes);
+
                 std::mt19937 rng(std::random_device{}());
                 for (size_t i = 0; i < limit; ++i)
                 {
@@ -421,28 +439,46 @@ namespace pomai::server
                         const auto &ids2 = groups[c2];
                         idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
                     }
-                    std::vector<float> va, vp, vn;
-                    supplier::fetch_vector(m, ida, va);
-                    supplier::fetch_vector(m, idp, vp);
-                    supplier::fetch_vector(m, idn, vn);
-                    out.append(reinterpret_cast<const char *>(va.data()), vec_bytes);
-                    out.append(reinterpret_cast<const char *>(vp.data()), vec_bytes);
-                    out.append(reinterpret_cast<const char *>(vn.data()), vec_bytes);
+
+                    // fetch raw bytes for ida,idp,idn and append
+                    pomai::core::DataType got_dt;
+                    uint32_t got_elem;
+                    std::string raw;
+                    supplier::fetch_vector_raw(m, ida, raw, dim, got_dt, got_elem);
+                    // ensure raw length is per_vec (hot/arena/converted)
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
+
+                    supplier::fetch_vector_raw(m, idp, raw, dim, got_dt, got_elem);
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
+
+                    supplier::fetch_vector_raw(m, idn, raw, dim, got_dt, got_elem);
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
                 }
                 return out;
             }
 
-            // MODE: PAIR -> emit (uint64 label) + vector(float32[])
+            // MODE: PAIR -> emit (uint64 label) + raw vector (element size = membrance elem)
             if (mode == "PAIR")
             {
                 if (!idxs)
                     return "ERR: No split indices available for PAIR\n";
                 if (off >= idxs->size())
-                    return "OK BINARY_PAIR 0 " + std::to_string(dim) + " 0\n";
+                    return "OK BINARY_PAIR float32 0 " + std::to_string(dim) + " 0\n";
+
+                std::string dtype_str;
+                uint32_t elem_size;
+                get_membrance_dtype(dtype_str, elem_size);
+                size_t per_vec = static_cast<size_t>(elem_size) * dim;
 
                 size_t cnt = std::min(lim, idxs->size() - off);
-                size_t per = sizeof(uint64_t) + vec_bytes;
-                std::string header = "OK BINARY_PAIR " + std::to_string(cnt) + " " + std::to_string(dim) + " " + std::to_string(cnt * per) + "\n";
+                size_t per = sizeof(uint64_t) + per_vec;
+                std::string header = "OK BINARY_PAIR " + dtype_str + " " + std::to_string(cnt) + " " + std::to_string(dim) + " " + std::to_string(cnt * per) + "\n";
                 std::string out;
                 out.reserve(header.size() + cnt * per);
                 out += header;
@@ -452,24 +488,33 @@ namespace pomai::server
                     uint64_t id = (*idxs)[off + i];
                     out.append(reinterpret_cast<const char *>(&id), sizeof(id));
 
-                    std::vector<float> vec;
-                    supplier::fetch_vector(m, id, vec);
-                    out.append(reinterpret_cast<const char *>(vec.data()), vec_bytes);
+                    pomai::core::DataType got_dt;
+                    uint32_t got_elem;
+                    std::string raw;
+                    supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
                 }
                 return out;
             }
 
-            // MODE: TRAIN/VAL/TEST -> emit vectors only
+            // MODE: TRAIN/VAL/TEST -> emit vectors only (raw storage bytes)
             if (mode == "TRAIN" || mode == "VAL" || mode == "TEST")
             {
                 if (!idxs)
                     return "ERR: No split indices available for ITERATE\n";
                 if (off >= idxs->size())
-                    return "OK BINARY 0 " + std::to_string(dim) + " 0\n";
+                    return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
+
+                std::string dtype_str;
+                uint32_t elem_size;
+                get_membrance_dtype(dtype_str, elem_size);
+                size_t per_vec = static_cast<size_t>(elem_size) * dim;
 
                 size_t cnt = std::min(lim, idxs->size() - off);
-                size_t total_bytes = cnt * vec_bytes;
-                std::string header = supplier::make_header("OK BINARY", cnt, dim, total_bytes);
+                size_t total_bytes = cnt * per_vec;
+                std::string header = supplier::make_header("OK BINARY", dtype_str, cnt, dim, total_bytes);
                 std::string out;
                 out.reserve(header.size() + std::min<size_t>(total_bytes, 1 << 20));
                 out += header;
@@ -477,9 +522,13 @@ namespace pomai::server
                 for (size_t i = 0; i < cnt; ++i)
                 {
                     uint64_t id = (*idxs)[off + i];
-                    std::vector<float> vec;
-                    supplier::fetch_vector(m, id, vec);
-                    out.append(reinterpret_cast<const char *>(vec.data()), vec_bytes);
+                    pomai::core::DataType got_dt;
+                    uint32_t got_elem;
+                    std::string raw;
+                    supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
                 }
                 return out;
             }
@@ -563,9 +612,12 @@ namespace pomai::server
             cfg.dim = dim;
             cfg.ram_mb = ram_mb;
             // convert textual data_type into enum
-            try {
+            try
+            {
                 cfg.data_type = pomai::core::parse_dtype(data_type);
-            } catch (...) {
+            }
+            catch (...)
+            {
                 return std::string("ERR: unsupported DATA_TYPE '") + data_type + "'\n";
             }
 
@@ -687,9 +739,12 @@ namespace pomai::server
             ss << " feature_dim: " << feature_dim << "\n";
             ss << " metric: L2\n";
             // Report actual data_type configured for this membrance
-            try {
+            try
+            {
                 ss << " data_type: " << pomai::core::dtype_name(m->data_type) << "\n";
-            } catch (...) {
+            }
+            catch (...)
+            {
                 ss << " data_type: float32\n";
             }
             ss << " total_vectors: " << total_vectors << "\n";

@@ -21,6 +21,9 @@ Notes:
    integer domain before formatting.
  - We support passing vectors as either numpy.ndarray or torch.Tensor; the builder
    will detect and convert accordingly.
+ - This version verifies that the server returns binary streams encoded in the
+   same storage element type configured for the membrance (i.e. it will fail
+   if the server always decodes everything into float32).
 """
 
 import argparse
@@ -114,31 +117,65 @@ class PomaiClient:
 
     def request_binary_stream(self, cmd: str) -> Tuple[int, int, bytes]:
         """
-        Sends command, parses 'OK BINARY <count> <dim> <bytes>\n', then reads raw bytes.
+        Sends command, parses header and reads raw bytes.
+
+        Supports both header formats:
+        - "OK BINARY <count> <dim> <bytes>\n"            (legacy)
+        - "OK BINARY <dtype> <count> <dim> <bytes>\n"    (new)
+        Also accepts "OK BINARY_PAIR" similarly.
         """
         self.send(cmd)
         header_buf = b""
+        # read header line (until newline)
         while b"\n" not in header_buf:
             try:
                 chunk = self.sock.recv(1)
-            except: raise TimeoutError("Socket timeout reading header")
-            if not chunk: raise ConnectionError("Socket closed")
+            except Exception:
+                raise TimeoutError("Socket timeout reading header")
+            if not chunk:
+                raise ConnectionError("Socket closed while reading header")
             header_buf += chunk
 
-        header_str = header_buf.decode("utf-8").strip()
-        if not header_str.startswith("OK BINARY"):
+        header_str = header_buf.decode("utf-8", errors="replace").strip()
+
+        # Accept both "OK BINARY" and "OK BINARY_PAIR"
+        if not (header_str.startswith("OK BINARY") or header_str.startswith("OK BINARY_PAIR")):
             print(f"[Binary Stream Error] Header: {header_str}")
+            # drain remainder until <END>\n to keep connection in sync
             if "ERR" in header_str or header_str:
                 self._drain_until_end()
             return 0, 0, b""
 
         parts = header_str.split()
-        if len(parts) < 5: return 0, 0, b""
-        count = int(parts[2])
-        dim = int(parts[3])
-        total_bytes = int(parts[4])
+        # parts examples:
+        # ["OK","BINARY","6","2048","49152"]                       -> legacy
+        # ["OK","BINARY","float32","6","2048","49152"]            -> new (dtype included)
+        # ["OK","BINARY_PAIR","float32","3","2048","24576"]
+        # Determine whether parts[2] is a dtype token:
+        dtypes = {"float32", "float64", "int32", "int8", "float16", "fp16", "double"}
+        # normalize lower-case for comparison
+        idx = 2
+        if len(parts) >= 3 and parts[2].lower() in dtypes:
+            # dtype present -> shift indices
+            idx = 3
+
+        # Ensure we have enough tokens after resolving optional dtype
+        if len(parts) <= idx + 2:
+            # malformed header: drain and return
+            self._drain_until_end()
+            return 0, 0, b""
+
+        try:
+            count = int(parts[idx])
+            dim = int(parts[idx + 1])
+            total_bytes = int(parts[idx + 2])
+        except Exception:
+            # malformed numeric fields
+            self._drain_until_end()
+            return 0, 0, b""
 
         if total_bytes == 0:
+            # still need to consume trailing <END>\n marker
             self._drain_until_end()
             return count, dim, b""
 
@@ -147,10 +184,13 @@ class PomaiClient:
             want = total_bytes - len(data_buf)
             try:
                 chunk = self.sock.recv(min(65536, want))
-            except: raise TimeoutError("Timeout reading body")
-            if not chunk: break
+            except Exception:
+                raise TimeoutError("Timeout reading body")
+            if not chunk:
+                break
             data_buf += chunk
 
+        # consume trailing protocol marker
         self._drain_until_end()
         return count, dim, data_buf
 
@@ -268,6 +308,84 @@ def query_membrance_info(client: PomaiClient, memname: str, verbose: bool = True
     if m: info["data_type"] = m.group(1).strip()
     return info
 
+# ---------- New: payload verification helpers ----------
+def dtype_str_to_numpy(dtype_str: str):
+    """
+    Map textual dtype to numpy dtype and element size in bytes.
+    Returns (np.dtype, elem_size) or (None, None) if unknown.
+    """
+    if not dtype_str:
+        return None, None
+    s = dtype_str.lower()
+    if s in ("float32", "float"):
+        return np.float32, 4
+    if s in ("float64", "double"):
+        return np.float64, 8
+    if s in ("int32",):
+        return np.int32, 4
+    if s in ("int8",):
+        return np.int8, 1
+    if s in ("float16", "fp16", "half"):
+        return np.float16, 2
+    return None, None
+
+def verify_payload_dtype(payload: bytes, dim: int, count: int, expected_dtype_str: str, verbose: bool = True) -> bool:
+    """
+    Verify that the binary payload length and element encoding match the expected storage dtype.
+    Returns True if the payload appears encoded in expected_dtype, False otherwise.
+    """
+    if count == 0:
+        if verbose: print("  -> No vectors expected/returned.")
+        return True
+
+    np_dtype, elem_size = dtype_str_to_numpy(expected_dtype_str)
+    if np_dtype is None:
+        if verbose:
+            print(f"  -> Unknown expected dtype '{expected_dtype_str}'. Falling back to float32 verification.")
+        np_dtype, elem_size = np.float32, 4
+
+    expected_bytes = count * dim * elem_size
+    if len(payload) != expected_bytes:
+        if verbose:
+            print(f"  -> Warning: payload size {len(payload)} != expected {expected_bytes} bytes (count*dim*elem_size).")
+        # continue to attempt parsing what we can
+
+    if len(payload) % elem_size != 0:
+        if verbose:
+            print(f"  -> Error: payload length {len(payload)} not divisible by element size {elem_size}.")
+        return False
+
+    try:
+        arr = np.frombuffer(payload, dtype=np_dtype)
+    except Exception as e:
+        if verbose:
+            print("  -> Error creating numpy array from payload with dtype", np_dtype, ":", e)
+        return False
+
+    if arr.dtype != np_dtype:
+        if verbose:
+            print("  -> Error: parsed array dtype", arr.dtype, "!= expected", np_dtype)
+        return False
+
+    if dim <= 0:
+        if verbose:
+            print("  -> Warning: received dim <= 0")
+        return True
+
+    if arr.size % dim != 0:
+        if verbose:
+            print("  -> Warning: total elements", arr.size, "is not divisible by dim", dim)
+        # still accept but warn
+
+    if verbose:
+        parsed_count = arr.size // dim if dim > 0 else 0
+        print(f"  -> Verified payload dtype {np_dtype}: parsed {parsed_count} vectors (elem_size={elem_size} bytes).")
+    return True
+
+# -----------------------
+# Main test flow
+# -----------------------
+
 def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbose: bool = True):
     exts = {".jpg", ".jpeg", ".png", ".bmp"}
     imgs = []
@@ -355,6 +473,11 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
 
             info = query_membrance_info(client, mname, verbose=verbose)
             print(f"Membrance info parsed: {info}")
+            # Determine expected storage dtype (from manifest/info if provided)
+            expected_dtype = dt
+            if info and info.get("data_type"):
+                # server may report a normalized name; prefer reported value for expectation
+                expected_dtype = info["data_type"]
 
             ##### ITERATE TRAIN ####
             print(f"ITERATE {mname} TRAIN to validate stream (drain)...")
@@ -362,48 +485,79 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
             print(f"  -> Received {count} vectors, dim reported={dim_ret}")
             if count == 0:
                 print(f"  [WARN] server returned 0 vectors (may be a bug if inserts succeeded)")
-            if count > 0 and payload:
-                try:
-                    arr = np.frombuffer(payload, dtype=np.float32)
-                    if dim_ret == 0:
-                        print("  -> Warning: server reported dim 0")
-                    else:
-                        if arr.size % dim_ret == 0:
+
+            # Verify payload matches expected storage dtype (NOT necessarily float32)
+            ok = verify_payload_dtype(payload, dim_ret, count, expected_dtype, verbose=verbose)
+            if not ok:
+                print(f"  [ERROR] ITERATE TRAIN payload verification failed for membrance {mname} (expected dtype={expected_dtype})")
+            else:
+                # parse and show a sample if possible
+                np_dtype, _ = dtype_str_to_numpy(expected_dtype)
+                if count > 0 and payload and np_dtype is not None:
+                    try:
+                        arr = np.frombuffer(payload, dtype=np_dtype)
+                        if dim_ret > 0 and arr.size % dim_ret == 0:
                             arr = arr.reshape(-1, dim_ret)
-                            print(f"  -> Parsed TRAIN array shape: {arr.shape}, first[0,:5]={arr[0,:5].tolist()}")
-                        else:
-                            print("  -> Warning: payload size not divisible by dim")
-                except Exception as e:
-                    print("  -> Error parsing payload:", e)
+                            # Print first 5 elements of first vector after casting to float for readability
+                            print(f"  -> Parsed TRAIN array shape: {arr.shape}, first[0,:5]={arr[0,:5].astype(np.float64).tolist()}")
+                    except Exception as e:
+                        print("  -> Error parsing payload after verification:", e)
 
             ##### ITERATE PAIR ####
             print(f"ITERATE {mname} PAIR to validate (label, vector) binary stream...")
             count, dim_ret, payload = client.request_binary_stream(f"ITERATE {mname} PAIR 0 1000;")
             print(f"  -> Received {count} label+vector pairs, dim reported={dim_ret}")
             if count > 0 and payload:
-                try:
-                    tuple_size = 8 + 4 * dim_ret
-                    for i in range(min(2, count)):
-                        label = struct.unpack('<Q', payload[i*tuple_size:i*tuple_size+8])[0]
-                        vec = np.frombuffer(payload[i*tuple_size+8:i*tuple_size+8+4*dim_ret], dtype=np.float32)
-                        print(f"    [PAIR {i}] label={label}, vec[:5]={vec[:5].tolist()}")
-                except Exception as e:
-                    print("  -> Error parsing PAIR stream:", e)
+                np_dtype, elem_size = dtype_str_to_numpy(expected_dtype)
+                tuple_size = 8 + (elem_size * dim_ret if elem_size else 4 * dim_ret)
+                if len(payload) < tuple_size * count:
+                    print("  -> Warning: payload smaller than expected for given count/dim/elem_size")
+                # Check first few
+                all_ok = True
+                for i in range(min(3, count)):
+                    start = i * tuple_size
+                    lbl_bytes = payload[start:start+8]
+                    label = struct.unpack('<Q', lbl_bytes)[0]
+                    vec_start = start + 8
+                    vec_end = vec_start + (elem_size * dim_ret if elem_size else 4 * dim_ret)
+                    vec_bytes = payload[vec_start:vec_end]
+                    ok = verify_payload_dtype(vec_bytes, dim_ret, 1, expected_dtype, verbose=False)
+                    if not ok:
+                        all_ok = False
+                        print(f"    -> PAIR vector #{i} failed verification (expected={expected_dtype})")
+                    else:
+                        # parse for print
+                        if np_dtype is not None:
+                            v = np.frombuffer(vec_bytes, dtype=np_dtype)
+                            print(f"    [PAIR {i}] label={label}, vec[:5]={v[:5].astype(np.float64).tolist()}")
+                if not all_ok:
+                    print(f"  [ERROR] One or more PAIR vectors failed verification for {mname}")
 
             ##### ITERATE TRIPLET ####
             print(f"ITERATE {mname} TRIPLET class 2 to validate triplet stream...")
-            # Only attempt if batch_items all have 'class' metadata!
             count, dim_ret, payload = client.request_binary_stream(f"ITERATE {mname} TRIPLET class 2;")
             print(f"  -> Received {count} triplets, dim={dim_ret}")
             if count > 0 and payload:
+                np_dtype, elem_size = dtype_str_to_numpy(expected_dtype)
+                triplet_size = 3 * (elem_size * dim_ret if elem_size else 4 * dim_ret)
+                if len(payload) < triplet_size * count:
+                    print("  -> Warning: triplet payload smaller than expected")
                 try:
-                    triplet_size = 3 * 4 * dim_ret
                     for i in range(min(1, count)):
                         chunk = payload[i*triplet_size:(i+1)*triplet_size]
-                        a = np.frombuffer(chunk[0:4*dim_ret], dtype=np.float32)
-                        p = np.frombuffer(chunk[4*dim_ret:8*dim_ret], dtype=np.float32)
-                        n = np.frombuffer(chunk[8*dim_ret:], dtype=np.float32)
-                        print(f"    [TRIPLET {i}] anchor[:5]={a[:5].tolist()}, pos[:5]={p[:5].tolist()}, neg[:5]={n[:5].tolist()}")
+                        a_b = chunk[0:elem_size*dim_ret]
+                        p_b = chunk[elem_size*dim_ret:2*elem_size*dim_ret]
+                        n_b = chunk[2*elem_size*dim_ret:3*elem_size*dim_ret]
+                        oka = verify_payload_dtype(a_b, dim_ret, 1, expected_dtype, verbose=False)
+                        okp = verify_payload_dtype(p_b, dim_ret, 1, expected_dtype, verbose=False)
+                        okn = verify_payload_dtype(n_b, dim_ret, 1, expected_dtype, verbose=False)
+                        if not (oka and okp and okn):
+                            print("  -> Error: one of triplet parts failed verification")
+                        else:
+                            a = np.frombuffer(a_b, dtype=np_dtype)
+                            p = np.frombuffer(p_b, dtype=np_dtype)
+                            n = np.frombuffer(n_b, dtype=np_dtype)
+                            print(f"    [TRIPLET {i}] anchor[:5]={a[:5].astype(np.float64).tolist()}, pos[:5]={p[:5].astype(np.float64).tolist()}, neg[:5]={n[:5].astype(np.float64).tolist()}")
                 except Exception as e:
                     print("  -> Error parsing TRIPLET stream:", e)
 
