@@ -58,7 +58,6 @@ void print_banner(int port)
  |_|    \___/|_|  |_/_/   \_\___|
                                  
 )" << ANSI_RESET;
-    std::cout << ANSI_GREEN << " :: Pomai Orbit Server ::" << ANSI_RESET << "   (v0.3.0 - AI Data Engine)\n";
     std::cout << " ------------------------------------------------\n";
     std::cout << "  Port:   " << port << "\n";
     std::cout << "  PID:    " << getpid() << "\n";
@@ -68,12 +67,25 @@ void print_banner(int port)
 
 int main(int argc, char **argv)
 {
-    // [CRITICAL FIX] Force standard C locale.
+    // [CRITICAL Fix] Force standard C locale.
     // This ensures strtof/stof parses "3.14" as 3.14, not 3 (if system locale expects comma).
     std::setlocale(LC_ALL, "C");
 
     // 1. Load Config (Duy nhất 1 lần từ CLI/Env)
     auto config = pomai::config::load_from_args(argc, argv);
+
+    // Print shard / arena info on startup as requested
+    {
+        size_t shard_count = (config.orchestrator.shard_count > 0)
+                                 ? static_cast<size_t>(config.orchestrator.shard_count)
+                                 : std::max<size_t>(1, std::thread::hardware_concurrency());
+        uint64_t arena_mb = config.res.arena_mb_per_shard;
+        uint64_t total_arena_mb = arena_mb * shard_count;
+        std::clog << "[Init] Shard configuration: shard_count=" << shard_count
+                  << ", arena_mb_per_shard=" << arena_mb << " MB"
+                  << " (total ~" << total_arena_mb << " MB)"
+                  << "\n";
+    }
 
     // 2. Init CPU Kernels
     pomai_init_cpu_kernels();
@@ -126,7 +138,7 @@ int main(int argc, char **argv)
     }
 
     print_banner(config.net.port);
-    std::clog << "[Init] CPU kernel selected: " << kernel_name_from_ptr(get_pomai_l2sq_kernel()) << "\n";
+    std::clog << "[Init] CPU kernels initialized\n";
 
     try
     {

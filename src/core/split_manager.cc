@@ -1,16 +1,17 @@
 /*
  * src/core/split_manager.cc
  * Implementation of Data Splitting Logic.
- * [FIXED] Added <map> include and handled unused parameter warnings.
  */
 
 #include "src/core/split_manager.h"
-#include <map>       // [FIXED] Critical for std::map
+
+#include <map>
 #include <vector>
 #include <numeric>
 #include <cstring>
 #include <algorithm> // for std::shuffle
-#include <random>    // for std::mt19937
+#include <random>    // for std::mt19937_64
+#include <fstream>
 
 namespace pomai::core {
 
@@ -39,7 +40,7 @@ namespace pomai::core {
     }
 
     void SplitManager::execute_split_with_items(const std::vector<uint64_t>& items, float train_pct, float val_pct, float test_pct) {
-        // [FIXED] Silence unused warning (test_pct is implicitly used as "the rest")
+        // test_pct implicitly the remainder; silence unused warning
         (void)test_pct;
 
         reset();
@@ -47,7 +48,7 @@ namespace pomai::core {
 
         std::vector<uint64_t> shuffled = items;
         
-        // 2. Shuffle Deterministically
+        // Deterministic shuffle via optional seed
         std::mt19937_64 rng;
         if (cfg_.rng_seed.has_value()) {
             rng.seed(*cfg_.rng_seed);
@@ -85,7 +86,6 @@ namespace pomai::core {
         const std::vector<uint64_t>& labels,
         float train_pct, float val_pct, float test_pct) 
     {
-        // [FIXED] Silence unused warning
         (void)test_pct;
 
         reset();
@@ -105,7 +105,7 @@ namespace pomai::core {
             rng.seed(std::random_device{}());
         }
 
-        // 3. Split each group
+        // 3. Split each group and collect
         for(auto& kv : groups) {
             std::vector<uint64_t>& group_items = kv.second;
             std::shuffle(group_items.begin(), group_items.end(), rng);
@@ -132,7 +132,7 @@ namespace pomai::core {
             }
         }
 
-        // 4. Shuffle final sets to mix labels
+        // 4. Shuffle final sets to mix labels while preserving proportions
         std::shuffle(train_indices.begin(), train_indices.end(), rng);
         std::shuffle(val_indices.begin(), val_indices.end(), rng);
         std::shuffle(test_indices.begin(), test_indices.end(), rng);
@@ -143,11 +143,12 @@ namespace pomai::core {
         std::ofstream ofs(path, std::ios::binary);
         if (!ofs) return false;
 
-        ofs.write(MAGIC, 8);
+        // Write magic
+        ofs.write(SplitManager::MAGIC, sizeof(SplitManager::MAGIC));
         
-        uint64_t sz_tr = train_indices.size();
-        uint64_t sz_va = val_indices.size();
-        uint64_t sz_te = test_indices.size();
+        uint64_t sz_tr = static_cast<uint64_t>(train_indices.size());
+        uint64_t sz_va = static_cast<uint64_t>(val_indices.size());
+        uint64_t sz_te = static_cast<uint64_t>(test_indices.size());
 
         ofs.write(reinterpret_cast<const char*>(&sz_tr), sizeof(sz_tr));
         ofs.write(reinterpret_cast<const char*>(&sz_va), sizeof(sz_va));
@@ -157,7 +158,7 @@ namespace pomai::core {
         if(sz_va) ofs.write(reinterpret_cast<const char*>(val_indices.data()), sz_va * sizeof(uint64_t));
         if(sz_te) ofs.write(reinterpret_cast<const char*>(test_indices.data()), sz_te * sizeof(uint64_t));
 
-        return true;
+        return ofs.good();
     }
 
     bool SplitManager::load(const std::string& data_root) {
@@ -165,27 +166,33 @@ namespace pomai::core {
         std::ifstream ifs(path, std::ios::binary);
         if (!ifs) return false;
 
-        char magic[8];
-        ifs.read(magic, 8);
-        if(std::strncmp(magic, MAGIC, 8) != 0) return false;
+        char magic[sizeof(SplitManager::MAGIC)];
+        ifs.read(magic, sizeof(magic));
+        if (!ifs) return false;
 
-        uint64_t sz_tr, sz_va, sz_te;
+        if (std::memcmp(magic, SplitManager::MAGIC, sizeof(SplitManager::MAGIC)) != 0) return false;
+
+        uint64_t sz_tr = 0, sz_va = 0, sz_te = 0;
         ifs.read(reinterpret_cast<char*>(&sz_tr), sizeof(sz_tr));
         ifs.read(reinterpret_cast<char*>(&sz_va), sizeof(sz_va));
         ifs.read(reinterpret_cast<char*>(&sz_te), sizeof(sz_te));
+        if (!ifs) return false;
 
         reset();
         if(sz_tr) {
             train_indices.resize(sz_tr);
             ifs.read(reinterpret_cast<char*>(train_indices.data()), sz_tr * sizeof(uint64_t));
+            if (!ifs) return false;
         }
         if(sz_va) {
             val_indices.resize(sz_va);
             ifs.read(reinterpret_cast<char*>(val_indices.data()), sz_va * sizeof(uint64_t));
+            if (!ifs) return false;
         }
         if(sz_te) {
             test_indices.resize(sz_te);
             ifs.read(reinterpret_cast<char*>(test_indices.data()), sz_te * sizeof(uint64_t));
+            if (!ifs) return false;
         }
         return true;
     }

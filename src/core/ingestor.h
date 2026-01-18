@@ -10,22 +10,33 @@
 #include <memory>
 #include <iostream>
 #include <cassert>
+#include <type_traits>
+
 #include "src/core/config.h"
+#include "src/core/types.h" // [REQUIRED] For DataType enum & dtype_size
 
 namespace pomai::core
 {
+    // IngestBatch: Holds raw bytes to support any data type (float, int8, fp16, etc.)
     struct IngestBatch
     {
         alignas(64) std::atomic<uint32_t> cursor{0};
         std::vector<uint64_t> labels;
-        std::vector<float> data_block;
+        std::vector<uint8_t> data_block; // [CHANGED] Raw bytes storage
         size_t capacity;
         size_t dim;
+        size_t element_size;   // Size of one scalar element (e.g., 4 for float, 1 for int8)
+        size_t vector_bytes;   // Size of one full vector in bytes
 
-        IngestBatch(size_t cap, size_t d) : capacity(cap), dim(d)
+        IngestBatch(size_t cap, size_t d, pomai::core::DataType dtype) 
+            : capacity(cap), dim(d)
         {
+            element_size = pomai::core::dtype_size(dtype);
+            vector_bytes = d * element_size;
+
             labels.resize(cap);
-            data_block.resize(cap * d);
+            // Allocate exactly enough bytes for the batch based on the data type
+            data_block.resize(cap * vector_bytes); 
             cursor.store(0, std::memory_order_relaxed);
         }
 
@@ -43,11 +54,32 @@ namespace pomai::core
     class Ingestor
     {
     public:
+        // NOTE: keep constructor backward-compatible. If no global data_type is configured,
+        // fall back to FLOAT32 for ingestion.
         Ingestor(const pomai::config::PomaiConfig &config, size_t dim)
             : cfg_(config.ingestor), dim_(dim), running_(true)
         {
-            active_batch_ = std::make_unique<IngestBatch>(cfg_.batch_size, dim_);
+            // Try to pick a global data type, but config.storage currently does not define one.
+            // Use FLOAT32 by default. If you want another default, add a string field to config.
+            dtype_ = pomai::core::DataType::FLOAT32;
+
+            active_batch_ = std::make_unique<IngestBatch>(cfg_.batch_size, dim_, dtype_);
             worker_thread_ = std::thread(&Ingestor::worker_loop, this);
+            
+            std::clog << "[Ingestor] Initialized. Dim=" << dim_ 
+                      << ", Type=" << pomai::core::dtype_name(dtype_) 
+                      << ", BatchSize=" << cfg_.batch_size << "\n";
+        }
+
+        // Optional constructor to explicitly set DataType
+        Ingestor(const pomai::config::PomaiConfig &config, size_t dim, pomai::core::DataType dtype)
+            : cfg_(config.ingestor), dim_(dim), dtype_(dtype), running_(true)
+        {
+            active_batch_ = std::make_unique<IngestBatch>(cfg_.batch_size, dim_, dtype_);
+            worker_thread_ = std::thread(&Ingestor::worker_loop, this);
+            std::clog << "[Ingestor] Initialized (explicit). Dim=" << dim_ 
+                      << ", Type=" << pomai::core::dtype_name(dtype_) 
+                      << ", BatchSize=" << cfg_.batch_size << "\n";
         }
 
         ~Ingestor()
@@ -61,17 +93,26 @@ namespace pomai::core
                 worker_thread_.join();
         }
 
-        bool submit(uint64_t label, const float *vec)
+        // Generic submit for any pointer type (float*, int8_t*, double*, etc.)
+        // Returns false if sizeof(T) doesn't match the configured system data type.
+        template <typename T>
+        bool submit(uint64_t label, const T *vec)
         {
+            // STRICT SAFETY CHECK: Ensure input type size matches storage configuration.
+            if (sizeof(T) != pomai::core::dtype_size(dtype_))
+            {
+                return false; 
+            }
+
             IngestBatch *batch = active_batch_.get();
+            // Optimistic reservation
             uint32_t idx = batch->cursor.fetch_add(1, std::memory_order_acq_rel);
 
             if (idx < batch->capacity)
             {
-                batch->labels[idx] = label;
-                size_t offset = static_cast<size_t>(idx) * dim_;
-                std::memcpy(batch->data_block.data() + offset, vec, dim_ * sizeof(float));
-
+                write_to_batch(batch, idx, label, vec);
+                
+                // If we filled the last slot, trigger rotation
                 if (idx == batch->capacity - 1)
                 {
                     rotate_batch();
@@ -80,12 +121,15 @@ namespace pomai::core
             }
             else
             {
+                // Batch full, force rotate and retry
                 rotate_batch();
                 return submit_retry(label, vec);
             }
         }
 
-        bool submit(uint64_t label, const std::vector<float> &vec)
+        // Overload for std::vector
+        template <typename T>
+        bool submit(uint64_t label, const std::vector<T> &vec)
         {
             if (vec.size() != dim_)
                 return false;
@@ -95,6 +139,8 @@ namespace pomai::core
     private:
         pomai::config::IngestorConfig cfg_;
         size_t dim_;
+        pomai::core::DataType dtype_; // Stored system type
+        
         std::atomic<bool> running_;
         std::unique_ptr<IngestBatch> active_batch_;
         std::queue<std::unique_ptr<IngestBatch>> full_queue_;
@@ -103,17 +149,30 @@ namespace pomai::core
         std::condition_variable cv_;
         std::thread worker_thread_;
 
-        bool submit_retry(uint64_t label, const float *vec)
+        // Helper to write data into the batch at a specific index
+        template <typename T>
+        inline void write_to_batch(IngestBatch *batch, uint32_t idx, uint64_t label, const T *vec)
+        {
+            batch->labels[idx] = label;
+            
+            // Calculate byte offset
+            size_t offset = static_cast<size_t>(idx) * batch->vector_bytes;
+            
+            // Memcpy raw bytes. Safe because we checked sizeof(T) vs element_size in public submit.
+            std::memcpy(batch->data_block.data() + offset, vec, batch->vector_bytes);
+        }
+
+        template <typename T>
+        bool submit_retry(uint64_t label, const T *vec)
         {
             IngestBatch *batch = active_batch_.get();
             uint32_t idx = batch->cursor.fetch_add(1, std::memory_order_acq_rel);
             if (idx < batch->capacity)
             {
-                batch->labels[idx] = label;
-                size_t offset = static_cast<size_t>(idx) * dim_;
-                std::memcpy(batch->data_block.data() + offset, vec, dim_ * sizeof(float));
+                write_to_batch(batch, idx, label, vec);
                 return true;
             }
+            // Should rarely happen unless ingestion is massively outpacing workers
             return false;
         }
 
@@ -123,6 +182,7 @@ namespace pomai::core
             if (active_batch_->is_full())
             {
                 full_queue_.push(std::move(active_batch_));
+                
                 if (!free_queue_.empty())
                 {
                     active_batch_ = std::move(free_queue_.front());
@@ -131,7 +191,8 @@ namespace pomai::core
                 }
                 else
                 {
-                    active_batch_ = std::make_unique<IngestBatch>(cfg_.batch_size, dim_);
+                    // Create new batch with same dimensions and type
+                    active_batch_ = std::make_unique<IngestBatch>(cfg_.batch_size, dim_, dtype_);
                 }
                 cv_.notify_one();
             }
@@ -153,7 +214,9 @@ namespace pomai::core
                     batch = std::move(full_queue_.front());
                     full_queue_.pop();
                 }
+                
                 process_batch(batch.get());
+                
                 {
                     std::lock_guard<std::mutex> lk(mu_);
                     if (free_queue_.size() < cfg_.max_free_batches)
@@ -164,8 +227,12 @@ namespace pomai::core
             }
         }
 
+        // This function will need to hand off data to HotTier/WAL.
+        // HotTier should now accept raw bytes or handle casting if needed.
         void process_batch(IngestBatch *batch)
         {
+            // TODO: Connect this to GlobalOrchestrator or HotTier.
+            // Ensure downstream accepts: (const uint8_t* data, size_t count, DataType type)
         }
     };
 }

@@ -29,13 +29,10 @@ namespace pomai::memory
         WAL_REC_CHECKPOINT = 100       // optional checkpoint record (manifest snapshot)
     };
 
-    struct WalConfig
-    {
-        // If true, each append_record will fsync the WAL before returning.
-        // This is the safest (default). Group commit can be implemented later.
-        bool sync_on_append = true;
-    };
-
+    // NOTE: Use the centralized config type pomai::config::WalConfig (declared in src/core/config.h)
+    // The WalManager provides a nested alias `WalConfig` so callers can write `WalManager::WalConfig`.
+    // (Do NOT declare a local WalConfig here to avoid type conflicts.)
+    
     class WalManager
     {
     public:

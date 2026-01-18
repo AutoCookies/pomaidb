@@ -187,7 +187,8 @@ Binaries:
 ## Running the Server
 
 ```bash
-./build/pomai_server
+chmod +x ./run.sh
+./run.sh
 ```
 
 **Env vars:**

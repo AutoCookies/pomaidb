@@ -1,4 +1,3 @@
-#pragma once
 // src/memory/arena.h
 //
 // PomaiArena -- a simple mmap-backed arena that provides:
@@ -22,6 +21,8 @@
 //
 // Threading: Most mutable members are protected by `mu_`. The async/pending maps
 // use `pending_mu_`. The demote queue is protected by `demote_mu_`.
+
+#pragma once
 
 #include <cstdint>
 #include <cstddef>
@@ -79,7 +80,7 @@ namespace pomai::memory
         PomaiArena();
 
         // Construct and allocate `bytes` bytes immediately (mmap).
-        explicit PomaiArena(const pomai::config::PomaiConfig& cfg);
+        explicit PomaiArena(const pomai::config::PomaiConfig &cfg);
 
         ~PomaiArena();
 

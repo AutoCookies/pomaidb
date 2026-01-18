@@ -131,7 +131,7 @@ namespace pomai::config
 
     struct OrchestratorConfig
     {
-        uint32_t shard_count = 0;                 // 0 = auto (hardware concurrency)
+        uint32_t shard_count = 4;                 // 0 = auto (hardware concurrency)
         std::string shard_path_prefix = "shard_"; // Tiền tố tên thư mục shard
         bool use_parallel_merging = true;         // Có sử dụng async futures không
     };
@@ -153,7 +153,6 @@ namespace pomai::config
 
     struct ShardConfig
     {
-        // Chuyển từ GB sang MB để đồng bộ với config.res.arena_mb_per_shard
         uint64_t arena_size_mb = 2048;
         uint64_t map_slots = 1048576; // 1M slots mặc định
     };

@@ -17,6 +17,7 @@
 #include "src/core/hot_tier.h"
 #include "src/core/config.h"
 #include "src/core/split_manager.h"
+#include "src/core/types.h"
 
 namespace pomai::core
 {
@@ -26,6 +27,7 @@ namespace pomai::core
         size_t ram_mb = 256;
         std::string engine = "orbit";
         bool enable_metadata_index = true;
+        pomai::core::DataType data_type = pomai::core::DataType::FLOAT32;
     };
 
     struct Membrance
@@ -34,19 +36,20 @@ namespace pomai::core
         size_t dim;
         size_t ram_mb;
         std::string data_path;
-        
+        pomai::core::DataType data_type; // configured storage type
+
         std::unique_ptr<pomai::memory::ShardArena> arena;
         std::unique_ptr<pomai::ai::orbit::PomaiOrbit> orbit;
         std::unique_ptr<HotTier> hot_tier;
-        
-        // [FIXED] Changed to shared_ptr to allow sharing with Orbit
+
+        // shared metadata index
         std::shared_ptr<MetadataIndex> meta_index;
-        
+
         std::unique_ptr<SplitManager> split_mgr;
 
         // Constructor takes Global Config
-        Membrance(const std::string& nm, const MembranceConfig& cfg, 
-                  const std::string& data_root, const pomai::config::PomaiConfig& global_cfg);
+        Membrance(const std::string &nm, const MembranceConfig &cfg,
+                  const std::string &data_root, const pomai::config::PomaiConfig &global_cfg);
 
         // Disable copy
         Membrance(const Membrance &) = delete;
@@ -84,8 +87,8 @@ namespace pomai::core
 
         std::unordered_map<std::string, std::unique_ptr<Membrance>> membrances_;
         mutable std::shared_mutex mu_;
-        
-        const pomai::config::PomaiConfig& config_;
+
+        const pomai::config::PomaiConfig &config_;
         pomai::memory::WalManager wal_;
 
         std::thread bg_thread_;

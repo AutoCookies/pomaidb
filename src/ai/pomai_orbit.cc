@@ -48,6 +48,7 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+#include <unordered_set> // <--- ADDED: used in find_routing_centroids
 
 namespace pomai::ai::orbit
 {
@@ -346,6 +347,7 @@ namespace pomai::ai::orbit
     void PomaiOrbit::save_schema()
     {
         SchemaHeader header;
+        header.magic_number = 0x504F4D41; // 'POMA'  <-- FIX: set magic number
         header.dim = cfg_.dim;
         header.num_centroids = cfg_.algo.num_centroids;
 
@@ -1663,8 +1665,9 @@ namespace pomai::ai::orbit
             if (count > 0)
             {
                 // Con trỏ tới vùng chứa IDs
+                // <-- FIX: use base + hdr->off_ids (not + sizeof(BucketHeader) again)
                 const uint64_t *id_ptr = reinterpret_cast<const uint64_t *>(
-                    *base_opt + sizeof(BucketHeader) + hdr->off_ids);
+                    *base_opt + hdr->off_ids);
 
                 // Copy ID ra ngoài
                 ids.insert(ids.end(), id_ptr, id_ptr + count);

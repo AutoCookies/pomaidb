@@ -15,6 +15,7 @@
 #include <thread>
 #include <cassert>
 #include <algorithm>
+#include <errno.h> // required for errno used by strerror()
 
 // Endianness macros... (giữ nguyên như file gốc)
 #if defined(__APPLE__)
@@ -181,7 +182,7 @@ namespace pomai::ai::orbit
         bcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
         bcast.sin_port = htons(cfg_.udp_port);
 
-        sendto(sockfd_, packet_buf, total_sz, 0, (struct sockaddr *)&bcast, sizeof(bcast));
+        sendto(sockfd_, packet_buf, static_cast<ssize_t>(total_sz), 0, (struct sockaddr *)&bcast, sizeof(bcast));
     }
 
     void NetworkCortex::process_packet(const sockaddr_in &sender, const uint8_t *buf, size_t len)
@@ -221,9 +222,7 @@ namespace pomai::ai::orbit
     {
         std::lock_guard<std::mutex> lk(neighbors_mu_);
         std::vector<NeighborInfo> out;
-        uint64_t now = now;
-
-        // Fix: now variable needs declaration or use helper
+        // Use helper to get current timestamp
         uint64_t ts = now_ms();
 
         for (auto it = neighbors_.begin(); it != neighbors_.end();)
