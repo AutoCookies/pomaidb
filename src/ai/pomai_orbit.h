@@ -223,6 +223,7 @@ namespace pomai::ai::orbit
         void apply_thermal_policy();
         std::vector<uint64_t> get_centroid_ids(uint32_t cid) const;
         size_t num_centroids() const { return centroids_.size(); }
+        std::vector<uint64_t> get_all_labels() const;
 
     private:
         Config cfg_;

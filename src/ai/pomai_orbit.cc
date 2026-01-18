@@ -1641,11 +1641,12 @@ namespace pomai::ai::orbit
 
     std::vector<uint64_t> PomaiOrbit::get_centroid_ids(uint32_t cid) const
     {
-        if (cid >= centroids_.size()) return {};
+        if (cid >= centroids_.size())
+            return {};
 
         std::vector<uint64_t> ids;
         const OrbitNode &node = *centroids_[cid];
-        
+
         // Duyệt Linked List các Bucket của Centroid này
         uint64_t curr = node.bucket_offset.load(std::memory_order_acquire);
         std::vector<char> temp_buf; // Buffer tạm cho bucket remote (nếu có)
@@ -1653,7 +1654,8 @@ namespace pomai::ai::orbit
         while (curr != 0)
         {
             auto base_opt = resolve_bucket_base(arena_, curr, temp_buf);
-            if (!base_opt) break;
+            if (!base_opt)
+                break;
 
             const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(*base_opt);
             uint32_t count = hdr->count.load(std::memory_order_acquire);
@@ -1662,9 +1664,8 @@ namespace pomai::ai::orbit
             {
                 // Con trỏ tới vùng chứa IDs
                 const uint64_t *id_ptr = reinterpret_cast<const uint64_t *>(
-                    *base_opt + sizeof(BucketHeader) + hdr->off_ids
-                );
-                
+                    *base_opt + sizeof(BucketHeader) + hdr->off_ids);
+
                 // Copy ID ra ngoài
                 ids.insert(ids.end(), id_ptr, id_ptr + count);
             }
@@ -1673,6 +1674,20 @@ namespace pomai::ai::orbit
             curr = hdr->next_bucket_offset.load(std::memory_order_acquire);
         }
         return ids;
+    }
+
+    std::vector<uint64_t> PomaiOrbit::get_all_labels() const
+    {
+        std::vector<uint64_t> out;
+        out.reserve(1024);
+        for (size_t si = 0; si < kLabelShardCount; ++si)
+        {
+            const LabelShard &sh = label_shards_[si];
+            std::shared_lock<std::shared_mutex> lk(sh.mu);
+            for (const auto &kv : sh.bucket)
+                out.push_back(kv.first);
+        }
+        return out;
     }
 
 } // namespace pomai::ai::orbit

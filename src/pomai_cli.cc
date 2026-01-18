@@ -4,7 +4,10 @@
  *
  * Updates:
  * - [NEW] Added ITERATE command support (Binary Protocol Handler).
- * Prevents CLI freezing when receiving raw binary data.
+ * - [NEW] Added specialized handlers for ITERATE PAIR and ITERATE TRIPLET.
+ * - CLI will choose appropriate binary handler based on the ITERATE mode token.
+ *
+ * This file is a self-contained usable implementation of the CLI client.
  */
 
 #include <iostream>
@@ -67,13 +70,14 @@ public:
     }
     ~PomaiSocket()
     {
-        if (sockfd_ != -1)
+        if (sockfd_ != -1) {
 #ifdef _WIN32
             closesocket(sockfd_);
-        WSACleanup();
+            WSACleanup();
 #else
             close(sockfd_);
 #endif
+        }
     }
 
     void sendln(const std::string &msg)
@@ -85,11 +89,11 @@ public:
         size_t to_send = tosend.size();
         while (to_send > 0)
         {
-            int sent = send(sockfd_, ptr, to_send, 0);
+            int sent = send(sockfd_, ptr, static_cast<int>(to_send), 0);
             if (sent <= 0)
                 throw std::runtime_error("Send failed");
             ptr += sent;
-            to_send -= sent;
+            to_send -= static_cast<size_t>(sent);
         }
     }
 
@@ -110,6 +114,22 @@ public:
         return out;
     }
 
+    // Read exact number of bytes into buffer (throws on EOF/error)
+    std::vector<char> recv_exact(size_t bytes)
+    {
+        std::vector<char> buf;
+        buf.resize(bytes);
+        size_t received = 0;
+        while (received < bytes)
+        {
+            int n = recv(sockfd_, buf.data() + received, static_cast<int>(bytes - received), 0);
+            if (n <= 0)
+                throw std::runtime_error("Socket closed during binary read");
+            received += static_cast<size_t>(n);
+        }
+        return buf;
+    }
+
     // Standard text response reader
     std::string recv_multiline(int maxlines = 100)
     {
@@ -126,18 +146,19 @@ public:
         return ss.str();
     }
 
-    // [NEW] Special handler for ITERATE command
-    // Protocol: OK BINARY <count> <dim> <bytes>\n[RAW BYTES]
-    void recv_binary_iterate()
+    // Generic binary ITERATE handler (drain-only, prints summary)
+    void recv_binary_iterate_generic()
     {
         // 1. Read Header
         std::string header = recv_until('\n');
-        std::cout << header; // Print header
+        std::cout << header; // Print header for visibility
 
-        if (header.find("OK BINARY") != 0) {
-            // Error or unknown format, maybe text error
-            if (header.find("<END>") == std::string::npos) {
-                 std::cout << recv_multiline(); // Flush rest if error
+        if (header.find("OK BINARY") != 0)
+        {
+            // Error or unknown format, flush rest as text
+            if (header.find("<END>") == std::string::npos)
+            {
+                std::cout << recv_multiline();
             }
             return;
         }
@@ -145,25 +166,167 @@ public:
         // 2. Parse Header
         std::stringstream ss(header);
         std::string tag;
-        size_t count, dim, total_bytes;
+        size_t count = 0, dim = 0, total_bytes = 0;
         ss >> tag >> tag >> count >> dim >> total_bytes;
 
-        std::cout << ANSI_CYAN << ">> Receiving " << total_bytes << " bytes of binary data..." << ANSI_RESET << "\n";
+        std::cout << ANSI_CYAN << ">> Draining " << total_bytes << " bytes of binary payload..." << ANSI_RESET << "\n";
 
-        // 3. Consume Binary Payload (Discard or Count)
-        // CLI shouldn't print binary to TTY. We just drain the socket.
-        size_t received = 0;
-        char buf[4096];
-        while (received < total_bytes) {
-            size_t want = total_bytes - received;
-            if (want > sizeof(buf)) want = sizeof(buf);
-            
-            int n = recv(sockfd_, buf, want, 0);
+        // 3. Drain binary payload (don't store)
+        const size_t BUF_SZ = 64 * 1024;
+        std::vector<char> tmp;
+        tmp.resize(BUF_SZ);
+        size_t remaining = total_bytes;
+        while (remaining > 0)
+        {
+            size_t want = (remaining > BUF_SZ) ? BUF_SZ : remaining;
+            int n = recv(sockfd_, tmp.data(), static_cast<int>(want), 0);
             if (n <= 0) throw std::runtime_error("Socket closed during binary read");
-            received += n;
+            remaining -= static_cast<size_t>(n);
         }
 
-        std::cout << ANSI_GREEN << ">> Successfully received " << count << " vectors (" << dim << "-dim)." << ANSI_RESET << "\n";
+        std::cout << ANSI_GREEN << ">> Binary iterate complete: " << count << " entries, dim=" << dim << ANSI_RESET << "\n";
+    }
+
+    // Special handler for ITERATE PAIR: each entry = uint64_t label + float32[dim]
+    void recv_binary_iterate_pair()
+    {
+        // Header
+        std::string header = recv_until('\n');
+        std::cout << header;
+        if (header.find("OK BINARY") != 0)
+        {
+            if (header.find("<END>") == std::string::npos)
+                std::cout << recv_multiline();
+            return;
+        }
+
+        std::stringstream ss(header);
+        std::string tmp;
+        size_t count = 0, dim = 0, total_bytes = 0;
+        ss >> tmp >> tmp >> count >> dim >> total_bytes;
+
+        const size_t bytes_per_vec = dim * sizeof(float);
+        const size_t pair_size = sizeof(uint64_t) + bytes_per_vec;
+        // best-effort validation
+        if (total_bytes != count * pair_size)
+        {
+            std::cerr << ANSI_YELLOW << "[WARN] size mismatch: header bytes=" << total_bytes
+                      << " expected=" << (count * pair_size) << ANSI_RESET << "\n";
+        }
+
+        std::cout << ANSI_CYAN << ">> Receiving " << count << " pairs; dim=" << dim << ", pair_bytes=" << pair_size << ANSI_RESET << "\n";
+
+        size_t got = 0;
+        uint64_t first_label = 0;
+        std::vector<float> first_vec;
+        bool printed_first = false;
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            // read label
+            auto lblb = recv_exact(sizeof(uint64_t));
+            uint64_t label = 0;
+            std::memcpy(&label, lblb.data(), sizeof(uint64_t));
+            // read vector
+            auto vbuf = recv_exact(bytes_per_vec);
+
+            if (!printed_first)
+            {
+                first_label = label;
+                first_vec.resize(dim);
+                std::memcpy(first_vec.data(), vbuf.data(), bytes_per_vec);
+                printed_first = true;
+            }
+            got++;
+        }
+
+        std::cout << ANSI_GREEN << ">> Received " << got << " pairs, dim=" << dim << ANSI_RESET << "\n";
+        if (printed_first)
+        {
+            std::cout << "  -> First pair label(hash)=" << first_label << ", vec[:5]=";
+            std::cout << "[";
+            for (size_t j = 0; j < std::min<size_t>(5, first_vec.size()); ++j)
+            {
+                if (j) std::cout << " ";
+                std::cout << std::fixed << std::setprecision(1) << first_vec[j];
+            }
+            std::cout << "]\n";
+        }
+    }
+
+    // Special handler for ITERATE TRIPLET: each entry = [A][P][N] where each is float32[dim]
+    void recv_binary_iterate_triplet()
+    {
+        std::string header = recv_until('\n');
+        std::cout << header;
+        if (header.find("OK BINARY") != 0)
+        {
+            if (header.find("<END>") == std::string::npos)
+                std::cout << recv_multiline();
+            return;
+        }
+
+        std::stringstream ss(header);
+        std::string tmp;
+        size_t count = 0, dim = 0, total_bytes = 0;
+        ss >> tmp >> tmp >> count >> dim >> total_bytes;
+
+        const size_t bytes_per_vec = dim * sizeof(float);
+        const size_t triplet_size = 3 * bytes_per_vec;
+        if (total_bytes != count * triplet_size)
+        {
+            std::cerr << ANSI_YELLOW << "[WARN] triplet size mismatch: header bytes=" << total_bytes
+                      << " expected=" << (count * triplet_size) << ANSI_RESET << "\n";
+        }
+
+        std::cout << ANSI_CYAN << ">> Receiving " << count << " triplets; dim=" << dim << ANSI_RESET << "\n";
+
+        bool printed_first = false;
+        std::vector<float> a, p, n;
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            auto ab = recv_exact(bytes_per_vec);
+            auto pb = recv_exact(bytes_per_vec);
+            auto nb = recv_exact(bytes_per_vec);
+
+            if (!printed_first)
+            {
+                a.resize(dim); p.resize(dim); n.resize(dim);
+                std::memcpy(a.data(), ab.data(), bytes_per_vec);
+                std::memcpy(p.data(), pb.data(), bytes_per_vec);
+                std::memcpy(n.data(), nb.data(), bytes_per_vec);
+                printed_first = true;
+            }
+        }
+
+        std::cout << ANSI_GREEN << ">> Received " << count << " triplets (A,P,N), dim=" << dim << ANSI_RESET << "\n";
+        if (printed_first)
+        {
+            std::cout << "  -> Anchor[:5]:   [";
+            for (size_t j = 0; j < std::min<size_t>(5, a.size()); ++j)
+            {
+                if (j) std::cout << " ";
+                std::cout << std::fixed << std::setprecision(1) << a[j];
+            }
+            std::cout << "]\n";
+
+            std::cout << "  -> Positive[:5]: [";
+            for (size_t j = 0; j < std::min<size_t>(5, p.size()); ++j)
+            {
+                if (j) std::cout << " ";
+                std::cout << std::fixed << std::setprecision(1) << p[j];
+            }
+            std::cout << "]\n";
+
+            std::cout << "  -> Negative[:5]: [";
+            for (size_t j = 0; j < std::min<size_t>(5, n.size()); ++j)
+            {
+                if (j) std::cout << " ";
+                std::cout << std::fixed << std::setprecision(1) << n[j];
+            }
+            std::cout << "]\n";
+        }
     }
 };
 
@@ -236,17 +399,36 @@ private:
                 std::stringstream ss(cmd);
                 std::string tmp, name;
                 ss >> tmp >> name;
-                if (name.back() == ';') name.pop_back();
+                if (!name.empty() && name.back() == ';') name.pop_back();
                 current_membr_ = name;
                 std::cout << "Switched to: " << ANSI_GREEN << current_membr_ << ANSI_RESET << "\n";
                 continue;
             }
 
-            // [NEW] ITERATE Command Handler
+            // ITERATE: dispatch to appropriate binary handler based on mode token
             if (up.rfind("ITERATE ", 0) == 0 && up.back() == ';') {
                 try {
+                    // determine mode token (PAIR/TRIPLET or TRAIN/VAL/TEST)
+                    std::stringstream ss(cmd);
+                    std::string tok;
+                    // ITERATE <name> <mode> ...
+                    ss >> tok; // ITERATE
+                    ss >> tok; // name
+                    std::string mode;
+                    if (!(ss >> mode)) mode = "";
+                    std::string mode_uc = uc(mode);
+
+                    // send command first
                     sock_->sendln(cmd);
-                    sock_->recv_binary_iterate();
+
+                    if (mode_uc == "PAIR") {
+                        sock_->recv_binary_iterate_pair();
+                    } else if (mode_uc == "TRIPLET") {
+                        sock_->recv_binary_iterate_triplet();
+                    } else {
+                        // generic binary drain (TRAIN/VAL/TEST will come here)
+                        sock_->recv_binary_iterate_generic();
+                    }
                 } catch (const std::exception &e) {
                     std::cerr << ANSI_RED << "Error: " << e.what() << ANSI_RESET << "\n";
                 }
@@ -257,9 +439,10 @@ private:
             try {
                 // Prepend current membrance for shortcuts
                 if (!current_membr_.empty()) {
-                    if (up.rfind("INSERT VALUES", 0) == 0) cmd = "INSERT INTO " + current_membr_ + " " + cmd.substr(6);
-                    else if (up.rfind("SEARCH QUERY", 0) == 0) cmd = "SEARCH " + current_membr_ + " " + cmd.substr(6);
-                    else if (up.rfind("GET LABEL", 0) == 0) cmd = "GET " + current_membr_ + " " + cmd.substr(3);
+                    std::string upcmd = uc(cmd);
+                    if (upcmd.rfind("INSERT VALUES", 0) == 0) cmd = "INSERT INTO " + current_membr_ + " " + cmd.substr(6);
+                    else if (upcmd.rfind("SEARCH QUERY", 0) == 0) cmd = "SEARCH " + current_membr_ + " " + cmd.substr(6);
+                    else if (upcmd.rfind("GET LABEL", 0) == 0) cmd = "GET " + current_membr_ + " " + cmd.substr(3);
                 }
 
                 sock_->sendln(cmd);
@@ -284,7 +467,9 @@ Commands:
   DML:
     INSERT INTO <name> VALUES (<lbl>,[v...]);
     SEARCH <name> QUERY ([v...]) TOP k;
-    ITERATE <name> <TRAIN|TEST> <off> <lim>; -- Stream binary data
+    ITERATE <name> <TRAIN|VAL|TEST> <off> <lim>; -- Stream binary data
+    ITERATE <name> PAIR <off> <lim>;  -- Stream (uint64 label + vector)
+    ITERATE <name> TRIPLET <off> <lim>; -- Stream triplets (A,P,N)
 
   Misc:
     USE <name>;

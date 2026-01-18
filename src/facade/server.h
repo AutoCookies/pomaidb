@@ -346,6 +346,49 @@ private:
         return ss.str();
     }
 
+    bool fetch_vector_bytes_or_fallback(pomai::core::Membrance *m, uint64_t id_or_offset, std::string &out, size_t dim)
+    {
+        size_t bytes_vec = dim * sizeof(float);
+
+        // 1) Try arena offset path (common for some internal indices)
+        const char *ptr = nullptr;
+        try
+        {
+            ptr = m->arena ? m->arena->blob_ptr_from_offset_for_map(id_or_offset) : nullptr;
+        }
+        catch (...)
+        {
+            ptr = nullptr;
+        }
+
+        if (ptr)
+        {
+            // blob header is uint32_t length at ptr
+            // append payload (skip header)
+            out.append(ptr + sizeof(uint32_t), bytes_vec);
+            return true;
+        }
+
+        // 2) Fallback: treat id_or_offset as label -> retrieve via Orbit API
+        try
+        {
+            std::vector<float> vec;
+            if (m->orbit && m->orbit->get(id_or_offset, vec) && vec.size() == dim)
+            {
+                out.append(reinterpret_cast<const char *>(vec.data()), bytes_vec);
+                return true;
+            }
+        }
+        catch (...)
+        {
+            // swallow and fall through to zero padding
+        }
+
+        // 3) Nothing found -> append zeros
+        out.append(bytes_vec, 0);
+        return false;
+    }
+
     // ---------- /proc/stat CPU sampling helpers ----------
     // Read first line of /proc/stat and parse cpu times
     static bool read_proc_stat(uint64_t &idle, uint64_t &total)
@@ -684,7 +727,8 @@ private:
                 total_vectors = m->split_mgr->train_indices.size() +
                                 m->split_mgr->val_indices.size() +
                                 m->split_mgr->test_indices.size();
-            } else if (strategy == "TEMPORAL")
+            }
+            else if (strategy == "TEMPORAL")
             {
                 if (!m->meta_index)
                     return "ERR: Metadata Index not enabled\n";
@@ -745,16 +789,34 @@ private:
 
                 total_vectors = n;
             }
-            // 3. RANDOM SPLIT (Mặc định)
-            else
-            {
-                if (total_vectors == 0)
-                    return "ERR: Membrance is empty (0 vectors)\n";
 
-                // Lưu ý: Random split mặc định dùng chỉ số ảo 0..N.
-                // Nếu muốn chính xác ID, cần dùng item-based split nhưng chậm hơn.
-                // Hiện tại giữ nguyên random index-based cho tốc độ.
-                m->split_mgr->execute_random_split(total_vectors, tr, val, te);
+            if (strategy == "RANDOM")
+            {
+                // Try to use actual labels inserted in Orbit (preferred)
+                std::vector<uint64_t> all_labels;
+                try
+                {
+                    if (m->orbit)
+                    {
+                        all_labels = m->orbit->get_all_labels(); // new helper
+                    }
+                }
+                catch (...)
+                {
+                    all_labels.clear();
+                }
+
+                if (!all_labels.empty())
+                {
+                    m->split_mgr->execute_split_with_items(all_labels, tr, val, te);
+                }
+                else
+                {
+                    // Fallback to ordinal split (legacy)
+                    if (total_vectors == 0)
+                        return "ERR: Membrance is empty (0 vectors)\n";
+                    m->split_mgr->execute_random_split(total_vectors, tr, val, te);
+                }
             }
 
             // Save result to disk
@@ -774,77 +836,269 @@ private:
         }
 
         // ---------------------------------------------------------
-        // 2. NEW: ITERATE COMMAND (Binary Stream)
-        // Syntax: ITERATE <name> <TRAIN|VAL|TEST> <offset> <limit>
+        // 5. ITERATE (Standardized Supplier)
         // ---------------------------------------------------------
         if (up.rfind("ITERATE", 0) == 0)
         {
             auto parts = split_ws(cmd);
-            if (parts.size() < 5)
-                return "ERR: Usage: ITERATE <name> <split> <off> <lim>\n";
+            if (parts.size() < 3)
+                return "ERR: Usage: ITERATE <name> <mode> [split] [off] [lim]\n";
 
             std::string name = parts[1];
-            std::string type = to_upper(parts[2]);
-            size_t off = 0, lim = 0;
-            try
-            {
-                off = std::stoul(parts[3]);
-                lim = std::stoul(parts[4]);
-            }
-            catch (...)
-            {
-            }
-
+            std::string mode = to_upper(parts[2]);
             auto *m = pomai_db_->get_membrance(name);
-            if (!m || !m->split_mgr)
-                return "ERR: Invalid membrance or no split\n";
+            if (!m)
+                return "ERR: Membrance not found\n";
 
-            const std::vector<uint64_t> *indices = nullptr;
-            if (type == "TRAIN")
-                indices = &m->split_mgr->train_indices;
-            else if (type == "VAL")
-                indices = &m->split_mgr->val_indices;
-            else if (type == "TEST")
-                indices = &m->split_mgr->test_indices;
-            else
-                return "ERR: Invalid split type\n";
-
-            if (off >= indices->size())
-                return "ERR: Offset out of range\n";
-            size_t end = std::min(off + lim, indices->size());
-            size_t count = end - off;
-
-            // Protocol: OK BINARY <count> <dim> <bytes>\n[RAW BYTES]
             size_t dim = m->dim;
-            size_t bytes_per_vec = dim * sizeof(float);
-            size_t total_bytes = count * bytes_per_vec;
+            size_t vec_bytes = dim * sizeof(float);
 
-            std::string header = "OK BINARY " + std::to_string(count) + " " +
-                                 std::to_string(dim) + " " + std::to_string(total_bytes) + "\n";
-
-            std::string response;
-            response.reserve(header.size() + total_bytes + 16);
-            response += header;
-
-            // Bulk Copy Data
-            for (size_t i = 0; i < count; ++i)
+            // Robust fetch: try Orbit (label), then Arena (offset), then ordinal -> map via orbit.get_all_labels()
+            auto fetch_vector = [&](uint64_t id_or_offset, std::vector<float> &out_vec) -> bool
             {
-                uint64_t offset = (*indices)[off + i];
-                const char *ptr = m->arena->blob_ptr_from_offset_for_map(offset);
-
-                if (ptr)
+                out_vec.clear();
+                try
                 {
-                    // Skip 4 bytes length header, copy float array
-                    response.append(ptr + sizeof(uint32_t), bytes_per_vec);
+                    // 1) Orbit (id treated as label)
+                    if (m->orbit)
+                    {
+                        if (m->orbit->get(id_or_offset, out_vec) && out_vec.size() == dim)
+                            return true;
+                    }
                 }
-                else
+                catch (...)
+                { /* ignore and continue */
+                }
+
+                try
                 {
-                    // Padding nếu lỗi (Zero vector)
-                    response.append(bytes_per_vec, 0);
+                    // 2) Arena offset / remote id
+                    if (m->arena)
+                    {
+                        const char *p = m->arena->blob_ptr_from_offset_for_map(id_or_offset);
+                        if (p)
+                        {
+                            out_vec.assign(dim, 0.0f);
+                            std::memcpy(out_vec.data(), p + sizeof(uint32_t), vec_bytes);
+                            return true;
+                        }
+                    }
+                }
+                catch (...)
+                { /* ignore */
+                }
+
+                try
+                {
+                    // 3) Ordinal mapping: if id_or_offset is small, treat as ordinal index into orbit's label list
+                    if (m->orbit)
+                    {
+                        // optimistic: orbit provides get_all_labels()
+                        // (some implementations have this helper; if not present this call should be guarded)
+                        auto all_labels = m->orbit->get_all_labels(); // may throw / may be empty
+                        if (!all_labels.empty())
+                        {
+                            uint64_t ord = id_or_offset;
+                            if (ord < all_labels.size())
+                            {
+                                uint64_t label = all_labels[ord];
+                                if (m->orbit->get(label, out_vec) && out_vec.size() == dim)
+                                    return true;
+                            }
+                        }
+                    }
+                }
+                catch (...)
+                { /* ignore */
+                }
+
+                // Not found
+                out_vec.assign(dim, 0.0f);
+                return false;
+            };
+
+            // parse optional split token and off/lim
+            size_t off = 0;
+            size_t lim = 1000000;
+            const std::vector<uint64_t> *idxs = nullptr;
+            auto choose_split = [&](const std::string &s) -> const std::vector<uint64_t> *
+            {
+                if (!m->split_mgr)
+                    return nullptr;
+                if (s == "TRAIN")
+                    return &m->split_mgr->train_indices;
+                if (s == "VAL")
+                    return &m->split_mgr->val_indices;
+                if (s == "TEST")
+                    return &m->split_mgr->test_indices;
+                return nullptr;
+            };
+
+            // Look for optional split token at parts[3]
+            size_t cur_tok = 3;
+            if (parts.size() > 3)
+            {
+                std::string maybe = to_upper(parts[3]);
+                const std::vector<uint64_t> *cand = choose_split(maybe);
+                if (cand)
+                {
+                    idxs = cand;
+                    cur_tok = 4;
                 }
             }
-            // Không thêm \n hay <END> ở cuối phần binary để giữ tốc độ và sự đơn giản
-            return response;
+            // default to TRAIN if available
+            if (!idxs && m->split_mgr)
+                idxs = &m->split_mgr->train_indices;
+
+            // parse numeric off/lim from remaining tokens
+            if (parts.size() > cur_tok)
+            {
+                try
+                {
+                    off = std::stoul(parts[cur_tok]);
+                }
+                catch (...)
+                {
+                    off = 0;
+                }
+            }
+            if (parts.size() > cur_tok + 1)
+            {
+                try
+                {
+                    lim = std::stoul(parts[cur_tok + 1]);
+                }
+                catch (...)
+                {
+                    lim = 1000000;
+                }
+            }
+
+            // helper to build binary header string
+            auto make_header = [](const char *tag, size_t cnt, size_t dim, size_t bytes) -> std::string
+            {
+                std::ostringstream h;
+                h << tag << " " << cnt << " " << dim << " " << bytes << "\n";
+                return h.str();
+            };
+
+            // MODE: TRIPLET (produce 3 vectors per record)
+            if (mode == "TRIPLET")
+            {
+                if (!m->meta_index || !m->orbit)
+                    return "OK BINARY 0 " + std::to_string(dim) + " 0\n";
+
+                if (parts.size() < 5)
+                    return "ERR: ITERATE <name> TRIPLET <key> <limit> [HARD]\n";
+                std::string key = parts[3];
+                size_t limit = 0;
+                try
+                {
+                    limit = std::stoul(parts[4]);
+                }
+                catch (...)
+                {
+                    return "ERR: invalid limit\n";
+                }
+                auto groups = m->meta_index->get_groups(key);
+                // collect valid classes with >=2 elements
+                std::vector<std::string> cls;
+                for (const auto &kv : groups)
+                    if (kv.second.size() >= 2)
+                        cls.push_back(kv.first);
+                if (cls.size() < 2)
+                    return "OK BINARY 0 " + std::to_string(dim) + " 0\n";
+
+                size_t total_bytes = limit * 3 * vec_bytes;
+                std::string out = make_header("OK BINARY", limit, dim, total_bytes);
+                std::mt19937 rng(std::random_device{}());
+                for (size_t i = 0; i < limit; ++i)
+                {
+                    // anchor class
+                    const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                    const auto &ids = groups[c];
+                    // pick anchor
+                    uint64_t ida = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                    uint64_t idp = ida;
+                    // pick positive different
+                    int tries = 0;
+                    while (idp == ida && ++tries < 20)
+                        idp = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                    // pick negative from another class
+                    uint64_t idn = ida;
+                    while (idn == ida)
+                    {
+                        const auto &c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                        if (c2 == c)
+                            continue;
+                        const auto &ids2 = groups[c2];
+                        idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
+                    }
+                    std::vector<float> va, vp, vn;
+                    fetch_vector(ida, va);
+                    fetch_vector(idp, vp);
+                    fetch_vector(idn, vn);
+                    out.append(reinterpret_cast<const char *>(va.data()), vec_bytes);
+                    out.append(reinterpret_cast<const char *>(vp.data()), vec_bytes);
+                    out.append(reinterpret_cast<const char *>(vn.data()), vec_bytes);
+                }
+                return out;
+            }
+
+            // MODE: PAIR -> emit (uint64 label) + vector(float32[])
+            if (mode == "PAIR")
+            {
+                if (!idxs)
+                    return "ERR: No split indices available for PAIR\n";
+                if (off >= idxs->size())
+                    return "OK BINARY_PAIR 0 " + std::to_string(dim) + " 0\n";
+
+                size_t cnt = std::min(lim, idxs->size() - off);
+                size_t per = sizeof(uint64_t) + vec_bytes;
+                std::string header = "OK BINARY_PAIR " + std::to_string(cnt) + " " + std::to_string(dim) + " " + std::to_string(cnt * per) + "\n";
+                std::string out;
+                out.reserve(header.size() + cnt * per);
+                out += header;
+
+                for (size_t i = 0; i < cnt; ++i)
+                {
+                    uint64_t id = (*idxs)[off + i];
+                    // append label (raw 8 bytes, platform endian)
+                    out.append(reinterpret_cast<const char *>(&id), sizeof(id));
+
+                    std::vector<float> vec;
+                    fetch_vector(id, vec);
+                    out.append(reinterpret_cast<const char *>(vec.data()), vec_bytes);
+                }
+                return out;
+            }
+
+            // MODE: TRAIN/VAL/TEST -> emit vectors only
+            if (mode == "TRAIN" || mode == "VAL" || mode == "TEST")
+            {
+                if (!idxs)
+                    return "ERR: No split indices available for ITERATE\n";
+                if (off >= idxs->size())
+                    return "OK BINARY 0 " + std::to_string(dim) + " 0\n";
+
+                size_t cnt = std::min(lim, idxs->size() - off);
+                size_t total_bytes = cnt * vec_bytes;
+                std::string header = make_header("OK BINARY", cnt, dim, total_bytes);
+                std::string out;
+                out.reserve(header.size() + std::min<size_t>(total_bytes, 1 << 20));
+                out += header;
+
+                for (size_t i = 0; i < cnt; ++i)
+                {
+                    uint64_t id = (*idxs)[off + i];
+                    std::vector<float> vec;
+                    fetch_vector(id, vec);
+                    out.append(reinterpret_cast<const char *>(vec.data()), vec_bytes);
+                }
+                return out;
+            }
+
+            return "ERR: Invalid ITERATE mode (TRAIN/VAL/TEST/TRIPLET/PAIR)\n";
         }
 
         // CREATE MEMBRANCE <name> DIM <n> [RAM <mb>];
@@ -914,25 +1168,39 @@ private:
             bool ok_parse = false;
 
             // Parsing logic (giữ nguyên logic ưu tiên của bạn)
-            if (parts.size() >= 4 && to_upper(parts[2]) == "INFO") {
-                name = parts[3]; ok_parse = true;
-            } else if (parts.size() >= 4 && to_upper(parts[3]) == "INFO") {
-                name = parts[2]; ok_parse = true;
-            } else if (parts.size() >= 3 && to_upper(parts[2]) == "INFO") {
-                if (c.sql_current_membr.empty()) return "ERR: no current membrance (USE <name>)\n";
-                name = c.sql_current_membr; ok_parse = true;
+            if (parts.size() >= 4 && to_upper(parts[2]) == "INFO")
+            {
+                name = parts[3];
+                ok_parse = true;
+            }
+            else if (parts.size() >= 4 && to_upper(parts[3]) == "INFO")
+            {
+                name = parts[2];
+                ok_parse = true;
+            }
+            else if (parts.size() >= 3 && to_upper(parts[2]) == "INFO")
+            {
+                if (c.sql_current_membr.empty())
+                    return "ERR: no current membrance (USE <name>)\n";
+                name = c.sql_current_membr;
+                ok_parse = true;
             }
 
-            if (!ok_parse) return "ERR: expected 'GET MEMBRANCE INFO ...'\n";
+            if (!ok_parse)
+                return "ERR: expected 'GET MEMBRANCE INFO ...'\n";
 
             auto *m = pomai_db_->get_membrance(name);
-            if (!m) return std::string("ERR: membrance not found: ") + name + "\n";
+            if (!m)
+                return std::string("ERR: membrance not found: ") + name + "\n";
 
             // 1. Gather Storage Info (Physical)
             pomai::ai::orbit::MembranceInfo info;
-            try {
+            try
+            {
                 info = m->orbit->get_info();
-            } catch (...) {
+            }
+            catch (...)
+            {
                 // fallback: use available membrance fields
                 info.dim = m->dim;
                 info.num_vectors = 0;
@@ -940,23 +1208,33 @@ private:
             }
 
             // Disk calc fallback (if orbit returned 0)
-            if (info.disk_bytes == 0) {
-                try {
+            if (info.disk_bytes == 0)
+            {
+                try
+                {
                     std::filesystem::path dp(m->data_path);
-                    if (std::filesystem::exists(dp)) {
-                        for (auto const &entry : std::filesystem::recursive_directory_iterator(dp)) {
-                            if (!entry.is_regular_file()) continue;
+                    if (std::filesystem::exists(dp))
+                    {
+                        for (auto const &entry : std::filesystem::recursive_directory_iterator(dp))
+                        {
+                            if (!entry.is_regular_file())
+                                continue;
                             std::error_code ec;
                             uint64_t fsz = static_cast<uint64_t>(entry.file_size(ec));
-                            if (!ec) info.disk_bytes += fsz;
+                            if (!ec)
+                                info.disk_bytes += fsz;
                         }
                     }
-                } catch (...) {}
+                }
+                catch (...)
+                {
+                }
             }
 
             // 2. Gather AI Contract Info (Logical Split) -> ĐÂY LÀ PHẦN MỚI
             size_t n_train = 0, n_val = 0, n_test = 0;
-            if (m->split_mgr) {
+            if (m->split_mgr)
+            {
                 n_train = m->split_mgr->train_indices.size();
                 n_val = m->split_mgr->val_indices.size();
                 n_test = m->split_mgr->test_indices.size();
@@ -967,7 +1245,8 @@ private:
 
             // Determine total vectors: prefer Orbit info, fallback to splits sum
             size_t total_vectors = info.num_vectors;
-            if (total_vectors == 0) {
+            if (total_vectors == 0)
+            {
                 total_vectors = n_train + n_val + n_test;
             }
 

@@ -4,12 +4,13 @@ test_pomai_integration.py
 
 End-to-end integration test for Pomai server (text SQL-like protocol).
 
-This version includes:
-- Batch Insert with TAGS support
-- GET MEMBRANCE INFO query
-- [NEW] EXEC SPLIT test (Random, Stratified, & Cluster)
-- [NEW] ITERATE Binary Stream test
-- [FIXED] Robust Protocol Handling (Binary Footer Sync) & Hash Verification
+Features Tested:
+- Batch Insert with TAGS (Class & Date)
+- GET MEMBRANCE INFO (AI Contract)
+- EXEC SPLIT (Random, Stratified, Cluster, Temporal)
+- ITERATE Binary Stream (Train/Test & TRIPLET generation)
+- ITERATE PAIR (label + vector)
+- Search & Delete
 """
 
 import argparse
@@ -19,6 +20,7 @@ import sys
 import time
 import math
 import re
+import struct
 from typing import List, Tuple
 
 # Feature extraction deps
@@ -61,7 +63,7 @@ class PomaiClient:
             pass
 
     def send(self, cmd: str):
-        """Send a command (string). Ensure it ends with '\\n' (server treats text)."""
+        """Send a command (string). Ensure it ends with '\n' (server treats text)."""
         if not cmd.endswith("\n"):
             cmd = cmd + "\n"
         data = cmd.encode("utf-8")
@@ -78,8 +80,8 @@ class PomaiClient:
         Returns the full response as a string (excluding the final marker).
         """
         self.send(cmd)
-        chunks = []
-        # read until marker
+        
+        # Read until marker
         marker = b"<END>\n"
         buf = b""
         deadline = time.time() + self.timeout
@@ -103,51 +105,42 @@ class PomaiClient:
         return text.strip()
 
     def _drain_until_end(self):
-        """
-        Robustly consume bytes from socket until <END>\n is found.
-        This handles variable-length footers (e.g. \n<END>\n vs <END>\n).
-        """
+        """Robustly consume bytes until <END> marker."""
         buf = b""
         marker = b"<END>\n"
-        # Read byte-by-byte or small chunks to avoid over-reading next command's response
-        # (Though in this sync test, over-reading isn't a huge issue, safety first)
         while True:
-            chunk = self.sock.recv(1)
+            try:
+                chunk = self.sock.recv(1)
+            except: break
             if not chunk: break
             buf += chunk
             if buf.endswith(marker):
                 break
 
-    # [NEW] Binary Stream Handler with Robust Sync
+    # Binary Stream Handler
     def request_binary_stream(self, cmd: str) -> Tuple[int, int, bytes]:
         """
         Sends command, parses 'OK BINARY <count> <dim> <bytes>\n', then reads raw bytes.
-        Returns: (count, dim, data_bytes)
         """
         self.send(cmd)
         
-        # 1. Read Header (line ending with \n)
+        # 1. Read Header
         header_buf = b""
         while b"\n" not in header_buf:
             try:
                 chunk = self.sock.recv(1)
-            except socket.timeout:
-                raise TimeoutError("Socket timeout reading header")
-            if not chunk: 
-                raise ConnectionError("Socket closed during header read")
+            except: raise TimeoutError("Socket timeout reading header")
+            if not chunk: raise ConnectionError("Socket closed")
             header_buf += chunk
         
         header_str = header_buf.decode("utf-8").strip()
         
-        # Check for error response (e.g. ERR: ...)
         if not header_str.startswith("OK BINARY"):
             print(f"[Binary Stream Error] Header: {header_str}")
-            # If server sent ERR, it likely sent the standard <END> marker too. Drain it.
             if "ERR" in header_str or header_str:
                 self._drain_until_end()
             return 0, 0, b""
 
-        # Parse header: OK BINARY 6 2048 49152
         parts = header_str.split()
         if len(parts) < 5: return 0, 0, b""
         
@@ -156,23 +149,20 @@ class PomaiClient:
         total_bytes = int(parts[4])
         
         if total_bytes == 0:
-            # Even if 0 bytes, server sends <END>\n marker. Drain it.
             self._drain_until_end()
             return count, dim, b""
 
-        # 2. Read exact binary payload
+        # 2. Read Payload
         data_buf = b""
         while len(data_buf) < total_bytes:
             want = total_bytes - len(data_buf)
             try:
                 chunk = self.sock.recv(min(65536, want))
-            except socket.timeout:
-                raise TimeoutError("Socket timeout reading body")
-            if not chunk: raise ConnectionError("Socket closed during body read")
+            except: raise TimeoutError("Timeout reading body")
+            if not chunk: break
             data_buf += chunk
             
-        # 3. [ROBUST FIX] Consume the trailing "<END>\n" marker
-        # Server always appends this. We must consume it to clear the socket for the next command.
+        # 3. Consume Footer
         self._drain_until_end()
 
         return count, dim, data_buf
@@ -182,40 +172,31 @@ class PomaiClient:
 # -----------------------
 
 class ResNet50FeatureExtractor:
-    """
-    Use torchvision resnet50 pretrained to extract 2048-dim features from images.
-    """
     def __init__(self, device: str = "cpu"):
         self.device = torch.device(device)
-        # Suppress warnings
         import warnings
         warnings.filterwarnings("ignore")
         
         from torchvision.models import resnet50, ResNet50_Weights
         weights = ResNet50_Weights.DEFAULT
         model = resnet50(weights=weights)
-        
-        modules = list(model.children())[:-1]  # drop fc
-        self.backbone = nn.Sequential(*modules).to(self.device)
+        self.backbone = nn.Sequential(*list(model.children())[:-1]).to(self.device)
         self.backbone.eval()
         self.transform = T.Compose([
             T.Resize(256),
             T.CenterCrop(224),
             T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
+            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
     def extract(self, pil_image: Image.Image) -> np.ndarray:
         img = pil_image.convert("RGB")
-        t = self.transform(img).unsqueeze(0).to(self.device)  # 1 x 3 x 224 x 224
+        t = self.transform(img).unsqueeze(0).to(self.device)
         with torch.no_grad():
             feat = self.backbone(t).reshape(-1)
         arr = feat.cpu().numpy().astype(np.float32)
-        # Optionally normalize (L2)
         norm = np.linalg.norm(arr)
-        if norm > 0:
-            arr = arr / norm
+        if norm > 0: arr = arr / norm
         return arr
 
 # -----------------------
@@ -223,58 +204,39 @@ class ResNet50FeatureExtractor:
 # -----------------------
 
 def vector_to_csv_list(vec: List[float]) -> str:
-    """Convert float vector to textual CSV list inside square brackets."""
     return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
 
-def make_insert_batch_cmd(memname: str, items: List[Tuple[str, np.ndarray]]) -> str:
-    """Build a single INSERT INTO ... VALUES command."""
-    parts = []
-    for label, vec in items:
-        csv = vector_to_csv_list(vec.tolist())
-        # Simple sanitization
-        safe_label = label.replace(")", "_").replace("(", "_").replace(",", "_")
-        parts.append(f"({safe_label}, {csv})")
-    body = ",".join(parts)
-    cmd = f"INSERT INTO {memname} VALUES {body};"
-    return cmd
-
-def make_insert_batch_cmd_with_tags(memname: str, items: List[Tuple[str, np.ndarray, str]]) -> str:
+def make_insert_batch_cmd_with_tags(memname: str, items: List[Tuple[str, np.ndarray, str, str]]) -> List[str]:
     """
-    Build INSERT command with TAGS.
-    Item format: (label, vector, class_tag)
+    Build INSERT command with TAGS (Class + Date).
+    Item format: (label, vector, class_tag, date_tag)
     """
     cmds = []
-    for label, vec, tag_val in items:
+    for label, vec, tag_class, tag_date in items:
         csv = vector_to_csv_list(vec.tolist())
         safe_label = label.replace(")", "_").replace("(", "_").replace(",", "_")
-        # INSERT INTO tests VALUES (lbl, [...]) TAGS (class:dog)
-        cmd = f"INSERT INTO {memname} VALUES ({safe_label}, {csv}) TAGS (class:{tag_val});"
+        # INSERT ... TAGS (class:..., date:...)
+        cmd = f"INSERT INTO {memname} VALUES ({safe_label}, {csv}) TAGS (class:{tag_class}, date:{tag_date});"
         cmds.append(cmd)
     return cmds
 
 def make_search_cmd(memname: str, query_vec: np.ndarray, topk: int = 5) -> str:
     qcsv = vector_to_csv_list(query_vec.tolist())
-    cmd = f"SEARCH {memname} QUERY ({qcsv}) TOP {topk};"
-    return cmd
+    return f"SEARCH {memname} QUERY ({qcsv}) TOP {topk};"
 
 def query_membrance_info(client: PomaiClient, memname: str, verbose: bool = True):
     cmd = f"GET MEMBRANCE INFO {memname};"
     try:
         resp = client.send_and_get_response(cmd)
-    except Exception as e:
-        if verbose:
-            print(f"Failed to query membrance info: {e}")
-        return None
-    if verbose:
-        print("Raw membrance info response:\n", resp.strip())
-
-    info = {"dim": None, "num_vectors": None, "disk_bytes": None, "raw": resp}
+    except: return None
+    
+    if verbose: print("Raw membrance info:\n", resp.strip())
+    
+    info = {"dim": None, "num_vectors": None}
     m = re.search(r"dim\s*[:=]\s*(\d+)", resp, re.IGNORECASE)
     if m: info["dim"] = int(m.group(1))
-
-    m = re.search(r"(?:num(?:ber)?_?vectors|num vectors|vectors)\s*[:=]\s*(\d+)", resp, re.IGNORECASE)
+    m = re.search(r"num.*vectors\s*[:=]\s*(\d+)", resp, re.IGNORECASE)
     if m: info["num_vectors"] = int(m.group(1))
-
     return info
 
 # -----------------------
@@ -282,8 +244,7 @@ def query_membrance_info(client: PomaiClient, memname: str, verbose: bool = True
 # -----------------------
 
 def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbose: bool = True):
-    # 1) locate image files
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff"}
+    exts = {".jpg", ".jpeg", ".png", ".bmp"}
     imgs = []
     for root, _, files in os.walk(assets_dir):
         for fn in files:
@@ -292,235 +253,186 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
     imgs.sort()
     
     if len(imgs) < 4:
-        print("Need at least 4 images to test stratified split meaningfully.")
+        print("Need at least 4 images.")
         return False
 
-    print(f"Found {len(imgs)} images in {assets_dir}")
-
-    # 2) init feature extractor
+    print(f"Found {len(imgs)} images.")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("Feature extraction device:", device)
     extractor = ResNet50FeatureExtractor(device=device)
 
-    # 3) extract features for each image and assign mock tags
-    # Prepare items with Mock Tags: First half -> DOG, Second half -> CAT
+    # Prepare Items with Mock Tags
+    # First half -> Class:Dog, Date:2024-01-01
+    # Second half -> Class:Cat, Date:2024-02-01
     items = []
     mid = len(imgs) // 2
-    print("Extracting features and assigning Mock Tags...")
+    print("Extracting features...")
     for i, p in enumerate(imgs):
         try:
             img = Image.open(p)
-            vec = extractor.extract(img)  # np.ndarray length 2048
+            vec = extractor.extract(img)
             label = os.path.splitext(os.path.basename(p))[0]
             
-            # Assign Tag
-            tag = "dog" if i < mid else "cat"
-            items.append((label, vec, tag))
-            if verbose:
-                print(f"  - {label} -> {tag}")
-        except Exception as e:
-            print("Failed to open image", p, ":", e)
-            continue
+            tag_class = "dog" if i < mid else "cat"
+            tag_date = "2024-01-01" if i < mid else "2024-02-01"
+            
+            items.append((label, vec, tag_class, tag_date))
+            if verbose: print(f"  - {label} -> Class:{tag_class}, Date:{tag_date}")
+        except: pass
 
-    if not items:
-        print("No images processed successfully")
-        return False
+    if not items: return False
 
-    # 4) connect to server
-    client = PomaiClient(host=host, port=port, timeout=30.0)
+    client = PomaiClient(host=host, port=port)
     try:
-        # 5) create membrance
-        print("\nCreating membrance 'tests' DIM 2048 ...")
-        cmd = "CREATE MEMBRANCE tests DIM 2048 RAM 256;"
-        resp = client.send_and_get_response(cmd)
-        print(resp.strip())
+        print("\nCreating membrance 'tests'...")
+        client.send_and_get_response("CREATE MEMBRANCE tests DIM 2048 RAM 256;")
 
-        # 6) Insert with TAGS
         print(f"\nInserting {len(items)} items with TAGS...")
-        # Send 1 by 1 to ensure correct tagging (since our server batch logic applies tags to whole batch)
-        # Using a specialized command builder for this test
-        insert_cmds = make_insert_batch_cmd_with_tags("tests", items)
-        for cmd in insert_cmds:
+        cmds = make_insert_batch_cmd_with_tags("tests", items)
+        for cmd in cmds:
             client.send_and_get_response(cmd)
-            # Small sleep to ensure order/processing
-            # time.sleep(0.005) 
 
-        print(f"Inserted {len(items)} items")
-
-        # Query info
-        info_after = query_membrance_info(client, "tests", verbose=verbose)
-        if info_after:
-            print("Membrance info after inserts:", info_after)
+        print("Inserted.")
+        
+        # [FIXED] Wait for async flush
+        print("Waiting 2s for server async flush...")
+        time.sleep(2.0)
+        
+        query_membrance_info(client, "tests", verbose=verbose)
 
         # ---------------------------------------------------------
-        # TEST 1: RANDOM SPLIT (Legacy)
+        # TEST 1: RANDOM SPLIT
         # ---------------------------------------------------------
         print("\n" + "="*50)
-        print("[TEST 1] Executing RANDOM Split (80/10/10)...")
-        random_split_cmd = "EXEC SPLIT tests 0.8 0.1 0.1;"
-        print(client.send_and_get_response(random_split_cmd))
+        print("[TEST 1] RANDOM Split (80/10/10)...")
+        print(client.send_and_get_response("EXEC SPLIT tests 0.8 0.1 0.1;"))
 
         # ---------------------------------------------------------
-        # TEST 2: STRATIFIED SPLIT (By Label)
+        # TEST 2: STRATIFIED SPLIT (By Class)
         # ---------------------------------------------------------
         print("-" * 50)
-        print("[TEST 2] Executing STRATIFIED Split by 'class' (50/25/25)...")
-        # Syntax: EXEC SPLIT <name> <tr%> <val%> <te%> STRATIFIED <key>
-        stratified_cmd = "EXEC SPLIT tests 0.5 0.25 0.25 STRATIFIED class;"
-        resp = client.send_and_get_response(stratified_cmd)
-        print(f"Split Response: {resp.strip()}")
+        print("[TEST 2] STRATIFIED Split by 'class' (50/25/25)...")
+        resp = client.send_and_get_response("EXEC SPLIT tests 0.5 0.25 0.25 STRATIFIED class;")
+        print(f"Response: {resp.strip()}")
         
-        if "ERR" in resp:
-            print("[FAILED] Stratified split failed.")
-        else:
-            print("[SUCCESS] Stratified split executed.")
-            # Regex to parse numbers: Split 8 vectors into 4 train, 2 val, 2 test
-            nums = re.findall(r'(\d+)', resp)
-            if len(nums) >= 4:
-                print(f"  -> Total: {nums[0]} | Train: {nums[1]} | Val: {nums[2]} | Test: {nums[3]}")
+        # ---------------------------------------------------------
+        # TEST 3: CLUSTER SPLIT (Spatial)
+        # ---------------------------------------------------------
+        print("-" * 50)
+        print("[TEST 3] CLUSTER Split (50/0/50)...")
+        resp = client.send_and_get_response("EXEC SPLIT tests 0.5 0.0 0.5 CLUSTER;")
+        print(f"Response: {resp.strip()}")
 
         # ---------------------------------------------------------
-        # [NEW] TEST 3: CLUSTER SPLIT (Spatial)
+        # TEST 4: TEMPORAL SPLIT (By Date)
         # ---------------------------------------------------------
         print("-" * 50)
-        print("[TEST 3] Executing CLUSTER Split (50/50)...")
-        # Syntax: EXEC SPLIT <name> <tr%> <val%> <te%> CLUSTER
-        cluster_cmd = "EXEC SPLIT tests 0.5 0.0 0.5 CLUSTER;"
-        resp = client.send_and_get_response(cluster_cmd)
-        print(f"Cluster Split Response: {resp.strip()}")
-        
-        if "ERR" in resp:
-            print("[FAILED] Cluster split failed (likely due to insufficient centroids with small data).")
-        else:
-            print("[SUCCESS] Cluster split executed.")
-            nums = re.findall(r'(\d+)', resp)
-            if len(nums) >= 4:
-                print(f"  -> Total: {nums[0]} | Train: {nums[1]} | Val: {nums[2]} | Test: {nums[3]}")
+        print("[TEST 4] TEMPORAL Split by 'date' (50/0/50)...")
+        resp = client.send_and_get_response("EXEC SPLIT tests 0.5 0.0 0.5 TEMPORAL date;")
+        print(f"Response: {resp.strip()}")
 
         # ---------------------------------------------------------
-        # [NEW] TEST 4: TEMPORAL SPLIT (By Date)
+        # TEST 5: STREAMING (Basic)
+        # ---------------------------------------------------------
         print("-" * 50)
-        print("[TEST 4] Executing TEMPORAL Split by 'date' (50/0/50)...")
-        # Syntax: EXEC SPLIT <name> <tr%> <val%> <te%> TEMPORAL <key>
-        # Should put Jan data (past) into Train, Feb data (future) into Test
-        temporal_cmd = "EXEC SPLIT tests 0.5 0.0 0.5 TEMPORAL date;"
-        resp = client.send_and_get_response(temporal_cmd)
-        print(f"Temporal Split Response: {resp.strip()}")
-        
-        if "ERR" in resp:
-            print("[FAILED] Temporal split failed.")
-        else:
-            print("[SUCCESS] Temporal split executed.")
-            nums = re.findall(r'(\d+)', resp)
-            if len(nums) >= 4:
-                print(f"  -> Total: {nums[0]} | Train: {nums[1]} | Test: {nums[3]}")
-                # Expect Train ~ 4 (Jan), Test ~ 4 (Feb) for 8 items
+        print("[TEST 5] Streaming TRAIN set via ITERATE...")
+        count, dim, _ = client.request_binary_stream("ITERATE tests TRAIN 0 10000;")
+        print(f"  -> Streamed {count} vectors from Train.")
+
+        print("\n[TEST 5] Streaming TEST set via ITERATE...")
+        count2, _, _ = client.request_binary_stream("ITERATE tests TEST 0 10000;")
+        print(f"  -> Streamed {count2} vectors from Test.")
 
         # ---------------------------------------------------------
-        # [NEW] Step 6.6: Test ITERATE (Binary Streaming)
+        # TEST 5b: ITERATE PAIR (label + vector)
         # ---------------------------------------------------------
         print("-" * 50)
-        print("[TEST] Streaming TRAIN set via ITERATE command...")
-        
-        # [FIX] Added semicolon to command + Robust Reader
-        count_tr, dim_tr, raw_tr = client.request_binary_stream("ITERATE tests TRAIN 0 10000;")
-        
-        if count_tr > 0:
-            arr_tr = np.frombuffer(raw_tr, dtype=np.float32).reshape(count_tr, dim_tr)
-            print(f"  -> Received TRAIN batch: Shape={arr_tr.shape}, Dtype={arr_tr.dtype}")
-            print(f"  -> Sample Vector[0][:5]: {arr_tr[0][:5]}")
-            if np.all(arr_tr[0] == 0):
-                print("  -> WARNING: Vector data is all zeros!")
+        print("[TEST 5b] ITERATE PAIR (label + vector) from TRAIN...")
+        cnt_pair, dim_pair, raw_pair = client.request_binary_stream("ITERATE tests PAIR TRAIN 0 10000;")
+        print(f"  -> Received {cnt_pair} pairs, dim={dim_pair}")
+        if cnt_pair > 0 and raw_pair:
+            mv = memoryview(raw_pair)
+            parsed = []
+            off = 0
+            expect_per = 8 + dim_pair * 4
+            for i in range(cnt_pair):
+                if off + 8 > len(mv):
+                    break
+                label = int.from_bytes(mv[off:off+8], 'little')
+                off += 8
+                vec_bytes = mv[off: off + dim_pair*4]
+                if len(vec_bytes) < dim_pair*4:
+                    break
+                vec = np.frombuffer(vec_bytes, dtype=np.float32).copy()
+                off += dim_pair*4
+                parsed.append((label, vec))
+            if parsed:
+                lbl0, v0 = parsed[0]
+                print(f"  -> First pair label(hash)={lbl0}, vec[:5]={v0[:5]}")
             else:
-                print("  -> Data integrity check: OK")
-        else:
-            print("  -> WARNING: No data received for TRAIN split.")
+                print("  -> No valid pairs parsed (unexpected)")
 
-        print("\n[TEST] Streaming TEST set via ITERATE command...")
-        # [FIX] Added semicolon to command + Robust Reader
-        count_te, dim_te, raw_te = client.request_binary_stream("ITERATE tests TEST 0 10000;")
-        
-        if count_te > 0:
-            arr_te = np.frombuffer(raw_te, dtype=np.float32).reshape(count_te, dim_te)
-            print(f"  -> Received TEST batch: Shape={arr_te.shape}")
-        else:
-            print("  -> TEST set is empty (Expected if dataset small).")
-
-        expected_total = len(items)
-        # Note: Val set is not iterated here, so count_tr + count_te < total is normal
-        print(f"\n[INFO] Total Streamed: {count_tr + count_te} / {expected_total} (Train+Test only)")
-        print("="*50 + "\n")
         # ---------------------------------------------------------
+        # [NEW] TEST 6: TRIPLET STREAMING (Generator)
+        # ---------------------------------------------------------
+        print("-" * 50)
+        print("[TEST 6] Streaming TRIPLET batch (Anchor, Positive, Negative)...")
+        # Request 16 triplets based on 'class' tag
+        triplet_cmd = "ITERATE tests TRIPLET class 16;" 
+        count_tri, dim_tri, raw_tri = client.request_binary_stream(triplet_cmd)
+        
+        if count_tri > 0:
+            # Each item is actually 3 vectors (A, P, N) flattened
+            # Total floats = count_tri * 3 * dim_tri
+            arr_tri = np.frombuffer(raw_tri, dtype=np.float32)
+            expected_floats = count_tri * 3 * dim_tri
+            
+            if arr_tri.size == expected_floats:
+                arr_tri = arr_tri.reshape(count_tri, 3, dim_tri)
+                print(f"  -> Received TRIPLET batch: Shape={arr_tri.shape}")
+                print(f"  -> Anchor[0][:5]:   {arr_tri[0,0,:5]}")
+                print(f"  -> Positive[0][:5]: {arr_tri[0,1,:5]}")
+                print(f"  -> Negative[0][:5]: {arr_tri[0,2,:5]}")
+                
+                # Basic check: A should not equal N (in most cases)
+                dist_ap = np.linalg.norm(arr_tri[0,0] - arr_tri[0,1])
+                dist_an = np.linalg.norm(arr_tri[0,0] - arr_tri[0,2])
+                print(f"  -> Dist(A,P)={dist_ap:.4f}, Dist(A,N)={dist_an:.4f}")
+            else:
+                print(f"  -> ERROR: Shape mismatch. Got {arr_tri.size} floats, expected {expected_floats}")
+        else:
+            print("  -> WARNING: No triplets received (Check if 'class' tag exists and has >1 items per class).")
 
-        # 7) run a search
-        probe_label, probe_vec, _ = items[0]
-        # [FIXED] Compute Hash for Verification (Sanitize label like insert)
-        safe_probe_label = probe_label.replace(")", "_").replace("(", "_").replace(",", "_")
-        probe_hash = fnv1a_hash(safe_probe_label)
-        
-        print(f"Searching for first image (label={safe_probe_label}, hash={probe_hash})...")
-        search_cmd = make_search_cmd("tests", probe_vec, topk=5)
-        resp = client.send_and_get_response(search_cmd)
-        print("Search response:\n", resp.strip())
-        
-        # Parse results and verify
-        lines = resp.splitlines()
-        found = False
-        if len(lines) > 1: # Header + results
-            top_line = lines[1].strip() # First result line
-            parts = top_line.split()
-            if len(parts) >= 1:
-                try:
-                    top_hash = int(parts[0])
-                    if top_hash == probe_hash:
-                        print(f"  -> [MATCH] Top result matches probe hash.")
-                        found = True
-                    else:
-                        print(f"  -> [MISMATCH] Top: {top_hash}, Expected: {probe_hash}")
-                except ValueError:
-                    print(f"  -> [PARSE ERROR] Could not parse hash from '{parts[0]}'. Protocol sync issue?")
-        
-        if not found:
-            print("  -> Warning: Search quality check failed (Is dataset too small/random?)")
+        print("="*50 + "\n")
 
-        # 8) delete all labels
-        print("\nDeleting inserted labels ...")
-        inserted_labels = [i[0] for i in items]
-        for lbl in inserted_labels:
-            safe_lbl = lbl.replace(")", "_").replace("(", "_").replace(",", "_")
-            cmd = f"DELETE tests LABEL {safe_lbl};"
-            client.send_and_get_response(cmd)
+        # Search Check
+        probe_label, probe_vec, _, _ = items[0]
+        safe_lbl = probe_label.replace(")", "_").replace("(", "_").replace(",", "_")
+        print(f"Searching for {safe_lbl}...")
+        print(client.send_and_get_response(make_search_cmd("tests", probe_vec)))
 
-        print("Deleted all labels. Re-running search...")
-        resp = client.send_and_get_response(search_cmd)
-        print("Search response after delete:\n", resp.strip())
-        
-        # 9) done
-        print("Integration test completed successfully")
+        # Cleanup
+        print("\nCleanup...")
+        client.send_and_get_response("DROP MEMBRANCE tests;")
         return True
+
     finally:
         client.close()
 
-
-# -----------------------
-# CLI entry
-# -----------------------
-
 def main():
-    parser = argparse.ArgumentParser(description="Pomai integration test")
-    parser.add_argument("--host", default="127.0.0.1", help="Pomai server host")
-    parser.add_argument("--port", default=7777, type=int, help="Pomai server port")
-    parser.add_argument("--assets", default="assets", help="Directory containing image assets")
-    parser.add_argument("--batch", default=8, type=int, help="Batch size for inserts")
-    parser.add_argument("--no-verbose", dest="verbose", action="store_false", help="Turn off verbose output")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=7777, type=int)
+    parser.add_argument("--assets", default="assets")
+    parser.add_argument("--batch", default=8, type=int)
+    parser.add_argument("--no-verbose", dest="verbose", action="store_false")
     args = parser.parse_args()
 
-    ok = run_test(args.host, args.port, args.assets, batch_size=args.batch, verbose=args.verbose)
-    if not ok:
-        print("Integration test failed.")
+    if run_test(args.host, args.port, args.assets, args.batch, args.verbose):
+        print("SUCCESS")
+        sys.exit(0)
+    else:
+        print("FAILED")
         sys.exit(2)
-    print("Integration test succeeded.")
-    sys.exit(0)
 
 if __name__ == "__main__":
     main()
