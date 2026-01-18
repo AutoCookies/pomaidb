@@ -2,11 +2,15 @@
  * src/core/pomai_db.cc
  *
  * Implementation for PomaiDB and Membrance persistence.
+ *
+ * Uses pomai::core::DataType (src/core/types.h) for storage types.
  */
 
 #include "src/core/pomai_db.h"
 #include "src/core/metadata_index.h"
 #include "src/core/split_manager.h"
+#include "src/core/types.h"
+#include "src/core/cpu_kernels.h" // for fp16 conversion helpers
 
 #include <filesystem>
 #include <fstream>
@@ -31,17 +35,17 @@ namespace pomai::core
         return s.substr(b, e - b + 1);
     }
 
-    // [FIXED] Constructor signature matches header (4 args)
+    // Membrance ctor
     Membrance::Membrance(const std::string &nm, const MembranceConfig &cfg,
                          const std::string &root_path, const pomai::config::PomaiConfig &global_cfg)
-        : name(nm), dim(cfg.dim), ram_mb(cfg.ram_mb)
+        : name(nm), dim(cfg.dim), ram_mb(cfg.ram_mb), data_type(cfg.data_type)
     {
         // Build data path: data_root/name
         try
         {
             std::filesystem::path base(root_path);
             std::filesystem::path p = base / name;
-            
+
             if (!std::filesystem::exists(p))
             {
                 std::error_code ec;
@@ -63,14 +67,14 @@ namespace pomai::core
         ocfg.data_path = data_path;
         ocfg.algo = global_cfg.orbit;
         ocfg.cortex_cfg = global_cfg.network;
-        
+
         // Use default EEQ config
         ocfg.eeq_cfg = pomai::config::EternalEchoConfig();
 
         orbit = std::make_unique<pomai::ai::orbit::PomaiOrbit>(ocfg, arena.get());
 
-        // 3. Initialize Hot Tier
-        hot_tier = std::make_unique<HotTier>(dim, global_cfg.hot_tier);
+        // 3. Initialize Hot Tier - pass DataType enum so HotTier stores correct element format
+        hot_tier = std::make_unique<HotTier>(dim, global_cfg.hot_tier, data_type);
 
         // 4. Initialize Metadata Index
         try
@@ -81,7 +85,6 @@ namespace pomai::core
                 if (!std::filesystem::exists(meta_path))
                     std::filesystem::create_directories(meta_path);
 
-                // [FIXED] Use make_shared instead of make_unique
                 meta_index = std::make_shared<MetadataIndex>(global_cfg.metadata);
 
                 // Link to Orbit
@@ -146,14 +149,17 @@ namespace pomai::core
                     {
                         std::string name = trim_str(parts[0]);
                         size_t dim = 0, ram_mb = 256;
+                        pomai::core::DataType dt = pomai::core::DataType::FLOAT32;
                         try { dim = static_cast<size_t>(std::stoul(parts[1])); } catch (...) {}
                         if (parts.size() >= 3) { try { ram_mb = static_cast<size_t>(std::stoul(parts[2])); } catch (...) {} }
+                        if (parts.size() >= 4) { try { dt = pomai::core::parse_dtype(trim_str(parts[3])); } catch (...) { dt = pomai::core::DataType::FLOAT32; } }
 
                         if (!name.empty() && dim != 0)
                         {
                             MembranceConfig c;
                             c.dim = dim;
                             c.ram_mb = ram_mb;
+                            c.data_type = dt;
                             std::unique_lock<std::shared_mutex> lk(mu_);
                             if (membrances_.count(name) == 0)
                                 create_membrance_internal(name, c);
@@ -205,7 +211,6 @@ namespace pomai::core
 
         try
         {
-            // [FIXED] Pass global config_ correctly here
             auto m = std::make_unique<Membrance>(name, cfg, config_.res.data_root, config_);
 
             try { m->orbit->save_schema(); } catch (...) {}
@@ -225,10 +230,14 @@ namespace pomai::core
         MembranceConfig final_cfg = cfg;
         if (final_cfg.engine.empty()) final_cfg.engine = config_.db.engine_type;
         if (final_cfg.ram_mb == 0) final_cfg.ram_mb = config_.db.default_membrance_ram_mb;
+        if (final_cfg.data_type == DataType::FLOAT32) {
+            // If left default that's fine; otherwise already set.
+        }
 
         try
         {
-            std::string payload = name + "|" + std::to_string(final_cfg.dim) + "|" + std::to_string(final_cfg.ram_mb);
+            // Persist an extended WAL payload: name|dim|ram_mb|data_type_name
+            std::string payload = name + "|" + std::to_string(final_cfg.dim) + "|" + std::to_string(final_cfg.ram_mb) + "|" + pomai::core::dtype_name(final_cfg.data_type);
             wal_.append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_CREATE_MEMBRANCE),
                                payload.data(), static_cast<uint32_t>(payload.size()));
         }
@@ -359,10 +368,12 @@ namespace pomai::core
         if (!ofs.is_open()) return false;
 
         ofs << "# PomaiDB Manifest\n";
+        // Write: name|dim|ram_mb|data_type
         for (const auto &kv : membrances_)
         {
             const auto *m = kv.second.get();
-            ofs << m->name << '|' << m->dim << '|' << m->ram_mb << '\n';
+            std::string dt = pomai::core::dtype_name(m->data_type);
+            ofs << m->name << '|' << m->dim << '|' << m->ram_mb << '|' << dt << '\n';
         }
         ofs.close();
         std::filesystem::rename(tmp, path);
@@ -390,14 +401,19 @@ namespace pomai::core
             {
                 std::string name = parts[0];
                 size_t dim = 0, ram = 256;
+                pomai::core::DataType dt = pomai::core::DataType::FLOAT32;
                 try { dim = std::stoul(parts[1]); } catch (...) {}
                 if (parts.size() >= 3) try { ram = std::stoul(parts[2]); } catch (...) {}
+                if (parts.size() >= 4) {
+                    try { dt = pomai::core::parse_dtype(parts[3]); } catch (...) { dt = pomai::core::DataType::FLOAT32; }
+                }
 
                 if (!name.empty() && dim > 0)
                 {
                     MembranceConfig c;
                     c.dim = dim;
                     c.ram_mb = ram;
+                    c.data_type = dt;
                     if (create_membrance_internal(name, c)) loaded++;
                 }
             }
@@ -415,7 +431,7 @@ namespace pomai::core
             {
                 auto* m = kv.second.get();
                 m->orbit->save_schema();
-                
+
                 if (m->split_mgr && m->split_mgr->has_split()) {
                     m->split_mgr->save(m->data_path);
                 }
@@ -443,14 +459,69 @@ namespace pomai::core
                 std::vector<std::pair<uint64_t, std::vector<float>>> vec_batch;
                 vec_batch.reserve(batch.count());
                 const size_t dim = batch.dim;
+                const uint32_t elem_size = batch.element_size;
+                const pomai::core::DataType bdt = batch.data_type;
 
+                // Decode each slot into std::vector<float> expected by orbit->insert_batch
                 for (size_t i = 0; i < batch.labels.size(); ++i)
                 {
                     std::vector<float> v(dim);
-                    std::memcpy(v.data(), batch.data.data() + i * dim, dim * sizeof(float));
+                    const uint8_t *slot = batch.data.data() + i * dim * elem_size;
+
+                    switch (bdt)
+                    {
+                        case DataType::FLOAT32:
+                            std::memcpy(v.data(), slot, dim * sizeof(float));
+                            break;
+                        case DataType::FLOAT64:
+                        {
+                            const double *dp = reinterpret_cast<const double *>(slot);
+                            for (size_t d = 0; d < dim; ++d) v[d] = static_cast<float>(dp[d]);
+                            break;
+                        }
+                        case DataType::INT32:
+                        {
+                            const int32_t *ip = reinterpret_cast<const int32_t *>(slot);
+                            for (size_t d = 0; d < dim; ++d) v[d] = static_cast<float>(ip[d]);
+                            break;
+                        }
+                        case DataType::INT8:
+                        {
+                            const int8_t *ip = reinterpret_cast<const int8_t *>(slot);
+                            for (size_t d = 0; d < dim; ++d) v[d] = static_cast<float>(ip[d]);
+                            break;
+                        }
+                        case DataType::FLOAT16:
+                        {
+                            const uint16_t *hp = reinterpret_cast<const uint16_t *>(slot);
+                            for (size_t d = 0; d < dim; ++d) v[d] = fp16_to_fp32(hp[d]);
+                            break;
+                        }
+                        default:
+                        {
+                            // fallback: try to memcpy as float32 up to available bytes
+                            size_t copy_bytes = std::min<size_t>(dim * sizeof(float), dim * elem_size);
+                            std::memcpy(v.data(), slot, copy_bytes);
+                            if (copy_bytes < dim * sizeof(float))
+                            {
+                                for (size_t d = (copy_bytes / sizeof(float)); d < dim; ++d) v[d] = 0.0f;
+                            }
+                            break;
+                        }
+                    }
+
                     vec_batch.emplace_back(batch.labels[i], std::move(v));
                 }
-                m->orbit->insert_batch(vec_batch);
+
+                // Insert into orbit (async writing)
+                try
+                {
+                    m->orbit->insert_batch(vec_batch);
+                }
+                catch (...)
+                {
+                    // swallow errors; metrics/logging could be added
+                }
             }
         }
     }

@@ -4,9 +4,6 @@
 #include <string>
 #include <cstdint>
 #include <random>
-#include <algorithm>
-#include <iostream>
-#include <fstream>
 #include "src/core/config.h"
 
 namespace pomai::core {
@@ -40,7 +37,8 @@ namespace pomai::core {
 
     private:
         const pomai::config::PomaiConfig& cfg_;
-        static constexpr char MAGIC[8] = {'P','M','S','P','L','I','T','1'};
+        // Make MAGIC inline to avoid ODR/linkage issues and allow use across TUs
+        inline static constexpr char MAGIC[8] = {'P','M','S','P','L','I','T','1'};
     };
 
 } // namespace pomai::core
