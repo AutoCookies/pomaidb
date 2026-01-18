@@ -54,8 +54,8 @@ namespace pomai::ai
     static inline __m256 lookup_16_avx2(__m256 table_lo, __m256 table_hi, __m256i indices)
     {
         // 1. Permute from Low Table.
-        // vpermps uses the lowest 3 bits of the index.
-        // So index 0 (0000) -> pos 0, index 8 (1000) -> pos 0.
+        // _mm256_permutevar8x32_ps uses the low 3 bits of each 32-bit lane to select
+        // elements 0..7 from the source.
         __m256 v_lo = _mm256_permutevar8x32_ps(table_lo, indices);
 
         // 2. Permute from High Table.
@@ -76,8 +76,6 @@ namespace pomai::ai
         if (k != 16)
         {
             // Fallback to scalar loop if k is not 16
-            // In a real optimized system, we might assert or have other kernels.
-            // For now, we reuse the scalar logic for the remainder or full array.
             size_t packed_bytes = (m + 1) / 2;
             std::vector<uint8_t> tmp(m);
             for (size_t i = 0; i < n; ++i)
@@ -105,22 +103,18 @@ namespace pomai::ai
             for (size_t j = 0; j < m; ++j)
             {
                 // 1. Load Table for sub-quantizer j (16 floats -> 2 YMMs)
-                // Cache locality: 'tables' is small (m*16 floats), stays in L1.
                 const float *t_ptr = tables + j * 16;
                 __m256 t_lo = _mm256_loadu_ps(t_ptr);
                 __m256 t_hi = _mm256_loadu_ps(t_ptr + 8);
 
                 // 2. Extract 4-bit codes for the 8 vectors
-                // Layout: Packed codes are row-major. We need the j-th nibble from 8 rows.
                 size_t byte_off = j / 2;
                 bool is_high_nibble = (j % 2 != 0);
 
-                // Scalar gather (faster than VGATHER for bytes/strided small loads)
-                // Compiler will likely vectorize these loads or issue efficient scalar loads.
                 alignas(32) uint32_t indices_buf[8];
                 const uint8_t *base_c = packed_codes + i * packed_stride + byte_off;
 
-                // Unrolling helps CPU pipeline
+                // Fetch the byte for each of the 8 rows (stride = packed_stride)
                 uint8_t b0 = base_c[0 * packed_stride];
                 uint8_t b1 = base_c[1 * packed_stride];
                 uint8_t b2 = base_c[2 * packed_stride];
@@ -153,7 +147,7 @@ namespace pomai::ai
                     indices_buf[7] = b7 & 0x0F;
                 }
 
-                __m256i v_idx = _mm256_load_si256((__m256i *)indices_buf);
+                __m256i v_idx = _mm256_load_si256(reinterpret_cast<const __m256i *>(indices_buf));
 
                 // 3. Register Lookup & Accumulate
                 __m256 dists = lookup_16_avx2(t_lo, t_hi, v_idx);
@@ -213,6 +207,15 @@ namespace pomai::ai
                               const uint8_t *codes, size_t n, float *out)
     {
         pq_approx_dist_batch_scalar(tables, m, k, codes, n, out);
+    }
+
+    // Provide an implementation for raw8 layout as declared in header.
+    // raw8_codes: N * m bytes, one byte per subquantizer per vector.
+    void pq_approx_dist_batch_raw8(const float *tables, size_t m, size_t k,
+                                   const uint8_t *raw8_codes, size_t n, float *out)
+    {
+        // raw8 layout is the same as the scalar batch expected layout (codes).
+        pq_approx_dist_batch_scalar(tables, m, k, raw8_codes, n, out);
     }
 
 } // namespace pomai::ai

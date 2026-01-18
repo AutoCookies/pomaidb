@@ -67,7 +67,7 @@ void print_banner(int port)
 
 int main(int argc, char **argv)
 {
-    // [CRITICAL FIX] Force standard C locale.
+    // [CRITICAL Fix] Force standard C locale.
     // This ensures strtof/stof parses "3.14" as 3.14, not 3 (if system locale expects comma).
     std::setlocale(LC_ALL, "C");
 
@@ -138,7 +138,7 @@ int main(int argc, char **argv)
     }
 
     print_banner(config.net.port);
-    std::clog << "[Init] CPU kernel selected: " << kernel_name_from_ptr(get_pomai_l2sq_kernel()) << "\n";
+    std::clog << "[Init] CPU kernels initialized\n";
 
     try
     {

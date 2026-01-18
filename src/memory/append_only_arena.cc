@@ -32,7 +32,7 @@ namespace pomai::memory
         if (initial_size_bytes == 0)
             throw std::invalid_argument("initial_size_bytes must be > 0");
 
-        int fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+        int fd = ::open(path.c_str(), O_RDWR | O_CREAT, static_cast<int>(cfg.default_file_permissions));
         if (fd < 0)
             throw std::runtime_error(std::string("open failed: ") + std::strerror(errno));
 
@@ -41,12 +41,20 @@ namespace pomai::memory
         size_t target = round_up_to_page(initial_size_bytes, page_size);
 
 #ifdef __linux__
-        if (posix_fallocate(fd, 0, static_cast<off_t>(target)) != 0)
+        if (cfg.prefer_fallocate && posix_fallocate(fd, 0, static_cast<off_t>(target)) != 0)
         {
             if (ftruncate(fd, static_cast<off_t>(target)) != 0)
             {
                 ::close(fd);
                 throw std::runtime_error(std::string("preallocate failed: ") + std::strerror(errno));
+            }
+        }
+        else if (!cfg.prefer_fallocate)
+        {
+            if (ftruncate(fd, static_cast<off_t>(target)) != 0)
+            {
+                ::close(fd);
+                throw std::runtime_error(std::string("ftruncate failed: ") + std::strerror(errno));
             }
         }
 #else
@@ -64,7 +72,7 @@ namespace pomai::memory
             throw std::runtime_error(std::string("mmap failed: ") + std::strerror(errno));
         }
 
-        // Truyền cfg vào constructor
+        // Pass cfg into constructor
         return new AppendOnlyArena(fd, map, target, path, page_size, cfg);
     }
 
@@ -77,7 +85,7 @@ namespace pomai::memory
           write_offset_(static_cast<uint64_t>(page_size)),
           path_(path),
           page_size_(page_size),
-          cfg_(cfg) // Lưu trữ config cục bộ
+          cfg_(cfg) // Store local copy
     {
         if (map_base_ && mapped_size_ >= page_size_)
             std::memset(reinterpret_cast<char *>(map_base_), 0, page_size_);
@@ -96,7 +104,7 @@ namespace pomai::memory
         const uint32_t hdr_len = sizeof(uint32_t);
         size_t total = static_cast<size_t>(hdr_len) + static_cast<size_t>(payload_size);
 
-        // [FIXED] Sử dụng cfg_ thay vì runtime global
+        // use cfg_.alignment
         const size_t ALIGN = cfg_.alignment;
         size_t total_aligned = ((total + ALIGN - 1) / ALIGN) * ALIGN;
 
@@ -105,22 +113,17 @@ namespace pomai::memory
         uint64_t cur_offset = static_cast<uint64_t>(write_offset_.load(std::memory_order_relaxed));
         if (cur_offset + total_aligned > mapped_size_)
         {
-            // [FIXED] Sử dụng cfg_.growth_factor
-            size_t new_size = std::max(
-                static_cast<size_t>(mapped_size_ * cfg_.growth_factor),
-                round_up_to_page(cur_offset + total_aligned, page_size_));
+            // Compute a growth target based on growth_factor and minimal required size
+            size_t desired_by_factor = static_cast<size_t>(static_cast<double>(mapped_size_) * static_cast<double>(cfg_.growth_factor));
+            size_t desired_by_need = round_up_to_page(cur_offset + total_aligned, page_size_);
+            size_t new_size = std::max(desired_by_factor, desired_by_need);
 
+            // Attempt to remap to the computed new_size
             if (!remap_locked(new_size))
             {
+                // Conservative fallback: try minimal sized mapping that fits the request (+ one page)
                 size_t min_needed = round_up_to_page(cur_offset + total_aligned + page_size_, page_size_);
-                if (min_needed < new_size)
-                {
-                    if (!remap_locked(min_needed))
-                    {
-                        throw std::runtime_error("AppendOnlyArena::alloc_blob: disk full (grow failed)");
-                    }
-                }
-                else
+                if (!remap_locked(min_needed))
                 {
                     throw std::runtime_error("AppendOnlyArena::alloc_blob: disk full (grow failed)");
                 }
@@ -133,7 +136,7 @@ namespace pomai::memory
             throw std::runtime_error("AppendOnlyArena::alloc_blob: allocation overflow after grow");
         }
 
-        char *ptr = reinterpret_cast<char *>(map_base_) + my_off;
+        char *ptr = reinterpret_cast<char *>(map_base_) + static_cast<size_t>(my_off);
         std::memset(ptr, 0, total_aligned);
 
         uint32_t *lenp = reinterpret_cast<uint32_t *>(ptr);
@@ -178,7 +181,12 @@ namespace pomai::memory
             return true;
 
 #ifdef __linux__
-        if (posix_fallocate(fd_, 0, static_cast<off_t>(new_size)) != 0)
+        if (cfg_.prefer_fallocate && posix_fallocate(fd_, 0, static_cast<off_t>(new_size)) != 0)
+        {
+            if (ftruncate(fd_, static_cast<off_t>(new_size)) != 0)
+                return false;
+        }
+        else if (!cfg_.prefer_fallocate)
         {
             if (ftruncate(fd_, static_cast<off_t>(new_size)) != 0)
                 return false;
@@ -201,10 +209,10 @@ namespace pomai::memory
         void *newmap = mmap(nullptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
         if (newmap == MAP_FAILED)
         {
-            // [FIXED] Kiểm tra kết quả ftruncate khi revert để hết cảnh báo
+            // Best-effort: attempt to revert file size to previous mapping to avoid surprising filesystem state
             if (ftruncate(fd_, static_cast<off_t>(mapped_size_)) != 0)
             {
-                // Best effort
+                // ignore
             }
             return false;
         }

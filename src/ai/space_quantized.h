@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <stdexcept>
 #include <cstring>
+#include <limits>
 
 namespace pomai::ai
 {
@@ -38,6 +39,9 @@ namespace pomai::ai
         QuantizedL2Space(size_t dim, const pomai::config::QuantizedSpaceConfig &cfg)
             : dim_(dim), cfg_(cfg)
         {
+            if (dim_ == 0)
+                throw std::invalid_argument("QuantizedL2Space: dim must be > 0");
+
             bits_ = static_cast<int>(cfg_.precision_bits);
 
             if (bits_ != 8 && bits_ != 4)
@@ -58,11 +62,12 @@ namespace pomai::ai
         }
 
         // distance function expects pointers to quantized payload (no header)
-        static dist_t QuantizedDist(const void *p1, const void *p2, const void * /*param*/)
+        // This placeholder is never intended to be called directly; PomaiSpace
+        // performs proper resolution/dequantization and calls the underlying L2 kernel.
+        static dist_t QuantizedDist(const void * /*p1*/, const void * /*p2*/, const void * /*param*/) noexcept
         {
-            // We'll not be called directly; PomaiSpace calls the underlying df with pointers
-            // to the vector payload (after PPE header). But to be safe, keep a stub.
-            return static_cast<dist_t>(0);
+            // Return maximum distance to indicate "not supported here".
+            return std::numeric_limits<dist_t>::max();
         }
 
         // The DISTFUNC we return will be a wrapper that dequantizes inside PomaiSpace.

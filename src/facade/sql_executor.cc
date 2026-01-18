@@ -13,6 +13,7 @@
 #include "src/core/metadata_index.h"
 #include "src/ai/whispergrain.h"
 #include "src/core/metrics.h"
+#include "src/core/types.h" // added to report/parse data_type names
 
 #include <sstream>
 #include <iomanip>
@@ -528,8 +529,8 @@ namespace pomai::server
                         return "ERR: DATA_TYPE requires a value (float32|float64|int32)\n";
                     // normalize to lowercase
                     std::transform(dt.begin(), dt.end(), dt.begin(), ::tolower);
-                    if (dt != "float32" && dt != "float64" && dt != "int32")
-                        return std::string("ERR: unsupported DATA_TYPE '") + dt + "' (supported: float32, float64, int32)\n";
+                    if (dt != "float32" && dt != "float64" && dt != "int32" && dt != "int8" && dt != "float16")
+                        return std::string("ERR: unsupported DATA_TYPE '") + dt + "' (supported: float32, float64, int32, int8, float16)\n";
                     data_type = dt;
                 }
                 else if (up_tok == "RAM")
@@ -561,7 +562,12 @@ namespace pomai::server
             pomai::core::MembranceConfig cfg;
             cfg.dim = dim;
             cfg.ram_mb = ram_mb;
-            cfg.data_type = data_type;
+            // convert textual data_type into enum
+            try {
+                cfg.data_type = pomai::core::parse_dtype(data_type);
+            } catch (...) {
+                return std::string("ERR: unsupported DATA_TYPE '") + data_type + "'\n";
+            }
 
             bool ok = db->create_membrance(name, cfg);
             if (ok)
@@ -680,7 +686,12 @@ namespace pomai::server
             ss << "--- AI Contract ---\n";
             ss << " feature_dim: " << feature_dim << "\n";
             ss << " metric: L2\n";
-            ss << " data_type: float32\n";
+            // Report actual data_type configured for this membrance
+            try {
+                ss << " data_type: " << pomai::core::dtype_name(m->data_type) << "\n";
+            } catch (...) {
+                ss << " data_type: float32\n";
+            }
             ss << " total_vectors: " << total_vectors << "\n";
             ss << " split_train: " << n_train << "\n";
             ss << " split_val: " << n_val << "\n";

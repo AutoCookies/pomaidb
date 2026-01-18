@@ -55,11 +55,13 @@ namespace pomai::memory
         return ++v;
     }
 
-    uint64_t PomaiArena::block_size_for(uint64_t bytes) {
-    uint64_t need = bytes;
-    if (need < cfg_.min_blob_block) need = cfg_.min_blob_block;
-    return roundup_pow2(need);
-}
+    uint64_t PomaiArena::block_size_for(uint64_t bytes)
+    {
+        uint64_t need = bytes;
+        if (need < cfg_.min_blob_block)
+            need = cfg_.min_blob_block;
+        return roundup_pow2(need);
+    }
 
     // ---------------- Constructors / Destructor ----------------
 
@@ -212,19 +214,24 @@ namespace pomai::memory
         return a;
     }
 
-    PomaiArena::PomaiArena(const pomai::config::PomaiConfig& global_cfg)
-    : PomaiArena() 
-{
-    cfg_ = global_cfg.arena; 
- 
-    remote_dir_ = cfg_.remote_dir;
-    max_remote_mmaps_ = cfg_.max_remote_mmaps;
-    demote_batch_bytes_ = cfg_.demote_batch_bytes;
-    max_pending_demotes_ = global_cfg.res.demote_async_max_pending;
+    PomaiArena PomaiArena::FromConfig(const pomai::config::PomaiConfig &cfg)
+    {
+        return PomaiArena(cfg);
+    }
 
-    // Tiến hành cấp phát
-    allocate_region(global_cfg.res.arena_mb_per_shard * 1024ULL * 1024ULL);
-}
+    PomaiArena::PomaiArena(const pomai::config::PomaiConfig &global_cfg)
+        : PomaiArena()
+    {
+        cfg_ = global_cfg.arena;
+
+        remote_dir_ = cfg_.remote_dir;
+        max_remote_mmaps_ = cfg_.max_remote_mmaps;
+        demote_batch_bytes_ = cfg_.demote_batch_bytes;
+        max_pending_demotes_ = global_cfg.res.demote_async_max_pending;
+
+        // Tiến hành cấp phát
+        allocate_region(global_cfg.res.arena_mb_per_shard * 1024ULL * 1024ULL);
+    }
 
     // ---------------- allocate_region / grow / remap ----------------
 
@@ -666,7 +673,8 @@ namespace pomai::memory
         const uint64_t block = block_size_for(total);
 
         auto &vec = free_lists_[block];
-        if (vec.size() < cfg_.max_freelist_per_bucket) {
+        if (vec.size() < cfg_.max_freelist_per_bucket)
+        {
             vec.push_back(offset);
         }
     }
@@ -998,39 +1006,6 @@ namespace pomai::memory
             return {};
         }
         return buffer;
-    }
-
-    // Non-blocking inspector: if placeholder present and resolved to filename, return placeholder id,
-    // otherwise return 0. This is a cheap check used by callers that don't want to wait.
-    uint64_t PomaiArena::resolve_pending_remote(uint64_t placeholder_remote_id) const
-    {
-        // non-blocking quick path: if placeholder -> check pending_map_ for completion
-        if (!is_placeholder_id(placeholder_remote_id))
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            auto it = remote_map_.find(placeholder_remote_id);
-            if (it == remote_map_.end())
-                return 0;
-            const std::string &fname = it->second;
-            if (fname.empty())
-                return 0;
-            return placeholder_remote_id;
-        }
-
-        std::shared_ptr<PendingDemote> pend;
-        {
-            std::lock_guard<std::mutex> lk(pending_mu_);
-            auto it = pending_map_.find(placeholder_remote_id);
-            if (it == pending_map_.end())
-                return 0;
-            pend = it->second;
-        }
-        if (!pend)
-            return 0;
-        std::lock_guard<std::mutex> plk(pend->m);
-        if (pend->done)
-            return pend->final_remote_id;
-        return 0;
     }
 
     // ---------------- Misc helpers / introspection ----------------

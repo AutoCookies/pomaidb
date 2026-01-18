@@ -91,7 +91,7 @@ namespace pomai::memory
         close();
     }
 
-    bool WalManager::open(const std::string &path, bool create_if_missing, const WalConfig &cfg)
+    bool WalManager::open(const std::string &path, bool create_if_missing, const WalManager::WalConfig &cfg)
     {
         if (fd_ != -1)
         {
