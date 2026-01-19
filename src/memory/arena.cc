@@ -13,6 +13,12 @@
  * Notes: heavy async logic lives here (single background worker).  Remote mmap cache
  * is LRU-capped to avoid unbounded growth.
  * [FIXED] Worker thread loop wrapped in try-catch to prevent process termination.
+ *
+ * UPDATE (Memory-mapped backing file):
+ * allocate_region now tries to create a file-backed mmap in the configured
+ * remote_dir_ (or /tmp fallback). This makes the arena persistent across crashes
+ * (OS page cache + file contents) and allows inspection using standard tools.
+ * If file-backed mmap fails we gracefully fall back to the original anonymous mmap.
  */
 
 #include "src/memory/arena.h"
@@ -36,6 +42,8 @@
 #include <fstream>
 #include <random>
 #include <cstdlib> // getenv
+#include <cstdio>  // remove
+#include <limits>
 
 namespace pomai::memory
 {
@@ -258,15 +266,86 @@ namespace pomai::memory
 
         size_t map_bytes = static_cast<size_t>(align_to_page(bytes));
 
-#ifdef MAP_HUGETLB
-        void *p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-        if (p == MAP_FAILED)
+        void *p = MAP_FAILED;
+        bool using_file_backing = false;
+
+        // Try file-backed mapping first (persistent arena file in remote_dir_)
+        // Build template path: remote_dir_/pomai_arena_XXXXXX
+        std::string dir = remote_dir_;
+        if (dir.empty())
+            dir = "/tmp";
+        // ensure no trailing slash duplication
+        if (dir.back() == '/')
+            dir.pop_back();
+
+        std::string templ = dir + "/pomai_arena_XXXXXX";
+        std::vector<char> tbuf(templ.begin(), templ.end());
+        tbuf.push_back('\0');
+
+        int fd = -1;
+        // Create file by mkstemp; then ftruncate to desired size and mmap MAP_SHARED
+        fd = mkstemp(tbuf.data());
+        if (fd >= 0)
         {
-            p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        }
-#else
-        void *p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            // try to allocate on-disk space (posix_fallocate is best-effort)
+#if defined(_POSIX_C_SOURCE) && (_POSIX_C_SOURCE >= 200112L)
+            // attempt posix_fallocate; ignore failures (fallbacks exist)
+            int falloc_ret = 0;
+#if defined(_GNU_SOURCE) || defined(_POSIX_C_SOURCE)
+            falloc_ret = posix_fallocate(fd, 0, map_bytes);
 #endif
+            (void)falloc_ret;
+#endif
+            if (ftruncate(fd, static_cast<off_t>(map_bytes)) == 0)
+            {
+                p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                if (p != MAP_FAILED)
+                {
+                    using_file_backing = true;
+                    arena_backing_path_ = std::string(tbuf.data()); // record path for diagnostics
+                }
+                else
+                {
+                    // mmap failed; we will fall back
+                    int err = errno;
+                    std::cerr << "PomaiArena::allocate_region: file-backed mmap failed (" << err << "): " << std::strerror(err) << "\n";
+                }
+            }
+            else
+            {
+                int err = errno;
+                std::cerr << "PomaiArena::allocate_region: ftruncate failed (" << err << "): " << std::strerror(err) << "\n";
+            }
+            // we can safely close fd after mmap; mapping remains valid
+            close(fd);
+            fd = -1;
+
+            if (!using_file_backing)
+            {
+                // remove the temp file if we failed to mmap it (avoid leaving garbage)
+                std::remove(tbuf.data());
+            }
+        }
+        else
+        {
+            int err = errno;
+            // If mkstemp fails simply fall through to anonymous mmap below
+            std::cerr << "PomaiArena::allocate_region: mkstemp failed (" << err << "): " << std::strerror(err) << " - falling back to anonymous mmap\n";
+        }
+
+        // If file-backed mmap not successful, fall back to anonymous mmap (original behavior)
+        if (!using_file_backing)
+        {
+#ifdef MAP_HUGETLB
+            p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+            if (p == MAP_FAILED)
+            {
+                p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            }
+#else
+            p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+        }
 
         if (p == MAP_FAILED)
         {
@@ -1072,8 +1151,8 @@ namespace pomai::memory
         if (base_addr_ && capacity_bytes_ > 0)
         {
             munmap(base_addr_, capacity_bytes_);
+            base_addr_ = nullptr;
         }
-        base_addr_ = nullptr;
         capacity_bytes_ = 0;
         seed_base_ = nullptr;
         seed_region_bytes_ = 0;
