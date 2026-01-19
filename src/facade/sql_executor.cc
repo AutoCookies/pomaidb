@@ -1,4 +1,3 @@
-/*
 // src/facade/sql_executor.cc
 //
 // Implementation of SqlExecutor extracted from server.h so the SQL/text protocol
@@ -10,7 +9,8 @@
 // - ITERATE now supports an optional "BATCH <n>" token to stream results in
 //   batches of at most n vectors. If BATCH is not provided, behavior is
 //   unchanged (single response containing up to lim entries).
-*/
+// - TRIPLET no longer requires an explicit <limit> token: if missing we compute
+//   a sensible default from available data.
 #include "src/facade/sql_executor.h"
 
 #include "src/facade/server_utils.h"
@@ -415,26 +415,62 @@ namespace pomai::server
                 if (!m->meta_index || !m->orbit)
                     return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
 
-                if (parts.size() < 5)
-                    return "ERR: ITERATE <name> TRIPLET <key> <limit> [HARD]\n";
-                std::string key = parts[3];
+                // key can be parts[3] or parts[cur_tok] depending on whether a split token was present.
+                std::string key;
+                size_t key_tok_index = 3;
+                if (cur_tok > 3)
+                    key_tok_index = cur_tok; // split token consumed token at 3, but TRIPLET syntax expects key at 3 originally
+                if (parts.size() > key_tok_index)
+                    key = parts[key_tok_index];
+                else
+                    return "ERR: ITERATE <name> TRIPLET <key> [<limit>] [BATCH <n>]\n";
+
+                // optional limit: if provided (e.g. parts[4] exists and is numeric) use it; otherwise compute default.
                 size_t limit = 0;
-                try
+                bool parsed_limit = false;
+                // find next token after key token to try parse limit
+                size_t maybe_limit_idx = key_tok_index + 1;
+                if (maybe_limit_idx < parts.size())
                 {
-                    limit = std::stoul(parts[4]);
+                    // skip tokens that are "BATCH" or other flags
+                    if (utils::to_upper(parts[maybe_limit_idx]) != "BATCH")
+                    {
+                        try
+                        {
+                            limit = std::stoul(parts[maybe_limit_idx]);
+                            parsed_limit = true;
+                        }
+                        catch (...)
+                        {
+                            parsed_limit = false;
+                        }
+                    }
                 }
-                catch (...)
-                {
-                    return "ERR: invalid limit\n";
-                }
+
                 auto groups = m->meta_index->get_groups(key);
                 // collect valid classes with >=2 elements
                 std::vector<std::string> cls;
+                size_t total_items = 0;
                 for (const auto &kv : groups)
+                {
                     if (kv.second.size() >= 2)
+                    {
                         cls.push_back(kv.first);
-                if (cls.size() < 2)
+                        total_items += kv.second.size();
+                    }
+                }
+
+                if (cls.size() < 2 || total_items < 2)
                     return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
+
+                // compute default limit if not provided: number of available triplets approximated by total_items/3
+                if (!parsed_limit)
+                {
+                    size_t default_limit = total_items / 3;
+                    if (default_limit == 0)
+                        default_limit = 1;
+                    limit = default_limit;
+                }
 
                 // determine dtype & element size
                 std::string dtype_str;

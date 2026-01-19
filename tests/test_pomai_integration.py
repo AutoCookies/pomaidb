@@ -274,7 +274,7 @@ def build_batch_insert_with_tags(memname: str,
         tup_text = ",".join([t[0] for t in chunk])
         tag_class = chunk[0][1]
         tag_date = chunk[0][2]
-        sql = f"INSERT INTO {memname} VALUES {tup_text} TAGS (class:{tag_class}, date:{tag_date});"
+        sql = f"INSERT INTO {memname} VALUES {tup_text} TAGS (class={tag_class}, date={tag_date});"
         cmds.append(sql)
         i += batch_size
     return cmds
