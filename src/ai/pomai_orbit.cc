@@ -1693,4 +1693,82 @@ namespace pomai::ai::orbit
         return out;
     }
 
+    // Add this method near other public method implementations of PomaiOrbit (e.g., after get_all_labels/get_centroid_ids).
+    bool PomaiOrbit::get_vectors_raw(const std::vector<uint64_t> &ids, std::vector<std::string> &outs) const
+    {
+        outs.clear();
+        outs.resize(ids.size());
+
+        if (ids.empty())
+            return true;
+
+        // Group request indices by bucket offset so we resolve each bucket once.
+        std::unordered_map<uint64_t, std::vector<size_t>> bucket_to_indices;
+        bucket_to_indices.reserve(std::min<size_t>(ids.size(), 1024));
+
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            uint64_t bucket_off = 0;
+            // get_label_bucket is const-qualified in header? It's a member helper; we can call it.
+            // It returns false if not found. Use const_cast to call non-const helper if needed.
+            if (!const_cast<PomaiOrbit *>(this)->get_label_bucket(ids[i], bucket_off) || bucket_off == 0)
+                continue;
+            bucket_to_indices[bucket_off].push_back(i);
+        }
+
+        // Temp buffer reused for remote bucket read
+        for (auto &kv : bucket_to_indices)
+        {
+            uint64_t bucket_off = kv.first;
+            const std::vector<size_t> &indices = kv.second;
+
+            // Resolve bucket once
+            std::vector<char> temp_buffer;
+            auto base_opt = resolve_bucket_base(arena_, bucket_off, temp_buffer);
+            if (!base_opt)
+            {
+                // bucket not available; leave corresponding outs entries as empty strings
+                continue;
+            }
+            const char *data_base_ptr = *base_opt;
+
+            const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(data_base_ptr);
+            uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
+            if (count == 0)
+                continue;
+
+            const uint64_t *id_base = reinterpret_cast<const uint64_t *>(data_base_ptr + hdr_ptr->off_ids);
+            const uint16_t *len_base = reinterpret_cast<const uint16_t *>(data_base_ptr + hdr_ptr->off_pq_codes);
+            const char *vec_area = data_base_ptr + hdr_ptr->off_vectors;
+
+            // Build a small lookup map for ids present in this bucket.
+            // Buckets are typically small (cap ~ 128..512), so linear scan is fine; but we optimize
+            // by building a map once per bucket for the subset of requested ids.
+            std::unordered_map<uint64_t, uint32_t> present;
+            present.reserve(std::min<uint32_t>(count, static_cast<uint32_t>(indices.size() * 2 + 4)));
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                uint64_t v = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
+                // store last seen slot for that id (if duplicates exist, last wins — same semantics as get())
+                present.emplace(v, i);
+            }
+
+            for (size_t req_idx : indices)
+            {
+                uint64_t id = ids[req_idx];
+                auto it = present.find(id);
+                if (it == present.end())
+                    continue;
+                uint32_t slot = it->second;
+                uint16_t len = __atomic_load_n(&len_base[slot], __ATOMIC_ACQUIRE);
+                if (len == 0 || len > MAX_ECHO_BYTES)
+                    continue;
+                const char *slot_ptr = vec_area + static_cast<size_t>(slot) * MAX_ECHO_BYTES;
+                outs[req_idx].assign(slot_ptr, slot_ptr + len);
+            }
+        }
+
+        return true;
+    }
+
 } // namespace pomai::ai::orbit

@@ -3,6 +3,12 @@
  *
  * Implementation of WalManager.
  * [UPDATED] Uses centralized configuration via Dependency Injection.
+ * [IMPROVED]
+ *  - Robust write/read helpers that handle partial writes and EINTR.
+ *  - Use O_CLOEXEC and set FD_CLOEXEC on open.
+ *  - Batched fsync support: when WalConfig.batch_commit_size > 0, fsync is
+ *    performed only after accumulated bytes reach the threshold.
+ *  - Safer reopen / truncation handling and more logging.
  */
 
 #include "src/memory/wal_manager.h"
@@ -19,6 +25,7 @@
 #include <array>
 #include <algorithm>
 #include <mutex>
+#include <atomic>
 
 namespace pomai::memory
 {
@@ -91,6 +98,64 @@ namespace pomai::memory
         close();
     }
 
+    // NOTE:
+    // bytes_since_last_fsync is a translation-unit-global accumulator used to
+    // implement batch fsync semantics. It's intentionally local to this TU
+    // because WalManager header cannot be changed here. In practice there is
+    // typically a single WAL per process, so this is acceptable.
+    static std::atomic<uint64_t> bytes_since_last_fsync{0};
+
+    // Helper: robust write that handles partial writes and EINTR.
+    static bool write_all(int fd, const uint8_t *buf, size_t len)
+    {
+        size_t written = 0;
+        while (written < len)
+        {
+            ssize_t w = ::write(fd, buf + written, len - written);
+            if (w < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    continue; // should not happen for blocking fd, but be tolerant
+                return false;
+            }
+            written += static_cast<size_t>(w);
+        }
+        return true;
+    }
+
+    // Helper: robust pwrite (used rarely) - loop on EINTR and partial writes.
+    static bool pwrite_all(int fd, const uint8_t *buf, size_t len, off_t offset)
+    {
+        size_t written = 0;
+        while (written < len)
+        {
+            ssize_t w = ::pwrite(fd, buf + written, len - written, offset + static_cast<off_t>(written));
+            if (w < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return false;
+            }
+            written += static_cast<size_t>(w);
+        }
+        return true;
+    }
+
+    // Helper: robust fsync that retries on EINTR.
+    static bool robust_fsync(int fd)
+    {
+        while (true)
+        {
+            if (::fsync(fd) == 0)
+                return true;
+            if (errno == EINTR)
+                continue;
+            return false;
+        }
+    }
+
     bool WalManager::open(const std::string &path, bool create_if_missing, const WalManager::WalConfig &cfg)
     {
         if (fd_ != -1)
@@ -105,13 +170,23 @@ namespace pomai::memory
         int flags = O_RDWR;
         if (create_if_missing)
             flags |= O_CREAT;
-        
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+
         // use 0600 mode
         fd_ = ::open(path_.c_str(), flags, 0600);
         if (fd_ < 0)
         {
             std::cerr << "WalManager::open: open(" << path_ << ") failed: " << strerror(errno) << "\n";
             return false;
+        }
+
+        // Ensure FD_CLOEXEC is set (portable guard)
+        int fd_flags = fcntl(fd_, F_GETFD);
+        if (fd_flags != -1)
+        {
+            fcntl(fd_, F_SETFD, fd_flags | FD_CLOEXEC);
         }
 
         // Check file header presence / validity
@@ -162,6 +237,7 @@ namespace pomai::memory
         seq_no_.store(max_seq);
         total_bytes_written_.store(0);
         total_records_written_.store(0);
+        bytes_since_last_fsync.store(0);
 
         return true;
     }
@@ -193,8 +269,7 @@ namespace pomai::memory
             return false;
         }
 
-        ssize_t w = write(fd_, &h, sizeof(h));
-        if (w != static_cast<ssize_t>(sizeof(h)))
+        if (!write_all(fd_, reinterpret_cast<const uint8_t *>(&h), sizeof(h)))
         {
             std::cerr << "WalManager::write_file_header_if_missing: write failed: " << strerror(errno) << "\n";
             return false;
@@ -203,7 +278,7 @@ namespace pomai::memory
         // [UPDATED] Use centralized config
         if (cfg_.sync_on_append)
         {
-            if (::fsync(fd_) != 0)
+            if (!robust_fsync(fd_))
             {
                 std::cerr << "WalManager::write_file_header_if_missing: fsync failed: " << strerror(errno) << "\n";
                 return false;
@@ -225,7 +300,7 @@ namespace pomai::memory
             return false;
         }
 
-        ssize_t r = read(fd_, &h, sizeof(h));
+        ssize_t r = ::read(fd_, &h, sizeof(h));
         if (r != static_cast<ssize_t>(sizeof(h)))
         {
             std::cerr << "WalManager::read_file_header_and_validate: read header failed: " << strerror(errno) << "\n";
@@ -283,25 +358,41 @@ namespace pomai::memory
                 std::cerr << "WalManager::append_record: lseek failed: " << strerror(errno) << "\n";
                 return std::nullopt;
             }
-            ssize_t w = write(fd_, buf.data(), buf.size());
-            if (w != static_cast<ssize_t>(buf.size()))
+
+            if (!write_all(fd_, buf.data(), buf.size()))
             {
                 std::cerr << "WalManager::append_record: write failed: " << strerror(errno) << "\n";
                 return std::nullopt;
             }
 
-            // [UPDATED] Use centralized config
-            if (cfg_.sync_on_append)
+            // update stats
+            total_bytes_written_.fetch_add(static_cast<uint64_t>(buf.size()), std::memory_order_relaxed);
+            total_records_written_.fetch_add(1, std::memory_order_relaxed);
+
+            // Batched fsync logic:
+            // - if batch_commit_size == 0: follow sync_on_append boolean.
+            // - if batch_commit_size > 0: accumulate bytes and fsync when threshold reached.
+            if (cfg_.batch_commit_size > 0)
             {
-                if (::fsync(fd_) != 0)
+                uint64_t acc = bytes_since_last_fsync.fetch_add(static_cast<uint64_t>(buf.size()), std::memory_order_relaxed) + static_cast<uint64_t>(buf.size());
+                if (acc >= cfg_.batch_commit_size)
+                {
+                    if (!robust_fsync(fd_))
+                    {
+                        std::cerr << "WalManager::append_record: fsync failed after batch threshold: " << strerror(errno) << "\n";
+                        return std::nullopt;
+                    }
+                    bytes_since_last_fsync.store(0, std::memory_order_relaxed);
+                }
+            }
+            else if (cfg_.sync_on_append)
+            {
+                if (!robust_fsync(fd_))
                 {
                     std::cerr << "WalManager::append_record: fsync failed: " << strerror(errno) << "\n";
                     return std::nullopt;
                 }
             }
-
-            total_bytes_written_.fetch_add(static_cast<uint64_t>(buf.size()));
-            total_records_written_.fetch_add(1);
 
             return rh.seq_no;
         }
@@ -312,11 +403,13 @@ namespace pomai::memory
         if (fd_ < 0)
             return false;
         std::lock_guard<std::mutex> lk(append_mu_);
-        if (::fsync(fd_) != 0)
+        if (!robust_fsync(fd_))
         {
             std::cerr << "WalManager::fsync_log: fsync failed: " << strerror(errno) << "\n";
             return false;
         }
+        // reset accumulator on explicit fsync
+        bytes_since_last_fsync.store(0, std::memory_order_relaxed);
         return true;
     }
 
@@ -409,7 +502,7 @@ namespace pomai::memory
                 std::cerr << "WalManager::replay: ftruncate failed: " << strerror(errno) << "\n";
                 return false;
             }
-            if (::fsync(fd_) != 0)
+            if (!robust_fsync(fd_))
             {
                 std::cerr << "WalManager::replay: fsync after truncate failed: " << strerror(errno) << "\n";
                 return false;
@@ -430,10 +523,15 @@ namespace pomai::memory
             std::cerr << "WalManager::truncate_to_zero: ftruncate failed: " << strerror(errno) << "\n";
             return false;
         }
+        // Reset accumulator and counters
+        bytes_since_last_fsync.store(0, std::memory_order_relaxed);
+        seq_no_.store(0);
+        total_bytes_written_.store(0);
+        total_records_written_.store(0);
+
         if (!write_file_header_if_missing())
             return false;
 
-        seq_no_.store(0);
         return true;
     }
 

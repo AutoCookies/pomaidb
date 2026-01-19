@@ -1,58 +1,113 @@
-# TODO: Kiểm tra và củng cố thực thi đúng "Memory-Mapped Architecture" của Pomai
+# Becoming The AI Vector Database For Everyone: PomaiDB System Design & Development Roadmap
 
-## 1. Đảm bảo Storage Path đúng triết lý "Everything is File (as RAM)"
+As a system design engineer with 30+ years in top bigtech companies, the vision to make PomaiDB the *vector database for everyone* — **from high-performance datacenters down to resource-constrained devices, empowering low-income researchers and developers to access AI infrastructure** — is both powerful and challenging.
 
-- [x] Blob files cho từng Shard (`shard_0.blob`, ...) được tạo dưới `data_root`
-- [ ] Tạo rõ ràng các file metadata (`pomai_schema.bin`/`manifest`, label map)
-- [x] WAL (`wal.log`) đang tồn tại cho durability
-
-## 2. Quy trình lưu trữ (Insert Path)
-
-- [ ] Khi insert, vector/data _được ghi tuần tự vào WAL trước_ (có đảm bảo fsync trước trả thành công)
-- [ ] Sau khi commit WAL => cấp phát Arena cho vector bằng offset trong blob file
-- [x] Arenas sử dụng `mmap`/`ftruncate` để mở rộng file vật lý, trả về pointer ánh xạ vào vùng RAM
-    - [`ShardArena`](src/memory/shard_arena.h/.cc) phải dùng đúng mmap, offset logic
-- [ ] Lưu pointer dạng "offset" (relative, pointer swizzling) trong mọi index trên RAM thay vì raw pointer address
-
-## 3. Truy xuất (Access Path)
-
-- [x] Khi truy xuất vector qua offset, code trả về đúng `ptr = base + offset`, OS tự đưa về RAM nếu thiếu (page fault)
-- [ ] Test di chuyển file `.blob` từ máy này sang máy khác, data vẫn access được
-
-## 4. Đảm bảo Arena và ShardArena không bị memcpy double/triple
-
-- [ ] Các API trả về chỉ pointer ánh xạ trực tiếp, không tạo buffer tạm
-- [ ] Khi cần force-write to disk: sử dụng đúng `msync()` hoặc rely vào OS's background flush
-
-## 5. Tối ưu Async Flush/Demotion
-
-- [ ] `bg_worker` thread hoặc `async_demote_range()` trigger đúng thời điểm để giải phóng RAM cho trang ít dùng (madvise(MADV_DONTNEED))
-- [ ] Balance latency <-> throughput: async flush không làm block main mutator
-
-## 6. Kiểm tra các vùng "Zero-Copy"
-
-- [ ] Buffer trả về cho vectordata, khi đọc/ghi, là zero-copy
-- [x] Xem lại logic decode/encode trong HotTier/ShardArena có dùng memcpy không cần thiết không
-
-## 7. Đảm bảo manifest/schema cập nhật khi cấu trúc file thay đổi
-
-- [ ] Khi thay đổi chiều hoặc định dạng (float32/float16), manifest/schema được cập nhật sync
-
-## 8. Bảo vệ WAL/Consistency on Crash
-
-- [ ] Boot lại server, code sẽ replay WAL và khôi phục lại được trạng thái RAM giống như trước crash
+Below is a strategic, phased development path for PomaiDB to achieve universal accessibility, robustness, and wide adoption. Each phase combines lessons from scalable systems (Google, Microsoft, AWS, Apple, etc) and recent innovations in AI/ML infrastructure.
 
 ---
 
-## 📌 Checklist thực tế trong code Pomai hiện tại:
+## 0. **Guiding Principles**
 
-- [x] Có ShardArena dùng mmap, offset chỉ tới blob file
-- [x] WAL đã có ghi tuần tự, mở lại replay
-- [x] Insert truy xuất blob qua offset
-- [x] Chưa có double memcpy (nhìn code)
-- [ ] Cần code tường minh msync/madvise cho trang lạnh
-- [ ] TODO: Tạo battery test copy .blob sang máy khác
+- **Universal Access:** Make PomaiDB usable on *any* device, OS, or hardware. No proprietary lock-in or expensive license.
+- **Resource Efficiency:** Optimize for both **high-performance** and **low-resource** environments.
+- **Open Ecosystem:** Foster vibrant open source, documentation, community tooling, with inclusive governance.
+- **Modular & Extensible:** Clean separation of "Heavy" and "Light" features (see below).
+- **AI for Everyone:** Lower hardware, software, and knowledge barriers.
+- **Privacy & Security:** First-class support for device-local operation (offline, no cloud dependency) and strong data security.
 
 ---
 
-**Nếu còn mục nào trên chưa tick được → cần bổ sung! Để framework Pomai hội đủ "Memory-Mapped VectorDB" thực thụ.**
+## 1. **Phase 1 – Efficient Universal Core**
+
+### #### 1.1. Target: Minimum Viable Vector DB
+
+- **MVP features:** Insert, search (nearest neighbor), get/remove by label, efficient storage/retrieval.
+- **Minimal dependencies:** No heavy frameworks, no use of CUDA, MKL, OpenBLAS, unless available *optionally*.
+- **Plain C++ core:** Keep main code in modern C++ (as current) or optionally Rust for easier memory/device management.
+
+### #### 1.2. Device Coverage
+
+- **Compile and run on:**
+    - x86/64, ARM32/64 (Raspberry Pi, Jetson, Android), RISC-V, Apple Silicon.
+    - OSs: Linux, MacOS, Windows, Android, iOS (limited), FreeBSD.
+    - *Headless support*: CLI, REST/gRPC API, and lightweight embeddable library.
+
+### #### 1.3. Memory, Storage & Compute Adaptivity
+
+- **Dynamic resource profiling:** At startup, detect available CPU, RAM, disk, and adapt kernel choices (`pomai_init_cpu_kernels()` does this partially).
+- **Tiered storage backend:**
+    - **RAM Arena** for speed, **File-backed Arena** for capacity, **Async demote/promote** to handle low memory.
+    - *No GPU required.* But can **optionally** use GPU/TPU if present.
+
+### #### 1.4. High Scalability *and* Tiny Footprint
+
+- **Batch APIs** for bulk ingest/search.
+- **"Hot Tier"** buffer (in-memory only; auto-flush if RAM low).
+- **Compression/quantization:** Store vectors in quantized formats (float16, int8, etc) to reduce storage and memory.
+- **Lightweight Indexing:** Use Bloom, inverted indexes, compressed metadata; only load needed features per queries.
+
+---
+
+## 2. **Phase 2 – Low Resource & Edge Support**
+
+### #### 2.1. Hardware Minimization
+
+- **Run on devices with <128MB RAM, low CPU.**
+- Use fixed size pages; swap out cold data.
+- Opt for quantized vector search (4-bit, fp16) by default.
+- Efficient codebooks/quantization for small vectors.
+
+### #### 2.2. "Portable Mode": No-SQLite, No-Cloud
+
+- *No dependency on separate RDBMS, cloud APIs, or big distro*. 
+- CLI interface can run on low-power ARM, single-board computers.
+- Tiny Docker images/flatpak for easy deployment.
+- **Static linking** for lightweight binary delivery.
+
+### #### 2.3. "Offline-First" Design
+
+- Can operate 100% offline, no telemetry.
+- All necessary docs and tests bundled for local use.
+- Focus on reliability over features in offline mode.
+
+### #### 2.4. Cross-Device Import/Export
+
+- Make data interoperable — allow users to carry data/tools on USB, SD, or cloudless network.
+- Simple dump/load of DB, data, codebooks, etc.
+
+---
+
+## 3. **Phase 3 – Feature Enrichment, Dev/Research Focus**
+
+### #### 3.1. "AI for Everyone" SDKs
+
+- **Python, C++, JavaScript, Rust SDKs.** Simple "insert", "search", "train" calls.
+- **Examples for low-income researchers**: image, text, bioscience, low-data regimes.
+
+### #### 3.2. Community Contributions
+
+- Documentation: *triple down* on guides for usage, deployment, demo, troubleshooting.
+- **"One-Click Installers"**: script runners, docker-compose, appimage, no-admin required.
+
+### #### 3.3. Inclusive User Experience
+
+- **Web UI, simple dashboards** (for those without CLI skills).
+- "Tiny GUI" mode for phones/tablets.
+- **Learning center:** Tutorials built into main repo, code notebooks with free sample data.
+
+### #### 3.4. Accessibility
+
+- Language localization.
+- Visual accessibility in UI/tools.
+
+---
+
+## 4. **Phase 4 – (Optional) Advanced Performance: Scale Up or Down**
+
+### #### 4.1. High-Performance Node Mode
+
+- If device has lots of RAM/cores: automatically use AVX2/AVX512, multithread, async search.
+- **Distributed deployment mode**: auto-discover nodes, sharding, federated search.
+- Upgrades for "power users": plugin system, custom kernels, optional GPU.
+
+### #### 4

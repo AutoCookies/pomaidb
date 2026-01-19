@@ -4,26 +4,17 @@ test_pomai_integration.py
 
 End-to-end integration test for Pomai server (text SQL-like protocol).
 
-This version builds fully-formed SQL commands for all supported storage
-data types and demonstrates constructing vector payloads from both Torch tensors
-and NumPy arrays. It groups inserts into batched "INSERT INTO ... VALUES (...),(...)" 
-statements (server parser supports multiple tuples).
+This extended version tests ITERATE in two modes:
+  1) Single-call ITERATE (no explicit batch/offset passed) -- server returns all requested items at once.
+  2) Batched ITERATE -- client repeatedly requests slices using offset/limit to drain dataset in chunks.
 
-For each data type we:
- - CREATE MEMBRANCE <name> DIM <n> DATA_TYPE <dtype>
- - INSERT a small batch of vectors (generated from Torch / NumPy tensors)
- - Wait briefly for server to process
- - EXEC SPLIT so ITERATE TRAIN returns the inserted vectors (split ratio 0.8/0.1/0.1)
- - ITERATE the TRAIN set and verify received vectors (shape/count) and print a sample
+Usage:
+    python3 test_pomai_integration.py --assets ./assets --batch 8
 
-Notes:
- - For integer storage types we quantize/round normalized float features into the
-   integer domain before formatting.
- - We support passing vectors as either numpy.ndarray or torch.Tensor; the builder
-   will detect and convert accordingly.
- - This version verifies that the server returns binary streams encoded in the
-   same storage element type configured for the membrance (i.e. it will fail
-   if the server always decodes everything into float32).
+The script will create membrances, insert vectors, create splits and then
+exercise ITERATE (TRAIN/PAIR/TRIPLET) for each configured dtype both as a
+single large response and as repeated small batches. This helps validate the
+server's support for both usage patterns.
 """
 
 import argparse
@@ -109,8 +100,10 @@ class PomaiClient:
         while True:
             try:
                 chunk = self.sock.recv(1)
-            except: break
-            if not chunk: break
+            except:
+                break
+            if not chunk:
+                break
             buf += chunk
             if buf.endswith(marker):
                 break
@@ -123,6 +116,8 @@ class PomaiClient:
         - "OK BINARY <count> <dim> <bytes>\n"            (legacy)
         - "OK BINARY <dtype> <count> <dim> <bytes>\n"    (new)
         Also accepts "OK BINARY_PAIR" similarly.
+
+        Returns (count, dim, bytes_payload)
         """
         self.send(cmd)
         header_buf = b""
@@ -147,21 +142,14 @@ class PomaiClient:
             return 0, 0, b""
 
         parts = header_str.split()
-        # parts examples:
-        # ["OK","BINARY","6","2048","49152"]                       -> legacy
-        # ["OK","BINARY","float32","6","2048","49152"]            -> new (dtype included)
-        # ["OK","BINARY_PAIR","float32","3","2048","24576"]
         # Determine whether parts[2] is a dtype token:
         dtypes = {"float32", "float64", "int32", "int8", "float16", "fp16", "double"}
-        # normalize lower-case for comparison
         idx = 2
         if len(parts) >= 3 and parts[2].lower() in dtypes:
-            # dtype present -> shift indices
             idx = 3
 
         # Ensure we have enough tokens after resolving optional dtype
         if len(parts) <= idx + 2:
-            # malformed header: drain and return
             self._drain_until_end()
             return 0, 0, b""
 
@@ -170,7 +158,6 @@ class PomaiClient:
             dim = int(parts[idx + 1])
             total_bytes = int(parts[idx + 2])
         except Exception:
-            # malformed numeric fields
             self._drain_until_end()
             return 0, 0, b""
 
@@ -383,6 +370,46 @@ def verify_payload_dtype(payload: bytes, dim: int, count: int, expected_dtype_st
     return True
 
 # -----------------------
+# ITERATE helpers
+# -----------------------
+
+def iterate_batches(client: PomaiClient, base_cmd: str, batch_size: int = 256):
+    """
+    Generator that yields (count, dim, payload) batches by repeatedly calling
+    ITERATE with increasing offsets.
+
+    base_cmd should be something like: "ITERATE <mem> TRAIN" or
+    "ITERATE <mem> PAIR" or "ITERATE <mem> TRIPLET <key>", without offset/limit.
+    We'll append "<off> <limit>;" each time.
+
+    Stops when server returns count == 0 or when a returned batch smaller than batch_size.
+    """
+    offset = 0
+    while True:
+        cmd = f"{base_cmd} {offset} {batch_size};"
+        try:
+            count, dim, payload = client.request_binary_stream(cmd)
+        except Exception as e:
+            print(f"[iterate_batches] Error requesting batch offset={offset}: {e}")
+            raise
+        yield count, dim, payload
+        if count == 0 or count < batch_size:
+            break
+        offset += count
+
+def iterate_single(client: PomaiClient, cmd_without_semicolon: str):
+    """
+    Perform a single-call ITERATE (no offset/limit). The caller passes base command
+    like "ITERATE <mem> TRAIN" or "ITERATE <mem> PAIR" or "ITERATE <mem> TRIPLET <key> <limit?>".
+    This function appends the semicolon and requests the stream once.
+    Returns (count, dim, payload)
+    """
+    cmd = cmd_without_semicolon.strip()
+    if not cmd.endswith(";"):
+        cmd = cmd + ";"
+    return client.request_binary_stream(cmd)
+
+# -----------------------
 # Main test flow
 # -----------------------
 
@@ -476,45 +503,72 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
             # Determine expected storage dtype (from manifest/info if provided)
             expected_dtype = dt
             if info and info.get("data_type"):
-                # server may report a normalized name; prefer reported value for expectation
                 expected_dtype = info["data_type"]
 
-            ##### ITERATE TRAIN ####
-            print(f"ITERATE {mname} TRAIN to validate stream (drain)...")
-            count, dim_ret, payload = client.request_binary_stream(f"ITERATE {mname} TRAIN 0 1000;")
-            print(f"  -> Received {count} vectors, dim reported={dim_ret}")
-            if count == 0:
-                print(f"  [WARN] server returned 0 vectors (may be a bug if inserts succeeded)")
+            ##### SINGLE-CALL ITERATE TRAIN #####
+            print(f"\n[SINGLE] ITERATE {mname} TRAIN (no batch param) -> validate single large response")
+            try:
+                count, dim_ret, payload = iterate_single(client, f"ITERATE {mname} TRAIN")
+                print(f"  -> Single-call TRAIN returned count={count}, dim={dim_ret}, bytes={len(payload)}")
+                ok = verify_payload_dtype(payload, dim_ret, count, expected_dtype, verbose=verbose)
+                if not ok:
+                    print(f"  [ERROR] Single-call TRAIN verification failed for {mname}")
+            except Exception as e:
+                print(f"  [ERROR] Single-call ITERATE TRAIN failed: {e}")
 
-            # Verify payload matches expected storage dtype (NOT necessarily float32)
-            ok = verify_payload_dtype(payload, dim_ret, count, expected_dtype, verbose=verbose)
-            if not ok:
-                print(f"  [ERROR] ITERATE TRAIN payload verification failed for membrance {mname} (expected dtype={expected_dtype})")
-            else:
-                # parse and show a sample if possible
-                np_dtype, _ = dtype_str_to_numpy(expected_dtype)
-                if count > 0 and payload and np_dtype is not None:
-                    try:
-                        arr = np.frombuffer(payload, dtype=np_dtype)
-                        if dim_ret > 0 and arr.size % dim_ret == 0:
-                            arr = arr.reshape(-1, dim_ret)
-                            # Print first 5 elements of first vector after casting to float for readability
-                            print(f"  -> Parsed TRAIN array shape: {arr.shape}, first[0,:5]={arr[0,:5].astype(np.float64).tolist()}")
-                    except Exception as e:
-                        print("  -> Error parsing payload after verification:", e)
+            ##### BATCHED ITERATE TRAIN #####
+            print(f"\n[BATCHED] ITERATE {mname} TRAIN in batches (batch_size={batch_size}) to validate stream (drain)...")
+            total_received = 0
+            base_cmd = f"ITERATE {mname} TRAIN"
+            for count, dim_ret, payload in iterate_batches(client, base_cmd, batch_size=batch_size):
+                print(f"  -> Batch received count={count}, dim={dim_ret}, bytes={len(payload)}")
+                ok = verify_payload_dtype(payload, dim_ret, count, expected_dtype, verbose=verbose)
+                if not ok:
+                    print(f"  [ERROR] Batch verification failed for {mname} TRAIN")
+                total_received += count
+            print(f"  -> Total TRAIN vectors received (all batches): {total_received}")
 
-            ##### ITERATE PAIR ####
-            print(f"ITERATE {mname} PAIR to validate (label, vector) binary stream...")
-            count, dim_ret, payload = client.request_binary_stream(f"ITERATE {mname} PAIR 0 1000;")
-            print(f"  -> Received {count} label+vector pairs, dim reported={dim_ret}")
-            if count > 0 and payload:
+            ##### SINGLE-CALL ITERATE PAIR #####
+            print(f"\n[SINGLE] ITERATE {mname} PAIR (no batch param) -> validate single large response of (label,vec) tuples")
+            try:
+                count, dim_ret, payload = iterate_single(client, f"ITERATE {mname} PAIR")
+                print(f"  -> Single-call PAIR returned count={count}, dim={dim_ret}, bytes={len(payload)}")
+                if count > 0:
+                    np_dtype, elem_size = dtype_str_to_numpy(expected_dtype)
+                    tuple_size = 8 + (elem_size * dim_ret if elem_size else 4 * dim_ret)
+                    if len(payload) < tuple_size * count:
+                        print("  -> Warning: payload smaller than expected for given count/dim/elem_size")
+                    for i in range(count):
+                        start = i * tuple_size
+                        lbl_bytes = payload[start:start+8]
+                        label = struct.unpack('<Q', lbl_bytes)[0]
+                        vec_start = start + 8
+                        vec_end = vec_start + (elem_size * dim_ret if elem_size else 4 * dim_ret)
+                        vec_bytes = payload[vec_start:vec_end]
+                        ok = verify_payload_dtype(vec_bytes, dim_ret, 1, expected_dtype, verbose=False)
+                        if not ok:
+                            print(f"    -> PAIR vector in single-call failed verification (expected={expected_dtype})")
+                        else:
+                            if np_dtype is not None:
+                                v = np.frombuffer(vec_bytes, dtype=np_dtype)
+                                print(f"    [PAIR] label={label}, vec[:5]={v[:5].astype(np.float64).tolist()}")
+            except Exception as e:
+                print(f"  [ERROR] Single-call ITERATE PAIR failed: {e}")
+
+            ##### BATCHED ITERATE PAIR #####
+            print(f"\n[BATCHED] ITERATE {mname} PAIR in batches (batch_size={batch_size}) to validate (label, vector) binary stream...")
+            total_pairs = 0
+            base_cmd = f"ITERATE {mname} PAIR"
+            for count, dim_ret, payload in iterate_batches(client, base_cmd, batch_size=batch_size):
+                print(f"  -> Batch PAIR count={count}, dim={dim_ret}, bytes={len(payload)}")
+                if count == 0:
+                    continue
                 np_dtype, elem_size = dtype_str_to_numpy(expected_dtype)
                 tuple_size = 8 + (elem_size * dim_ret if elem_size else 4 * dim_ret)
                 if len(payload) < tuple_size * count:
                     print("  -> Warning: payload smaller than expected for given count/dim/elem_size")
-                # Check first few
-                all_ok = True
-                for i in range(min(3, count)):
+                # Validate each pair in batch
+                for i in range(count):
                     start = i * tuple_size
                     lbl_bytes = payload[start:start+8]
                     label = struct.unpack('<Q', lbl_bytes)[0]
@@ -523,27 +577,62 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
                     vec_bytes = payload[vec_start:vec_end]
                     ok = verify_payload_dtype(vec_bytes, dim_ret, 1, expected_dtype, verbose=False)
                     if not ok:
-                        all_ok = False
-                        print(f"    -> PAIR vector #{i} failed verification (expected={expected_dtype})")
+                        print(f"    -> PAIR vector in batch failed verification (expected={expected_dtype})")
                     else:
-                        # parse for print
                         if np_dtype is not None:
                             v = np.frombuffer(vec_bytes, dtype=np_dtype)
-                            print(f"    [PAIR {i}] label={label}, vec[:5]={v[:5].astype(np.float64).tolist()}")
-                if not all_ok:
-                    print(f"  [ERROR] One or more PAIR vectors failed verification for {mname}")
+                            print(f"    [PAIR] label={label}, vec[:5]={v[:5].astype(np.float64).tolist()}")
+                total_pairs += count
+            print(f"  -> Total PAIRs received (all batches): {total_pairs}")
 
-            ##### ITERATE TRIPLET ####
-            print(f"ITERATE {mname} TRIPLET class 2 to validate triplet stream...")
-            count, dim_ret, payload = client.request_binary_stream(f"ITERATE {mname} TRIPLET class 2;")
-            print(f"  -> Received {count} triplets, dim={dim_ret}")
-            if count > 0 and payload:
+            ##### SINGLE-CALL ITERATE TRIPLET #####
+            print(f"\n[SINGLE] ITERATE {mname} TRIPLET class (no batch param) -> validate single large triplet response")
+            # For single-call TRIPLET we must provide a key and a limit; we'll request a large limit to get all triplets
+            try:
+                # large limit (server will clamp), class key 'class'
+                single_cmd = f"ITERATE {mname} TRIPLET class 1000000"
+                count, dim_ret, payload = iterate_single(client, single_cmd)
+                print(f"  -> Single-call TRIPLET returned count={count}, dim={dim_ret}, bytes={len(payload)}")
+                if count > 0:
+                    np_dtype, elem_size = dtype_str_to_numpy(expected_dtype)
+                    triplet_size = 3 * (elem_size * dim_ret if elem_size else 4 * dim_ret)
+                    if len(payload) < triplet_size * count:
+                        print("  -> Warning: triplet payload smaller than expected")
+                    try:
+                        for i in range(count):
+                            chunk = payload[i*triplet_size:(i+1)*triplet_size]
+                            a_b = chunk[0:elem_size*dim_ret]
+                            p_b = chunk[elem_size*dim_ret:2*elem_size*dim_ret]
+                            n_b = chunk[2*elem_size*dim_ret:3*elem_size*dim_ret]
+                            oka = verify_payload_dtype(a_b, dim_ret, 1, expected_dtype, verbose=False)
+                            okp = verify_payload_dtype(p_b, dim_ret, 1, expected_dtype, verbose=False)
+                            okn = verify_payload_dtype(n_b, dim_ret, 1, expected_dtype, verbose=False)
+                            if not (oka and okp and okn):
+                                print("  -> Error: one of triplet parts failed verification")
+                            else:
+                                a = np.frombuffer(a_b, dtype=np_dtype)
+                                p = np.frombuffer(p_b, dtype=np_dtype)
+                                n = np.frombuffer(n_b, dtype=np_dtype)
+                                print(f"    [TRIPLET] anchor[:5]={a[:5].astype(np.float64).tolist()}, pos[:5]={p[:5].astype(np.float64).tolist()}, neg[:5]={n[:5].astype(np.float64).tolist()}")
+                    except Exception as e:
+                        print("  -> Error parsing TRIPLET single-call stream:", e)
+            except Exception as e:
+                print(f"  [ERROR] Single-call ITERATE TRIPLET failed: {e}")
+
+            ##### BATCHED ITERATE TRIPLET #####
+            print(f"\n[BATCHED] ITERATE {mname} TRIPLET class in batches (batch_size={batch_size}) to validate triplet stream...")
+            base_cmd = f"ITERATE {mname} TRIPLET class"
+            total_triplets = 0
+            for count, dim_ret, payload in iterate_batches(client, base_cmd, batch_size=batch_size):
+                print(f"  -> Batch TRIPLET count={count}, dim={dim_ret}, bytes={len(payload)}")
+                if count == 0:
+                    continue
                 np_dtype, elem_size = dtype_str_to_numpy(expected_dtype)
                 triplet_size = 3 * (elem_size * dim_ret if elem_size else 4 * dim_ret)
                 if len(payload) < triplet_size * count:
                     print("  -> Warning: triplet payload smaller than expected")
                 try:
-                    for i in range(min(1, count)):
+                    for i in range(count):
                         chunk = payload[i*triplet_size:(i+1)*triplet_size]
                         a_b = chunk[0:elem_size*dim_ret]
                         p_b = chunk[elem_size*dim_ret:2*elem_size*dim_ret]
@@ -557,11 +646,13 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
                             a = np.frombuffer(a_b, dtype=np_dtype)
                             p = np.frombuffer(p_b, dtype=np_dtype)
                             n = np.frombuffer(n_b, dtype=np_dtype)
-                            print(f"    [TRIPLET {i}] anchor[:5]={a[:5].astype(np.float64).tolist()}, pos[:5]={p[:5].astype(np.float64).tolist()}, neg[:5]={n[:5].astype(np.float64).tolist()}")
+                            print(f"    [TRIPLET] anchor[:5]={a[:5].astype(np.float64).tolist()}, pos[:5]={p[:5].astype(np.float64).tolist()}, neg[:5]={n[:5].astype(np.float64).tolist()}")
                 except Exception as e:
                     print("  -> Error parsing TRIPLET stream:", e)
+                total_triplets += count
+            print(f"  -> Total TRIPLETs received (all batches): {total_triplets}")
 
-            if count > 0:
+            if total_triplets > 0:
                 probe_label, probe_vec, _, _ = batch_items[0]
                 probe_np = as_numpy(probe_vec)
                 print(f"Searching for first inserted label vector in {mname} (probe)...")
@@ -588,7 +679,7 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=7777, type=int)
     parser.add_argument("--assets", default="assets")
-    parser.add_argument("--batch", default=8, type=int)
+    parser.add_argument("--batch", default=2, type=int)
     parser.add_argument("--no-verbose", dest="verbose", action="store_false")
     args = parser.parse_args()
 

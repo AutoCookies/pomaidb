@@ -29,7 +29,7 @@ namespace pomai::memory
         // Constructor: create (or open) a file-backed arena with capacity_bytes.
         // cfg.arena.remote_dir is used to place broken-out remote files; the backing file lives
         // under cfg.res.data_root/shard_<id>.blob if cfg.res.data_root is set, otherwise remote_dir.
-        ShardArena(uint32_t shard_id, size_t capacity_bytes, const pomai::config::PomaiConfig &cfg);
+        ShardArena(uint32_t shard_id, size_t capacity_bytes, const pomai::config::PomaiConfig& cfg);
         ~ShardArena();
 
         ShardArena(const ShardArena &) = delete;
@@ -73,9 +73,9 @@ namespace pomai::memory
         std::string backing_filename() const;
 
         uint32_t id_;
-        size_t capacity_; // current mapped size in bytes
-        char *base_addr_; // mmap base pointer
-        int fd_;          // backing file descriptor (-1 if not open)
+        size_t capacity_;        // current mapped size in bytes
+        char *base_addr_;        // mmap base pointer
+        int fd_;                 // backing file descriptor (-1 if not open)
 
         alignas(64) std::atomic<uint64_t> write_head_;
 

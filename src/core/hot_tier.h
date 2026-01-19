@@ -1,4 +1,3 @@
-#pragma once
 /*
  * src/core/hot_tier.h
  *
@@ -13,7 +12,15 @@
  * - data_ is a single contiguous std::vector<uint8_t> (SoA flattened).
  * - push() is zero-alloc hot-path: reserves capacity up-front and writes directly.
  * - swap_and_flush() uses move semantics (O(1)) to hand off buffers to background worker.
+ *
+ * Updates:
+ * - Non-growing hot buffer: push() will drop new entries if the already-reserved
+ *   capacity_hint_ is reached. This provides a simple backpressure/drop policy
+ *   to avoid unbounded memory growth when upstream outpaces downstream flushing.
+ * - Drop counter exposed for observability.
  */
+
+#pragma once
 
 #include <vector>
 #include <atomic>
@@ -26,6 +33,7 @@
 #include <cstdint>
 #include <string>
 #include <type_traits>
+#include <iostream>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -100,7 +108,8 @@ namespace pomai::core
         HotTier(size_t dim, const pomai::config::HotTierConfig &cfg, pomai::core::DataType dt = pomai::core::DataType::FLOAT32)
             : dim_(dim),
               capacity_hint_(cfg.initial_capacity),
-              data_type_(dt)
+              data_type_(dt),
+              capacity_limit_(cfg.initial_capacity)
         {
             // FIX: use dtype_size from src/core/types.h (name unified)
             element_size_ = static_cast<uint32_t>(pomai::core::dtype_size(data_type_));
@@ -119,10 +128,20 @@ namespace pomai::core
 
         // Push API accepts float* (most callers operate in float); conversion to storage type occurs here.
         // This keeps hot path simple for callers while allowing storage of other numeric types.
+        // NOTE: To avoid unbounded heap growth we enforce a non-growing policy: if the current
+        // number of stored vectors >= capacity_limit_ we drop the incoming vector and increment drop counter.
         void push(uint64_t label, const float *vec)
         {
             if (!vec) return;
+
             ScopedSpinLock g(lock_);
+
+            // Backpressure / drop policy: if we're at capacity, drop new element.
+            if (labels_.size() >= capacity_limit_)
+            {
+                dropped_count_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
 
             labels_.push_back(label);
 
@@ -185,7 +204,14 @@ namespace pomai::core
         void push_raw(uint64_t label, const void *raw_vec)
         {
             if (!raw_vec) return;
+
             ScopedSpinLock g(lock_);
+
+            if (labels_.size() >= capacity_limit_)
+            {
+                dropped_count_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
 
             labels_.push_back(label);
             size_t vec_bytes = dim_ * element_size_;
@@ -291,6 +317,13 @@ namespace pomai::core
         uint32_t element_size() const { return element_size_; }
         size_t dim() const { return dim_; }
 
+        // Capacity management & observability
+        size_t capacity_hint() const noexcept { return capacity_hint_; }
+        void set_capacity_limit(size_t cap) noexcept { capacity_limit_ = cap; }
+        size_t capacity_limit() const noexcept { return capacity_limit_; }
+
+        static uint64_t dropped_count() noexcept { return dropped_count_.load(std::memory_order_relaxed); }
+
     private:
         size_t dim_;
         size_t capacity_hint_;
@@ -301,6 +334,12 @@ namespace pomai::core
         std::vector<uint8_t> data_;
 
         mutable AdaptiveSpinLock lock_;
+
+        // In-memory non-growing cap (number of vectors). When reached, new pushes are dropped.
+        size_t capacity_limit_;
+
+        // Global dropped counter across HotTier instances (simple observability).
+        static inline std::atomic<uint64_t> dropped_count_{0};
 
         static pomai::core::DataType str_to_dtype(const std::string &s)
         {

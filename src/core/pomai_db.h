@@ -9,6 +9,7 @@
 #include <optional>
 #include <thread>
 #include <atomic>
+#include <functional>
 
 #include "src/memory/shard_arena.h"
 #include "src/ai/pomai_orbit.h"
@@ -79,6 +80,21 @@ namespace pomai::core
         bool save_manifest();
         bool save_all_membrances();
         bool insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
+
+        // New: iterate in batches and deliver raw stored bytes to a consumer callback.
+        // - mode: "TRAIN"/"VAL"/"TEST" or empty/other to mean "all"
+        // - off/lim: offset and limit within the selected index list
+        // - batch_size: number of vectors per invocation to the consumer
+        // - consumer: function(ids, concatenated_raw_bytes, per_vector_bytes)
+        //   per_vector_bytes is the element_size * dim for this membrance (fixed per call)
+        bool iterate_batch(const std::string &membr,
+                           const std::string &mode,
+                           size_t off,
+                           size_t lim,
+                           size_t batch_size,
+                           const std::function<void(const std::vector<uint64_t> &ids, const std::string &concat_buf, uint32_t per_vec_bytes)> &consumer);
+
+        bool fetch_batch_raw(const std::string &membr, const std::vector<uint64_t> &ids, std::vector<std::string> &outs);
 
     private:
         bool load_manifest();

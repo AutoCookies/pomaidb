@@ -225,6 +225,8 @@ namespace pomai::ai::orbit
         size_t num_centroids() const { return centroids_.size(); }
         std::vector<uint64_t> get_all_labels() const;
 
+        bool get_vectors_raw(const std::vector<uint64_t> &ids, std::vector<std::string> &outs) const;
+
     private:
         Config cfg_;
         ArenaView arena_;

@@ -38,7 +38,7 @@ namespace pomai::memory
         return ((v + page - 1) / page) * page;
     }
 
-    ShardArena::ShardArena(uint32_t shard_id, size_t capacity_bytes, const pomai::config::PomaiConfig &cfg)
+    ShardArena::ShardArena(uint32_t shard_id, size_t capacity_bytes, const pomai::config::PomaiConfig& cfg)
         : id_(shard_id),
           capacity_(0),
           base_addr_(nullptr),
@@ -53,13 +53,7 @@ namespace pomai::memory
             throw std::invalid_argument("ShardArena: capacity must be > 0");
 
         // Ensure remote dir exists
-        try
-        {
-            std::filesystem::create_directories(remote_dir_);
-        }
-        catch (...)
-        {
-        }
+        try { std::filesystem::create_directories(remote_dir_); } catch (...) {}
 
         // Determine backing file path: prefer config.res.data_root if present else remote_dir_
         std::string bfile = backing_filename();
@@ -224,8 +218,7 @@ namespace pomai::memory
                 auto victim = remote_mmaps_.begin();
                 const char *v_addr = victim->second.first;
                 size_t v_sz = victim->second.second;
-                if (v_addr && v_sz > 0)
-                    munmap(const_cast<char *>(v_addr), v_sz);
+                if (v_addr && v_sz > 0) munmap(const_cast<char *>(v_addr), v_sz);
                 remote_mmaps_.erase(victim);
             }
 

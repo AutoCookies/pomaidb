@@ -5,6 +5,17 @@
  * Updated: full SQL support + ITERATE handlers that query MEMBRANCE INFO first
  * and decode stored element types (float32, float64, int32, int8, float16)
  * into float32 for human-friendly preview / testing.
+ *
+ * Added: Client-side support for ITERATE ... BATCH <size>
+ * Behavior:
+ *   - If user supplies "BATCH <n>" the CLI will request the data in chunks of n
+ *     by repeatedly calling the server's ITERATE with off/lim parameters.
+ *   - If BATCH is not provided, behavior is unchanged (single request).
+ *
+ * Note:
+ *   The server already accepts ITERATE <name> <mode> [split] [off] [lim].
+ *   Some deployments may also support server-side batching; the CLI implements
+ *   a portable client-side batching fallback that works with existing servers.
  */
 
 #include <iostream>
@@ -227,7 +238,7 @@ public:
         if (header.empty()) return {header, {}};
 
         // If header not OK BINARY, read multiline text (error) and return
-        if (header.rfind("OK BINARY", 0) != 0 && header.rfind("OK BINARY_PAIR", 0) != 0 && header.rfind("OK BINARY_PAIR", 0) != 0) {
+        if (header.rfind("OK BINARY", 0) != 0 && header.rfind("OK BINARY_PAIR", 0) != 0) {
             // read until <END>
             if (header.find("<END>") == std::string::npos) {
                 std::string rest = recv_multiline();
@@ -264,7 +275,8 @@ static void print_help()
               << "  INSERT INTO <name> VALUES (<label,[v...]>) , ...\n"
               << "  SEARCH <name> QUERY [v...] TOP <k>\n"
               << "  GET MEMBRANCE INFO <name>\n"
-              << "  ITERATE <name> <mode> [split] [off] [lim]  -- modes: TRAIN/VAL/TEST/PAIR/TRIPLET\n"
+              << "  ITERATE <name> <mode> [split] [off] [lim] [BATCH <n>]  -- modes: TRAIN/VAL/TEST/PAIR/TRIPLET\n"
+              << "      If BATCH <n> is provided the CLI performs client-side batching (requests chunks of n)\n"
               << "  EXEC SPLIT <name> <tr> <val> <te> [STRATIFIED key | CLUSTER | TEMPORAL key]\n"
               << "  DELETE <name> LABEL <label>\n"
               << "  QUIT\n";
@@ -340,53 +352,25 @@ static void decode_slot_to_float(const char *slot, size_t dim, cli_helpers::Data
 }
 
 // Generic handler: drain binary stream and optionally preview first vector
-static void handle_iterate_binary(PomaiSocket &sock, const std::string &name, const std::string &orig_cmd)
+static void process_binary_payload(const std::string &header, const std::vector<char> &payload)
 {
-    // 1) Fetch membrance info to know dtype/dim
-    size_t dim = 0;
-    cli_helpers::DataType dtype = cli_helpers::DataType::FLOAT32;
-    try {
-        std::string info = sock.get_membrance_info(name);
-        if (!parse_membrance_info(info, dim, dtype)) {
-            // fallback: try to parse from header later
-            dim = 0;
-            dtype = cli_helpers::DataType::FLOAT32;
-        }
-    } catch (...) {
-        // ignore: we'll rely on header
-    }
-
-    // 2) Request binary stream
-    auto [header, payload] = sock.request_binary_stream(orig_cmd);
     if (header.empty()) {
         std::cout << ANSI_RED << "No response from server\n" << ANSI_RESET;
         return;
     }
 
-    // If header is error text, print and return
-    if (header.rfind("OK BINARY", 0) != 0 && header.rfind("OK BINARY_PAIR", 0) != 0)
-    {
+    if (header.rfind("OK BINARY", 0) != 0 && header.rfind("OK BINARY_PAIR", 0) != 0) {
         std::cout << header << "\n";
         return;
     }
 
-    // parse header
     std::istringstream hs(header);
     std::string tag, subtype;
-    size_t count = 0, hdr_dim = 0, total_bytes = 0;
-    hs >> tag >> subtype >> count >> hdr_dim >> total_bytes;
-    if (dim == 0) dim = hdr_dim;
+    size_t count = 0, dim = 0, total_bytes = 0;
+    hs >> tag >> subtype >> count >> dim >> total_bytes;
 
-    size_t elem_bytes = sizeof(float); // server external format is float32 output; but internal storage may differ only for stored payloads. For ITERATE server always sends float32 external bytes (sql_executor does convert) — but keep decoding safe.
-    // If server returns raw stored representation (unlikely for external protocol), we would need dtype & elem size; but sql_executor already converts to float32 before sending ITERATE.
-    // So we treat payload as float32 vectors.
     size_t vec_bytes = dim * sizeof(float);
     size_t expected = count * vec_bytes;
-    if (payload.size() < expected) {
-        // partial or 0 payload; print header and exit
-        std::cout << header;
-        std::cout << ANSI_YELLOW << "Warning: payload smaller than expected\n" << ANSI_RESET;
-    }
 
     std::cout << ANSI_CYAN << "ITERATE -> entries=" << count << " dim=" << dim << " bytes=" << payload.size() << ANSI_RESET << "\n";
 
@@ -400,23 +384,13 @@ static void handle_iterate_binary(PomaiSocket &sock, const std::string &name, co
         }
         std::cout << ANSI_RESET << "\n";
     }
-
-    // For test-draining we don't print all bytes (could be huge)
+    // We do not dump all data to console to avoid massive output.
     std::cout << "Drained binary payload (" << payload.size() << " bytes).\n";
 }
 
 // Handler for PAIR: payload layout = [uint64_t label][vector bytes] * count
-static void handle_iterate_pair(PomaiSocket &sock, const std::string &name, const std::string &orig_cmd)
+static void process_pair_payload(const std::string &header, const std::vector<char> &payload)
 {
-    // Get info
-    size_t dim = 0;
-    cli_helpers::DataType dtype = cli_helpers::DataType::FLOAT32;
-    try {
-        std::string info = sock.get_membrance_info(name);
-        parse_membrance_info(info, dim, dtype);
-    } catch (...) {}
-
-    auto [header, payload] = sock.request_binary_stream(orig_cmd);
     if (header.empty()) { std::cout << "No response\n"; return; }
     if (header.rfind("OK BINARY_PAIR", 0) != 0) { std::cout << header; return; }
 
@@ -424,7 +398,7 @@ static void handle_iterate_pair(PomaiSocket &sock, const std::string &name, cons
     std::string a,b;
     size_t count=0,hdr_dim=0,total_bytes=0;
     hs >> a >> b >> count >> hdr_dim >> total_bytes;
-    if (dim == 0) dim = hdr_dim;
+    size_t dim = hdr_dim;
     size_t vec_bytes = dim * sizeof(float);
     size_t per = sizeof(uint64_t) + vec_bytes;
     if (payload.size() < per * count) {
@@ -450,13 +424,8 @@ static void handle_iterate_pair(PomaiSocket &sock, const std::string &name, cons
 }
 
 // Handler for TRIPLET: server returns OK BINARY header with limit * 3 * vec_bytes bytes
-static void handle_iterate_triplet(PomaiSocket &sock, const std::string &name, const std::string &orig_cmd)
+static void process_triplet_payload(const std::string &header, const std::vector<char> &payload)
 {
-    size_t dim = 0;
-    cli_helpers::DataType dtype = cli_helpers::DataType::FLOAT32;
-    try { std::string info = sock.get_membrance_info(name); parse_membrance_info(info, dim, dtype); } catch (...) {}
-
-    auto [header, payload] = sock.request_binary_stream(orig_cmd);
     if (header.empty()) { std::cout << "No response\n"; return; }
     if (header.rfind("OK BINARY", 0) != 0) { std::cout << header; return; }
 
@@ -464,7 +433,7 @@ static void handle_iterate_triplet(PomaiSocket &sock, const std::string &name, c
     std::string t1,t2;
     size_t count=0,hdr_dim=0,total_bytes=0;
     hs >> t1 >> t2 >> count >> hdr_dim >> total_bytes;
-    if (dim == 0) dim = hdr_dim;
+    size_t dim = hdr_dim;
     size_t vec_bytes = dim * sizeof(float);
     size_t per = vec_bytes * 3;
     std::cout << ANSI_CYAN << "TRIPLET stream: triplets=" << count << " dim=" << dim << ANSI_RESET << "\n";
@@ -518,30 +487,135 @@ int main(int argc, char **argv)
                 std::string tok;
                 std::vector<std::string> parts;
                 while (iss >> tok) parts.push_back(tok);
-                if (parts.size() < 3) { std::cout << "ERR: Usage: ITERATE <name> <mode> [split] [off] [lim]\n"; continue; }
+                if (parts.size() < 3) { std::cout << "ERR: Usage: ITERATE <name> <mode> [split] [off] [lim] [BATCH n]\n"; continue; }
+
+                // detect optional BATCH token (case-insensitive)
+                int batch_size = 0;
+                for (size_t i = 0; i + 1 < parts.size(); ++i) {
+                    std::string upi = parts[i];
+                    std::transform(upi.begin(), upi.end(), upi.begin(), ::toupper);
+                    if (upi == "BATCH") {
+                        try { batch_size = std::stoi(parts[i+1]); } catch (...) { batch_size = 0; }
+                        // erase the two tokens so remaining positions line up with server syntax
+                        parts.erase(parts.begin() + i, parts.begin() + i + 2);
+                        break;
+                    }
+                }
+
                 std::string name = parts[1];
                 std::string mode = parts[2];
                 std::string upper_mode = mode;
                 std::transform(upper_mode.begin(), upper_mode.end(), upper_mode.begin(), ::toupper);
 
-                // For robust behavior: fetch membrance info first (so handlers can decode)
-                try {
-                    std::string info = sock.get_membrance_info(name);
-                    // print small summary
-                    //std::cout << info << "\n";
-                } catch (...) {}
-
-                // Build the command to send (the same user input)
-                std::string full_cmd = cmd;
-                if (full_cmd.back() != ';') full_cmd += ";";
-
-                if (upper_mode == "PAIR") {
-                    handle_iterate_pair(sock, name, full_cmd);
-                } else if (upper_mode == "TRIPLET") {
-                    handle_iterate_triplet(sock, name, full_cmd);
-                } else {
-                    handle_iterate_binary(sock, name, full_cmd);
+                // parse optional split/off/lim from remaining parts (after possible removal of BATCH)
+                size_t off = 0;
+                size_t lim = 1000000;
+                // parts now: [ITERATE, name, mode, maybe split, maybe off, maybe lim]
+                if (parts.size() > 3) {
+                    // could be a split token (TRAIN/VAL/TEST) or an offset number
+                    std::string p3u = parts[3];
+                    std::transform(p3u.begin(), p3u.end(), p3u.begin(), ::toupper);
+                    if (p3u == "TRAIN" || p3u == "VAL" || p3u == "TEST") {
+                        // split present
+                        if (parts.size() > 4) {
+                            try { off = static_cast<size_t>(std::stoul(parts[4])); } catch (...) { off = 0; }
+                        }
+                        if (parts.size() > 5) {
+                            try { lim = static_cast<size_t>(std::stoul(parts[5])); } catch (...) { lim = 1000000; }
+                        }
+                    } else {
+                        // treat parts[3] as off
+                        try { off = static_cast<size_t>(std::stoul(parts[3])); } catch (...) { off = 0; }
+                        if (parts.size() > 4) {
+                            try { lim = static_cast<size_t>(std::stoul(parts[4])); } catch (...) { lim = 1000000; }
+                        }
+                    }
                 }
+
+                // Build base command prefix (we will append off/lim or let server default)
+                // We'll reconstruct the command to be safe: ITERATE <name> <mode> [split] <off> <lim>;
+                std::ostringstream base_cmd_ss;
+                base_cmd_ss << "ITERATE " << name << " " << mode;
+                // if a split token exists (and is TRAIN/VAL/TEST), include it
+                if (parts.size() > 3) {
+                    std::string p3u = parts[3];
+                    std::transform(p3u.begin(), p3u.end(), p3u.begin(), ::toupper);
+                    if (p3u == "TRAIN" || p3u == "VAL" || p3u == "TEST") {
+                        base_cmd_ss << " " << parts[3];
+                    }
+                }
+                std::string base_cmd = base_cmd_ss.str();
+
+                // If no batching requested, send a single request with provided off/lim
+                if (batch_size <= 0)
+                {
+                    std::ostringstream one;
+                    one << base_cmd << " " << off << " " << lim << ";";
+                    std::string full_cmd = one.str();
+                    // delegate to handler by mode
+                    if (upper_mode == "PAIR") {
+                        auto [h,p] = sock.request_binary_stream(full_cmd);
+                        process_pair_payload(h, p);
+                    } else if (upper_mode == "TRIPLET") {
+                        auto [h,p] = sock.request_binary_stream(full_cmd);
+                        process_triplet_payload(h, p);
+                    } else {
+                        auto [h,p] = sock.request_binary_stream(full_cmd);
+                        process_binary_payload(h, p);
+                    }
+                }
+                else
+                {
+                    // Client-side batching loop: iteratively request chunks of batch_size
+                    size_t remaining = lim;
+                    size_t cur_off = off;
+                    size_t total_processed = 0;
+                    while (remaining > 0)
+                    {
+                        size_t this_lim = std::min<size_t>(batch_size, remaining);
+                        std::ostringstream chunk_cmd;
+                        chunk_cmd << base_cmd << " " << cur_off << " " << this_lim << ";";
+                        std::string full_chunk = chunk_cmd.str();
+
+                        auto [h,p] = sock.request_binary_stream(full_chunk);
+
+                        // parse header to know how many entries returned
+                        std::istringstream hs(h);
+                        std::string tag, subtype;
+                        size_t cnt = 0, hdr_dim = 0, bytes = 0;
+                        hs >> tag >> subtype >> cnt >> hdr_dim >> bytes;
+
+                        if (upper_mode == "PAIR") {
+                            process_pair_payload(h, p);
+                        } else if (upper_mode == "TRIPLET") {
+                            process_triplet_payload(h, p);
+                        } else {
+                            process_binary_payload(h, p);
+                        }
+
+                        // If server returned zero entries or empty payload, stop early
+                        if (cnt == 0 || p.empty())
+                            break;
+
+                        total_processed += cnt;
+                        if (remaining != (size_t)-1) {
+                            if (remaining > cnt)
+                                remaining -= cnt;
+                            else
+                                remaining = 0;
+                        }
+
+                        // advance offset by number of returned entries
+                        cur_off += cnt;
+
+                        // Safety: if server returned fewer entries than requested and less than batch_size,
+                        // it might indicate end-of-data; break to avoid tight loop.
+                        if (cnt < this_lim)
+                            break;
+                    }
+                    std::cout << ANSI_CYAN << "Batch iteration completed. Total processed (approx): " << total_processed << ANSI_RESET << "\n";
+                }
+
                 continue;
             }
 

@@ -1,10 +1,16 @@
+/*
 // src/facade/sql_executor.cc
 //
 // Implementation of SqlExecutor extracted from server.h so the SQL/text protocol
 // logic can be reused outside of the server class. The code preserves original
 // behavior (no logic changes), but uses the injected PomaiDB/WhisperGrain/ClientState
 // instead of server members.
-
+//
+// Enhancement:
+// - ITERATE now supports an optional "BATCH <n>" token to stream results in
+//   batches of at most n vectors. If BATCH is not provided, behavior is
+//   unchanged (single response containing up to lim entries).
+*/
 #include "src/facade/sql_executor.h"
 
 #include "src/facade/server_utils.h"
@@ -305,7 +311,7 @@ namespace pomai::server
         {
             auto parts = utils::split_ws(cmd);
             if (parts.size() < 3)
-                return "ERR: Usage: ITERATE <name> <mode> [split] [off] [lim]\n";
+                return "ERR: Usage: ITERATE <name> <mode> [split] [off] [lim] [BATCH <n>]\n";
 
             std::string name = parts[1];
             std::string mode = utils::to_upper(parts[2]);
@@ -369,6 +375,25 @@ namespace pomai::server
                 }
             }
 
+            // New: parse optional BATCH token anywhere in parts
+            size_t batch_size_param = 0;
+            for (size_t t = 3; t < parts.size(); ++t)
+            {
+                if (utils::to_upper(parts[t]) == "BATCH" && t + 1 < parts.size())
+                {
+                    try
+                    {
+                        batch_size_param = std::stoul(parts[t + 1]);
+                        if (batch_size_param == 0) batch_size_param = 0; // treat 0 as disabled
+                    }
+                    catch (...)
+                    {
+                        batch_size_param = 0;
+                    }
+                    break;
+                }
+            }
+
             // Helper: get dtype string & elem_size for this membrance/hot_tier
             auto get_membrance_dtype = [&](std::string &out_dtype_str, uint32_t &out_elem_size)
             {
@@ -417,50 +442,101 @@ namespace pomai::server
                 get_membrance_dtype(dtype_str, elem_size);
 
                 size_t per_vec = static_cast<size_t>(elem_size) * dim;
-                size_t total_bytes = limit * 3 * per_vec;
-                std::string out = supplier::make_header("OK BINARY", dtype_str, limit, dim, total_bytes);
 
-                std::mt19937 rng(std::random_device{}());
-                for (size_t i = 0; i < limit; ++i)
+                // If batching requested - stream in chunks of batch_size_param triplets
+                if (batch_size_param > 0)
                 {
-                    const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
-                    const auto &ids = groups[c];
-                    uint64_t ida = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
-                    uint64_t idp = ida;
-                    int tries = 0;
-                    while (idp == ida && ++tries < 20)
-                        idp = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
-                    uint64_t idn = ida;
-                    while (idn == ida)
+                    std::string out;
+                    std::mt19937 rng(std::random_device{}());
+                    size_t remaining = limit;
+                    while (remaining > 0)
                     {
-                        const auto &c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
-                        if (c2 == c)
-                            continue;
-                        const auto &ids2 = groups[c2];
-                        idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
+                        size_t this_batch = std::min<size_t>(batch_size_param, remaining);
+                        size_t total_bytes = this_batch * 3 * per_vec;
+                        out += supplier::make_header("OK BINARY", dtype_str, this_batch, dim, total_bytes);
+                        for (size_t i = 0; i < this_batch; ++i)
+                        {
+                            const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                            const auto &ids = groups[c];
+                            uint64_t ida = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                            uint64_t idp = ida;
+                            int tries = 0;
+                            while (idp == ida && ++tries < 20)
+                                idp = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                            uint64_t idn = ida;
+                            while (idn == ida)
+                            {
+                                const auto &c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                                if (c2 == c)
+                                    continue;
+                                const auto &ids2 = groups[c2];
+                                idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
+                            }
+
+                            // fetch raw bytes for ida,idp,idn and append
+                            pomai::core::DataType got_dt;
+                            uint32_t got_elem;
+                            std::string raw;
+                            supplier::fetch_vector_raw(m, ida, raw, dim, got_dt, got_elem);
+                            if (raw.size() < per_vec) raw.resize(per_vec, 0);
+                            out.append(raw.data(), per_vec);
+
+                            supplier::fetch_vector_raw(m, idp, raw, dim, got_dt, got_elem);
+                            if (raw.size() < per_vec) raw.resize(per_vec, 0);
+                            out.append(raw.data(), per_vec);
+
+                            supplier::fetch_vector_raw(m, idn, raw, dim, got_dt, got_elem);
+                            if (raw.size() < per_vec) raw.resize(per_vec, 0);
+                            out.append(raw.data(), per_vec);
+                        }
+                        remaining -= this_batch;
                     }
-
-                    // fetch raw bytes for ida,idp,idn and append
-                    pomai::core::DataType got_dt;
-                    uint32_t got_elem;
-                    std::string raw;
-                    supplier::fetch_vector_raw(m, ida, raw, dim, got_dt, got_elem);
-                    // ensure raw length is per_vec (hot/arena/converted)
-                    if (raw.size() < per_vec)
-                        raw.resize(per_vec, 0);
-                    out.append(raw.data(), per_vec);
-
-                    supplier::fetch_vector_raw(m, idp, raw, dim, got_dt, got_elem);
-                    if (raw.size() < per_vec)
-                        raw.resize(per_vec, 0);
-                    out.append(raw.data(), per_vec);
-
-                    supplier::fetch_vector_raw(m, idn, raw, dim, got_dt, got_elem);
-                    if (raw.size() < per_vec)
-                        raw.resize(per_vec, 0);
-                    out.append(raw.data(), per_vec);
+                    return out;
                 }
-                return out;
+                else
+                {
+                    // previous single-response behavior
+                    size_t total_bytes = limit * 3 * per_vec;
+                    std::string out = supplier::make_header("OK BINARY", dtype_str, limit, dim, total_bytes);
+
+                    std::mt19937 rng(std::random_device{}());
+                    for (size_t i = 0; i < limit; ++i)
+                    {
+                        const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                        const auto &ids = groups[c];
+                        uint64_t ida = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                        uint64_t idp = ida;
+                        int tries = 0;
+                        while (idp == ida && ++tries < 20)
+                            idp = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                        uint64_t idn = ida;
+                        while (idn == ida)
+                        {
+                            const auto &c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                            if (c2 == c)
+                                continue;
+                            const auto &ids2 = groups[c2];
+                            idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
+                        }
+
+                        // fetch raw bytes for ida,idp,idn and append
+                        pomai::core::DataType got_dt;
+                        uint32_t got_elem;
+                        std::string raw;
+                        supplier::fetch_vector_raw(m, ida, raw, dim, got_dt, got_elem);
+                        if (raw.size() < per_vec) raw.resize(per_vec, 0);
+                        out.append(raw.data(), per_vec);
+
+                        supplier::fetch_vector_raw(m, idp, raw, dim, got_dt, got_elem);
+                        if (raw.size() < per_vec) raw.resize(per_vec, 0);
+                        out.append(raw.data(), per_vec);
+
+                        supplier::fetch_vector_raw(m, idn, raw, dim, got_dt, got_elem);
+                        if (raw.size() < per_vec) raw.resize(per_vec, 0);
+                        out.append(raw.data(), per_vec);
+                    }
+                    return out;
+                }
             }
 
             // MODE: PAIR -> emit (uint64 label) + raw vector (element size = membrance elem)
@@ -478,25 +554,57 @@ namespace pomai::server
 
                 size_t cnt = std::min(lim, idxs->size() - off);
                 size_t per = sizeof(uint64_t) + per_vec;
-                std::string header = "OK BINARY_PAIR " + dtype_str + " " + std::to_string(cnt) + " " + std::to_string(dim) + " " + std::to_string(cnt * per) + "\n";
-                std::string out;
-                out.reserve(header.size() + cnt * per);
-                out += header;
 
-                for (size_t i = 0; i < cnt; ++i)
+                // Batching support: stream chunks of batch_size_param pairs
+                if (batch_size_param > 0)
                 {
-                    uint64_t id = (*idxs)[off + i];
-                    out.append(reinterpret_cast<const char *>(&id), sizeof(id));
-
-                    pomai::core::DataType got_dt;
-                    uint32_t got_elem;
-                    std::string raw;
-                    supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
-                    if (raw.size() < per_vec)
-                        raw.resize(per_vec, 0);
-                    out.append(raw.data(), per_vec);
+                    std::string out;
+                    size_t processed = 0;
+                    while (processed < cnt)
+                    {
+                        size_t this_batch = std::min<size_t>(batch_size_param, cnt - processed);
+                        std::string header = "OK BINARY_PAIR " + dtype_str + " " + std::to_string(this_batch) + " " + std::to_string(dim) + " " + std::to_string(this_batch * per) + "\n";
+                        out += header;
+                        for (size_t i = 0; i < this_batch; ++i)
+                        {
+                            uint64_t id = (*idxs)[off + processed + i];
+                            out.append(reinterpret_cast<const char *>(&id), sizeof(id));
+                            pomai::core::DataType got_dt;
+                            uint32_t got_elem;
+                            std::string raw;
+                            supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
+                            if (raw.size() < per_vec)
+                                raw.resize(per_vec, 0);
+                            out.append(raw.data(), per_vec);
+                        }
+                        processed += this_batch;
+                    }
+                    return out;
                 }
-                return out;
+                else
+                {
+                    // single response (existing behavior)
+                    size_t cnt_bytes = cnt * per;
+                    std::string header = "OK BINARY_PAIR " + dtype_str + " " + std::to_string(cnt) + " " + std::to_string(dim) + " " + std::to_string(cnt_bytes) + "\n";
+                    std::string out;
+                    out.reserve(header.size() + cnt * per);
+                    out += header;
+
+                    for (size_t i = 0; i < cnt; ++i)
+                    {
+                        uint64_t id = (*idxs)[off + i];
+                        out.append(reinterpret_cast<const char *>(&id), sizeof(id));
+
+                        pomai::core::DataType got_dt;
+                        uint32_t got_elem;
+                        std::string raw;
+                        supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
+                        if (raw.size() < per_vec)
+                            raw.resize(per_vec, 0);
+                        out.append(raw.data(), per_vec);
+                    }
+                    return out;
+                }
             }
 
             // MODE: TRAIN/VAL/TEST -> emit vectors only (raw storage bytes)
@@ -513,24 +621,54 @@ namespace pomai::server
                 size_t per_vec = static_cast<size_t>(elem_size) * dim;
 
                 size_t cnt = std::min(lim, idxs->size() - off);
-                size_t total_bytes = cnt * per_vec;
-                std::string header = supplier::make_header("OK BINARY", dtype_str, cnt, dim, total_bytes);
-                std::string out;
-                out.reserve(header.size() + std::min<size_t>(total_bytes, 1 << 20));
-                out += header;
 
-                for (size_t i = 0; i < cnt; ++i)
+                // Batching support: stream sequential chunks
+                if (batch_size_param > 0)
                 {
-                    uint64_t id = (*idxs)[off + i];
-                    pomai::core::DataType got_dt;
-                    uint32_t got_elem;
-                    std::string raw;
-                    supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
-                    if (raw.size() < per_vec)
-                        raw.resize(per_vec, 0);
-                    out.append(raw.data(), per_vec);
+                    std::string out;
+                    size_t processed = 0;
+                    while (processed < cnt)
+                    {
+                        size_t this_batch = std::min<size_t>(batch_size_param, cnt - processed);
+                        size_t total_bytes = this_batch * per_vec;
+                        out += supplier::make_header("OK BINARY", dtype_str, this_batch, dim, total_bytes);
+                        for (size_t i = 0; i < this_batch; ++i)
+                        {
+                            uint64_t id = (*idxs)[off + processed + i];
+                            pomai::core::DataType got_dt;
+                            uint32_t got_elem;
+                            std::string raw;
+                            supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
+                            if (raw.size() < per_vec)
+                                raw.resize(per_vec, 0);
+                            out.append(raw.data(), per_vec);
+                        }
+                        processed += this_batch;
+                    }
+                    return out;
                 }
-                return out;
+                else
+                {
+                    // single response (existing behavior)
+                    size_t total_bytes = cnt * per_vec;
+                    std::string header = supplier::make_header("OK BINARY", dtype_str, cnt, dim, total_bytes);
+                    std::string out;
+                    out.reserve(header.size() + std::min<size_t>(total_bytes, 1 << 20));
+                    out += header;
+
+                    for (size_t i = 0; i < cnt; ++i)
+                    {
+                        uint64_t id = (*idxs)[off + i];
+                        pomai::core::DataType got_dt;
+                        uint32_t got_elem;
+                        std::string raw;
+                        supplier::fetch_vector_raw(m, id, raw, dim, got_dt, got_elem);
+                        if (raw.size() < per_vec)
+                            raw.resize(per_vec, 0);
+                        out.append(raw.data(), per_vec);
+                    }
+                    return out;
+                }
             }
 
             return "ERR: Invalid ITERATE mode (TRAIN/VAL/TEST/TRIPLET/PAIR)\n";

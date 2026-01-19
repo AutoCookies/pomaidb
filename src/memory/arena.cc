@@ -302,7 +302,7 @@ namespace pomai::memory
                 if (p != MAP_FAILED)
                 {
                     using_file_backing = true;
-                    arena_backing_path_ = std::string(tbuf.data()); // record path for diagnostics
+                    arena_backing_dir_ = std::string(tbuf.data()); // record path for diagnostics
                 }
                 else
                 {

@@ -4,6 +4,11 @@
  * Implementation for PomaiDB and Membrance persistence.
  *
  * Uses pomai::core::DataType (src/core/types.h) for storage types.
+ *
+ * Added: iterate_batch(...) which delivers raw stored bytes in configurable batches
+ * to a user-supplied consumer callback. The implementation reuses existing
+ * helpers (data_supplier::fetch_vector_raw) and is careful to preallocate and
+ * reuse buffers to avoid repeated malloc churn.
  */
 
 #include "src/core/pomai_db.h"
@@ -11,6 +16,9 @@
 #include "src/core/split_manager.h"
 #include "src/core/types.h"
 #include "src/core/cpu_kernels.h" // for fp16 conversion helpers
+
+// New include for data_supplier helper used to fetch raw bytes
+#include "src/facade/data_supplier.h"
 
 #include <filesystem>
 #include <fstream>
@@ -21,6 +29,8 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <functional>
+#include <cctype>
 
 namespace pomai::core
 {
@@ -33,6 +43,15 @@ namespace pomai::core
             return "";
         size_t e = s.find_last_not_of(ws);
         return s.substr(b, e - b + 1);
+    }
+
+    // Helper: uppercase copy
+    static inline std::string upcase(const std::string &s)
+    {
+        std::string r = s;
+        for (char &c : r)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return r;
     }
 
     // Membrance ctor
@@ -117,7 +136,9 @@ namespace pomai::core
             if (!std::filesystem::exists(root))
                 std::filesystem::create_directories(root);
         }
-        catch (...) {}
+        catch (...)
+        {
+        }
 
         std::string manifest_path = (root / "membrances.manifest").string();
         std::string wal_path = (root / "wal.log").string();
@@ -138,21 +159,48 @@ namespace pomai::core
             {
                 if (type == pomai::memory::WAL_REC_CREATE_MEMBRANCE)
                 {
-                    if (!payload || len == 0) return true;
+                    if (!payload || len == 0)
+                        return true;
                     std::string s(reinterpret_cast<const char *>(payload), len);
                     std::istringstream iss(s);
                     std::string t;
                     std::vector<std::string> parts;
-                    while (std::getline(iss, t, '|')) parts.push_back(t);
+                    while (std::getline(iss, t, '|'))
+                        parts.push_back(t);
 
                     if (parts.size() >= 2)
                     {
                         std::string name = trim_str(parts[0]);
                         size_t dim = 0, ram_mb = 256;
                         pomai::core::DataType dt = pomai::core::DataType::FLOAT32;
-                        try { dim = static_cast<size_t>(std::stoul(parts[1])); } catch (...) {}
-                        if (parts.size() >= 3) { try { ram_mb = static_cast<size_t>(std::stoul(parts[2])); } catch (...) {} }
-                        if (parts.size() >= 4) { try { dt = pomai::core::parse_dtype(trim_str(parts[3])); } catch (...) { dt = pomai::core::DataType::FLOAT32; } }
+                        try
+                        {
+                            dim = static_cast<size_t>(std::stoul(parts[1]));
+                        }
+                        catch (...)
+                        {
+                        }
+                        if (parts.size() >= 3)
+                        {
+                            try
+                            {
+                                ram_mb = static_cast<size_t>(std::stoul(parts[2]));
+                            }
+                            catch (...)
+                            {
+                            }
+                        }
+                        if (parts.size() >= 4)
+                        {
+                            try
+                            {
+                                dt = pomai::core::parse_dtype(trim_str(parts[3]));
+                            }
+                            catch (...)
+                            {
+                                dt = pomai::core::DataType::FLOAT32;
+                            }
+                        }
 
                         if (!name.empty() && dim != 0)
                         {
@@ -168,7 +216,8 @@ namespace pomai::core
                 }
                 else if (type == pomai::memory::WAL_REC_DROP_MEMBRANCE)
                 {
-                    if (!payload || len == 0) return true;
+                    if (!payload || len == 0)
+                        return true;
                     std::string name(reinterpret_cast<const char *>(payload), len);
                     name = trim_str(name);
                     if (!name.empty())
@@ -178,12 +227,20 @@ namespace pomai::core
                         if (it != membrances_.end())
                         {
                             membrances_.erase(it);
-                            try { std::filesystem::remove_all(std::filesystem::path(config_.res.data_root) / name); } catch (...) {}
+                            try
+                            {
+                                std::filesystem::remove_all(std::filesystem::path(config_.res.data_root) / name);
+                            }
+                            catch (...)
+                            {
+                            }
                         }
                     }
                 }
             }
-            catch (...) {}
+            catch (...)
+            {
+            }
             return true;
         };
 
@@ -206,14 +263,22 @@ namespace pomai::core
 
     bool PomaiDB::create_membrance_internal(const std::string &name, const MembranceConfig &cfg)
     {
-        if (membrances_.count(name)) return false;
-        if (cfg.dim == 0) return false;
+        if (membrances_.count(name))
+            return false;
+        if (cfg.dim == 0)
+            return false;
 
         try
         {
             auto m = std::make_unique<Membrance>(name, cfg, config_.res.data_root, config_);
 
-            try { m->orbit->save_schema(); } catch (...) {}
+            try
+            {
+                m->orbit->save_schema();
+            }
+            catch (...)
+            {
+            }
 
             membrances_.emplace(name, std::move(m));
             return true;
@@ -228,9 +293,12 @@ namespace pomai::core
     bool PomaiDB::create_membrance(const std::string &name, const MembranceConfig &cfg)
     {
         MembranceConfig final_cfg = cfg;
-        if (final_cfg.engine.empty()) final_cfg.engine = config_.db.engine_type;
-        if (final_cfg.ram_mb == 0) final_cfg.ram_mb = config_.db.default_membrance_ram_mb;
-        if (final_cfg.data_type == DataType::FLOAT32) {
+        if (final_cfg.engine.empty())
+            final_cfg.engine = config_.db.engine_type;
+        if (final_cfg.ram_mb == 0)
+            final_cfg.ram_mb = config_.db.default_membrance_ram_mb;
+        if (final_cfg.data_type == DataType::FLOAT32)
+        {
             // If left default that's fine; otherwise already set.
         }
 
@@ -241,11 +309,15 @@ namespace pomai::core
             wal_.append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_CREATE_MEMBRANCE),
                                payload.data(), static_cast<uint32_t>(payload.size()));
         }
-        catch (...) { return false; }
+        catch (...)
+        {
+            return false;
+        }
 
         {
             std::unique_lock<std::shared_mutex> lock(mu_);
-            if (!create_membrance_internal(name, final_cfg)) return false;
+            if (!create_membrance_internal(name, final_cfg))
+                return false;
         }
 
         save_manifest();
@@ -260,14 +332,24 @@ namespace pomai::core
             wal_.append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_DROP_MEMBRANCE),
                                name.data(), static_cast<uint32_t>(name.size()));
         }
-        catch (...) { return false; }
+        catch (...)
+        {
+            return false;
+        }
 
         {
             std::unique_lock<std::shared_mutex> lock(mu_);
             auto it = membrances_.find(name);
-            if (it == membrances_.end()) return false;
+            if (it == membrances_.end())
+                return false;
 
-            try { std::filesystem::remove_all(std::filesystem::path(config_.res.data_root) / name); } catch (...) {}
+            try
+            {
+                std::filesystem::remove_all(std::filesystem::path(config_.res.data_root) / name);
+            }
+            catch (...)
+            {
+            }
             membrances_.erase(it);
         }
 
@@ -302,28 +384,37 @@ namespace pomai::core
     bool PomaiDB::insert(const std::string &membr, const float *vec, uint64_t label)
     {
         Membrance *m = get_membrance(membr);
-        if (!m) return false;
-        if (m->hot_tier) { m->hot_tier->push(label, vec); return true; }
+        if (!m)
+            return false;
+        if (m->hot_tier)
+        {
+            m->hot_tier->push(label, vec);
+            return true;
+        }
         return m->orbit->insert(vec, label);
     }
 
     bool PomaiDB::insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
     {
         Membrance *m = get_membrance(membr);
-        if (!m) return false;
+        if (!m)
+            return false;
         return m->orbit->insert_batch(batch);
     }
 
     std::vector<std::pair<uint64_t, float>> PomaiDB::search(const std::string &membr, const float *query, size_t k)
     {
         Membrance *m = get_membrance(membr);
-        if (!m) return {};
+        if (!m)
+            return {};
 
         auto hot = m->hot_tier ? m->hot_tier->search(query, k) : std::vector<std::pair<uint64_t, float>>{};
         auto warm = m->orbit->search(query, k);
 
-        if (hot.empty()) return warm;
-        if (warm.empty()) return hot;
+        if (hot.empty())
+            return warm;
+        if (warm.empty())
+            return hot;
 
         std::vector<std::pair<uint64_t, float>> merged;
         merged.reserve(k);
@@ -341,14 +432,16 @@ namespace pomai::core
     bool PomaiDB::get(const std::string &membr, uint64_t label, std::vector<float> &out)
     {
         Membrance *m = get_membrance(membr);
-        if (!m) return false;
+        if (!m)
+            return false;
         return m->orbit->get(label, out);
     }
 
     bool PomaiDB::remove(const std::string &membr, uint64_t label)
     {
         Membrance *m = get_membrance(membr);
-        if (!m) return false;
+        if (!m)
+            return false;
         return m->orbit->remove(label);
     }
 
@@ -365,7 +458,8 @@ namespace pomai::core
         std::string tmp = path + ".tmp";
 
         std::ofstream ofs(tmp, std::ios::trunc);
-        if (!ofs.is_open()) return false;
+        if (!ofs.is_open())
+            return false;
 
         ofs << "# PomaiDB Manifest\n";
         // Write: name|dim|ram_mb|data_type
@@ -385,27 +479,51 @@ namespace pomai::core
         std::unique_lock<std::shared_mutex> lock(mu_);
         std::string path = config_.res.data_root + "/" + config_.db.manifest_file;
         std::ifstream ifs(path);
-        if (!ifs.is_open()) return false;
+        if (!ifs.is_open())
+            return false;
 
         std::string line;
         size_t loaded = 0;
         while (std::getline(ifs, line))
         {
-            if (line.empty() || line[0] == '#') continue;
+            if (line.empty() || line[0] == '#')
+                continue;
             std::istringstream iss(line);
             std::string t;
             std::vector<std::string> parts;
-            while (std::getline(iss, t, '|')) parts.push_back(trim_str(t));
+            while (std::getline(iss, t, '|'))
+                parts.push_back(trim_str(t));
 
             if (parts.size() >= 2)
             {
                 std::string name = parts[0];
                 size_t dim = 0, ram = 256;
                 pomai::core::DataType dt = pomai::core::DataType::FLOAT32;
-                try { dim = std::stoul(parts[1]); } catch (...) {}
-                if (parts.size() >= 3) try { ram = std::stoul(parts[2]); } catch (...) {}
-                if (parts.size() >= 4) {
-                    try { dt = pomai::core::parse_dtype(parts[3]); } catch (...) { dt = pomai::core::DataType::FLOAT32; }
+                try
+                {
+                    dim = std::stoul(parts[1]);
+                }
+                catch (...)
+                {
+                }
+                if (parts.size() >= 3)
+                    try
+                    {
+                        ram = std::stoul(parts[2]);
+                    }
+                    catch (...)
+                    {
+                    }
+                if (parts.size() >= 4)
+                {
+                    try
+                    {
+                        dt = pomai::core::parse_dtype(parts[3]);
+                    }
+                    catch (...)
+                    {
+                        dt = pomai::core::DataType::FLOAT32;
+                    }
                 }
 
                 if (!name.empty() && dim > 0)
@@ -414,7 +532,8 @@ namespace pomai::core
                     c.dim = dim;
                     c.ram_mb = ram;
                     c.data_type = dt;
-                    if (create_membrance_internal(name, c)) loaded++;
+                    if (create_membrance_internal(name, c))
+                        loaded++;
                 }
             }
         }
@@ -429,14 +548,18 @@ namespace pomai::core
         {
             try
             {
-                auto* m = kv.second.get();
+                auto *m = kv.second.get();
                 m->orbit->save_schema();
 
-                if (m->split_mgr && m->split_mgr->has_split()) {
+                if (m->split_mgr && m->split_mgr->has_split())
+                {
                     m->split_mgr->save(m->data_path);
                 }
             }
-            catch (...) { ok = false; }
+            catch (...)
+            {
+                ok = false;
+            }
         }
         return ok;
     }
@@ -451,79 +574,298 @@ namespace pomai::core
             for (auto &kv : membrances_)
             {
                 Membrance *m = kv.second.get();
-                if (!m || !m->hot_tier) continue;
+                if (!m || !m->hot_tier)
+                    continue;
 
                 auto batch = m->hot_tier->swap_and_flush();
-                if (batch.empty()) continue;
+                if (batch.empty())
+                    continue;
 
-                std::vector<std::pair<uint64_t, std::vector<float>>> vec_batch;
-                vec_batch.reserve(batch.count());
                 const size_t dim = batch.dim;
                 const uint32_t elem_size = batch.element_size;
                 const pomai::core::DataType bdt = batch.data_type;
+                const size_t count = batch.count();
+                const uint8_t *flat = batch.data.data();
 
-                // Decode each slot into std::vector<float> expected by orbit->insert_batch
-                for (size_t i = 0; i < batch.labels.size(); ++i)
+                // Allocate single temporary buffer reused for each vector decode.
+                std::vector<float> tmp;
+                tmp.resize(dim);
+
+                for (size_t i = 0; i < count; ++i)
                 {
-                    std::vector<float> v(dim);
-                    const uint8_t *slot = batch.data.data() + i * dim * elem_size;
-
+                    const uint8_t *slot = flat + i * dim * elem_size;
+                    // decode slot -> tmp
                     switch (bdt)
                     {
-                        case DataType::FLOAT32:
-                            std::memcpy(v.data(), slot, dim * sizeof(float));
-                            break;
-                        case DataType::FLOAT64:
+                    case DataType::FLOAT32:
+                        std::memcpy(tmp.data(), slot, dim * sizeof(float));
+                        break;
+                    case DataType::FLOAT64:
+                    {
+                        const double *dp = reinterpret_cast<const double *>(slot);
+                        for (size_t d = 0; d < dim; ++d)
+                            tmp[d] = static_cast<float>(dp[d]);
+                        break;
+                    }
+                    case DataType::INT32:
+                    {
+                        const int32_t *ip = reinterpret_cast<const int32_t *>(slot);
+                        for (size_t d = 0; d < dim; ++d)
+                            tmp[d] = static_cast<float>(ip[d]);
+                        break;
+                    }
+                    case DataType::INT8:
+                    {
+                        const int8_t *ip = reinterpret_cast<const int8_t *>(slot);
+                        for (size_t d = 0; d < dim; ++d)
+                            tmp[d] = static_cast<float>(ip[d]);
+                        break;
+                    }
+                    case DataType::FLOAT16:
+                    {
+                        const uint16_t *hp = reinterpret_cast<const uint16_t *>(slot);
+                        for (size_t d = 0; d < dim; ++d)
+                            tmp[d] = fp16_to_fp32(hp[d]);
+                        break;
+                    }
+                    default:
+                    {
+                        size_t copy_bytes = std::min<size_t>(dim * sizeof(float), dim * elem_size);
+                        std::memcpy(tmp.data(), slot, copy_bytes);
+                        if (copy_bytes < dim * sizeof(float))
                         {
-                            const double *dp = reinterpret_cast<const double *>(slot);
-                            for (size_t d = 0; d < dim; ++d) v[d] = static_cast<float>(dp[d]);
-                            break;
+                            for (size_t d = (copy_bytes / sizeof(float)); d < dim; ++d)
+                                tmp[d] = 0.0f;
                         }
-                        case DataType::INT32:
-                        {
-                            const int32_t *ip = reinterpret_cast<const int32_t *>(slot);
-                            for (size_t d = 0; d < dim; ++d) v[d] = static_cast<float>(ip[d]);
-                            break;
-                        }
-                        case DataType::INT8:
-                        {
-                            const int8_t *ip = reinterpret_cast<const int8_t *>(slot);
-                            for (size_t d = 0; d < dim; ++d) v[d] = static_cast<float>(ip[d]);
-                            break;
-                        }
-                        case DataType::FLOAT16:
-                        {
-                            const uint16_t *hp = reinterpret_cast<const uint16_t *>(slot);
-                            for (size_t d = 0; d < dim; ++d) v[d] = fp16_to_fp32(hp[d]);
-                            break;
-                        }
-                        default:
-                        {
-                            // fallback: try to memcpy as float32 up to available bytes
-                            size_t copy_bytes = std::min<size_t>(dim * sizeof(float), dim * elem_size);
-                            std::memcpy(v.data(), slot, copy_bytes);
-                            if (copy_bytes < dim * sizeof(float))
-                            {
-                                for (size_t d = (copy_bytes / sizeof(float)); d < dim; ++d) v[d] = 0.0f;
-                            }
-                            break;
-                        }
+                        break;
+                    }
                     }
 
-                    vec_batch.emplace_back(batch.labels[i], std::move(v));
-                }
-
-                // Insert into orbit (async writing)
-                try
-                {
-                    m->orbit->insert_batch(vec_batch);
-                }
-                catch (...)
-                {
-                    // swallow errors; metrics/logging could be added
+                    // Insert single vector into orbit. Use the per-vector insert API to avoid
+                    // materializing many std::vector<float> simultaneously.
+                    try
+                    {
+                        m->orbit->insert(tmp.data(), batch.labels[i]);
+                    }
+                    catch (const std::exception &e)
+                    {
+                        std::cerr << "[PomaiDB] orbit->insert failed for membrance=" << m->name
+                                  << " label=" << batch.labels[i] << " : " << e.what() << "\n";
+                        // swallow and continue; consider metrics/alerting in production
+                    }
+                    catch (...)
+                    {
+                        std::cerr << "[PomaiDB] Unknown error inserting label=" << batch.labels[i] << "\n";
+                    }
                 }
             }
         }
+    }
+
+    // ----------------------------------------------------------------------------
+    // New: iterate_batch implementation
+    // ----------------------------------------------------------------------------
+    bool PomaiDB::iterate_batch(const std::string &membr,
+                                const std::string &mode,
+                                size_t off,
+                                size_t lim,
+                                size_t batch_size,
+                                const std::function<void(const std::vector<uint64_t> &ids, const std::string &concat_buf, uint32_t per_vec_bytes)> &consumer)
+    {
+        if (!consumer)
+            return false;
+
+        Membrance *m = get_membrance(membr);
+        if (!m)
+            return false;
+
+        // Determine the index vector to iterate over (split or full labels)
+        const std::vector<uint64_t> *idxs_ptr = nullptr;
+        std::vector<uint64_t> temp_all_labels; // used if we need to materialize all labels
+
+        std::string upmode = upcase(mode);
+        if (upmode == "TRAIN" || upmode == "VAL" || upmode == "TEST")
+        {
+            if (!m->split_mgr)
+                return false;
+            if (upmode == "TRAIN")
+                idxs_ptr = &m->split_mgr->train_indices;
+            else if (upmode == "VAL")
+                idxs_ptr = &m->split_mgr->val_indices;
+            else
+                idxs_ptr = &m->split_mgr->test_indices;
+        }
+        else
+        {
+            // Default: use all labels available in orbit (best-effort)
+            try
+            {
+                temp_all_labels = m->orbit->get_all_labels();
+            }
+            catch (...)
+            {
+                temp_all_labels.clear();
+            }
+            idxs_ptr = &temp_all_labels;
+        }
+
+        if (!idxs_ptr)
+            return false;
+
+        const std::vector<uint64_t> &idxs = *idxs_ptr;
+        if (off >= idxs.size())
+            return true; // nothing to do
+
+        size_t available = idxs.size() - off;
+        size_t to_process = std::min(available, lim == 0 ? available : std::min(available, lim));
+
+        if (to_process == 0)
+            return true;
+
+        // Determine per-vector raw length in bytes (element_size * dim)
+        uint32_t elem_size = 0;
+        {
+            if (m->hot_tier)
+                elem_size = m->hot_tier->element_size();
+            else
+                elem_size = static_cast<uint32_t>(pomai::core::dtype_size(m->data_type));
+        }
+        uint32_t per_vec_bytes = static_cast<uint32_t>(elem_size * m->dim);
+
+        // Thread-local buffers to avoid repeated allocations
+        thread_local std::string tl_concat_buf;
+        thread_local std::vector<uint64_t> tl_ids;
+
+        size_t processed = 0;
+        size_t start = off;
+        while (processed < to_process)
+        {
+            size_t chunk = std::min(batch_size == 0 ? to_process - processed : batch_size, to_process - processed);
+            tl_ids.clear();
+            tl_ids.reserve(chunk);
+
+            // Pre-reserve concatenation buffer
+            tl_concat_buf.clear();
+            tl_concat_buf.reserve(static_cast<size_t>(chunk) * per_vec_bytes);
+
+            for (size_t i = 0; i < chunk; ++i)
+            {
+                uint64_t id = idxs[start + processed + i];
+                tl_ids.push_back(id);
+
+                // Try to fetch raw vector bytes (prefer arena/local when possible)
+                // data_supplier::fetch_vector_raw will try arena first, then orbit, then pad zeros.
+                pomai::core::DataType got_dt;
+                uint32_t got_elem_size = 0;
+                std::string raw;
+                bool ok = false;
+                try
+                {
+                    ok = pomai::server::data_supplier::fetch_vector_raw(m, id, raw, m->dim, got_dt, got_elem_size);
+                }
+                catch (...)
+                {
+                    ok = false;
+                }
+
+                if (!ok)
+                {
+                    // Not found: append zero-filled vector
+                    tl_concat_buf.append(per_vec_bytes, '\0');
+                }
+                else
+                {
+                    // If returned raw size matches expected per_vec_bytes, append directly.
+                    if (raw.size() == per_vec_bytes)
+                    {
+                        tl_concat_buf.append(raw.data(), raw.size());
+                    }
+                    else if (raw.size() > per_vec_bytes)
+                    {
+                        // If larger, append only required prefix
+                        tl_concat_buf.append(raw.data(), per_vec_bytes);
+                    }
+                    else
+                    {
+                        // If smaller, append raw and pad zeros
+                        tl_concat_buf.append(raw.data(), raw.size());
+                        tl_concat_buf.append(per_vec_bytes - raw.size(), '\0');
+                    }
+                }
+            }
+
+            // Call consumer with batch ids and concatenated raw buffer
+            try
+            {
+                consumer(tl_ids, tl_concat_buf, per_vec_bytes);
+            }
+            catch (...)
+            {
+                // Consumer may throw; propagate failure status to caller
+                return false;
+            }
+
+            processed += chunk;
+        }
+
+        return true;
+    }
+
+    bool PomaiDB::fetch_batch_raw(const std::string &membr, const std::vector<uint64_t> &ids, std::vector<std::string> &outs)
+    {
+        outs.clear();
+        if (ids.empty())
+            return true;
+
+        Membrance *m = get_membrance(membr);
+        if (!m)
+            return false;
+
+        // Prefer direct Orbit batch path (fast path, groups by bucket)
+        try
+        {
+            if (m->orbit)
+            {
+                if (m->orbit->get_vectors_raw(ids, outs))
+                {
+                    // ensure outs sized properly (the orbit helper should do this)
+                    if (outs.size() != ids.size())
+                        outs.resize(ids.size());
+                    return true;
+                }
+            }
+        }
+        catch (...)
+        {
+            // fallthrough to per-id fallback
+        }
+
+        // Fallback: best-effort per-id fetch (existing behavior)
+        outs.resize(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i)
+        {
+            pomai::core::DataType got_dt;
+            uint32_t got_elem = 0;
+            try
+            {
+                // supplier::fetch_vector_raw will append exact element bytes (in membrance storage dtype)
+                std::string raw;
+                bool ok = pomai::server::data_supplier::fetch_vector_raw(m, ids[i], raw, m->dim, got_dt, got_elem);
+                if (ok || !raw.empty())
+                {
+                    outs[i] = std::move(raw);
+                }
+                else
+                {
+                    outs[i].clear();
+                }
+            }
+            catch (...)
+            {
+                outs[i].clear();
+            }
+        }
+        return true;
     }
 
 } // namespace pomai::core
