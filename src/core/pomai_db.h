@@ -95,6 +95,7 @@ namespace pomai::core
                            const std::function<void(const std::vector<uint64_t> &ids, const std::string &concat_buf, uint32_t per_vec_bytes)> &consumer);
 
         bool fetch_batch_raw(const std::string &membr, const std::vector<uint64_t> &ids, std::vector<std::string> &outs);
+        bool checkpoint_all();
 
     private:
         bool load_manifest();

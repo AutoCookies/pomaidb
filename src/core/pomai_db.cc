@@ -868,4 +868,20 @@ namespace pomai::core
         return true;
     }
 
+    bool PomaiDB::checkpoint_all()
+    {
+        std::unique_lock<std::shared_mutex> lock(mu_);
+        bool ok = true;
+        for (auto &kv : membrances_)
+        {
+            if (!kv.second->orbit->checkpoint())
+            {
+                ok = false;
+            }
+        }
+        save_manifest();
+        wal_.truncate_to_zero();
+        return ok;
+    }
+
 } // namespace pomai::core

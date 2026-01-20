@@ -1,16 +1,4 @@
-/*
- * src/memory/wal_manager.cc
- *
- * Implementation of WalManager.
- * [UPDATED] Uses centralized configuration via Dependency Injection.
- * [IMPROVED]
- *  - Robust write/read helpers that handle partial writes and EINTR.
- *  - Use O_CLOEXEC and set FD_CLOEXEC on open.
- *  - Batched fsync support: when WalConfig.batch_commit_size > 0, fsync is
- *    performed only after accumulated bytes reach the threshold.
- *  - Safer reopen / truncation handling and more logging.
- */
-
+/* src/memory/wal_manager.cc */
 #include "src/memory/wal_manager.h"
 
 #include <sys/types.h>
@@ -29,7 +17,6 @@
 
 namespace pomai::memory
 {
-
     // On-disk file header layout helper values
     static constexpr char WAL_MAGIC[8] = {'P', 'O', 'M', 'A', 'I', 'W', 'A', 'L'};
     static constexpr uint32_t WAL_RECORD_MAGIC = 0xCAFEBABE;
@@ -58,12 +45,11 @@ namespace pomai::memory
 
     // CRC32 implementation (table)
     static uint32_t crc32_table[256];
-    static bool crc32_table_init = false;
+    // [FIX] Thread-safe CRC32 init using call_once
+    static std::once_flag crc32_once_flag;
 
     static void init_crc32_table()
     {
-        if (crc32_table_init)
-            return;
         const uint32_t poly = 0xEDB88320u;
         for (uint32_t i = 0; i < 256; ++i)
         {
@@ -77,12 +63,11 @@ namespace pomai::memory
             }
             crc32_table[i] = c;
         }
-        crc32_table_init = true;
     }
 
     uint32_t WalManager::crc32(const uint8_t *buf, size_t len)
     {
-        init_crc32_table();
+        std::call_once(crc32_once_flag, init_crc32_table);
         uint32_t c = 0xFFFFFFFFu;
         for (size_t i = 0; i < len; ++i)
         {
@@ -97,13 +82,6 @@ namespace pomai::memory
     {
         close();
     }
-
-    // NOTE:
-    // bytes_since_last_fsync is a translation-unit-global accumulator used to
-    // implement batch fsync semantics. It's intentionally local to this TU
-    // because WalManager header cannot be changed here. In practice there is
-    // typically a single WAL per process, so this is acceptable.
-    static std::atomic<uint64_t> bytes_since_last_fsync{0};
 
     // Helper: robust write that handles partial writes and EINTR.
     static bool write_all(int fd, const uint8_t *buf, size_t len)
@@ -164,7 +142,7 @@ namespace pomai::memory
             return true;
         }
 
-        cfg_ = cfg; // [UPDATED] Store the injected config
+        cfg_ = cfg;
         path_ = path;
 
         int flags = O_RDWR;
@@ -178,9 +156,12 @@ namespace pomai::memory
         fd_ = ::open(path_.c_str(), flags, 0600);
         if (fd_ < 0)
         {
-            std::cerr << "WalManager::open: open(" << path_ << ") failed: " << strerror(errno) << "\n";
+            std::cerr << "[WAL] open(" << path_ << ") failed: " << strerror(errno) << "\n";
             return false;
         }
+
+        // Init member accumulator
+        bytes_since_last_fsync_.store(0);
 
         // Ensure FD_CLOEXEC is set (portable guard)
         int fd_flags = fcntl(fd_, F_GETFD);
@@ -218,7 +199,7 @@ namespace pomai::memory
             }
         }
 
-        // Initialize counters
+        // Initialize counters based on file content
         uint64_t max_seq = 0;
         auto cb = [&max_seq](uint16_t /*type*/, const void * /*payload*/, uint32_t /*len*/, uint64_t seq) -> bool
         {
@@ -237,7 +218,6 @@ namespace pomai::memory
         seq_no_.store(max_seq);
         total_bytes_written_.store(0);
         total_records_written_.store(0);
-        bytes_since_last_fsync.store(0);
 
         return true;
     }
@@ -247,6 +227,8 @@ namespace pomai::memory
         std::lock_guard<std::mutex> lk(append_mu_);
         if (fd_ != -1)
         {
+            // Optional: flush before close
+            robust_fsync(fd_);
             ::close(fd_);
             fd_ = -1;
         }
@@ -275,14 +257,11 @@ namespace pomai::memory
             return false;
         }
 
-        // [UPDATED] Use centralized config
-        if (cfg_.sync_on_append)
+        // Initial header write should always sync
+        if (!robust_fsync(fd_))
         {
-            if (!robust_fsync(fd_))
-            {
-                std::cerr << "WalManager::write_file_header_if_missing: fsync failed: " << strerror(errno) << "\n";
-                return false;
-            }
+            std::cerr << "WalManager::write_file_header_if_missing: fsync failed: " << strerror(errno) << "\n";
+            return false;
         }
 
         return true;
@@ -336,7 +315,7 @@ namespace pomai::memory
         rh.rec_type = type;
         rh.flags = 0;
 
-        size_t rec_size = sizeof(WalRecordHeader) + payload_len + sizeof(uint32_t);
+        size_t rec_size = sizeof(WalRecordHeader) + payload_len + sizeof(uint32_t); // Header + Payload + CRC
         std::vector<uint8_t> buf;
         buf.resize(rec_size);
 
@@ -346,10 +325,14 @@ namespace pomai::memory
             uint64_t seq = seq_no_.fetch_add(1) + 1;
             rh.seq_no = seq;
 
+            // 1. Header
             std::memcpy(buf.data(), &rh, sizeof(WalRecordHeader));
+            // 2. Payload
             if (payload_len > 0 && payload)
+            {
                 std::memcpy(buf.data() + sizeof(WalRecordHeader), payload, payload_len);
-
+            }
+            // 3. CRC
             uint32_t c = crc32(buf.data(), sizeof(WalRecordHeader) + payload_len);
             std::memcpy(buf.data() + sizeof(WalRecordHeader) + payload_len, &c, sizeof(c));
 
@@ -369,12 +352,10 @@ namespace pomai::memory
             total_bytes_written_.fetch_add(static_cast<uint64_t>(buf.size()), std::memory_order_relaxed);
             total_records_written_.fetch_add(1, std::memory_order_relaxed);
 
-            // Batched fsync logic:
-            // - if batch_commit_size == 0: follow sync_on_append boolean.
-            // - if batch_commit_size > 0: accumulate bytes and fsync when threshold reached.
+            // [FIXED] Batched fsync logic using member variable
             if (cfg_.batch_commit_size > 0)
             {
-                uint64_t acc = bytes_since_last_fsync.fetch_add(static_cast<uint64_t>(buf.size()), std::memory_order_relaxed) + static_cast<uint64_t>(buf.size());
+                uint64_t acc = bytes_since_last_fsync_.fetch_add(static_cast<uint64_t>(buf.size()), std::memory_order_relaxed) + static_cast<uint64_t>(buf.size());
                 if (acc >= cfg_.batch_commit_size)
                 {
                     if (!robust_fsync(fd_))
@@ -382,7 +363,7 @@ namespace pomai::memory
                         std::cerr << "WalManager::append_record: fsync failed after batch threshold: " << strerror(errno) << "\n";
                         return std::nullopt;
                     }
-                    bytes_since_last_fsync.store(0, std::memory_order_relaxed);
+                    bytes_since_last_fsync_.store(0, std::memory_order_relaxed);
                 }
             }
             else if (cfg_.sync_on_append)
@@ -409,7 +390,7 @@ namespace pomai::memory
             return false;
         }
         // reset accumulator on explicit fsync
-        bytes_since_last_fsync.store(0, std::memory_order_relaxed);
+        bytes_since_last_fsync_.store(0, std::memory_order_relaxed);
         return true;
     }
 
@@ -459,7 +440,7 @@ namespace pomai::memory
             off_t end_off = crc_off + static_cast<off_t>(sizeof(uint32_t));
 
             if (crc_off < 0 || end_off < 0 || end_off > file_size)
-                break;
+                break; // Incomplete record
 
             std::vector<uint8_t> payload;
             if (rh.rec_len > 0)
@@ -475,11 +456,13 @@ namespace pomai::memory
             if (rc != static_cast<ssize_t>(sizeof(stored_crc)))
                 break;
 
+            // Verify CRC
             std::vector<uint8_t> tmp;
             tmp.resize(sizeof(WalRecordHeader) + rh.rec_len);
             std::memcpy(tmp.data(), &rh, sizeof(WalRecordHeader));
             if (rh.rec_len > 0 && !payload.empty())
                 std::memcpy(tmp.data() + sizeof(WalRecordHeader), payload.data(), rh.rec_len);
+
             uint32_t computed = crc32(tmp.data(), tmp.size());
             if (computed != stored_crc)
             {
@@ -524,7 +507,7 @@ namespace pomai::memory
             return false;
         }
         // Reset accumulator and counters
-        bytes_since_last_fsync.store(0, std::memory_order_relaxed);
+        bytes_since_last_fsync_.store(0, std::memory_order_relaxed);
         seq_no_.store(0);
         total_bytes_written_.store(0);
         total_records_written_.store(0);

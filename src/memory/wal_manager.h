@@ -1,11 +1,4 @@
-/*
- * src/memory/wal_manager.h
- *
- * WalManager: Structured, durable, replayable Write-Ahead Log.
- *
- * ...
- */
-
+/* src/memory/wal_manager.h */
 #pragma once
 
 #include <cstdint>
@@ -19,20 +12,19 @@
 
 namespace pomai::memory
 {
-
-    // Record types (extend as needed)
+    // Record types
     enum WalRecordType : uint16_t
     {
-        WAL_REC_IDS_UPDATE = 1,        // payload: struct { uint64_t idx; uint64_t value; }
-        WAL_REC_CREATE_MEMBRANCE = 10, // payload: text "name|dim|ram_mb"
-        WAL_REC_DROP_MEMBRANCE = 11,   // payload: text "name"
-        WAL_REC_CHECKPOINT = 100       // optional checkpoint record (manifest snapshot)
+        WAL_REC_IDS_UPDATE = 1,
+        WAL_REC_CREATE_MEMBRANCE = 10,
+        WAL_REC_DROP_MEMBRANCE = 11,
+
+        // [THÊM MỚI] Dùng cho vector data batch. Payload khớp với PomaiOrbit.
+        WAL_REC_INSERT_BATCH = 20,
+
+        WAL_REC_CHECKPOINT = 100
     };
 
-    // NOTE: Use the centralized config type pomai::config::WalConfig (declared in src/core/config.h)
-    // The WalManager provides a nested alias `WalConfig` so callers can write `WalManager::WalConfig`.
-    // (Do NOT declare a local WalConfig here to avoid type conflicts.)
-    
     class WalManager
     {
     public:
@@ -94,12 +86,15 @@ namespace pomai::memory
         std::string path_;
         int fd_ = -1;
         WalConfig cfg_;
+
         std::atomic<uint64_t> seq_no_{0};
         std::atomic<uint64_t> total_bytes_written_{0};
         std::atomic<uint64_t> total_records_written_{0};
 
+        // [SỬA LỖI QUAN TRỌNG] Biến thành viên để tracking batch fsync cho từng instance riêng biệt
+        std::atomic<uint64_t> bytes_since_last_fsync_{0};
+
         // Serialize append/fsync/truncate/replay operations in-process
         std::mutex append_mu_;
     };
-
-} // namespace pomai::memory
+}

@@ -856,6 +856,18 @@ namespace pomai::server
             return ok ? std::string("OK: dropped ") + name + "\n" : std::string("ERR: drop failed\n");
         }
 
+        if (up == "EXEC CHECKPOINT")
+        {
+            if (db->checkpoint_all())
+            {
+                return "OK: Checkpoint completed. WAL truncated.\n";
+            }
+            else
+            {
+                return "ERR: Checkpoint failed partially.\n";
+            }
+        }
+
         // GET MEMBRANCE INFO ...
         if (up.rfind("GET MEMBRANCE", 0) == 0)
         {
