@@ -40,8 +40,20 @@ namespace pomai::core
             std::unique_lock<std::shared_mutex> lock(mu_);
             for (const auto &t : tags)
             {
+                // normalize key (case-insensitive matching for keys)
+                std::string key_norm = t.key;
+                std::transform(key_norm.begin(), key_norm.end(), key_norm.begin(),
+                               [](unsigned char c)
+                               { return static_cast<char>(std::tolower(c)); });
+
+                // Optionally normalize value as well to avoid case mismatches in queries.
+                std::string val_norm = t.val;
+                std::transform(val_norm.begin(), val_norm.end(), val_norm.begin(),
+                               [](unsigned char c)
+                               { return static_cast<char>(std::tolower(c)); });
+
                 // Sử dụng delimiter từ config (mặc định là "=")
-                std::string composite = t.key + cfg_.delimiter + t.val;
+                std::string composite = key_norm + cfg_.delimiter + val_norm;
                 index_[composite].push_back(label);
             }
         }
@@ -50,7 +62,16 @@ namespace pomai::core
         std::vector<uint64_t> filter(const std::string &key, const std::string &val) const
         {
             std::shared_lock<std::shared_mutex> lock(mu_);
-            std::string composite = key + cfg_.delimiter + val;
+            std::string key_norm = key;
+            std::transform(key_norm.begin(), key_norm.end(), key_norm.begin(),
+                           [](unsigned char c)
+                           { return static_cast<char>(std::tolower(c)); });
+            std::string val_norm = val;
+            std::transform(val_norm.begin(), val_norm.end(), val_norm.begin(),
+                           [](unsigned char c)
+                           { return static_cast<char>(std::tolower(c)); });
+
+            std::string composite = key_norm + cfg_.delimiter + val_norm;
             auto it = index_.find(composite);
             if (it != index_.end())
                 return it->second;
@@ -65,22 +86,28 @@ namespace pomai::core
         {
             std::shared_lock<std::shared_mutex> lock(mu_);
             std::map<std::string, std::vector<uint64_t>> groups;
-            
+
+            // Normalize the requested key to lowercase to match stored composites
+            std::string key_norm = tag_key;
+            std::transform(key_norm.begin(), key_norm.end(), key_norm.begin(),
+                           [](unsigned char c)
+                           { return static_cast<char>(std::tolower(c)); });
+
             // Prefix cần tìm: "key=" (ví dụ "class=")
-            std::string prefix = tag_key + cfg_.delimiter;
-            
+            std::string prefix = key_norm + cfg_.delimiter;
+
             for (const auto &kv : index_)
             {
                 const std::string &composite = kv.first;
                 // Kiểm tra xem composite key có bắt đầu bằng prefix không
-                if (composite.rfind(prefix, 0) == 0) 
+                if (composite.rfind(prefix, 0) == 0)
                 {
                     // Tách value: "key=value" -> "value"
                     std::string val = composite.substr(prefix.size());
                     const auto &ids = kv.second;
-                    
+
                     // Copy IDs vào nhóm tương ứng
-                    auto& group_list = groups[val];
+                    auto &group_list = groups[val];
                     group_list.insert(group_list.end(), ids.begin(), ids.end());
                 }
             }

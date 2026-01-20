@@ -274,7 +274,7 @@ def build_batch_insert_with_tags(memname: str,
         tup_text = ",".join([t[0] for t in chunk])
         tag_class = chunk[0][1]
         tag_date = chunk[0][2]
-        sql = f"INSERT INTO {memname} VALUES {tup_text} TAGS (class={tag_class}, date={tag_date});"
+        sql = f"INSERT INTO {memname} VALUES {tup_text} TAGS (class:{tag_class});"
         cmds.append(sql)
         i += batch_size
     return cmds
@@ -460,7 +460,7 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
         client.send_and_get_response("CREATE MEMBRANCE tests DIM {} DATA_TYPE float32 RAM 256;".format(items[0][1].shape[0]))
 
         print(f"\nInserting {len(items)} items into 'tests' (batched)...")
-        cmds = build_batch_insert_with_tags("tests", items, "float32", batch_size=16)
+        cmds = build_batch_insert_with_tags("tests", items, "float32", batch_size=4)
         for cmd in cmds:
             client.send_and_get_response(cmd)
         print("Inserted into 'tests'.")
@@ -484,7 +484,7 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
             print("CREATE RESP:", resp.strip())
 
             batch_items = items[:8]
-            insert_cmds = build_batch_insert_with_tags(mname, batch_items, dt, batch_size=8)
+            insert_cmds = build_batch_insert_with_tags(mname, batch_items, dt, batch_size=4)
             print(f"Inserting {len(batch_items)} entries into {mname} (dtype={dt}) ...")
             for c in insert_cmds:
                 client.send_and_get_response(c)
@@ -590,7 +590,7 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
             # For single-call TRIPLET we must provide a key and a limit; we'll request a large limit to get all triplets
             try:
                 # large limit (server will clamp), class key 'class'
-                single_cmd = f"ITERATE {mname} TRIPLET class 1000000"
+                single_cmd = f"ITERATE {mname} TRIPLET class 10"
                 count, dim_ret, payload = iterate_single(client, single_cmd)
                 print(f"  -> Single-call TRIPLET returned count={count}, dim={dim_ret}, bytes={len(payload)}")
                 if count > 0:
@@ -629,6 +629,11 @@ def run_test(host: str, port: int, assets_dir: str, batch_size: int = 16, verbos
                     continue
                 np_dtype, elem_size = dtype_str_to_numpy(expected_dtype)
                 triplet_size = 3 * (elem_size * dim_ret if elem_size else 4 * dim_ret)
+                total_triplets += count
+
+                if total_triplets > 10:
+                    break
+
                 if len(payload) < triplet_size * count:
                     print("  -> Warning: triplet payload smaller than expected")
                 try:

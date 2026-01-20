@@ -115,6 +115,24 @@ namespace pomai::server::utils
         }
     }
 
+    static inline bool parse_vector(std::string s, std::vector<float> &out)
+    {
+        // Remove brackets if any
+        if (!s.empty() && s.front() == '[')
+            s = s.substr(1);
+        if (!s.empty() && s.back() == ']')
+            s.pop_back();
+
+        std::replace(s.begin(), s.end(), ',', ' ');
+        std::istringstream iss(s);
+        float v;
+        while (iss >> v)
+        {
+            out.push_back(v);
+        }
+        return !out.empty();
+    }
+
     // Parse CSV list of floats using string_view tokens and parse_float_token_sv.
     static std::vector<float> parse_float_list_sv(std::string_view csv)
     {

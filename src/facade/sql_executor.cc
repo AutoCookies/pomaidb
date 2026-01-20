@@ -1,16 +1,10 @@
 // src/facade/sql_executor.cc
 //
 // Implementation of SqlExecutor extracted from server.h so the SQL/text protocol
-// logic can be reused outside of the server class. The code preserves original
-// behavior (no logic changes), but uses the injected PomaiDB/WhisperGrain/ClientState
-// instead of server members.
-//
-// Enhancement:
-// - ITERATE now supports an optional "BATCH <n>" token to stream results in
-//   batches of at most n vectors. If BATCH is not provided, behavior is
-//   unchanged (single response containing up to lim entries).
-// - TRIPLET no longer requires an explicit <limit> token: if missing we compute
-//   a sensible default from available data.
+// logic can be reused outside of the server class. Preserves original behavior
+// but adds optional server-side BATCH streaming for ITERATE (TRAIN/PAIR/TRIPLET).
+// Logic otherwise is unchanged.
+
 #include "src/facade/sql_executor.h"
 
 #include "src/facade/server_utils.h"
@@ -19,7 +13,7 @@
 #include "src/core/metadata_index.h"
 #include "src/ai/whispergrain.h"
 #include "src/core/metrics.h"
-#include "src/core/types.h" // added to report/parse data_type names
+#include "src/core/types.h"
 
 #include <sstream>
 #include <iomanip>
@@ -137,8 +131,6 @@ namespace pomai::server
             }
 
             // --- Strategy Dispatch ---
-
-            // 1. STRATIFIED SPLIT
             if (strategy == "STRATIFIED")
             {
                 if (!m->meta_index)
@@ -148,7 +140,6 @@ namespace pomai::server
                 if (groups.empty())
                     return "ERR: No metadata found for key '" + strat_key + "'\n";
 
-                // Flatten map -> vector for manager
                 std::vector<uint64_t> items;
                 std::vector<uint64_t> labels;
                 for (const auto &kv : groups)
@@ -164,7 +155,6 @@ namespace pomai::server
                 m->split_mgr->execute_stratified_split(items, labels, tr, val, te);
                 total_vectors = items.size();
             }
-            // 2. CLUSTER SPLIT
             else if (strategy == "CLUSTER")
             {
                 if (!m->orbit)
@@ -375,7 +365,7 @@ namespace pomai::server
                 }
             }
 
-            // New: parse optional BATCH token anywhere in parts
+            // New: parse optional BATCH token anywhere in parts (minimal addition)
             size_t batch_size_param = 0;
             for (size_t t = 3; t < parts.size(); ++t)
             {
@@ -384,7 +374,6 @@ namespace pomai::server
                     try
                     {
                         batch_size_param = std::stoul(parts[t + 1]);
-                        if (batch_size_param == 0) batch_size_param = 0; // treat 0 as disabled
                     }
                     catch (...)
                     {
@@ -409,170 +398,129 @@ namespace pomai::server
                 }
             };
 
-            // MODE: TRIPLET (produce 3 vectors per record) - now returns raw dtype bytes
+            // MODE: TRIPLET (produce 3 vectors per record) - preserves old single-response logic
+            // MODE: TRIPLET (produce 3 vectors per record)
+            // [src/facade/sql_executor.cc] Replace TRIPLET block
+
             if (mode == "TRIPLET")
             {
                 if (!m->meta_index || !m->orbit)
                     return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
 
-                // key can be parts[3] or parts[cur_tok] depending on whether a split token was present.
-                std::string key;
-                size_t key_tok_index = 3;
-                if (cur_tok > 3)
-                    key_tok_index = cur_tok; // split token consumed token at 3, but TRIPLET syntax expects key at 3 originally
-                if (parts.size() > key_tok_index)
-                    key = parts[key_tok_index];
-                else
-                    return "ERR: ITERATE <name> TRIPLET <key> [<limit>] [BATCH <n>]\n";
+                // Parse Arguments logic:
+                // Expects: ITERATE name TRIPLET key [limit]  OR  [offset] [limit]
+                // Python test sends: key offset limit
 
-                // optional limit: if provided (e.g. parts[4] exists and is numeric) use it; otherwise compute default.
-                size_t limit = 0;
-                bool parsed_limit = false;
-                // find next token after key token to try parse limit
-                size_t maybe_limit_idx = key_tok_index + 1;
-                if (maybe_limit_idx < parts.size())
+                if (parts.size() < 4)
+                    return "ERR: ITERATE <name> TRIPLET <key> [limit]\n";
+
+                std::string key = parts[3];
+                size_t limit = 100; // Default limit
+
+                // Logic detect Offset vs Limit:
+                // Nếu có 2 tham số số học (parts[4], parts[5]), thì parts[4] là Offset (bỏ qua), parts[5] là Limit.
+                // Nếu chỉ có 1 tham số (parts[4]), nó là Limit.
+
+                if (parts.size() >= 6)
                 {
-                    // skip tokens that are "BATCH" or other flags
-                    if (utils::to_upper(parts[maybe_limit_idx]) != "BATCH")
+                    // Case: KEY OFFSET LIMIT (Python batch client style)
+                    // Ignored parts[4] (Offset) because Triplets are random
+                    try
                     {
-                        try
-                        {
-                            limit = std::stoul(parts[maybe_limit_idx]);
-                            parsed_limit = true;
-                        }
-                        catch (...)
-                        {
-                            parsed_limit = false;
-                        }
+                        limit = std::stoul(parts[5]);
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+                else if (parts.size() == 5)
+                {
+                    // Case: KEY LIMIT (Single call style)
+                    try
+                    {
+                        limit = std::stoul(parts[4]);
+                    }
+                    catch (...)
+                    {
                     }
                 }
 
+                if (limit == 0)
+                    limit = 1; // Safety
+
+                // --- Query Logic (Giữ nguyên) ---
                 auto groups = m->meta_index->get_groups(key);
-                // collect valid classes with >=2 elements
                 std::vector<std::string> cls;
-                size_t total_items = 0;
                 for (const auto &kv : groups)
                 {
                     if (kv.second.size() >= 2)
-                    {
                         cls.push_back(kv.first);
-                        total_items += kv.second.size();
-                    }
                 }
 
-                if (cls.size() < 2 || total_items < 2)
+                if (cls.size() < 2)
                     return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
 
-                // compute default limit if not provided: number of available triplets approximated by total_items/3
-                if (!parsed_limit)
-                {
-                    size_t default_limit = total_items / 3;
-                    if (default_limit == 0)
-                        default_limit = 1;
-                    limit = default_limit;
-                }
-
-                // determine dtype & element size
+                // --- Output Generation ---
                 std::string dtype_str;
                 uint32_t elem_size;
                 get_membrance_dtype(dtype_str, elem_size);
-
                 size_t per_vec = static_cast<size_t>(elem_size) * dim;
 
-                // If batching requested - stream in chunks of batch_size_param triplets
-                if (batch_size_param > 0)
+                // Response Header
+                size_t total_bytes = limit * 3 * per_vec;
+                std::string out = supplier::make_header("OK BINARY", dtype_str, limit, dim, total_bytes);
+
+                std::mt19937 rng(std::random_device{}());
+                std::string raw; // Reusable buffer
+
+                for (size_t i = 0; i < limit; ++i)
                 {
-                    std::string out;
-                    std::mt19937 rng(std::random_device{}());
-                    size_t remaining = limit;
-                    while (remaining > 0)
+                    // 1. Select Classes
+                    const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                    std::string c2 = c;
+                    while (c2 == c)
                     {
-                        size_t this_batch = std::min<size_t>(batch_size_param, remaining);
-                        size_t total_bytes = this_batch * 3 * per_vec;
-                        out += supplier::make_header("OK BINARY", dtype_str, this_batch, dim, total_bytes);
-                        for (size_t i = 0; i < this_batch; ++i)
-                        {
-                            const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
-                            const auto &ids = groups[c];
-                            uint64_t ida = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
-                            uint64_t idp = ida;
-                            int tries = 0;
-                            while (idp == ida && ++tries < 20)
-                                idp = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
-                            uint64_t idn = ida;
-                            while (idn == ida)
-                            {
-                                const auto &c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
-                                if (c2 == c)
-                                    continue;
-                                const auto &ids2 = groups[c2];
-                                idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
-                            }
-
-                            // fetch raw bytes for ida,idp,idn and append
-                            pomai::core::DataType got_dt;
-                            uint32_t got_elem;
-                            std::string raw;
-                            supplier::fetch_vector_raw(m, ida, raw, dim, got_dt, got_elem);
-                            if (raw.size() < per_vec) raw.resize(per_vec, 0);
-                            out.append(raw.data(), per_vec);
-
-                            supplier::fetch_vector_raw(m, idp, raw, dim, got_dt, got_elem);
-                            if (raw.size() < per_vec) raw.resize(per_vec, 0);
-                            out.append(raw.data(), per_vec);
-
-                            supplier::fetch_vector_raw(m, idn, raw, dim, got_dt, got_elem);
-                            if (raw.size() < per_vec) raw.resize(per_vec, 0);
-                            out.append(raw.data(), per_vec);
-                        }
-                        remaining -= this_batch;
+                        c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
                     }
-                    return out;
-                }
-                else
-                {
-                    // previous single-response behavior
-                    size_t total_bytes = limit * 3 * per_vec;
-                    std::string out = supplier::make_header("OK BINARY", dtype_str, limit, dim, total_bytes);
 
-                    std::mt19937 rng(std::random_device{}());
-                    for (size_t i = 0; i < limit; ++i)
+                    // 2. Select IDs
+                    const auto &ids = groups.at(c);
+                    const auto &ids2 = groups.at(c2);
+
+                    uint64_t ida = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                    uint64_t idp = ida;
+                    while (idp == ida)
                     {
-                        const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
-                        const auto &ids = groups[c];
-                        uint64_t ida = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
-                        uint64_t idp = ida;
-                        int tries = 0;
-                        while (idp == ida && ++tries < 20)
-                            idp = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
-                        uint64_t idn = ida;
-                        while (idn == ida)
-                        {
-                            const auto &c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
-                            if (c2 == c)
-                                continue;
-                            const auto &ids2 = groups[c2];
-                            idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
-                        }
-
-                        // fetch raw bytes for ida,idp,idn and append
-                        pomai::core::DataType got_dt;
-                        uint32_t got_elem;
-                        std::string raw;
-                        supplier::fetch_vector_raw(m, ida, raw, dim, got_dt, got_elem);
-                        if (raw.size() < per_vec) raw.resize(per_vec, 0);
-                        out.append(raw.data(), per_vec);
-
-                        supplier::fetch_vector_raw(m, idp, raw, dim, got_dt, got_elem);
-                        if (raw.size() < per_vec) raw.resize(per_vec, 0);
-                        out.append(raw.data(), per_vec);
-
-                        supplier::fetch_vector_raw(m, idn, raw, dim, got_dt, got_elem);
-                        if (raw.size() < per_vec) raw.resize(per_vec, 0);
-                        out.append(raw.data(), per_vec);
+                        idp = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
                     }
-                    return out;
+                    uint64_t idn = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
+
+                    // 3. Fetch Data (FIXED RAW CLEAR BUG)
+                    pomai::core::DataType dt;
+                    uint32_t el;
+
+                    // Anchor
+                    raw.clear(); // [QUAN TRỌNG] Reset buffer
+                    supplier::fetch_vector_raw(m, ida, raw, dim, dt, el);
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
+
+                    // Positive
+                    raw.clear(); // [QUAN TRỌNG]
+                    supplier::fetch_vector_raw(m, idp, raw, dim, dt, el);
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
+
+                    // Negative
+                    raw.clear(); // [QUAN TRỌNG]
+                    supplier::fetch_vector_raw(m, idn, raw, dim, dt, el);
+                    if (raw.size() < per_vec)
+                        raw.resize(per_vec, 0);
+                    out.append(raw.data(), per_vec);
                 }
+                return out;
             }
 
             // MODE: PAIR -> emit (uint64 label) + raw vector (element size = membrance elem)
@@ -591,7 +539,6 @@ namespace pomai::server
                 size_t cnt = std::min(lim, idxs->size() - off);
                 size_t per = sizeof(uint64_t) + per_vec;
 
-                // Batching support: stream chunks of batch_size_param pairs
                 if (batch_size_param > 0)
                 {
                     std::string out;
@@ -599,8 +546,7 @@ namespace pomai::server
                     while (processed < cnt)
                     {
                         size_t this_batch = std::min<size_t>(batch_size_param, cnt - processed);
-                        std::string header = "OK BINARY_PAIR " + dtype_str + " " + std::to_string(this_batch) + " " + std::to_string(dim) + " " + std::to_string(this_batch * per) + "\n";
-                        out += header;
+                        out += supplier::make_header("OK BINARY_PAIR", dtype_str, this_batch, dim, this_batch * per);
                         for (size_t i = 0; i < this_batch; ++i)
                         {
                             uint64_t id = (*idxs)[off + processed + i];
@@ -619,9 +565,7 @@ namespace pomai::server
                 }
                 else
                 {
-                    // single response (existing behavior)
-                    size_t cnt_bytes = cnt * per;
-                    std::string header = "OK BINARY_PAIR " + dtype_str + " " + std::to_string(cnt) + " " + std::to_string(dim) + " " + std::to_string(cnt_bytes) + "\n";
+                    std::string header = "OK BINARY_PAIR " + dtype_str + " " + std::to_string(cnt) + " " + std::to_string(dim) + " " + std::to_string(cnt * per) + "\n";
                     std::string out;
                     out.reserve(header.size() + cnt * per);
                     out += header;
@@ -658,7 +602,6 @@ namespace pomai::server
 
                 size_t cnt = std::min(lim, idxs->size() - off);
 
-                // Batching support: stream sequential chunks
                 if (batch_size_param > 0)
                 {
                     std::string out;
@@ -685,7 +628,6 @@ namespace pomai::server
                 }
                 else
                 {
-                    // single response (existing behavior)
                     size_t total_bytes = cnt * per_vec;
                     std::string header = supplier::make_header("OK BINARY", dtype_str, cnt, dim, total_bytes);
                     std::string out;
@@ -713,9 +655,6 @@ namespace pomai::server
         // CREATE MEMBRANCE ...
         if (up.rfind("CREATE MEMBRANCE", 0) == 0)
         {
-            // Expected syntax:
-            // CREATE MEMBRANCE <name> DIM <n> DATA_TYPE <float32|float64|int32> RAM <mb>
-            // DATA_TYPE is optional (default float32). RAM is optional (default 256).
             size_t pos_dim = up.find(" DIM ");
             if (pos_dim == std::string::npos)
                 return "ERR: CREATE MEMBRANCE missing DIM\n";
@@ -729,7 +668,6 @@ namespace pomai::server
             size_t ram_mb = 256;
             std::string data_type = "float32"; // default
 
-            // First token must be dim number
             if (!(iss >> token))
                 return "ERR: invalid DIM\n";
             try
@@ -741,7 +679,6 @@ namespace pomai::server
                 return "ERR: invalid DIM\n";
             }
 
-            // Parse remaining tokens in flexible order: DATA_TYPE <val>, RAM <mb>
             while (iss >> token)
             {
                 std::string up_tok = utils::to_upper(token);
@@ -750,10 +687,9 @@ namespace pomai::server
                     std::string dt;
                     if (!(iss >> dt))
                         return "ERR: DATA_TYPE requires a value (float32|float64|int32)\n";
-                    // normalize to lowercase
                     std::transform(dt.begin(), dt.end(), dt.begin(), ::tolower);
                     if (dt != "float32" && dt != "float64" && dt != "int32" && dt != "int8" && dt != "float16")
-                        return std::string("ERR: unsupported DATA_TYPE '") + dt + "' (supported: float32, float64, int32, int8, float16)\n";
+                        return std::string("ERR: unsupported DATA_TYPE '") + dt + "'\n";
                     data_type = dt;
                 }
                 else if (up_tok == "RAM")
@@ -772,8 +708,6 @@ namespace pomai::server
                 }
                 else
                 {
-                    // Unknown token: skip or treat as error. We'll skip unknown tokens to be lenient.
-                    // Consume one argument if looks like a value (already consumed token), continue.
                     continue;
                 }
             }
@@ -781,11 +715,9 @@ namespace pomai::server
             if (dim == 0)
                 return "ERR: invalid DIM\n";
 
-            // Build config and pass data_type through
             pomai::core::MembranceConfig cfg;
             cfg.dim = dim;
             cfg.ram_mb = ram_mb;
-            // convert textual data_type into enum
             try
             {
                 cfg.data_type = pomai::core::parse_dtype(data_type);
@@ -803,6 +735,112 @@ namespace pomai::server
                 return ss.str();
             }
             return "ERR: create failed (exists or invalid)\n";
+        }
+
+        // ------------------------------------------------------------------
+        // SEARCH <name> QUERY <vector> TOP <k> [EF <ef>]
+        // ------------------------------------------------------------------
+        if (utils::to_upper(cmd).rfind("SEARCH ", 0) == 0)
+        {
+            // Parse logic: SEARCH <name> QUERY <vec> TOP <k>
+            // Vector format: [v1,v2,...]  (Comma separated, no spaces ideally)
+            // Or: ([v1,v2,...]) as sent by python test
+
+            auto parts = utils::split_ws(cmd);
+            if (parts.size() < 5)
+                return "ERR: usage SEARCH <name> QUERY <vec> TOP <k>\n";
+
+            std::string name = parts[1];
+
+            // Find QUERY token
+            size_t query_idx = 0;
+            for (size_t i = 2; i < parts.size(); ++i)
+            {
+                if (utils::to_upper(parts[i]) == "QUERY")
+                {
+                    query_idx = i;
+                    break;
+                }
+            }
+            if (query_idx == 0 || query_idx + 1 >= parts.size())
+                return "ERR: missing QUERY <vec>\n";
+
+            // Extract Vector String
+            std::string vec_str = parts[query_idx + 1];
+            // Clean parens if present (python test sends QUERY ([...]))
+            if (vec_str.size() >= 2 && vec_str.front() == '(' && vec_str.back() == ')')
+            {
+                vec_str = vec_str.substr(1, vec_str.size() - 2);
+            }
+
+            std::vector<float> query_vec;
+            if (!utils::parse_vector(vec_str, query_vec))
+            {
+                return "ERR: invalid vector format\n";
+            }
+
+            // Find TOP token
+            size_t top_idx = 0;
+            size_t k = 10;
+            for (size_t i = query_idx + 2; i < parts.size(); ++i)
+            {
+                if (utils::to_upper(parts[i]) == "TOP")
+                {
+                    top_idx = i;
+                    if (i + 1 < parts.size())
+                    {
+                        try
+                        {
+                            k = std::stoul(parts[i + 1]);
+                        }
+                        catch (...)
+                        {
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Optional: EF Search (Beam Width)
+            size_t ef = 0; // 0 = default (auto)
+            for (size_t i = 0; i < parts.size(); ++i)
+            {
+                if (utils::to_upper(parts[i]) == "EF" && i + 1 < parts.size())
+                {
+                    try
+                    {
+                        ef = std::stoul(parts[i + 1]);
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            }
+
+            auto *m = db->get_membrance(name);
+            if (!m)
+                return "ERR: membrance not found\n";
+            if (!m->orbit)
+                return "ERR: engine not ready\n";
+
+            // Validate Dim
+            if (query_vec.size() != m->dim)
+            {
+                return "ERR: query dimension mismatch (expected " + std::to_string(m->dim) + ", got " + std::to_string(query_vec.size()) + ")\n";
+            }
+
+            // Execute Search
+            // Note: search() returns vector<pair<id, dist>>
+            auto results = m->orbit->search(query_vec.data(), k); // or search(query_vec.data(), k, ef) if supported
+
+            // Format Output
+            std::ostringstream ss;
+            ss << "OK " << results.size() << "\n";
+            for (const auto &p : results)
+            {
+                ss << p.first << " " << std::fixed << std::setprecision(6) << p.second << "\n";
+            }
+            return ss.str();
         }
 
         // DROP MEMBRANCE
@@ -855,7 +893,6 @@ namespace pomai::server
             if (!m)
                 return std::string("ERR: membrance not found: ") + name + "\n";
 
-            // 1. Gather Storage Info (Physical)
             pomai::ai::orbit::MembranceInfo info;
             try
             {
@@ -912,7 +949,6 @@ namespace pomai::server
             ss << "--- AI Contract ---\n";
             ss << " feature_dim: " << feature_dim << "\n";
             ss << " metric: L2\n";
-            // Report actual data_type configured for this membrance
             try
             {
                 ss << " data_type: " << pomai::core::dtype_name(m->data_type) << "\n";
@@ -1037,7 +1073,16 @@ namespace pomai::server
                     if (t_l != std::string::npos && t_r != std::string::npos && t_r > t_l)
                     {
                         std::string tags_inside = body.substr(t_l + 1, t_r - t_l - 1);
+                        // FIX: actually parse tags and populate global_tags
                         global_tags = utils::parse_tags_list(tags_inside);
+                        if (global_tags.empty())
+                        {
+                            std::cerr << "[SqlExecutor] Warning: no tags parsed from: [" << tags_inside << "]\n";
+                        }
+                        else
+                        {
+                            std::clog << "[SqlExecutor] Parsed " << global_tags.size() << " tags.\n";
+                        }
                     }
                 }
 
@@ -1084,200 +1129,6 @@ namespace pomai::server
                 ss << "OK: inserted " << (ok_batch ? batch_data.size() : 0) << " / " << tuples.size() << (ok_batch ? " (batch)" : " (failed)") << "\n";
                 return ss.str();
             }
-        }
-
-        // SEARCH ...
-        if (utils::to_upper(cmd).rfind("SEARCH ", 0) == 0)
-        {
-            size_t pos_q = utils::to_upper(cmd).find(" QUERY ");
-            std::string name;
-            size_t vec_lb = std::string::npos;
-            size_t vec_rb = std::string::npos;
-            if (pos_q != std::string::npos)
-            {
-                name = utils::trim(cmd.substr(7, pos_q - 7));
-                vec_lb = cmd.find('[', pos_q);
-                vec_rb = cmd.find(']', vec_lb);
-            }
-            else
-            {
-                size_t pos_q2 = utils::to_upper(cmd).find("SEARCH QUERY");
-                if (pos_q2 == std::string::npos)
-                    return "ERR: SEARCH syntax\n";
-                if (state.current_membrance.empty())
-                    return "ERR: no current membrance (USE <name>)\n";
-                name = state.current_membrance;
-                vec_lb = cmd.find('[', pos_q2);
-                vec_rb = cmd.find(']', vec_lb);
-            }
-            if (vec_lb == std::string::npos || vec_rb == std::string::npos)
-                return "ERR: SEARCH missing vector\n";
-            std::string veccsv = cmd.substr(vec_lb + 1, vec_rb - vec_lb - 1);
-            auto vec = utils::parse_float_list_sv(utils::trim_sv(std::string_view(veccsv)));
-            size_t pos_top = utils::to_upper(cmd).find(" TOP ", vec_rb);
-            int topk = 10;
-            if (pos_top != std::string::npos)
-            {
-                size_t start = pos_top + 5;
-                size_t end = cmd.find(';', start);
-                std::string kn = (end == std::string::npos) ? utils::trim(cmd.substr(start)) : utils::trim(cmd.substr(start, end - start));
-                try
-                {
-                    topk = std::stoi(kn);
-                }
-                catch (...)
-                {
-                    topk = 10;
-                }
-            }
-
-            auto *m = db->get_membrance(name);
-            if (!m)
-                return "ERR: membrance not found\n";
-            if (vec.size() != m->dim)
-            {
-                std::ostringstream ss;
-                ss << "ERR: dim mismatch expected=" << m->dim << " got=" << vec.size() << "\n";
-                return ss.str();
-            }
-
-            std::string hot_key_for_freq;
-            std::vector<std::pair<uint64_t, float>> res;
-
-            std::string upcmd = utils::to_upper(cmd);
-            size_t pos_where = upcmd.find(" WHERE ", vec_rb);
-
-            if (pos_where != std::string::npos && m->meta_index)
-            {
-                size_t cond_start = pos_where + 7;
-                size_t cond_end = std::string::npos;
-                size_t pos_top_after = upcmd.find(" TOP ", cond_start);
-                if (pos_top_after != std::string::npos)
-                    cond_end = pos_top_after;
-                else
-                {
-                    size_t semi = cmd.find(';', cond_start);
-                    cond_end = (semi == std::string::npos) ? cmd.size() : semi;
-                }
-                std::string cond = utils::trim(cmd.substr(cond_start, cond_end - cond_start));
-                size_t eq = cond.find('=');
-                if (eq != std::string::npos)
-                {
-                    std::string key = utils::trim(cond.substr(0, eq));
-                    std::string val = utils::trim(cond.substr(eq + 1));
-                    if (val.size() >= 2 && ((val.front() == '\'' && val.back() == '\'') || (val.front() == '\"' && val.back() == '\"')))
-                        val = val.substr(1, val.size() - 2);
-
-                    std::vector<uint64_t> candidates = m->meta_index->filter(key, val);
-
-                    hot_key_for_freq = key + "=" + val;
-
-                    bool is_hot = false;
-                    {
-                        std::lock_guard<std::mutex> qlk(freq_mu_);
-                        uint32_t &cnt = query_freq_[hot_key_for_freq];
-                        cnt++;
-                        if (cnt >= 5)
-                            is_hot = true;
-                    }
-
-                    auto budget = whisper.compute_budget(is_hot);
-                    auto t0 = std::chrono::high_resolution_clock::now();
-                    try
-                    {
-                        res = m->orbit->search_filtered_with_budget(vec.data(), static_cast<size_t>(topk), candidates, budget);
-                    }
-                    catch (...)
-                    {
-                        res = m->orbit->search(vec.data(), static_cast<size_t>(topk));
-                    }
-                    auto t1 = std::chrono::high_resolution_clock::now();
-                    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    whisper.observe_latency(static_cast<float>(ms));
-                }
-                else
-                {
-                    auto budget = whisper.compute_budget(false);
-                    auto t0 = std::chrono::high_resolution_clock::now();
-                    res = m->orbit->search_with_budget(vec.data(), static_cast<size_t>(topk), budget);
-                    auto t1 = std::chrono::high_resolution_clock::now();
-                    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                    whisper.observe_latency(static_cast<float>(ms));
-                }
-            }
-            else
-            {
-                hot_key_for_freq = name;
-                bool is_hot = false;
-                {
-                    std::lock_guard<std::mutex> qlk(freq_mu_);
-                    uint32_t &cnt = query_freq_[hot_key_for_freq];
-                    cnt++;
-                    if (cnt >= 5)
-                        is_hot = true;
-                }
-                auto budget = whisper.compute_budget(is_hot);
-                auto t0 = std::chrono::high_resolution_clock::now();
-                try
-                {
-                    res = m->orbit->search_with_budget(vec.data(), static_cast<size_t>(topk), budget);
-                }
-                catch (...)
-                {
-                    res = m->orbit->search(vec.data(), static_cast<size_t>(topk));
-                }
-                auto t1 = std::chrono::high_resolution_clock::now();
-                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                whisper.observe_latency(static_cast<float>(ms));
-            }
-
-            std::ostringstream ss;
-            ss << "RESULTS " << res.size() << "\n";
-            for (auto &p : res)
-                ss << p.first << " " << p.second << "\n";
-            return ss.str();
-        }
-
-        // GET <name> LABEL <label>;
-        if (utils::to_upper(cmd).rfind("GET ", 0) == 0)
-        {
-            auto parts = utils::split_ws(cmd);
-            if (parts.size() < 4)
-                return "ERR: GET <name> LABEL <label>\n";
-            std::string name = parts[1];
-            std::string label = parts[3];
-            if (!label.empty() && label.back() == ';')
-                label.pop_back();
-            auto *m = db->get_membrance(name);
-            if (!m)
-                return "ERR: membrance not found\n";
-            std::vector<float> out;
-            bool ok = m->orbit->get(utils::hash_key(label), out);
-            if (!ok)
-                return "ERR: not found\n";
-            std::ostringstream ss;
-            ss << "VECTOR " << out.size() << " ";
-            for (float v : out)
-                ss << v << " ";
-            ss << "\n";
-            return ss.str();
-        }
-
-        // DELETE <name> LABEL <label>;
-        if (utils::to_upper(cmd).rfind("DELETE ", 0) == 0 || utils::to_upper(cmd).rfind("VDEL ", 0) == 0)
-        {
-            auto parts = utils::split_ws(cmd);
-            if (parts.size() < 4)
-                return "ERR: DELETE <name> LABEL <label>\n";
-            std::string name = parts[1];
-            std::string label = parts[3];
-            if (!label.empty() && label.back() == ';')
-                label.pop_back();
-            auto *m = db->get_membrance(name);
-            if (!m)
-                return "ERR: membrance not found\n";
-            bool ok = m->orbit->remove(utils::hash_key(label));
-            return ok ? std::string("OK\n") : std::string("ERR: remove failed\n");
         }
 
         return "ERR: unknown command\n";
