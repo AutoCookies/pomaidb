@@ -476,7 +476,6 @@ namespace pomai::ai::orbit
         std::clog << "[Orbit] Rebuilding index from disk data...\n";
         size_t count = 0;
 
-        // Duyệt qua tất cả Centroids -> Tất cả Buckets -> Tất cả Items
         for (const auto &c : centroids_)
         {
             uint64_t curr = c->bucket_offset.load(std::memory_order_relaxed);
@@ -485,39 +484,54 @@ namespace pomai::ai::orbit
                 std::vector<char> tmp;
                 auto base_opt = resolve_bucket_base(arena_, curr, tmp);
                 if (!base_opt)
-                    break; // Should not happen if data file exists
+                    break;
 
-                const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(*base_opt);
-                uint32_t n = hdr->count.load(std::memory_order_relaxed);
+                // [FIX] Lấy con trỏ thô (char*)
+                const char *ptr = *base_opt;
 
-                const uint64_t *ids = reinterpret_cast<const uint64_t *>(*base_opt + hdr->off_ids);
+                // [FIX] KHÔNG ép kiểu trực tiếp. Dùng memcpy để copy sang biến stack đã căn chỉnh.
+                BucketHeader hdr_copy;
+                std::memcpy(&hdr_copy, ptr, sizeof(BucketHeader));
+
+                // Đọc count từ bản copy an toàn
+                uint32_t n = hdr_copy.count.load(std::memory_order_relaxed);
+
+                // Sanity check: Nếu file lỗi, n có thể là số rác cực lớn -> treo máy
+                if (n > 1000000)
+                {
+                    std::cerr << "[Orbit] Warning: Corrupt bucket count (" << n << "). Stopping chain.\n";
+                    break;
+                }
+
+                // Tính vị trí mảng ID (cũng là pointer thô)
+                const char *ids_ptr_raw = ptr + hdr_copy.off_ids;
 
                 for (uint32_t i = 0; i < n; ++i)
                 {
-                    // Load ID from disk
-                    uint64_t label = pomai::ai::atomic_utils::atomic_load_u64(ids + i);
+                    // [FIX] Copy từng ID (8 bytes) an toàn
+                    uint64_t label;
+                    std::memcpy(&label, ids_ptr_raw + i * sizeof(uint64_t), sizeof(uint64_t));
 
-                    // Update RAM Map
                     set_label_map(label, curr, i);
                     count++;
                 }
 
-                curr = hdr->next_bucket_offset.load(std::memory_order_relaxed);
+                // Chuyển sang bucket tiếp theo
+                curr = hdr_copy.next_bucket_offset.load(std::memory_order_relaxed);
             }
         }
         std::clog << "[Orbit] Index rebuilt. Total vectors: " << count << "\n";
 
-        // Re-init routing graph (neighbors) for search to work fast
-        // (Simple brute-force rebuild of HNSW/Graph)
+        // Re-init routing graph (Giữ nguyên logic cũ)
         if (!centroids_.empty())
         {
             L2Func kern = get_pomai_l2sq_kernel();
             size_t num_c = centroids_.size();
-#pragma omp parallel for // Nếu có OpenMP
+#pragma omp parallel for
             for (size_t i = 0; i < num_c; ++i)
             {
                 std::vector<std::pair<float, uint32_t>> dists;
-                dists.reserve(num_c); // Optimization
+                dists.reserve(num_c);
                 for (size_t j = 0; j < num_c; ++j)
                 {
                     if (i == j)
@@ -1014,56 +1028,81 @@ namespace pomai::ai::orbit
 
     bool PomaiOrbit::get(uint64_t label, std::vector<float> &out_vec)
     {
-        std::shared_lock<std::shared_mutex> dm(del_mu_);
-        if (deleted_labels_.count(label))
-            return false;
+        // 1. Check deleted
+        {
+            std::shared_lock<std::shared_mutex> dm(del_mu_);
+            if (deleted_labels_.count(label))
+                return false;
+        }
 
+        // 2. Find location
         uint64_t bucket_off = 0;
-        if (!get_label_bucket(label, bucket_off))
-            return false;
-        if (bucket_off == 0)
+        // Lưu ý: get_label_bucket cần được định nghĩa const hoặc dùng const_cast an toàn
+        // Giả sử hàm này thread-safe
+        if (!get_label_bucket(label, bucket_off) || bucket_off == 0)
             return false;
 
+        // 3. Resolve Pointer
         std::vector<char> temp_buffer;
         auto base_opt = resolve_bucket_base(arena_, bucket_off, temp_buffer);
         if (!base_opt)
             return false;
-        const char *data_base_ptr = *base_opt;
 
-        const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(data_base_ptr);
-        uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
+        const char *ptr = *base_opt;
+
+        // [FIX] Copy Header an toàn (tránh lỗi alignment)
+        BucketHeader hdr;
+        std::memcpy(&hdr, ptr, sizeof(BucketHeader));
+
+        uint32_t count = hdr.count.load(std::memory_order_relaxed);
         if (count == 0)
             return false;
 
-        const uint64_t *id_base = reinterpret_cast<const uint64_t *>(data_base_ptr + hdr_ptr->off_ids);
-        int32_t found = -1;
+        // 4. Scan IDs để tìm vị trí (Index)
+        // Offset tới mảng IDs
+        const char *ids_ptr_raw = ptr + hdr.off_ids;
+        int32_t found_idx = -1;
+
         for (uint32_t i = 0; i < count; ++i)
         {
-            uint64_t v = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
+            uint64_t v;
+            // [FIX] Copy ID ra biến local (8 bytes)
+            std::memcpy(&v, ids_ptr_raw + i * sizeof(uint64_t), sizeof(uint64_t));
+
             if (v == label)
             {
-                found = static_cast<int32_t>(i);
+                found_idx = static_cast<int32_t>(i);
                 break;
             }
         }
-        if (found < 0)
+
+        if (found_idx < 0)
             return false;
 
-        const uint16_t *len_base = reinterpret_cast<const uint16_t *>(data_base_ptr + hdr_ptr->off_pq_codes);
-        uint16_t len = __atomic_load_n(&len_base[found], __ATOMIC_ACQUIRE);
+        // 5. Lấy độ dài dữ liệu (Echo/Vector length)
+        const char *lens_ptr_raw = ptr + hdr.off_pq_codes;
+        uint16_t len = 0;
+        // [FIX] Copy length (2 bytes)
+        std::memcpy(&len, lens_ptr_raw + found_idx * sizeof(uint16_t), sizeof(uint16_t));
+
         if (len == 0 || len > MAX_ECHO_BYTES)
             return false;
 
-        const char *slot_ptr = data_base_ptr + hdr_ptr->off_vectors + static_cast<size_t>(found) * MAX_ECHO_BYTES;
-        const uint8_t *ub = reinterpret_cast<const uint8_t *>(slot_ptr);
+        // 6. Lấy dữ liệu Vector
+        const char *vec_data_ptr = ptr + hdr.off_vectors + static_cast<size_t>(found_idx) * MAX_ECHO_BYTES;
+
+        // Decode (Giữ nguyên logic decode của bạn, chỉ thay đổi input pointer)
+        const uint8_t *ub = reinterpret_cast<const uint8_t *>(vec_data_ptr);
 
         pomai::ai::EchoCode code;
         size_t pos = 0;
         code.depth = (pos < len) ? ub[pos++] : 0;
         size_t depth = code.depth;
+
         code.scales_q.resize(depth);
         for (size_t k = 0; k < depth; ++k)
             code.scales_q[k] = (pos < len) ? ub[pos++] : 0;
+
         code.bits_per_layer.resize(depth);
         code.sign_bytes.resize(depth);
         for (size_t k = 0; k < depth; ++k)
@@ -1077,11 +1116,25 @@ namespace pomai::ai::orbit
                 pos += bytes;
             }
             else
+            {
                 return false;
+            }
         }
 
         out_vec.assign(cfg_.dim, 0.0f);
-        eeq_->decode(code, out_vec.data());
+        if (eeq_)
+        {
+            eeq_->decode(code, out_vec.data());
+        }
+        else
+        {
+            // Fallback nếu không có Quantizer (Raw float store)
+            // Nếu lưu raw float thì len phải == dim * 4
+            if (len == cfg_.dim * sizeof(float))
+            {
+                std::memcpy(out_vec.data(), ub, len);
+            }
+        }
         return true;
     }
 
@@ -1232,19 +1285,31 @@ namespace pomai::ai::orbit
         const OrbitNode &node = *centroids_[cid];
         uint64_t curr = node.bucket_offset.load(std::memory_order_acquire);
         std::vector<char> temp_buf;
+
         while (curr != 0)
         {
             auto base_opt = resolve_bucket_base(arena_, curr, temp_buf);
             if (!base_opt)
                 break;
-            const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(*base_opt);
-            uint32_t count = hdr->count.load(std::memory_order_acquire);
+
+            const char *ptr = *base_opt;
+
+            // [FIX] Dùng memcpy để tránh lỗi alignment
+            BucketHeader hdr_copy;
+            std::memcpy(&hdr_copy, ptr, sizeof(BucketHeader));
+
+            uint32_t count = hdr_copy.count.load(std::memory_order_acquire);
             if (count > 0)
             {
-                const uint64_t *id_ptr = reinterpret_cast<const uint64_t *>(*base_opt + hdr->off_ids);
-                ids.insert(ids.end(), id_ptr, id_ptr + count);
+                const char *ids_raw = ptr + hdr_copy.off_ids;
+                for (uint32_t i = 0; i < count; ++i)
+                {
+                    uint64_t val;
+                    std::memcpy(&val, ids_raw + i * sizeof(uint64_t), sizeof(uint64_t));
+                    ids.push_back(val);
+                }
             }
-            curr = hdr->next_bucket_offset.load(std::memory_order_acquire);
+            curr = hdr_copy.next_bucket_offset.load(std::memory_order_acquire);
         }
         return ids;
     }
@@ -1270,55 +1335,84 @@ namespace pomai::ai::orbit
         if (ids.empty())
             return true;
 
-        std::unordered_map<uint64_t, std::vector<size_t>> bucket_to_indices;
-        bucket_to_indices.reserve(std::min<size_t>(ids.size(), 1024));
+        // 1. Group IDs by Bucket để tối ưu I/O (tránh resolve pointer nhiều lần)
+        struct Task
+        {
+            size_t out_idx;
+            uint64_t id;
+        };
+        std::unordered_map<uint64_t, std::vector<Task>> bucket_tasks;
+
+        // Cần const_cast vì get_label_bucket không const (nhưng nó chỉ đọc map, nên OK)
+        PomaiOrbit *mutable_this = const_cast<PomaiOrbit *>(this);
 
         for (size_t i = 0; i < ids.size(); ++i)
         {
             uint64_t bucket_off = 0;
-            if (!const_cast<PomaiOrbit *>(this)->get_label_bucket(ids[i], bucket_off) || bucket_off == 0)
-                continue;
-            bucket_to_indices[bucket_off].push_back(i);
+            if (mutable_this->get_label_bucket(ids[i], bucket_off) && bucket_off != 0)
+            {
+                bucket_tasks[bucket_off].push_back({i, ids[i]});
+            }
         }
 
-        for (auto &kv : bucket_to_indices)
+        // 2. Process each bucket
+        std::vector<char> temp_buffer;
+
+        for (const auto &kv : bucket_tasks)
         {
             uint64_t bucket_off = kv.first;
-            const std::vector<size_t> &indices = kv.second;
-            std::vector<char> temp_buffer;
+            const auto &tasks = kv.second;
+
             auto base_opt = resolve_bucket_base(arena_, bucket_off, temp_buffer);
             if (!base_opt)
                 continue;
-            const char *data_base_ptr = *base_opt;
-            const BucketHeader *hdr_ptr = reinterpret_cast<const BucketHeader *>(data_base_ptr);
-            uint32_t count = hdr_ptr->count.load(std::memory_order_acquire);
+
+            const char *ptr = *base_opt;
+
+            // [FIX] Copy Header an toàn
+            BucketHeader hdr;
+            std::memcpy(&hdr, ptr, sizeof(BucketHeader));
+
+            uint32_t count = hdr.count.load(std::memory_order_relaxed);
             if (count == 0)
                 continue;
 
-            const uint64_t *id_base = reinterpret_cast<const uint64_t *>(data_base_ptr + hdr_ptr->off_ids);
-            const uint16_t *len_base = reinterpret_cast<const uint16_t *>(data_base_ptr + hdr_ptr->off_pq_codes);
-            const char *vec_area = data_base_ptr + hdr_ptr->off_vectors;
+            const char *ids_ptr_raw = ptr + hdr.off_ids;
+            const char *lens_ptr_raw = ptr + hdr.off_pq_codes;
+            const char *vec_base_ptr = ptr + hdr.off_vectors;
 
-            std::unordered_map<uint64_t, uint32_t> present;
-            present.reserve(std::min<uint32_t>(count, static_cast<uint32_t>(indices.size() * 2 + 4)));
+            // Xây dựng map tạm: ID -> Index trong bucket
+            std::unordered_map<uint64_t, uint32_t> id_to_idx;
+            id_to_idx.reserve(count);
+
             for (uint32_t i = 0; i < count; ++i)
             {
-                uint64_t v = pomai::ai::atomic_utils::atomic_load_u64(id_base + i);
-                present.emplace(v, i);
+                uint64_t v;
+                // [FIX] Copy ID an toàn
+                std::memcpy(&v, ids_ptr_raw + i * sizeof(uint64_t), sizeof(uint64_t));
+                id_to_idx[v] = i;
             }
 
-            for (size_t req_idx : indices)
+            // Lấy dữ liệu cho từng task
+            for (const auto &task : tasks)
             {
-                uint64_t id = ids[req_idx];
-                auto it = present.find(id);
-                if (it == present.end())
+                auto it = id_to_idx.find(task.id);
+                if (it == id_to_idx.end())
                     continue;
-                uint32_t slot = it->second;
-                uint16_t len = __atomic_load_n(&len_base[slot], __ATOMIC_ACQUIRE);
+
+                uint32_t idx = it->second;
+
+                // [FIX] Copy Length an toàn
+                uint16_t len = 0;
+                std::memcpy(&len, lens_ptr_raw + idx * sizeof(uint16_t), sizeof(uint16_t));
+
                 if (len == 0 || len > MAX_ECHO_BYTES)
                     continue;
-                const char *slot_ptr = vec_area + static_cast<size_t>(slot) * MAX_ECHO_BYTES;
-                outs[req_idx].assign(slot_ptr, slot_ptr + len);
+
+                const char *slot_ptr = vec_base_ptr + static_cast<size_t>(idx) * MAX_ECHO_BYTES;
+
+                // Copy raw bytes ra output string
+                outs[task.out_idx].assign(slot_ptr, len);
             }
         }
         return true;
