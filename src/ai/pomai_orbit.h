@@ -190,11 +190,9 @@ namespace pomai::ai::orbit
         bool checkpoint();
 
     private:
-        // [FIXED] Internal insert for replay/memory-only ops
         bool insert_batch_memory_only(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
-
-        // [FIXED] Recovery function
         void recover_from_wal();
+        void rebuild_index();
 
         Config cfg_;
         ArenaView arena_;
@@ -247,5 +245,6 @@ namespace pomai::ai::orbit
         uint64_t alloc_new_bucket(uint32_t centroid_id);
         bool compute_distance_for_id(const float *query, uint64_t id, float &out_dist);
         bool compute_distance_for_id_with_proj(const std::vector<std::vector<float>> &qproj, float qnorm2, uint64_t id, float &out_dist);
+        mutable std::shared_mutex checkpoint_mu_;
     };
 } // namespace pomai::ai::orbit

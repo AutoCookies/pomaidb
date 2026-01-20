@@ -81,12 +81,6 @@ namespace pomai::core
         bool save_all_membrances();
         bool insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
 
-        // New: iterate in batches and deliver raw stored bytes to a consumer callback.
-        // - mode: "TRAIN"/"VAL"/"TEST" or empty/other to mean "all"
-        // - off/lim: offset and limit within the selected index list
-        // - batch_size: number of vectors per invocation to the consumer
-        // - consumer: function(ids, concatenated_raw_bytes, per_vector_bytes)
-        //   per_vector_bytes is the element_size * dim for this membrance (fixed per call)
         bool iterate_batch(const std::string &membr,
                            const std::string &mode,
                            size_t off,
@@ -99,6 +93,9 @@ namespace pomai::core
 
     private:
         bool load_manifest();
+        // [FIX] Helper function for saving manifest without locking
+        bool save_manifest_internal();
+        
         bool create_membrance_internal(const std::string &name, const MembranceConfig &cfg);
         void background_worker();
 

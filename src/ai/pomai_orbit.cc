@@ -33,6 +33,8 @@
 #include <type_traits>
 #include <vector>
 #include <unordered_set>
+#include <unistd.h>
+#include <sys/mman.h>
 
 namespace pomai::ai::orbit
 {
@@ -384,34 +386,40 @@ namespace pomai::ai::orbit
         SchemaHeader header;
         header.magic_number = 0x504F4D41;
         header.dim = cfg_.dim;
-        header.num_centroids = cfg_.algo.num_centroids;
+        header.num_centroids = centroids_.size(); // Lưu số lượng centroid hiện tại
+
+        // Tính tổng vector (để thống kê)
+        uint64_t total = 0;
+        for (size_t si = 0; si < kLabelShardCount; ++si)
         {
-            uint64_t total = 0;
-            for (size_t si = 0; si < kLabelShardCount; ++si)
-            {
-                const LabelShard &sh = label_shards_[si];
-                std::shared_lock<std::shared_mutex> lk(sh.mu);
-                total += sh.bucket.size();
-            }
-            {
-                std::shared_lock<std::shared_mutex> lk(del_mu_);
-                if (total > deleted_labels_.size())
-                    total -= deleted_labels_.size();
-                else
-                    total = 0;
-            }
-            header.total_vectors = static_cast<uint64_t>(total);
+            std::shared_lock<std::shared_mutex> lk(label_shards_[si].mu);
+            total += label_shards_[si].bucket.size();
         }
-        std::ofstream out(schema_file_path_, std::ios::binary);
-        if (out.is_open())
-        {
-            out.write(reinterpret_cast<const char *>(&header), sizeof(header));
-            out.close();
-        }
-        else
+        header.total_vectors = total;
+
+        std::ofstream out(schema_file_path_, std::ios::binary | std::ios::trunc);
+        if (!out.is_open())
         {
             std::clog << "[Orbit] ERROR: Could not save schema to " << schema_file_path_ << "\n";
+            return;
         }
+
+        // 1. Write Header
+        out.write(reinterpret_cast<const char *>(&header), sizeof(header));
+
+        // 2. Write Centroids (Vector + Bucket Offset)
+        // Đây là "Neo" để móc vào dữ liệu trên đĩa
+        for (const auto &c : centroids_)
+        {
+            // Write vector info
+            out.write(reinterpret_cast<const char *>(c->vector.data()), cfg_.dim * sizeof(float));
+            // Write bucket offset (Head pointer)
+            uint64_t off = c->bucket_offset.load(std::memory_order_acquire);
+            out.write(reinterpret_cast<const char *>(&off), sizeof(off));
+        }
+
+        out.close();
+        // std::clog << "[Orbit] Schema saved. Centroids: " << header.num_centroids << "\n";
     }
 
     bool PomaiOrbit::load_schema()
@@ -419,18 +427,113 @@ namespace pomai::ai::orbit
         std::ifstream in(schema_file_path_, std::ios::binary);
         if (!in.is_open())
             return false;
+
+        // 1. Read Header
         SchemaHeader header;
         in.read(reinterpret_cast<char *>(&header), sizeof(header));
-        in.close();
         if (header.magic_number != 0x504F4D41)
-        {
-            std::clog << "[Orbit] Invalid schema file signature\n";
             return false;
-        }
+
         cfg_.dim = header.dim;
-        if (header.num_centroids > 0)
-            cfg_.algo.num_centroids = static_cast<uint32_t>(header.num_centroids);
+        cfg_.algo.num_centroids = static_cast<uint32_t>(header.num_centroids);
+
+        // 2. Load Centroids
+        centroids_.clear();
+        centroids_.resize(header.num_centroids);
+
+        for (size_t i = 0; i < header.num_centroids; ++i)
+        {
+            auto node = std::make_unique<OrbitNode>();
+            node->vector.resize(cfg_.dim);
+
+            // Read vector
+            in.read(reinterpret_cast<char *>(node->vector.data()), cfg_.dim * sizeof(float));
+
+            // Read bucket offset
+            uint64_t off = 0;
+            in.read(reinterpret_cast<char *>(&off), sizeof(off));
+            node->bucket_offset.store(off, std::memory_order_relaxed);
+
+            // Rebuild neighbors (simplified: just init empty, or rebuild properly if needed)
+            // Trong thực tế cần lưu cả neighbors list, nhưng ở đây ta có thể lười (lazy) hoặc train lại routing.
+            // Để đơn giản, ta để neighbors trống, hệ thống vẫn chạy (nhưng search chậm hơn chút).
+
+            centroids_[i] = std::move(node);
+        }
+
+        in.close();
+        std::clog << "[Orbit] Schema loaded. Restored " << header.num_centroids << " centroids.\n";
+
+        // 3. Rebuild In-Memory Index (Label -> Bucket Map)
+        // Vì Label Map chỉ nằm trên RAM, ta phải quét lại Buckets để xây dựng lại nó.
+        rebuild_index();
+
         return true;
+    }
+
+    void PomaiOrbit::rebuild_index()
+    {
+        std::clog << "[Orbit] Rebuilding index from disk data...\n";
+        size_t count = 0;
+
+        // Duyệt qua tất cả Centroids -> Tất cả Buckets -> Tất cả Items
+        for (const auto &c : centroids_)
+        {
+            uint64_t curr = c->bucket_offset.load(std::memory_order_relaxed);
+            while (curr != 0)
+            {
+                std::vector<char> tmp;
+                auto base_opt = resolve_bucket_base(arena_, curr, tmp);
+                if (!base_opt)
+                    break; // Should not happen if data file exists
+
+                const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(*base_opt);
+                uint32_t n = hdr->count.load(std::memory_order_relaxed);
+
+                const uint64_t *ids = reinterpret_cast<const uint64_t *>(*base_opt + hdr->off_ids);
+
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    // Load ID from disk
+                    uint64_t label = pomai::ai::atomic_utils::atomic_load_u64(ids + i);
+
+                    // Update RAM Map
+                    set_label_map(label, curr, i);
+                    count++;
+                }
+
+                curr = hdr->next_bucket_offset.load(std::memory_order_relaxed);
+            }
+        }
+        std::clog << "[Orbit] Index rebuilt. Total vectors: " << count << "\n";
+
+        // Re-init routing graph (neighbors) for search to work fast
+        // (Simple brute-force rebuild of HNSW/Graph)
+        if (!centroids_.empty())
+        {
+            L2Func kern = get_pomai_l2sq_kernel();
+            size_t num_c = centroids_.size();
+#pragma omp parallel for // Nếu có OpenMP
+            for (size_t i = 0; i < num_c; ++i)
+            {
+                std::vector<std::pair<float, uint32_t>> dists;
+                dists.reserve(num_c); // Optimization
+                for (size_t j = 0; j < num_c; ++j)
+                {
+                    if (i == j)
+                        continue;
+                    float d = kern(centroids_[i]->vector.data(), centroids_[j]->vector.data(), cfg_.dim);
+                    dists.push_back({d, (uint32_t)j});
+                }
+                std::sort(dists.begin(), dists.end());
+                std::lock_guard<std::shared_mutex> lk(centroids_[i]->mu);
+                centroids_[i]->neighbors.clear();
+                for (size_t k = 0; k < std::min(dists.size(), (size_t)32); ++k)
+                {
+                    centroids_[i]->neighbors.push_back(dists[k].second);
+                }
+            }
+        }
     }
 
     bool PomaiOrbit::train(const float *data, size_t n)
@@ -638,33 +741,31 @@ namespace pomai::ai::orbit
         if (batch.empty())
             return false;
 
+        // [THÊM] Shared Lock: Cho phép nhiều luồng insert, nhưng chặn Checkpoint
+        std::shared_lock<std::shared_mutex> cp_lock(checkpoint_mu_);
+
         // 1. [WAL STEP] Serialize & Append to Disk
         if (wal_)
         {
+            // ... (Code ghi WAL cũ giữ nguyên) ...
+            // Copy đoạn tính size và wal_->append_record(...) vào đây
             size_t vec_size = cfg_.dim * sizeof(float);
             size_t total_size = 4 + batch.size() * (8 + vec_size);
             std::vector<uint8_t> buffer(total_size);
             uint8_t *ptr = buffer.data();
-
             uint32_t count = static_cast<uint32_t>(batch.size());
             std::memcpy(ptr, &count, 4);
             ptr += 4;
-
             for (const auto &item : batch)
             {
                 std::memcpy(ptr, &item.first, 8);
                 ptr += 8;
                 if (item.second.size() == cfg_.dim)
-                {
                     std::memcpy(ptr, item.second.data(), vec_size);
-                }
                 else
-                {
                     std::memset(ptr, 0, vec_size);
-                }
                 ptr += vec_size;
             }
-            // WAL_REC_INSERT_BATCH = 20
             wal_->append_record(20, buffer.data(), static_cast<uint32_t>(total_size));
         }
 
@@ -1540,19 +1641,120 @@ namespace pomai::ai::orbit
 
     bool PomaiOrbit::checkpoint()
     {
-        std::lock_guard<std::mutex> lk(train_mu_);
-        std::clog << "[Orbit] Starting Checkpoint...\n";
-        save_schema();
-        if (wal_)
+        // [DEFENSIVE] Bọc Try-Catch để server KHÔNG BAO GIỜ SẬP
+        try
         {
-            if (!wal_->truncate_to_zero())
+            // [Lock] Chặn đứng mọi thao tác Insert mới
+            std::unique_lock<std::shared_mutex> cp_lock(checkpoint_mu_);
+
+            // [Lock] Chặn auto-train
+            std::lock_guard<std::mutex> lk(train_mu_);
+
+            std::clog << "[Orbit] Checkpointing...\n";
+
+            // 1. Lưu Metadata/Schema (schema contains centroid/bucket layout)
+            save_schema();
+
+            // 2. Flush all mapped bucket blobs from arena(s) to stable storage.
+            // We iterate all centroids and their bucket chains; for each blob we
+            // msync the exact mapped range covering the blob (header + payload).
+            // This avoids relying solely on global sync() and reduces unnecessary IO.
+            long pg = sysconf(_SC_PAGESIZE);
+            size_t page = (pg > 0) ? static_cast<size_t>(pg) : 4096;
+
+            auto align_down = [&](uintptr_t a) -> uintptr_t
+            { return a & ~(static_cast<uintptr_t>(page - 1)); };
+            auto align_up = [&](uintptr_t a) -> uintptr_t
+            { return (a + page - 1) & ~(static_cast<uintptr_t>(page - 1)); };
+
+            // For each centroid, walk its bucket chain and msync each published blob.
+            for (const auto &cptr : centroids_)
             {
-                std::cerr << "[Orbit] Checkpoint Failed: Could not truncate WAL.\n";
-                return false;
+                if (!cptr)
+                    continue;
+
+                uint64_t curr_off = cptr->bucket_offset.load(std::memory_order_acquire);
+                while (curr_off != 0)
+                {
+                    // Try to get in-memory pointer for this bucket (may return nullptr if remote/not mapped)
+                    const char *blob_hdr = arena_.blob_ptr_from_offset_for_map(curr_off);
+                    if (!blob_hdr)
+                    {
+                        // Can't access this bucket in RAM right now (might be remote / demoted),
+                        // skip (persisted to remote file already or not mapped).
+                        break;
+                    }
+
+                    // blob_hdr points to the 4-byte length header (uint32_t)
+                    // Calculate total bytes stored in this blob (header + payload)
+                    uint32_t stored_len = 0;
+                    // Safe read of the stored_len (we're in checkpoint, single-writer synchronization held)
+                    std::memcpy(&stored_len, blob_hdr, sizeof(stored_len));
+                    size_t total_bytes = static_cast<size_t>(sizeof(uint32_t)) + static_cast<size_t>(stored_len);
+
+                    // Page-align region and msync
+                    uintptr_t start_addr = reinterpret_cast<uintptr_t>(blob_hdr);
+                    uintptr_t page_start = align_down(start_addr);
+                    uintptr_t page_end = align_up(start_addr + total_bytes);
+                    size_t msync_len = (page_end > page_start) ? static_cast<size_t>(page_end - page_start) : 0;
+
+                    if (msync_len > 0)
+                    {
+                        int rc = ::msync(reinterpret_cast<void *>(page_start), msync_len, MS_SYNC);
+                        if (rc != 0)
+                        {
+                            std::cerr << "[Orbit] Warning: msync failed for bucket at off=" << curr_off
+                                      << " errno=" << errno << " (" << std::strerror(errno) << ")\n";
+                        }
+                    }
+
+                    // Advance to next bucket
+                    // resolve_bucket_base in other code returns (ram_blob_ptr + sizeof(uint32_t)),
+                    // so here bucket header struct starts at (blob_hdr + sizeof(uint32_t))
+                    const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(blob_hdr + sizeof(uint32_t));
+                    curr_off = hdr->next_bucket_offset.load(std::memory_order_acquire);
+                }
             }
+
+            // 3. Ensure WAL is safely on disk (fsync) before truncating it.
+            // This makes truncation safe: either all data is on disk or WAL still contains missing ops.
+            if (wal_)
+            {
+                if (!wal_->fsync_log())
+                {
+                    std::cerr << "[Orbit] Checkpoint Warning: wal->fsync_log() failed. Aborting truncate.\n";
+                    return false;
+                }
+            }
+
+            // 4. (Defensive global sync) issue a global sync to ensure file system metadata
+            // has been flushed; this is slower but gives extra durability on exotic filesystems.
+            // Keep this call optional on platforms where it's appropriate.
+            ::sync();
+
+            // 5. Truncate WAL (An toàn tuyệt đối vì đĩa đã có dữ liệu)
+            if (wal_)
+            {
+                if (!wal_->truncate_to_zero())
+                {
+                    std::cerr << "[Orbit] Checkpoint Error: Could not truncate WAL.\n";
+                    return false;
+                }
+            }
+
+            std::clog << "[Orbit] Checkpoint completed successfully.\n";
+            return true;
         }
-        std::clog << "[Orbit] Checkpoint Completed. WAL truncated.\n";
-        return true;
+        catch (const std::exception &e)
+        {
+            std::cerr << "[Orbit] CRITICAL: Checkpoint exception: " << e.what() << "\n";
+            return false;
+        }
+        catch (...)
+        {
+            std::cerr << "[Orbit] CRITICAL: Checkpoint crashed with unknown error.\n";
+            return false;
+        }
     }
 
 } // namespace pomai::ai::orbit

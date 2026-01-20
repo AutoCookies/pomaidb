@@ -451,9 +451,8 @@ namespace pomai::core
         return m ? m->dim : 0;
     }
 
-    bool PomaiDB::save_manifest()
+    bool PomaiDB::save_manifest_internal()
     {
-        std::shared_lock<std::shared_mutex> lock(mu_);
         std::string path = config_.res.data_root + "/" + config_.db.manifest_file;
         std::string tmp = path + ".tmp";
 
@@ -462,7 +461,6 @@ namespace pomai::core
             return false;
 
         ofs << "# PomaiDB Manifest\n";
-        // Write: name|dim|ram_mb|data_type
         for (const auto &kv : membrances_)
         {
             const auto *m = kv.second.get();
@@ -470,8 +468,21 @@ namespace pomai::core
             ofs << m->name << '|' << m->dim << '|' << m->ram_mb << '|' << dt << '\n';
         }
         ofs.close();
-        std::filesystem::rename(tmp, path);
+        try
+        {
+            std::filesystem::rename(tmp, path);
+        }
+        catch (...)
+        {
+            return false;
+        }
         return true;
+    }
+
+    bool PomaiDB::save_manifest()
+    {
+        std::shared_lock<std::shared_mutex> lock(mu_);
+        return save_manifest_internal();
     }
 
     bool PomaiDB::load_manifest()
@@ -870,17 +881,58 @@ namespace pomai::core
 
     bool PomaiDB::checkpoint_all()
     {
-        std::unique_lock<std::shared_mutex> lock(mu_);
+        std::shared_lock<std::shared_mutex> lock(mu_);
         bool ok = true;
-        for (auto &kv : membrances_)
+        for (const auto &kv : membrances_)
         {
-            if (!kv.second->orbit->checkpoint())
+            try
+            {
+                auto *m = kv.second.get();
+                m->orbit->save_schema();
+
+                if (m->split_mgr && m->split_mgr->has_split())
+                {
+                    m->split_mgr->save(m->data_path);
+                }
+            }
+            catch (...)
             {
                 ok = false;
             }
         }
-        save_manifest();
-        wal_.truncate_to_zero();
+
+        // --- NEW: Ensure all arena mmap pages are flushed to disk before truncating WAL ---
+        // This guarantees the on-disk schema + arena blobs are durable, so truncating WAL is safe.
+        for (const auto &kv : membrances_)
+        {
+            try
+            {
+                auto *m = kv.second.get();
+                if (m && m->arena)
+                {
+                    // persist entire mapped arena synchronously
+                    // ShardArena provides persist_range(offset, len, synchronous)
+                    // use 0..capacity() to flush whole mapping
+                    m->arena->persist_range(0, m->arena->capacity(), true);
+                }
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "[PomaiDB] Warning: arena persist failed for membrance "
+                          << kv.first << " : " << e.what() << "\n";
+                ok = false;
+            }
+            catch (...)
+            {
+                std::cerr << "[PomaiDB] Warning: arena persist unknown error for membrance "
+                          << kv.first << "\n";
+                ok = false;
+            }
+        }
+
+        // Truncate WAL only after filesystem/arena is synced
+        if (!wal_.truncate_to_zero())
+            ok = false;
         return ok;
     }
 

@@ -1,7 +1,9 @@
-// src/memory/shard_arena.cc
-//
-// File-backed ShardArena implementation using mmap(MAP_SHARED).
-// See header for behavior notes.
+/*
+ * src/memory/shard_arena.cc
+ *
+ * File-backed ShardArena implementation using mmap(MAP_SHARED).
+ * See header for behavior notes.
+ */
 
 #include "src/memory/shard_arena.h"
 
@@ -251,9 +253,14 @@ namespace pomai::memory
         if (offset == 0 || offset >= capacity_)
             return nullptr;
 
-        uint64_t wh = write_head_.load(std::memory_order_acquire);
-        if (offset >= wh)
-            return nullptr; // not yet published
+        // NOTE:
+        // Previously we rejected offsets >= write_head_ (not yet published).
+        // On restart the mapping may still contain persisted data even though
+        // write_head_ was reset. For file-backed mmap we should allow reading
+        // offsets that lie within capacity_ so that saved schema bucket offsets
+        // can be recovered. Ensure a minimal bounds check (header size).
+        if (offset + sizeof(uint32_t) > capacity_)
+            return nullptr;
 
         return base_addr_ + static_cast<size_t>(offset);
     }
@@ -295,7 +302,6 @@ namespace pomai::memory
         }
         fsync(fd);
         close(fd);
-
         if (rename(tmp.c_str(), fname.c_str()) != 0)
         {
             unlink(tmp.c_str());

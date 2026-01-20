@@ -17,7 +17,7 @@ PORT = 7777
 DB_NAME = 'bench_db'
 DIM = 128
 BATCH_SIZE = 100       # Insert 100 vectors per command
-WAL_PATH = "./data/orbit.wal" # Đường dẫn file WAL mặc định
+WAL_PATH = "./data/pomai_db/bench_db/orbit.wal"
 
 def get_file_size_mb(path):
     try:
