@@ -1,4 +1,3 @@
-#pragma once
 /*
  * src/ai/eternalecho_quantizer.h
  *
@@ -8,6 +7,8 @@
  * - The canonical config struct now lives in pomai::config::EternalEchoConfig
  *   and we bring a local alias (pomai::ai::EternalEchoConfig) for backwards-compatibility.
  */
+
+#pragma once
 
 #include <cstdint>
 #include <vector>
@@ -84,6 +85,10 @@ namespace pomai::ai
 
         // Per-layer precomputed column energy sums
         std::vector<float> layer_col_energy_; // length = layers
+
+        // Per-layer Gram matrices (flattened b*b) for exact per-layer recon norm computation
+        // layer_grams_[k] is size b*b where b = cfg_.bits_per_layer[k], layout row-major G[i*b + j] = col_i · col_j
+        std::vector<std::vector<float>> layer_gram_matrices_;
 
         // RNG seed used to generate proj_
         uint64_t seed_;

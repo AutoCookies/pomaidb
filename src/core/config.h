@@ -29,7 +29,7 @@ namespace pomai::config
         uint32_t max_depth = 5;
         float stop_threshold = 1e-2f;
         bool quantize_scales = true;
-        float scale_quant_max = 4.0f;
+        float scale_quant_max = 20.0f;
     };
 
     struct FingerprintConfig
@@ -169,27 +169,30 @@ namespace pomai::config
         size_t initial_arena_size_mb = 64;
         float growth_factor = 2.0f;
         size_t alignment = 8;
-        size_t fallback_page_size = 4096;  
-        int default_file_permissions = 0644; 
+        size_t fallback_page_size = 4096;
+        int default_file_permissions = 0644;
         bool prefer_fallocate = true;
     };
 
-    struct ArenaConfig {
-        float seed_region_ratio = 0.25f;       // Tỷ lệ vùng Seed trong Arena
-        size_t max_remote_mmaps = 256;         // Số lượng file mmap tối đa được cache
-        size_t demote_batch_bytes = 4*1024*1024; // 4MB per batch cho worker
-        uint64_t min_blob_block = 64;          // Kích thước block tối thiểu
-        size_t max_freelist_per_bucket = 4096; // Tránh freelist phình quá to
-        std::string remote_dir = "/tmp";       // Thư mục lưu blob demote
+    struct ArenaConfig
+    {
+        float seed_region_ratio = 0.25f;             // Tỷ lệ vùng Seed trong Arena
+        size_t max_remote_mmaps = 256;               // Số lượng file mmap tối đa được cache
+        size_t demote_batch_bytes = 4 * 1024 * 1024; // 4MB per batch cho worker
+        uint64_t min_blob_block = 64;                // Kích thước block tối thiểu
+        size_t max_freelist_per_bucket = 4096;       // Tránh freelist phình quá to
+        std::string remote_dir = "/tmp";             // Thư mục lưu blob demote
     };
-    
-    struct WalConfig {
+
+    struct WalConfig
+    {
         bool sync_on_append = true;
         size_t batch_commit_size = 0;
     };
 
     // [NEW] Cấu hình cho Data Split (Train/Val/Test)
-    struct SplitConfig {
+    struct SplitConfig
+    {
         std::string file_name = "splits.bin";
         float default_train_ratio = 0.8f;
         float default_val_ratio = 0.1f;
@@ -197,11 +200,12 @@ namespace pomai::config
     };
 
     // [NEW] Cấu hình cho Server (TCP/Epoll tuning)
-    struct ServerConfig {
-        int backlog = 1024;              // Kích thước hàng đợi kết nối (cho hàm listen)
-        int max_events = 1024;           // Số lượng sự kiện tối đa xử lý trong một vòng lặp epoll
-        int epoll_timeout_ms = 100;      // Thời gian chờ của epoll (ms)
-        int cpu_sample_interval_ms = 200;// Chu kỳ lấy mẫu CPU cho WhisperGrain (ms)
+    struct ServerConfig
+    {
+        int backlog = 1024;               // Kích thước hàng đợi kết nối (cho hàm listen)
+        int max_events = 1024;            // Số lượng sự kiện tối đa xử lý trong một vòng lặp epoll
+        int epoll_timeout_ms = 100;       // Thời gian chờ của epoll (ms)
+        int cpu_sample_interval_ms = 200; // Chu kỳ lấy mẫu CPU cho WhisperGrain (ms)
     };
 
     // --- Compile-time Constants ---
@@ -254,8 +258,8 @@ namespace pomai::config
         StorageConfig storage;
         ArenaConfig arena;
         WalConfig wal;
-        ServerConfig server; 
-        SplitConfig split;  
+        ServerConfig server;
+        SplitConfig split;
 
         PomaiConfig()
         {

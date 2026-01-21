@@ -3,10 +3,17 @@
  *
  * Pomai EternalEcho Quantizer (EESQ) - High Performance Implementation
  *
- * Optimizations:
- * - Uses vectorized kernels (pomai_packed_signed_dot) for AVX2/512 speed.
- * - Correctly handles unnormalized vectors via precomputed layer_col_energy_.
- * - Zero-allocation hot paths using thread_local buffers.
+ * Robustified to guard against NaN/Inf, numeric overflow and tiny scales
+ * that caused NaNs to appear after repeated residual updates.
+ *
+ * - Validate inputs (NaN/Inf) early.
+ * - Clamp / sanitize norms and scales to safe ranges.
+ * - Check residual after each layer; bail out with a clear error if it becomes invalid.
+ * - Defensive guards around quantization path and scale decoding consistency.
+ * - Fixed approx_dist_code_bytes: now parses code bytes, decodes reconstruction
+ *   into a thread-local buffer and computes exact distance using qproj for
+ *   the q·recon term. This removes the previous approximate recon-norm heuristic
+ *   which could diverge beyond acceptable tolerance.
  */
 
 #include "src/ai/eternalecho_quantizer.h"
@@ -19,10 +26,27 @@
 #include <stdexcept>
 #include <algorithm>
 #include <cassert>
+#include <limits>
 
 namespace pomai::ai
 {
     // -------------------- Helpers --------------------
+
+    static inline bool has_nan_or_inf(const float *v, size_t dim)
+    {
+        for (size_t i = 0; i < dim; ++i)
+        {
+            if (!std::isfinite(v[i]))
+                return true;
+        }
+        return false;
+    }
+
+    static inline void ensure_finite_or_throw(const float *v, size_t dim, const char *msg)
+    {
+        if (has_nan_or_inf(v, dim))
+            throw std::runtime_error(msg);
+    }
 
     EternalEchoQuantizer::EternalEchoQuantizer(size_t dim, const EternalEchoConfig &cfg, uint64_t seed)
         : dim_(dim), cfg_(cfg), seed_(seed)
@@ -59,8 +83,7 @@ namespace pomai::ai
                 proj_[base + d] = nd(rng);
         }
 
-        // [CORRECTION] Precompute per-layer column energy: sum_j ||col_j||^2
-        // This is crucial for correctly estimating ||Recon||^2 without full reconstruction.
+        // Precompute per-layer column energy: sum_j ||col_j||^2
         layer_col_energy_.assign(layers, 0.0f);
         for (size_t k = 0; k < layers; ++k)
         {
@@ -79,6 +102,9 @@ namespace pomai::ai
                 }
                 layer_sum += s;
             }
+            // guard: ensure non-zero positive value (columns are random gaussian; but be defensive)
+            if (!std::isfinite(layer_sum) || layer_sum <= 0.0)
+                layer_sum = static_cast<double>(b); // fallback conservative
             layer_col_energy_[k] = static_cast<float>(layer_sum);
         }
     }
@@ -122,6 +148,10 @@ namespace pomai::ai
         if (!vec)
             throw std::invalid_argument("EternalEchoQuantizer::encode: null vec");
 
+        // Quick input sanity check
+        if (has_nan_or_inf(vec, dim_))
+            throw std::invalid_argument("EternalEchoQuantizer::encode: input contains NaN or Inf");
+
         EchoCode code;
         size_t layers = layer_offsets_.size();
         code.bits_per_layer.resize(layers);
@@ -129,67 +159,109 @@ namespace pomai::ai
         std::vector<float> residual(dim_);
         std::memcpy(residual.data(), vec, dim_ * sizeof(float));
 
+        // compute original norm and sanitize
         float orig_norm = compute_vector_norm(vec);
-        if (orig_norm == 0.0f)
+        if (!std::isfinite(orig_norm) || orig_norm < 1e-9f)
             orig_norm = 1.0f;
 
         DotFunc dotk = get_pomai_dot_kernel();
         FmaFunc fmak = get_pomai_fma_kernel();
 
+        // per-layer loop
         for (size_t k = 0; k < layers; ++k)
         {
             uint32_t b = cfg_.bits_per_layer[k];
             code.bits_per_layer[k] = b;
             uint32_t col0 = layer_offsets_[k];
 
-            std::vector<float> proj_vals(b);
-            std::vector<int8_t> signs(b);
+            std::vector<float> proj_vals;
+            proj_vals.resize(b);
+            std::vector<int8_t> signs;
+            signs.resize(b);
 
+            // project residual onto columns
             for (uint32_t j = 0; j < b; ++j)
             {
                 const float *col_ptr = &proj_[(static_cast<size_t>(col0 + j) * dim_)];
                 float accf = dotk(col_ptr, residual.data(), dim_);
+                if (!std::isfinite(accf))
+                    accf = 0.0f; // defensive fallback
                 proj_vals[j] = accf;
                 signs[j] = (proj_vals[j] >= 0.0f) ? int8_t(+1) : int8_t(-1);
             }
 
+            // compute scale as average absolute projection; sanitize result
             double sum_abs = 0.0;
             for (uint32_t j = 0; j < b; ++j)
                 sum_abs += std::fabs(static_cast<double>(proj_vals[j]));
+
             float scale = static_cast<float>(sum_abs / static_cast<double>(b));
+            // sanitize scale to avoid tiny/NaN/Inf values that propagate to residual
+            if (!std::isfinite(scale) || scale < 1e-9f)
+                scale = 1e-6f;
 
             if (cfg_.quantize_scales)
             {
-                float s = std::min(scale, cfg_.scale_quant_max);
-                uint32_t q = static_cast<uint32_t>(std::round((s / cfg_.scale_quant_max) * 255.0f));
+                // clamp scale into [small_eps, scale_quant_max] then quantize
+                float s_clamped = std::min(std::max(scale, 1e-6f), cfg_.scale_quant_max);
+                uint32_t q = static_cast<uint32_t>(std::round((s_clamped / cfg_.scale_quant_max) * 255.0f));
                 if (q > 255)
                     q = 255;
                 code.scales_q.push_back(static_cast<uint8_t>(q));
             }
             else
             {
-                code.scales_f.push_back(scale);
+                // store full precision but clamp to safe range
+                float s_clamped = std::min(std::max(scale, 1e-6f), 1e12f);
+                code.scales_f.push_back(s_clamped);
             }
 
+            // pack sign bits
             std::vector<uint8_t> packed;
             pack_signs_to_bytes(signs, packed);
             code.sign_bytes.push_back(std::move(packed));
 
+            // Apply sign*scale to residual: residual -= scale * sign_j * col_j
+            // Defensive: ensure coeff finite for each j
             for (uint32_t j = 0; j < b; ++j)
             {
                 const float *col_ptr = &proj_[(static_cast<size_t>(col0 + j) * dim_)];
                 float sgn = static_cast<float>(signs[j]);
-                float coeff = scale * sgn;
-                fmak(residual.data(), col_ptr, -coeff, dim_);
+                float coeff = (cfg_.quantize_scales ? (
+                                                          (static_cast<float>(code.scales_q.back()) / 255.0f) * cfg_.scale_quant_max)
+                                                    : code.scales_f.back());
+                // In case quantization unexpectedly produced zero, fall back to 'scale'
+                if (!std::isfinite(coeff) || std::fabs(coeff) < 1e-12f)
+                {
+                    coeff = scale;
+                }
+                // subtract scaled column
+                // fmak(acc, val, scale, dim) does: acc[i] += val[i] * scale
+                // we want residual += col * (-coeff * sgn)
+                float cold_coeff = -coeff * sgn;
+                fmak(residual.data(), col_ptr, cold_coeff, dim_);
             }
 
             code.depth = static_cast<uint8_t>(k + 1);
 
+            // Validate residual numerics after update
+            if (has_nan_or_inf(residual.data(), dim_))
+            {
+                // Best-effort: attempt to repair by zeroing tiny infinities / NaNs -> but better to fail loudly
+                throw std::runtime_error("EternalEchoQuantizer::encode: residual contains NaN/Inf after layer updates");
+            }
+
             float res_norm = compute_vector_norm(residual.data());
+            if (!std::isfinite(res_norm))
+            {
+                throw std::runtime_error("EternalEchoQuantizer::encode: residual norm became non-finite");
+            }
+
             if (res_norm <= cfg_.stop_threshold * orig_norm)
                 break;
         }
 
+        // cleanup: if using full-precision scales flag mismatch, ensure consistency
         if (!cfg_.quantize_scales && !code.scales_q.empty())
             code.scales_q.clear();
 
@@ -231,6 +303,10 @@ namespace pomai::ai
                 if (k < code.scales_f.size())
                     scale = code.scales_f[k];
             }
+
+            // Defensive clamp on decode-time scale
+            if (!std::isfinite(scale) || std::fabs(scale) < 1e-12f)
+                scale = 1e-6f;
 
             for (uint32_t j = 0; j < b; ++j)
             {
@@ -287,10 +363,16 @@ namespace pomai::ai
     }
 
     // -------------------------------------------------------------------------
-    // [10/10 PERFORMANCE] approx_dist_code_bytes
+    // approx_dist_code_bytes (robust & consistent)
     // -------------------------------------------------------------------------
-    // Computes L2 distance directly from compressed bytes without full decode.
-    // Uses SIMD-accelerated packed signed dot product.
+    // This implementation parses the compact byte layout used by the server/test
+    // (depth, quantized scales, packed sign bytes), reconstructs the EchoCode,
+    // decodes the reconstruction into a thread-local buffer and computes the
+    // exact squared-L2 distance using qproj for q·recon term when available.
+    //
+    // This is slightly more expensive than the previous purely-analytic
+    // approximation but gives correct and stable scores (no large divergence).
+    //
     float EternalEchoQuantizer::approx_dist_code_bytes(
         const std::vector<std::vector<float>> &qproj,
         float qnorm2,
@@ -300,76 +382,107 @@ namespace pomai::ai
         if (!code_ptr || code_len == 0)
             return 0.0f;
 
-        // [PRECISION] Use double accumulators to prevent cancellation errors
-        double q_dot_recon = 0.0;
-        double recon_norm_sq = 0.0;
-
+        // Parse byte layout:
+        // [0] depth (1 byte)
+        // [1..depth] scales_q (one byte each)  -- test/serialize uses this layout
+        // [..] followed by packed sign bytes per layer (ceil(bits/8) each)
         size_t pos = 0;
         uint8_t depth = (pos < code_len) ? code_ptr[pos++] : 0;
+        if (depth == 0)
+            return qnorm2; // no recon -> distance is qnorm2
 
-        // 1. Unpack Scales (Zero-alloc thread_local)
-        static thread_local std::vector<float> scales;
-        if (scales.size() < depth)
-            scales.resize(depth);
+        EchoCode code;
+        code.depth = depth;
+        code.bits_per_layer.resize(depth);
+        code.sign_bytes.resize(depth);
+        code.scales_q.resize(depth);
 
+        // read scales_q (if truncated, fill with 0)
         for (size_t i = 0; i < depth; ++i)
         {
-            if (pos >= code_len)
-            {
-                scales[i] = 0.0f;
-                continue;
-            }
-            scales[i] = static_cast<float>(code_ptr[pos++]) / 255.0f; // Scale is [0..1] normalized here
-            // If scale_quant_max is involved, it should be applied.
-            // Assuming simplified model here or scale_quant_max=1 for ranking logic.
-            // If using real values: scales[i] *= cfg_.scale_quant_max;
+            if (pos < code_len)
+                code.scales_q[i] = code_ptr[pos++];
+            else
+                code.scales_q[i] = 0;
         }
 
-        // 2. Compute Dist Components Per Layer
-        // Formula: Dist^2 = ||Q||^2 + ||Recon||^2 - 2(Q . Recon)
+        // read sign bytes for each layer using cfg_.bits_per_layer to know sizes
         for (size_t k = 0; k < depth; ++k)
         {
-            if (k >= qproj.size())
+            uint32_t b = (k < cfg_.bits_per_layer.size()) ? cfg_.bits_per_layer[k] : 0;
+            code.bits_per_layer[k] = b;
+            size_t nbytes = (b + 7) / 8;
+            if (nbytes == 0)
+                continue;
+            if (pos + nbytes > code_len)
+            {
+                // truncated data => stop reading further
+                // adjust depth to what we actually parsed
+                code.depth = static_cast<uint8_t>(k);
                 break;
-
-            // Query projections for this layer: <q, col_j>
-            const auto &layer_qproj = qproj[k];
-
-            float scale = scales[k];
-            if (cfg_.quantize_scales)
-                scale *= cfg_.scale_quant_max; // Restore magnitude
-            double scale_d = static_cast<double>(scale);
-
-            uint32_t n_bits = static_cast<uint32_t>(layer_qproj.size());
-            size_t n_bytes = (n_bits + 7) / 8;
-
-            if (pos + n_bytes > code_len)
-                break;
-            const uint8_t *sign_bytes = code_ptr + pos;
-            pos += n_bytes;
-
-            // [OPTIMIZATION] SIMD Kernel Call
-            // Computes: sum(layer_qproj[j] * sign[j])
-            double layer_dot = ::pomai_packed_signed_dot(sign_bytes, layer_qproj.data(), n_bits);
-
-            q_dot_recon += layer_dot * scale_d;
-
-            // [CORRECTION] Use precomputed layer energy for norm
-            // ||Recon_layer||^2 = scale^2 * || sum(sign * col) ||^2
-            // Approx orthogonal columns: || sum(sign * col) ||^2 ~= sum ||col||^2
-            double layer_energy_factor = (k < layer_col_energy_.size())
-                                             ? static_cast<double>(layer_col_energy_[k])
-                                             : static_cast<double>(n_bits); // Fallback
-
-            recon_norm_sq += (scale_d * scale_d) * layer_energy_factor;
+            }
+            code.sign_bytes[k].assign(code_ptr + pos, code_ptr + pos + nbytes);
+            pos += nbytes;
         }
 
-        // 3. Final Assembly
-        double dist_sq = static_cast<double>(qnorm2) + recon_norm_sq - 2.0 * q_dot_recon;
+        // 1) Compute q·recon term using qproj if available
+        double q_dot_recon = 0.0;
+        for (size_t k = 0; k < code.depth; ++k)
+        {
+            if (k >= qproj.size())
+                break; // cannot compute qdot for remaining layers
+            const auto &layer_qproj = qproj[k];
+            uint32_t b = code.bits_per_layer[k];
+            const uint8_t *sign_bytes = (code.sign_bytes[k].empty()) ? nullptr : code.sign_bytes[k].data();
+            double layer_dot = 0.0;
+            if (sign_bytes && b > 0)
+            {
+                layer_dot = ::pomai_packed_signed_dot(sign_bytes, layer_qproj.data(), b);
+            }
+            float scale = 0.0f;
+            if (cfg_.quantize_scales)
+            {
+                scale = (static_cast<float>(code.scales_q[k]) / 255.0f) * cfg_.scale_quant_max;
+            }
+            else
+            {
+                if (k < code.scales_f.size())
+                    scale = code.scales_f[k];
+            }
+            if (!std::isfinite(scale))
+                scale = 0.0f;
+            q_dot_recon += layer_dot * static_cast<double>(scale);
+        }
 
-        // 4. Sanity Clamp
-        if (dist_sq < 1e-5)
-            dist_sq = 0.0;
+        // 2) Decode reconstruction into TLS buffer and compute recon norm exactly
+        thread_local std::vector<float> recon_tls;
+        if (recon_tls.size() < dim_)
+            recon_tls.resize(dim_);
+        std::fill(recon_tls.begin(), recon_tls.begin() + dim_, 0.0f);
+
+        // Use decode() to reconstruct into recon_tls (it uses code.scales_q / scales_f and sign_bytes)
+        try
+        {
+            decode(code, recon_tls.data());
+        }
+        catch (...)
+        {
+            // If decode fails for any reason, fallback to safe conservative estimate
+            // (treat recon as zero -> distance = qnorm2)
+            return qnorm2;
+        }
+
+        float recon_norm_sq = ::pomai_dot(recon_tls.data(), recon_tls.data(), dim_);
+
+        double dist_sq = static_cast<double>(qnorm2) + static_cast<double>(recon_norm_sq) - 2.0 * q_dot_recon;
+
+        if (!std::isfinite(dist_sq) || dist_sq < 0.0)
+        {
+            if (dist_sq < 0.0 && dist_sq > -1e-3)
+                dist_sq = 0.0;
+            else if (!std::isfinite(dist_sq))
+                dist_sq = static_cast<double>(qnorm2); // fallback
+        }
 
         return static_cast<float>(dist_sq);
     }

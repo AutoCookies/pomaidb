@@ -1,10 +1,4 @@
 #pragma once
-/*
- * src/ai/pomai_orbit.h
- *
- * PomaiOrbit public header (updated to integrate WhisperGrain controller + Thermal Thermodynamics).
- * [FIXED] Fully synchronized with WalManager API.
- */
 
 #include <vector>
 #include <atomic>
@@ -22,6 +16,7 @@
 #include <array>
 
 #include "src/ai/fingerprint.h"
+#include "src/ai/ids_block.h" // [NEW] Tích hợp IdsBlock
 #include "src/core/config.h"
 #include "src/ai/network_cortex.h"
 #include "src/core/metadata_index.h"
@@ -40,17 +35,20 @@ namespace pomai::ai::orbit
     struct SchemaHeader
     {
         uint32_t magic_number = 0x504F4D41;
-        uint32_t version = 1;
+        uint32_t version = 2; // Bump version for new POD layout
         uint64_t dim;
         uint64_t num_centroids;
         uint64_t total_vectors;
     };
 
+    // [CRITICAL FIX] Struct này phải là POD (Plain Old Data).
+    // Tuyệt đối KHÔNG dùng std::atomic trong struct sẽ ghi xuống đĩa.
+    // Việc truy cập atomic sẽ được thực hiện qua helper functions.
     struct BucketHeader
     {
         uint32_t centroid_id;
-        std::atomic<uint32_t> count;
-        std::atomic<uint64_t> next_bucket_offset;
+        uint32_t count;              // Atomic access via helper
+        uint64_t next_bucket_offset; // Atomic access via helper
         uint32_t off_fingerprints;
         uint32_t off_pq_codes;
         uint32_t off_vectors;
@@ -60,6 +58,7 @@ namespace pomai::ai::orbit
         uint64_t disk_offset;
         uint64_t last_access_ms;
     };
+    static_assert(std::is_trivially_copyable_v<BucketHeader>, "BucketHeader must be POD for disk IO");
 
     struct OrbitNode
     {
@@ -110,46 +109,6 @@ namespace pomai::ai::orbit
             bool use_cortex = true;
         };
 
-        struct DeletedBloom
-        {
-            static constexpr uint32_t kBits = 1 << 16;
-            static constexpr uint32_t kMask = kBits - 1;
-            alignas(64) uint8_t bits[kBits / 8]{};
-
-            static inline uint32_t h1(uint64_t x)
-            {
-                x ^= x >> 33;
-                x *= 0xff51afd7ed558ccdULL;
-                return uint32_t(x);
-            }
-            static inline uint32_t h2(uint64_t x)
-            {
-                x ^= x >> 29;
-                x *= 0xc4ceb9fe1a85ec53ULL;
-                return uint32_t(x);
-            }
-
-            inline void add(uint64_t v)
-            {
-                uint32_t a = h1(v) & kMask;
-                uint32_t b = h2(v) & kMask;
-                uint32_t c = (a ^ b) & kMask;
-                bits[a >> 3] |= 1u << (a & 7);
-                bits[b >> 3] |= 1u << (b & 7);
-                bits[c >> 3] |= 1u << (c & 7);
-            }
-
-            inline bool maybe_contains(uint64_t v) const
-            {
-                uint32_t a = h1(v) & kMask;
-                uint32_t b = h2(v) & kMask;
-                uint32_t c = (a ^ b) & kMask;
-                return (bits[a >> 3] & (1u << (a & 7))) &&
-                       (bits[b >> 3] & (1u << (b & 7))) &&
-                       (bits[c >> 3] & (1u << (c & 7)));
-            }
-        };
-
         PomaiOrbit(const Config &cfg, pomai::memory::PomaiArena *arena);
         PomaiOrbit(const Config &cfg, pomai::memory::ShardArena *arena);
         ~PomaiOrbit();
@@ -157,31 +116,26 @@ namespace pomai::ai::orbit
         bool train(const float *data, size_t n);
         bool insert(const float *vec, uint64_t label);
         bool insert_batch(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
+
+        // Search API
         std::vector<std::pair<uint64_t, float>> search(const float *query, size_t k, size_t nprobe = 0);
+        std::vector<std::pair<uint64_t, float>> search_filtered(const float *query, size_t k, const std::vector<uint64_t> &candidates);
+        std::vector<std::pair<uint64_t, float>> search_with_budget(const float *query, size_t k, const pomai::ai::Budget &budget, size_t nprobe = 0);
+        std::vector<std::pair<uint64_t, float>> search_filtered_with_budget(const float *query, size_t k, const std::vector<uint64_t> &candidates, const pomai::ai::Budget &budget);
 
         bool get(uint64_t label, std::vector<float> &out_vec);
         bool remove(uint64_t label);
 
-        std::vector<std::pair<uint64_t, float>> search_filtered(const float *query, size_t k, const std::vector<uint64_t> &candidates);
-
         void set_whisper_grain(std::shared_ptr<pomai::ai::WhisperGrain> wg) { whisper_ctrl_ = std::move(wg); }
         std::shared_ptr<pomai::ai::WhisperGrain> whisper_grain() const { return whisper_ctrl_; }
 
-        std::vector<std::pair<uint64_t, float>> search_with_budget(
-            const float *query, size_t k, const pomai::ai::Budget &budget, size_t nprobe = 0);
-
-        std::vector<std::pair<uint64_t, float>> search_filtered_with_budget(
-            const float *query, size_t k, const std::vector<uint64_t> &candidates, const pomai::ai::Budget &budget);
-
         void save_schema();
         bool load_schema();
-        // Removed unused routing save/load to clean up header if not implemented
 
         void set_metadata_index(std::shared_ptr<pomai::core::MetadataIndex> idx) { metadata_index_ = std::move(idx); }
         std::shared_ptr<pomai::core::MetadataIndex> metadata_index() const { return metadata_index_; }
 
         MembranceInfo get_info() const;
-
         void apply_thermal_policy();
         std::vector<uint64_t> get_centroid_ids(uint32_t cid) const;
         size_t num_centroids() const { return centroids_.size(); }
@@ -243,7 +197,7 @@ namespace pomai::ai::orbit
         uint32_t find_nearest_centroid(const float *vec);
         std::vector<uint32_t> find_routing_centroids(const float *vec, size_t n);
         uint64_t alloc_new_bucket(uint32_t centroid_id);
-        bool compute_distance_for_id(const float *query, uint64_t id, float &out_dist);
+
         bool compute_distance_for_id_with_proj(const std::vector<std::vector<float>> &qproj, float qnorm2, uint64_t id, float &out_dist);
         mutable std::shared_mutex checkpoint_mu_;
     };
