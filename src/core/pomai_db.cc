@@ -65,7 +65,10 @@ namespace pomai::core
         ocfg.data_path = data_path;
         ocfg.algo = global_cfg.orbit;
         ocfg.cortex_cfg = global_cfg.network;
-        ocfg.eeq_cfg = pomai::config::EternalEchoConfig();
+        // Updated: PomaiOrbit::Config now uses ZeroHarmonyConfig (named zero_harmony_cfg).
+        // Construct a default ZeroHarmonyConfig (alias EternalEchoConfig still available),
+        // but prefer explicit ZeroHarmonyConfig to avoid ambiguity.
+        ocfg.zero_harmony_cfg = pomai::config::ZeroHarmonyConfig();
 
         orbit = std::make_unique<pomai::ai::orbit::PomaiOrbit>(ocfg, arena.get());
 

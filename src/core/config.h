@@ -23,14 +23,34 @@ namespace pomai::config
         size_t max_key_inline = 40;
     };
 
-    struct EternalEchoConfig
+    // Replaced EternalEchoConfig with a new lossless packer config: ZeroHarmonyConfig.
+    // Keep a backwards-compatibility alias `EternalEchoConfig = ZeroHarmonyConfig`.
+    struct ZeroHarmonyConfig
     {
-        std::vector<uint32_t> bits_per_layer = {96, 64, 48, 32, 16};
-        uint32_t max_depth = 5;
-        float stop_threshold = 1e-2f;
-        bool quantize_scales = true;
-        float scale_quant_max = 20.0f;
+        // Enable the zero-harmony packing pipeline (per-bucket mean + delta packing).
+        bool enable = true;
+
+        // RLE zero-run encoding of exact-zero deltas (lossless).
+        bool enable_rle_zero = true;
+
+        // Attempt to store small non-zero deltas as IEEE754 float16 when the roundtrip
+        // is exact; otherwise store full float32. This preserves lossless reconstruction
+        // because the packer will use float32 whenever fp16 would lose information.
+        bool use_half_nonzero = true;
+
+        // Maximum absolute magnitude for which fp16 is considered (safety).
+        // 65504 is the maximum finite fp16 value; conservative default.
+        float half_max_exact_abs = 65504.0f;
+
+        // Advisory: target maximum per-vector packed bytes for short in-place storage.
+        // If a packed vector exceeds this size, callers may store it out-of-line (blob arena).
+        size_t max_packed_bytes = 64;
+
+        float zero_threshold = 1e-7f;
     };
+
+    // Backwards alias: where code still refers to EternalEchoConfig, it will resolve to ZeroHarmonyConfig.
+    using EternalEchoConfig = ZeroHarmonyConfig;
 
     struct FingerprintConfig
     {
@@ -71,14 +91,6 @@ namespace pomai::config
         uint32_t num_centroids = 0;
         uint32_t m_neighbors = 16;
         uint32_t initial_bucket_cap = 128;
-    };
-
-    struct PQConfig
-    {
-        uint32_t m_subquantizers = 16;
-        uint32_t k_centroids = 256;
-        uint32_t train_iters = 15;
-        uint64_t seed = 0x12345678ULL;
     };
 
     struct QuantizedSpaceConfig
@@ -242,7 +254,6 @@ namespace pomai::config
         MapTuning map_tuning;
         WhisperConfig whisper;
         QuantizedSpaceConfig quantized_space;
-        PQConfig pq;
         OrbitConfig orbit;
         FingerprintConfig fingerprint;
         NetworkCortexConfig network;

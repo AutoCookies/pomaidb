@@ -40,6 +40,7 @@
 #include <random>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 
 namespace pomai::server
 {
@@ -212,12 +213,19 @@ namespace pomai::server
             }
 
             size_t total_vectors = 0;
-            try { total_vectors = m->orbit->get_info().num_vectors; }
-            catch (...) { total_vectors = 0; }
+            try
+            {
+                total_vectors = m->orbit->get_info().num_vectors;
+            }
+            catch (...)
+            {
+                total_vectors = 0;
+            }
 
             if (strategy == "STRATIFIED")
             {
-                if (!m->meta_index) return "ERR: Metadata Index not enabled\n";
+                if (!m->meta_index)
+                    return "ERR: Metadata Index not enabled\n";
                 auto groups = m->meta_index->get_groups(strat_key);
                 if (groups.empty())
                     return std::string("ERR: No metadata for key '") + strat_key + "'\n";
@@ -239,9 +247,11 @@ namespace pomai::server
             }
             else if (strategy == "CLUSTER")
             {
-                if (!m->orbit) return "ERR: Orbit required for CLUSTER\n";
+                if (!m->orbit)
+                    return "ERR: Orbit required for CLUSTER\n";
                 size_t num_c = m->orbit->num_centroids();
-                if (num_c == 0) return "ERR: No centroids (train first)\n";
+                if (num_c == 0)
+                    return "ERR: No centroids (train first)\n";
 
                 std::vector<uint32_t> cids(num_c);
                 std::iota(cids.begin(), cids.end(), 0);
@@ -277,10 +287,13 @@ namespace pomai::server
             }
             else if (strategy == "TEMPORAL")
             {
-                if (!m->meta_index) return "ERR: Metadata Index not enabled\n";
-                if (strat_key.empty()) return "ERR: TEMPORAL requires a key\n";
+                if (!m->meta_index)
+                    return "ERR: Metadata Index not enabled\n";
+                if (strat_key.empty())
+                    return "ERR: TEMPORAL requires a key\n";
                 auto groups = m->meta_index->get_groups(strat_key);
-                if (groups.empty()) return "ERR: No metadata found\n";
+                if (groups.empty())
+                    return "ERR: No metadata found\n";
                 std::vector<uint64_t> all_ordered;
                 for (const auto &kv : groups)
                     all_ordered.insert(all_ordered.end(), kv.second.begin(), kv.second.end());
@@ -311,14 +324,22 @@ namespace pomai::server
             if (strategy == "RANDOM")
             {
                 std::vector<uint64_t> all_labels;
-                try { if (m->orbit) all_labels = m->orbit->get_all_labels(); }
-                catch (...) { all_labels.clear(); }
+                try
+                {
+                    if (m->orbit)
+                        all_labels = m->orbit->get_all_labels();
+                }
+                catch (...)
+                {
+                    all_labels.clear();
+                }
 
                 if (!all_labels.empty())
                     m->split_mgr->execute_split_with_items(all_labels, tr, val, te);
                 else
                 {
-                    if (total_vectors == 0) return "ERR: Membrance empty\n";
+                    if (total_vectors == 0)
+                        return "ERR: Membrance empty\n";
                     m->split_mgr->execute_random_split(total_vectors, tr, val, te);
                 }
             }
@@ -345,20 +366,25 @@ namespace pomai::server
             std::string name = parts2[1];
             std::string mode = utils::to_upper(parts2[2]);
             auto *m = db->get_membrance(name);
-            if (!m) return "ERR: Membrance not found\n";
+            if (!m)
+                return "ERR: Membrance not found\n";
 
             size_t dim = m->dim;
 
             // parse optional split token and off/lim
             size_t off = 0;
             size_t lim = 1000000;
-            const std::vector<uint64_t> *idxs = nullptr;
+            const std::vector<uint64_t> *idxs_ptr = nullptr;
             auto choose_split = [&](const std::string &s) -> const std::vector<uint64_t> *
             {
-                if (!m->split_mgr) return nullptr;
-                if (s == "TRAIN") return &m->split_mgr->train_indices;
-                if (s == "VAL") return &m->split_mgr->val_indices;
-                if (s == "TEST") return &m->split_mgr->test_indices;
+                if (!m->split_mgr)
+                    return nullptr;
+                if (s == "TRAIN")
+                    return &m->split_mgr->train_indices;
+                if (s == "VAL")
+                    return &m->split_mgr->val_indices;
+                if (s == "TEST")
+                    return &m->split_mgr->test_indices;
                 return nullptr;
             };
 
@@ -367,17 +393,36 @@ namespace pomai::server
             {
                 std::string maybe = utils::to_upper(parts2[3]);
                 const std::vector<uint64_t> *cand = choose_split(maybe);
-                if (cand) { idxs = cand; cur_tok = 4; }
+                if (cand)
+                {
+                    idxs_ptr = cand;
+                    cur_tok = 4;
+                }
             }
-            if (!idxs && m->split_mgr) idxs = &m->split_mgr->train_indices;
+            if (!idxs_ptr && m->split_mgr)
+                idxs_ptr = &m->split_mgr->train_indices;
 
             if (parts2.size() > cur_tok)
             {
-                try { off = std::stoul(parts2[cur_tok]); } catch(...) { off = 0; }
+                try
+                {
+                    off = std::stoul(parts2[cur_tok]);
+                }
+                catch (...)
+                {
+                    off = 0;
+                }
             }
             if (parts2.size() > cur_tok + 1)
             {
-                try { lim = std::stoul(parts2[cur_tok + 1]); } catch(...) { lim = 1000000; }
+                try
+                {
+                    lim = std::stoul(parts2[cur_tok + 1]);
+                }
+                catch (...)
+                {
+                    lim = 1000000;
+                }
             }
 
             // optional BATCH param
@@ -386,7 +431,14 @@ namespace pomai::server
             {
                 if (utils::to_upper(parts2[t]) == "BATCH" && t + 1 < parts2.size())
                 {
-                    try { batch_size_param = std::stoul(parts2[t + 1]); } catch(...) { batch_size_param = 0; }
+                    try
+                    {
+                        batch_size_param = std::stoul(parts2[t + 1]);
+                    }
+                    catch (...)
+                    {
+                        batch_size_param = 0;
+                    }
                     break;
                 }
             }
@@ -394,28 +446,62 @@ namespace pomai::server
             // helper: dtype & elem_size
             auto get_membrance_dtype = [&](std::string &out_dtype_str, uint32_t &out_elem_size)
             {
-                if (m->hot_tier) { out_elem_size = m->hot_tier->element_size(); out_dtype_str = m->hot_tier->data_type_string(); }
-                else { out_elem_size = static_cast<uint32_t>(pomai::core::dtype_size(m->data_type)); out_dtype_str = pomai::core::dtype_name(m->data_type); }
+                if (m->hot_tier)
+                {
+                    out_elem_size = m->hot_tier->element_size();
+                    out_dtype_str = m->hot_tier->data_type_string();
+                }
+                else
+                {
+                    out_elem_size = static_cast<uint32_t>(pomai::core::dtype_size(m->data_type));
+                    out_dtype_str = pomai::core::dtype_name(m->data_type);
+                }
             };
 
             // ---- TRIPLET ----
             if (mode == "TRIPLET")
             {
-                if (!m->meta_index || !m->orbit) return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
-                if (parts2.size() < 4) return "ERR: ITERATE <name> TRIPLET <key> [limit]\n";
+                if (!m->meta_index || !m->orbit)
+                    return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
+                if (parts2.size() < 4)
+                    return "ERR: ITERATE <name> TRIPLET <key> [limit]\n";
 
                 std::string key = parts2[3];
                 size_t limit = 100;
-                if (parts2.size() >= 6) { try { limit = std::stoul(parts2[5]); } catch(...) {} }
-                else if (parts2.size() == 5) { try { limit = std::stoul(parts2[4]); } catch(...) {} }
-                if (limit == 0) limit = 1;
+                if (parts2.size() >= 6)
+                {
+                    try
+                    {
+                        limit = std::stoul(parts2[5]);
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+                else if (parts2.size() == 5)
+                {
+                    try
+                    {
+                        limit = std::stoul(parts2[4]);
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+                if (limit == 0)
+                    limit = 1;
 
                 auto groups = m->meta_index->get_groups(key);
                 std::vector<std::string> cls;
-                for (const auto &kv : groups) if (kv.second.size() >= 2) cls.push_back(kv.first);
-                if (cls.size() < 2) return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
+                for (const auto &kv : groups)
+                    if (kv.second.size() >= 2)
+                        cls.push_back(kv.first);
+                if (cls.size() < 2)
+                    return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
 
-                std::string dtype_str; uint32_t elem_size; get_membrance_dtype(dtype_str, elem_size);
+                std::string dtype_str;
+                uint32_t elem_size;
+                get_membrance_dtype(dtype_str, elem_size);
                 size_t per_vec = static_cast<size_t>(elem_size) * dim;
                 size_t total_bytes = limit * 3 * per_vec;
 
@@ -430,13 +516,15 @@ namespace pomai::server
                 {
                     const auto &c = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
                     std::string c2 = c;
-                    while (c2 == c) c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
+                    while (c2 == c)
+                        c2 = cls[std::uniform_int_distribution<size_t>(0, cls.size() - 1)(rng)];
                     const auto &ids = groups.at(c);
                     const auto &ids2 = groups.at(c2);
 
                     trip_ids[0] = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
                     trip_ids[1] = trip_ids[0];
-                    while (trip_ids[1] == trip_ids[0]) trip_ids[1] = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
+                    while (trip_ids[1] == trip_ids[0])
+                        trip_ids[1] = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
                     trip_ids[2] = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
 
                     // Batch fetch 3 ids
@@ -449,12 +537,16 @@ namespace pomai::server
             // ---- PAIR ----
             if (mode == "PAIR")
             {
-                if (!idxs) return "ERR: No split indices available for PAIR\n";
-                if (off >= idxs->size()) return "OK BINARY_PAIR float32 0 " + std::to_string(dim) + " 0\n";
+                if (!idxs_ptr)
+                    return "ERR: No split indices available for PAIR\n";
+                if (off >= idxs_ptr->size())
+                    return "OK BINARY_PAIR float32 0 " + std::to_string(dim) + " 0\n";
 
-                std::string dtype_str; uint32_t elem_size; get_membrance_dtype(dtype_str, elem_size);
+                std::string dtype_str;
+                uint32_t elem_size;
+                get_membrance_dtype(dtype_str, elem_size);
                 size_t per_vec = static_cast<size_t>(elem_size) * dim;
-                size_t cnt = std::min(lim, idxs->size() - off);
+                size_t cnt = std::min(lim, idxs_ptr->size() - off);
                 size_t per = sizeof(uint64_t) + per_vec;
 
                 // Batched streaming path
@@ -468,8 +560,10 @@ namespace pomai::server
                     while (processed < cnt)
                     {
                         size_t this_batch = std::min<size_t>(batch_size_param, cnt - processed);
-                        ids.clear(); ids.reserve(this_batch);
-                        for (size_t i = 0; i < this_batch; ++i) ids.push_back((*idxs)[off + processed + i]);
+                        ids.clear();
+                        ids.reserve(this_batch);
+                        for (size_t i = 0; i < this_batch; ++i)
+                            ids.push_back((*idxs_ptr)[off + processed + i]);
 
                         fetch_raws_with_fallback(db, m, ids, per_vec, raws);
 
@@ -481,8 +575,13 @@ namespace pomai::server
                             uint64_t id = ids[i];
                             out.append(reinterpret_cast<const char *>(&id), sizeof(id));
                             const std::string &raw = raws[i];
-                            if (raw.size() >= per_vec) out.append(raw.data(), per_vec);
-                            else { out.append(raw.data(), raw.size()); out.append(per_vec - raw.size(), '\0'); }
+                            if (raw.size() >= per_vec)
+                                out.append(raw.data(), per_vec);
+                            else
+                            {
+                                out.append(raw.data(), raw.size());
+                                out.append(per_vec - raw.size(), '\0');
+                            }
                         }
                         processed += this_batch;
                     }
@@ -493,7 +592,8 @@ namespace pomai::server
                     // Single-response path: fetch all ids at once
                     std::vector<uint64_t> ids;
                     ids.reserve(cnt);
-                    for (size_t i = 0; i < cnt; ++i) ids.push_back((*idxs)[off + i]);
+                    for (size_t i = 0; i < cnt; ++i)
+                        ids.push_back((*idxs_ptr)[off + i]);
 
                     std::vector<std::string> raws;
                     fetch_raws_with_fallback(db, m, ids, per_vec, raws);
@@ -509,8 +609,13 @@ namespace pomai::server
                         uint64_t id = ids[i];
                         out.append(reinterpret_cast<const char *>(&id), sizeof(id));
                         const std::string &raw = raws[i];
-                        if (raw.size() >= per_vec) out.append(raw.data(), per_vec);
-                        else { out.append(raw.data(), raw.size()); out.append(per_vec - raw.size(), '\0'); }
+                        if (raw.size() >= per_vec)
+                            out.append(raw.data(), per_vec);
+                        else
+                        {
+                            out.append(raw.data(), raw.size());
+                            out.append(per_vec - raw.size(), '\0');
+                        }
                     }
                     return out;
                 }
@@ -519,12 +624,16 @@ namespace pomai::server
             // ---- TRAIN/VAL/TEST ----
             if (mode == "TRAIN" || mode == "VAL" || mode == "TEST")
             {
-                if (!idxs) return "ERR: No split indices available for ITERATE\n";
-                if (off >= idxs->size()) return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
+                if (!idxs_ptr)
+                    return "ERR: No split indices available for ITERATE\n";
+                if (off >= idxs_ptr->size())
+                    return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
 
-                std::string dtype_str; uint32_t elem_size; get_membrance_dtype(dtype_str, elem_size);
+                std::string dtype_str;
+                uint32_t elem_size;
+                get_membrance_dtype(dtype_str, elem_size);
                 size_t per_vec = static_cast<size_t>(elem_size) * dim;
-                size_t cnt = std::min(lim, idxs->size() - off);
+                size_t cnt = std::min(lim, idxs_ptr->size() - off);
 
                 if (batch_size_param > 0)
                 {
@@ -536,8 +645,10 @@ namespace pomai::server
                     while (processed < cnt)
                     {
                         size_t this_batch = std::min<size_t>(batch_size_param, cnt - processed);
-                        ids.clear(); ids.reserve(this_batch);
-                        for (size_t i = 0; i < this_batch; ++i) ids.push_back((*idxs)[off + processed + i]);
+                        ids.clear();
+                        ids.reserve(this_batch);
+                        for (size_t i = 0; i < this_batch; ++i)
+                            ids.push_back((*idxs_ptr)[off + processed + i]);
 
                         fetch_raws_with_fallback(db, m, ids, per_vec, raws);
 
@@ -554,7 +665,8 @@ namespace pomai::server
                 {
                     std::vector<uint64_t> ids;
                     ids.reserve(cnt);
-                    for (size_t i = 0; i < cnt; ++i) ids.push_back((*idxs)[off + i]);
+                    for (size_t i = 0; i < cnt; ++i)
+                        ids.push_back((*idxs_ptr)[off + i]);
 
                     std::vector<std::string> raws;
                     fetch_raws_with_fallback(db, m, ids, per_vec, raws);
@@ -576,7 +688,8 @@ namespace pomai::server
         if (up.rfind("CREATE MEMBRANCE", 0) == 0)
         {
             size_t pos_dim = up.find(" DIM ");
-            if (pos_dim == std::string::npos) return "ERR: CREATE MEMBRANCE missing DIM\n";
+            if (pos_dim == std::string::npos)
+                return "ERR: CREATE MEMBRANCE missing DIM\n";
 
             std::string name = utils::trim(cmd.substr(std::string("CREATE MEMBRANCE").size(), pos_dim - std::string("CREATE MEMBRANCE").size()));
             std::string tail = utils::trim(cmd.substr(pos_dim + 5));
@@ -587,8 +700,16 @@ namespace pomai::server
             size_t ram_mb = 256;
             std::string data_type = "float32";
 
-            if (!(iss >> token)) return "ERR: invalid DIM\n";
-            try { dim = static_cast<size_t>(std::stoul(token)); } catch(...) { return "ERR: invalid DIM\n"; }
+            if (!(iss >> token))
+                return "ERR: invalid DIM\n";
+            try
+            {
+                dim = static_cast<size_t>(std::stoul(token));
+            }
+            catch (...)
+            {
+                return "ERR: invalid DIM\n";
+            }
 
             while (iss >> token)
             {
@@ -596,7 +717,8 @@ namespace pomai::server
                 if (up_tok == "DATA_TYPE" || up_tok == "DATA-TYPE")
                 {
                     std::string dt;
-                    if (!(iss >> dt)) return "ERR: DATA_TYPE requires a value\n";
+                    if (!(iss >> dt))
+                        return "ERR: DATA_TYPE requires a value\n";
                     std::transform(dt.begin(), dt.end(), dt.begin(), ::tolower);
                     if (dt != "float32" && dt != "float64" && dt != "int32" && dt != "int8" && dt != "float16")
                         return std::string("ERR: unsupported DATA_TYPE '") + dt + "'\n";
@@ -605,19 +727,37 @@ namespace pomai::server
                 else if (up_tok == "RAM")
                 {
                     std::string r;
-                    if (!(iss >> r)) return "ERR: RAM requires a numeric value\n";
-                    try { ram_mb = static_cast<size_t>(std::stoul(r)); } catch(...) { return "ERR: invalid RAM value\n"; }
+                    if (!(iss >> r))
+                        return "ERR: RAM requires a numeric value\n";
+                    try
+                    {
+                        ram_mb = static_cast<size_t>(std::stoul(r));
+                    }
+                    catch (...)
+                    {
+                        return "ERR: invalid RAM value\n";
+                    }
                 }
             }
 
-            if (dim == 0) return "ERR: invalid DIM\n";
+            if (dim == 0)
+                return "ERR: invalid DIM\n";
 
             pomai::core::MembranceConfig cfg;
-            cfg.dim = dim; cfg.ram_mb = ram_mb;
-            try { cfg.data_type = pomai::core::parse_dtype(data_type); } catch(...) { return std::string("ERR: unsupported DATA_TYPE '") + data_type + "'\n"; }
+            cfg.dim = dim;
+            cfg.ram_mb = ram_mb;
+            try
+            {
+                cfg.data_type = pomai::core::parse_dtype(data_type);
+            }
+            catch (...)
+            {
+                return std::string("ERR: unsupported DATA_TYPE '") + data_type + "'\n";
+            }
 
             bool ok = db->create_membrance(name, cfg);
-            if (ok) {
+            if (ok)
+            {
                 std::ostringstream ss;
                 ss << "OK: created membrance " << name << " dim=" << dim << " data_type=" << data_type << " ram=" << ram_mb << "MB\n";
                 return ss.str();
@@ -629,40 +769,59 @@ namespace pomai::server
         if (utils::to_upper(cmd).rfind("SEARCH ", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
-            if (parts2.size() < 5) return "ERR: usage SEARCH <name> QUERY <vec> TOP <k>\n";
+            if (parts2.size() < 5)
+                return "ERR: usage SEARCH <name> QUERY <vec> TOP <k>\n";
 
             std::string name = parts2[1];
             size_t query_idx = 0;
             for (size_t i = 2; i < parts2.size(); ++i)
             {
-                if (utils::to_upper(parts2[i]) == "QUERY") { query_idx = i; break; }
+                if (utils::to_upper(parts2[i]) == "QUERY")
+                {
+                    query_idx = i;
+                    break;
+                }
             }
-            if (query_idx == 0 || query_idx + 1 >= parts2.size()) return "ERR: missing QUERY <vec>\n";
+            if (query_idx == 0 || query_idx + 1 >= parts2.size())
+                return "ERR: missing QUERY <vec>\n";
 
             std::string vec_str = parts2[query_idx + 1];
-            if (vec_str.size() >= 2 && vec_str.front() == '(' && vec_str.back() == ')') vec_str = vec_str.substr(1, vec_str.size() - 2);
+            if (vec_str.size() >= 2 && vec_str.front() == '(' && vec_str.back() == ')')
+                vec_str = vec_str.substr(1, vec_str.size() - 2);
 
             std::vector<float> query_vec;
-            if (!utils::parse_vector(vec_str, query_vec)) return "ERR: invalid vector format\n";
+            if (!utils::parse_vector(vec_str, query_vec))
+                return "ERR: invalid vector format\n";
 
             size_t k = 10;
             for (size_t i = query_idx + 2; i < parts2.size(); ++i)
             {
-                if (utils::to_upper(parts2[i]) == "TOP" && i + 1 < parts2.size()) {
-                    try { k = std::stoul(parts2[i + 1]); } catch(...) {}
+                if (utils::to_upper(parts2[i]) == "TOP" && i + 1 < parts2.size())
+                {
+                    try
+                    {
+                        k = std::stoul(parts2[i + 1]);
+                    }
+                    catch (...)
+                    {
+                    }
                     break;
                 }
             }
 
             auto *m = db->get_membrance(name);
-            if (!m) return "ERR: membrance not found\n";
-            if (!m->orbit) return "ERR: engine not ready\n";
-            if (query_vec.size() != m->dim) return "ERR: query dimension mismatch\n";
+            if (!m)
+                return "ERR: membrance not found\n";
+            if (!m->orbit)
+                return "ERR: engine not ready\n";
+            if (query_vec.size() != m->dim)
+                return "ERR: query dimension mismatch\n";
 
             auto results = m->orbit->search(query_vec.data(), k);
             std::ostringstream ss;
             ss << "OK " << results.size() << "\n";
-            for (const auto &p : results) ss << p.first << " " << std::fixed << std::setprecision(6) << p.second << "\n";
+            for (const auto &p : results)
+                ss << p.first << " " << std::fixed << std::setprecision(6) << p.second << "\n";
             return ss.str();
         }
 
@@ -670,7 +829,8 @@ namespace pomai::server
         if (up.rfind("DROP MEMBRANCE", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
-            if (parts2.size() < 3) return "ERR: DROP MEMBRANCE <name>;\n";
+            if (parts2.size() < 3)
+                return "ERR: DROP MEMBRANCE <name>;\n";
             std::string name = parts2[2];
             bool ok = db->drop_membrance(name);
             return ok ? std::string("OK: dropped ") + name + "\n" : std::string("ERR: drop failed\n");
@@ -678,7 +838,8 @@ namespace pomai::server
 
         if (up == "EXEC CHECKPOINT")
         {
-            if (db->checkpoint_all()) return "OK: Checkpoint completed. WAL truncated.\n";
+            if (db->checkpoint_all())
+                return "OK: Checkpoint completed. WAL truncated.\n";
             return "ERR: Checkpoint failed partially.\n";
         }
 
@@ -688,19 +849,41 @@ namespace pomai::server
             auto parts2 = utils::split_ws(cmd);
             std::string name;
             bool ok_parse = false;
-            if (parts2.size() >= 4 && utils::to_upper(parts2[2]) == "INFO") { name = parts2[3]; ok_parse = true; }
-            else if (parts2.size() >= 4 && utils::to_upper(parts2[3]) == "INFO") { name = parts2[2]; ok_parse = true; }
-            else if (parts2.size() >= 3 && utils::to_upper(parts2[2]) == "INFO") {
-                if (state.current_membrance.empty()) return "ERR: no current membrance (USE <name>)\n";
-                name = state.current_membrance; ok_parse = true;
+            if (parts2.size() >= 4 && utils::to_upper(parts2[2]) == "INFO")
+            {
+                name = parts2[3];
+                ok_parse = true;
             }
-            if (!ok_parse) return "ERR: expected 'GET MEMBRANCE INFO ...'\n";
+            else if (parts2.size() >= 4 && utils::to_upper(parts2[3]) == "INFO")
+            {
+                name = parts2[2];
+                ok_parse = true;
+            }
+            else if (parts2.size() >= 3 && utils::to_upper(parts2[2]) == "INFO")
+            {
+                if (state.current_membrance.empty())
+                    return "ERR: no current membrance (USE <name>)\n";
+                name = state.current_membrance;
+                ok_parse = true;
+            }
+            if (!ok_parse)
+                return "ERR: expected 'GET MEMBRANCE INFO ...'\n";
 
             auto *m = db->get_membrance(name);
-            if (!m) return std::string("ERR: membrance not found: ") + name + "\n";
+            if (!m)
+                return std::string("ERR: membrance not found: ") + name + "\n";
 
             pomai::ai::orbit::MembranceInfo info;
-            try { info = m->orbit->get_info(); } catch(...) { info.dim = m->dim; info.num_vectors = 0; info.disk_bytes = 0; }
+            try
+            {
+                info = m->orbit->get_info();
+            }
+            catch (...)
+            {
+                info.dim = m->dim;
+                info.num_vectors = 0;
+                info.disk_bytes = 0;
+            }
 
             if (info.disk_bytes == 0)
             {
@@ -711,22 +894,33 @@ namespace pomai::server
                     {
                         for (auto const &entry : std::filesystem::recursive_directory_iterator(dp))
                         {
-                            if (!entry.is_regular_file()) continue;
+                            if (!entry.is_regular_file())
+                                continue;
                             std::error_code ec;
                             uint64_t fsz = static_cast<uint64_t>(entry.file_size(ec));
-                            if (!ec) info.disk_bytes += fsz;
+                            if (!ec)
+                                info.disk_bytes += fsz;
                         }
                     }
                 }
-                catch (...) {}
+                catch (...)
+                {
+                }
             }
 
             size_t n_train = 0, n_val = 0, n_test = 0;
-            if (m->split_mgr) { n_train = m->split_mgr->train_indices.size(); n_val = m->split_mgr->val_indices.size(); n_test = m->split_mgr->test_indices.size(); }
+            if (m->split_mgr)
+            {
+                n_train = m->split_mgr->train_indices.size();
+                n_val = m->split_mgr->val_indices.size();
+                n_test =
+                    m->split_mgr->test_indices.size();
+            }
 
             size_t feature_dim = (m->dim > 0) ? m->dim : info.dim;
             size_t total_vectors = info.num_vectors;
-            if (total_vectors == 0) total_vectors = n_train + n_val + n_test;
+            if (total_vectors == 0)
+                total_vectors = n_train + n_val + n_test;
 
             std::ostringstream ss;
             ss << "MEMBRANCE: " << name << "\n";
@@ -754,47 +948,67 @@ namespace pomai::server
                 bool has_explicit_into = (utils::to_upper(cmd).find("INTO") != std::string::npos);
                 if (!has_explicit_into && utils::to_upper(cmd).rfind("INSERT VALUES", 0) == 0)
                 {
-                    if (state.current_membrance.empty()) return "ERR: no current membrance (USE <name>)\n";
+                    if (state.current_membrance.empty())
+                        return "ERR: no current membrance (USE <name>)\n";
                     name = state.current_membrance;
                     body = std::string("INSERT INTO ") + name + " " + cmd.substr(std::string("INSERT VALUES").size());
                 }
                 size_t pos_into = utils::to_upper(body).find("INTO");
                 size_t pos_values = utils::to_upper(body).find("VALUES");
-                if (pos_values == std::string::npos) return "ERR: INSERT missing VALUES\n";
-                if (pos_into == std::string::npos) return "ERR: INSERT missing INTO\n";
+                if (pos_values == std::string::npos)
+                    return "ERR: INSERT missing VALUES\n";
+                if (pos_into == std::string::npos)
+                    return "ERR: INSERT missing INTO\n";
                 size_t name_start = pos_into + 4;
                 name = utils::trim(body.substr(name_start, pos_values - name_start));
-                if (name.empty()) return "ERR: missing membrance name\n";
+                if (name.empty())
+                    return "ERR: missing membrance name\n";
 
                 auto *m = db->get_membrance(name);
-                if (!m) return "ERR: membrance not found\n";
+                if (!m)
+                    return "ERR: membrance not found\n";
 
                 size_t pos_after_values = pos_values + std::string("VALUES").size();
                 size_t cur = body.find_first_not_of(" \t\r\n", pos_after_values);
-                if (cur == std::string::npos || body[cur] != '(') return "ERR: VALUES syntax\n";
+                if (cur == std::string::npos || body[cur] != '(')
+                    return "ERR: VALUES syntax\n";
 
                 std::vector<std::pair<std::string, std::vector<float>>> tuples;
                 tuples.reserve(8);
 
                 while (true)
                 {
-                    if (cur >= body.size() || body[cur] != '(') break;
+                    if (cur >= body.size() || body[cur] != '(')
+                        break;
                     size_t depth = 0;
                     size_t start = cur;
                     size_t end = std::string::npos;
                     for (size_t p = cur; p < body.size(); ++p)
                     {
-                        if (body[p] == '(') ++depth;
-                        else if (body[p] == ')') { --depth; if (depth == 0) { end = p; cur = p + 1; break; } }
+                        if (body[p] == '(')
+                            ++depth;
+                        else if (body[p] == ')')
+                        {
+                            --depth;
+                            if (depth == 0)
+                            {
+                                end = p;
+                                cur = p + 1;
+                                break;
+                            }
+                        }
                     }
-                    if (end == std::string::npos) return "ERR: unmatched parentheses in VALUES\n";
+                    if (end == std::string::npos)
+                        return "ERR: unmatched parentheses in VALUES\n";
 
                     std::string tuple_text = body.substr(start + 1, end - start - 1);
                     size_t vec_lb = tuple_text.find('[');
                     size_t vec_rb = tuple_text.rfind(']');
-                    if (vec_lb == std::string::npos || vec_rb == std::string::npos || vec_rb <= vec_lb) return "ERR: tuple vector syntax\n";
+                    if (vec_lb == std::string::npos || vec_rb == std::string::npos || vec_rb <= vec_lb)
+                        return "ERR: tuple vector syntax\n";
                     size_t comma_before_vec = tuple_text.rfind(',', vec_lb);
-                    if (comma_before_vec == std::string::npos) return "ERR: tuple syntax (label, [vec])\n";
+                    if (comma_before_vec == std::string::npos)
+                        return "ERR: tuple syntax (label, [vec])\n";
                     std::string label_tok = utils::trim(tuple_text.substr(0, comma_before_vec));
                     std::string_view vec_view(tuple_text.data() + vec_lb + 1, vec_rb - vec_lb - 1);
 
@@ -808,8 +1022,14 @@ namespace pomai::server
                     tuples.emplace_back(label_tok, std::move(vec_vals));
 
                     cur = body.find_first_not_of(" \t\r\n", cur);
-                    if (cur == std::string::npos) break;
-                    if (body[cur] == ',') { ++cur; cur = body.find_first_not_of(" \t\r\n", cur); continue; }
+                    if (cur == std::string::npos)
+                        break;
+                    if (body[cur] == ',')
+                    {
+                        ++cur;
+                        cur = body.find_first_not_of(" \t\r\n", cur);
+                        continue;
+                    }
                     break;
                 }
 
@@ -830,23 +1050,57 @@ namespace pomai::server
                 std::vector<std::pair<uint64_t, std::vector<float>>> batch_data;
                 batch_data.reserve(tuples.size());
                 std::vector<uint64_t> inserted_hashes;
-                if (!global_tags.empty()) inserted_hashes.reserve(tuples.size());
+                if (!global_tags.empty())
+                    inserted_hashes.reserve(tuples.size());
 
                 for (auto &tp : tuples)
                 {
-                    uint64_t label_hash = utils::hash_key(tp.first);
+                    uint64_t label_hash = 0;
+                    std::string lbl_tok_trim = utils::trim(tp.first);
+                    bool is_numeric = !lbl_tok_trim.empty() && std::all_of(lbl_tok_trim.begin(), lbl_tok_trim.end(), [](unsigned char c)
+                                                                           { return std::isdigit(c); });
+                    if (is_numeric)
+                    {
+                        try
+                        {
+                            label_hash = std::stoull(lbl_tok_trim);
+                        }
+                        catch (...)
+                        {
+                            label_hash = utils::hash_key(tp.first);
+                        }
+                    }
+                    else
+                    {
+                        label_hash = utils::hash_key(tp.first);
+                    }
+
                     batch_data.emplace_back(label_hash, std::move(tp.second));
-                    if (!global_tags.empty()) inserted_hashes.push_back(label_hash);
+                    if (!global_tags.empty())
+                        inserted_hashes.push_back(label_hash);
                 }
 
                 bool ok_batch = false;
-                try { ok_batch = db->insert_batch(name, batch_data); } catch(...) { ok_batch = false; }
+                try
+                {
+                    ok_batch = db->insert_batch(name, batch_data);
+                }
+                catch (...)
+                {
+                    ok_batch = false;
+                }
 
                 if (ok_batch && !global_tags.empty() && m->meta_index)
                 {
                     for (uint64_t h : inserted_hashes)
                     {
-                        try { m->meta_index->add_tags(h, global_tags); } catch(...) {}
+                        try
+                        {
+                            m->meta_index->add_tags(h, global_tags);
+                        }
+                        catch (...)
+                        {
+                        }
                     }
                 }
 

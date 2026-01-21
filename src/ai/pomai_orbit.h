@@ -16,11 +16,11 @@
 #include <array>
 
 #include "src/ai/fingerprint.h"
-#include "src/ai/ids_block.h" // [NEW] Tích hợp IdsBlock
+#include "src/ai/ids_block.h"
 #include "src/core/config.h"
 #include "src/ai/network_cortex.h"
 #include "src/core/metadata_index.h"
-#include "src/ai/eternalecho_quantizer.h"
+#include "src/ai/zeroharmony_pack.h"
 #include "src/ai/whispergrain.h"
 #include "src/memory/wal_manager.h"
 
@@ -49,6 +49,8 @@ namespace pomai::ai::orbit
         uint32_t centroid_id;
         uint32_t count;              // Atomic access via helper
         uint64_t next_bucket_offset; // Atomic access via helper
+        uint32_t off_mean;
+        
         uint32_t off_fingerprints;
         uint32_t off_pq_codes;
         uint32_t off_vectors;
@@ -104,7 +106,7 @@ namespace pomai::ai::orbit
             size_t dim = 0;
             std::string data_path = "./data";
             pomai::config::OrbitConfig algo;
-            pomai::ai::EternalEchoConfig eeq_cfg;
+            pomai::config::ZeroHarmonyConfig zero_harmony_cfg;
             pomai::config::NetworkCortexConfig cortex_cfg;
             bool use_cortex = true;
         };
@@ -142,6 +144,7 @@ namespace pomai::ai::orbit
         std::vector<uint64_t> get_all_labels() const;
         bool get_vectors_raw(const std::vector<uint64_t> &ids, std::vector<std::string> &outs) const;
         bool checkpoint();
+        size_t packed_slot_size_ = 512;
 
     private:
         bool insert_batch_memory_only(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
@@ -183,7 +186,8 @@ namespace pomai::ai::orbit
         std::unordered_set<uint64_t> deleted_labels_;
         mutable std::shared_mutex del_mu_;
 
-        std::unique_ptr<pomai::ai::EternalEchoQuantizer> eeq_;
+        // Replace EternalEchoQuantizer pointer with ZeroHarmony packer pointer.
+        std::unique_ptr<pomai::ai::ZeroHarmonyPacker> zeroharmony_;
         std::shared_ptr<pomai::core::MetadataIndex> metadata_index_;
         std::shared_ptr<pomai::ai::WhisperGrain> whisper_ctrl_;
 

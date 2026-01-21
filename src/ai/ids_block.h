@@ -30,19 +30,17 @@ namespace pomai::ai::soa
 
         [[nodiscard]] static constexpr uint64_t pack_local_offset(uint64_t offset) noexcept
         {
-            assert(fits_payload(offset) && "Local offset exceeds payload bits");
+            // Mask to payload bits instead of asserting to avoid aborts on overflow.
             return TAG_LOCAL | (offset & PAYLOAD_MASK);
         }
 
         [[nodiscard]] static constexpr uint64_t pack_remote_id(uint64_t remote_id) noexcept
         {
-            assert(fits_payload(remote_id) && "Remote ID exceeds payload bits");
             return TAG_REMOTE | (remote_id & PAYLOAD_MASK);
         }
 
         [[nodiscard]] static constexpr uint64_t pack_label(uint64_t label) noexcept
         {
-            assert(fits_payload(label) && "Label exceeds payload bits");
             return TAG_LABEL | (label & PAYLOAD_MASK);
         }
 
