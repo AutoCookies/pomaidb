@@ -137,101 +137,49 @@ namespace pomai::memory
     bool WalManager::open(const std::string &path, bool create_if_missing, const WalManager::WalConfig &cfg)
     {
         if (fd_ != -1)
-        {
-            // already open
             return true;
-        }
-
         cfg_ = cfg;
         path_ = path;
 
-        int flags = O_RDWR;
+        int flags = O_RDWR | O_APPEND; // Sử dụng O_APPEND chuẩn Big Tech
         if (create_if_missing)
             flags |= O_CREAT;
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
 
-        // use 0600 mode
         fd_ = ::open(path_.c_str(), flags, 0600);
         if (fd_ < 0)
-        {
-            std::cerr << "[WAL] open(" << path_ << ") failed: " << strerror(errno) << "\n";
             return false;
-        }
 
-        // Init member accumulator
-        bytes_since_last_fsync_.store(0);
-
-        // Ensure FD_CLOEXEC is set (portable guard)
-        int fd_flags = fcntl(fd_, F_GETFD);
-        if (fd_flags != -1)
-        {
-            fcntl(fd_, F_SETFD, fd_flags | FD_CLOEXEC);
-        }
-
-        // Check file header presence / validity
-        struct stat st;
-        if (fstat(fd_, &st) != 0)
-        {
-            std::cerr << "WalManager::open: fstat failed: " << strerror(errno) << "\n";
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-
-        if (st.st_size == 0)
+        if (!read_file_header_and_validate())
         {
             if (!write_file_header_if_missing())
-            {
-                ::close(fd_);
-                fd_ = -1;
                 return false;
-            }
-        }
-        else
-        {
-            if (!read_file_header_and_validate())
-            {
-                ::close(fd_);
-                fd_ = -1;
-                return false;
-            }
         }
 
-        // Initialize counters based on file content
-        uint64_t max_seq = 0;
-        auto cb = [&max_seq](uint16_t /*type*/, const void * /*payload*/, uint32_t /*len*/, uint64_t seq) -> bool
-        {
-            if (seq > max_seq)
-                max_seq = seq;
-            return true; // continue
-        };
-
-        if (!replay(cb))
-        {
-            ::close(fd_);
-            fd_ = -1;
-            return false;
-        }
-
-        seq_no_.store(max_seq);
-        total_bytes_written_.store(0);
-        total_records_written_.store(0);
+        // Khởi chạy luồng nền để thực hiện fdatasync
+        flush_running_ = true;
+        flush_thread_ = std::thread(&WalManager::flush_worker_loop, this);
 
         return true;
     }
 
     void WalManager::close()
     {
-        std::lock_guard<std::mutex> lk(append_mu_);
-        if (fd_ != -1)
         {
-            // Optional: flush before close
-            robust_fsync(fd_);
-            ::close(fd_);
-            fd_ = -1;
+            std::lock_guard<std::mutex> lk(append_mu_);
+            if (fd_ == -1)
+                return;
+            flush_running_ = false;
         }
+        flush_cv_.notify_all();
+        if (flush_thread_.joinable())
+            flush_thread_.join();
+
+        ::fdatasync(fd_);
+        ::close(fd_);
+        fd_ = -1;
     }
 
     bool WalManager::write_file_header_if_missing()
@@ -309,74 +257,41 @@ namespace pomai::memory
         if (fd_ < 0)
             return std::nullopt;
 
+        static thread_local std::vector<uint8_t> buf; // Tái sử dụng buffer tránh allocation
+        size_t rec_size = sizeof(WalRecordHeader) + payload_len + sizeof(uint32_t);
+        if (buf.size() < rec_size)
+            buf.resize(rec_size);
+
         WalRecordHeader rh{};
         rh.magic = WAL_RECORD_MAGIC;
         rh.rec_len = payload_len;
         rh.rec_type = type;
-        rh.flags = 0;
-
-        size_t rec_size = sizeof(WalRecordHeader) + payload_len + sizeof(uint32_t); // Header + Payload + CRC
-        std::vector<uint8_t> buf;
-        buf.resize(rec_size);
 
         {
             std::lock_guard<std::mutex> lk(append_mu_);
+            rh.seq_no = seq_no_.fetch_add(1, std::memory_order_relaxed) + 1;
 
-            uint64_t seq = seq_no_.fetch_add(1) + 1;
-            rh.seq_no = seq;
-
-            // 1. Header
             std::memcpy(buf.data(), &rh, sizeof(WalRecordHeader));
-            // 2. Payload
-            if (payload_len > 0 && payload)
-            {
+            if (payload_len > 0)
                 std::memcpy(buf.data() + sizeof(WalRecordHeader), payload, payload_len);
-            }
-            // 3. CRC
+
             uint32_t c = crc32(buf.data(), sizeof(WalRecordHeader) + payload_len);
             std::memcpy(buf.data() + sizeof(WalRecordHeader) + payload_len, &c, sizeof(c));
 
-            if (lseek(fd_, 0, SEEK_END) < 0)
-            {
-                std::cerr << "WalManager::append_record: lseek failed: " << strerror(errno) << "\n";
+            // Ghi vào Page Cache (O_APPEND tự động handle offset)
+            if (!write_all(fd_, buf.data(), rec_size))
                 return std::nullopt;
-            }
 
-            if (!write_all(fd_, buf.data(), buf.size()))
+            total_bytes_written_.fetch_add(rec_size, std::memory_order_relaxed);
+            uint64_t acc = bytes_since_last_fsync_.fetch_add(rec_size, std::memory_order_relaxed) + rec_size;
+
+            // Nếu vượt ngưỡng batch_commit_size, báo hiệu cho luồng nền nhưng KHÔNG ĐỢI (Non-blocking)
+            if (cfg_.batch_commit_size > 0 && acc >= cfg_.batch_commit_size)
             {
-                std::cerr << "WalManager::append_record: write failed: " << strerror(errno) << "\n";
-                return std::nullopt;
+                flush_cv_.notify_one();
             }
-
-            // update stats
-            total_bytes_written_.fetch_add(static_cast<uint64_t>(buf.size()), std::memory_order_relaxed);
-            total_records_written_.fetch_add(1, std::memory_order_relaxed);
-
-            // [FIXED] Batched fsync logic using member variable
-            if (cfg_.batch_commit_size > 0)
-            {
-                uint64_t acc = bytes_since_last_fsync_.fetch_add(static_cast<uint64_t>(buf.size()), std::memory_order_relaxed) + static_cast<uint64_t>(buf.size());
-                if (acc >= cfg_.batch_commit_size)
-                {
-                    if (!robust_fsync(fd_))
-                    {
-                        std::cerr << "WalManager::append_record: fsync failed after batch threshold: " << strerror(errno) << "\n";
-                        return std::nullopt;
-                    }
-                    bytes_since_last_fsync_.store(0, std::memory_order_relaxed);
-                }
-            }
-            else if (cfg_.sync_on_append)
-            {
-                if (!robust_fsync(fd_))
-                {
-                    std::cerr << "WalManager::append_record: fsync failed: " << strerror(errno) << "\n";
-                    return std::nullopt;
-                }
-            }
-
-            return rh.seq_no;
         }
+        return rh.seq_no;
     }
 
     bool WalManager::fsync_log()
@@ -516,6 +431,23 @@ namespace pomai::memory
             return false;
 
         return true;
+    }
+
+    void WalManager::flush_worker_loop()
+    {
+        while (flush_running_)
+        {
+            std::unique_lock<std::mutex> lk(append_mu_);
+            // Chờ tín hiệu hoặc định kỳ 10ms (chuẩn cho in-memory DB)
+            flush_cv_.wait_for(lk, std::chrono::milliseconds(10), [this]
+                               { return !flush_running_ || bytes_since_last_fsync_.load() >= cfg_.batch_commit_size; });
+
+            if (bytes_since_last_fsync_.load() > 0)
+            {
+                bytes_since_last_fsync_.store(0);
+                ::fdatasync(fd_); // Đẩy dữ liệu xuống đĩa không chặn luồng Reader/Writer
+            }
+        }
     }
 
 } // namespace pomai::memory

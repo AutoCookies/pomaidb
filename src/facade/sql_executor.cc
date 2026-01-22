@@ -1113,4 +1113,32 @@ namespace pomai::server
         return "ERR: unknown command\n";
     }
 
+    std::string SqlExecutor::execute_binary_insert(pomai::core::PomaiDB *db, const char *raw_data, size_t len)
+    {
+        // 1. Zero-copy Header Parsing
+        if (len < 13)
+            return "ERR: packet too short\n";
+
+        // Đọc Metadata trực tiếp từ vùng nhớ (Mechanical Sympathy)
+        uint64_t label = *reinterpret_cast<const uint64_t *>(raw_data);
+        uint32_t dim = *reinterpret_cast<const uint32_t *>(raw_data + 8);
+        const float *vec_data = reinterpret_cast<const float *>(raw_data + 12);
+
+        // Kiểm tra tính toàn vẹn gói tin
+        if (len < 12 + (dim * sizeof(float)))
+            return "ERR: incomplete vector data\n";
+
+        // 2. Chuẩn bị Batch (BigTech luôn dùng Batch ngay cả với 1 vector để tối ưu pipeline)
+        std::vector<std::pair<uint64_t, std::vector<float>>> batch;
+        batch.reserve(1);
+
+        // Copy trực tiếp raw memory vào vector (Sử dụng constructor vector tối ưu)
+        std::vector<float> vec(vec_data, vec_data + dim);
+        batch.emplace_back(label, std::move(vec));
+
+        // 3. Đẩy xuống tầng DB (AppendOnlyArena sẽ nhận raw bytes)
+        bool ok = db->insert_batch("default", batch);
+
+        return ok ? "OK\n" : "ERR: insert failed\n";
+    }
 } // namespace pomai::server

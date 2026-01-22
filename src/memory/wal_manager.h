@@ -8,6 +8,8 @@
 #include <atomic>
 #include <optional>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
 #include "src/core/config.h"
 
 namespace pomai::memory
@@ -96,5 +98,10 @@ namespace pomai::memory
 
         // Serialize append/fsync/truncate/replay operations in-process
         std::mutex append_mu_;
+
+        void flush_worker_loop();
+        std::thread flush_thread_;
+        std::atomic<bool> flush_running_{false};
+        std::condition_variable flush_cv_;
     };
 }

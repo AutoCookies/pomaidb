@@ -332,6 +332,17 @@ namespace pomai::core
         Membrance *m = get_membrance(membr);
         if (!m)
             return false;
+
+        if (m->hot_tier)
+        {
+            for (const auto &item : batch)
+            {
+                m->hot_tier->push(item.first, item.second.data());
+            }
+            return true;
+        }
+
+        std::unique_lock<std::shared_mutex> lock(mu_);
         return m->orbit->insert_batch(batch);
     }
 
@@ -623,6 +634,7 @@ namespace pomai::core
                 uint32_t got_elem_size = 0;
                 std::string raw;
                 bool ok = pomai::server::data_supplier::fetch_vector_raw(m, id, raw, m->dim, got_dt, got_elem_size);
+                (void)ok;
                 if (raw.size() < per_vec_bytes)
                 {
                     if (!raw.empty())

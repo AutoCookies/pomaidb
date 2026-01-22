@@ -255,24 +255,53 @@ private:
         }
     }
 
-    // Process any complete SQL commands (terminated by ';') in conn buffer.
     void process_sql_buffer(Conn &c)
     {
-        size_t consumed = 0;
-        for (size_t i = 0; i < c.rbuf.size(); ++i)
+        while (!c.rbuf.empty())
         {
-            if (c.rbuf[i] == ';')
+            // 1. Kiểm tra Binary Magic Fast-Path ('PMIB' = 0x504D4942)
+            if (c.rbuf.size() >= 4)
             {
-                // extract command including semicolon (SqlExecutor will handle trimming)
-                std::string cmd(c.rbuf.begin() + consumed, c.rbuf.begin() + i + 1);
+                uint32_t magic;
+                std::memcpy(&magic, c.rbuf.data(), 4);
+                if (magic == 0x504D4942)
+                {
+                    // Cần ít nhất 9 bytes để đọc Header (Magic + Op + PayloadLen)
+                    if (c.rbuf.size() < 9)
+                        break;
+
+                    uint32_t payload_len;
+                    std::memcpy(&payload_len, c.rbuf.data() + 5, 4);
+
+                    // Đợi cho đến khi nhận đủ toàn bộ gói tin nhị phân
+                    if (c.rbuf.size() < 9 + payload_len)
+                        break;
+
+                    // Thực thi Fast-path không qua Parser văn bản
+                    std::string resp = sql_executor_.execute_binary_insert(pomai_db_, c.rbuf.data() + 9, payload_len);
+                    send_response(c, resp);
+
+                    // Xóa gói tin đã xử lý khỏi buffer
+                    c.rbuf.erase(c.rbuf.begin(), c.rbuf.begin() + 9 + payload_len);
+                    continue;
+                }
+            }
+
+            // 2. Fallback: Giao thức văn bản (Dựa trên dấu chấm phẩy)
+            auto it = std::find(c.rbuf.begin(), c.rbuf.end(), ';');
+            if (it != c.rbuf.end())
+            {
+                size_t pos = std::distance(c.rbuf.begin(), it);
+                std::string cmd(c.rbuf.begin(), c.rbuf.begin() + pos + 1);
                 std::string resp = exec_sql_command(c, cmd);
                 send_response(c, resp);
-                consumed = i + 1;
+
+                c.rbuf.erase(c.rbuf.begin(), c.rbuf.begin() + pos + 1);
+                continue;
             }
-        }
-        if (consumed > 0)
-        {
-            c.rbuf.erase(c.rbuf.begin(), c.rbuf.begin() + static_cast<ptrdiff_t>(consumed));
+
+            // Không tìm thấy lệnh hoàn chỉnh nào, thoát vòng lặp để đợi thêm dữ liệu
+            break;
         }
     }
 

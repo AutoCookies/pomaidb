@@ -29,6 +29,7 @@ echo "CXXFLAGS: ${CXXFLAGS}"
 
 # Find source files under src/ (exclude tests/)
 mapfile -d '' SRC_FILES < <(find "${SRC_DIR}" -type f \( -name '*.cc' -o -name '*.cpp' \) -not -path "${SRC_DIR}/tests/*" -print0)
+mapfile -d '' SRC_FILES < <(find "${SRC_DIR}" "${REPO_ROOT}/benchmarks" -type f \( -name '*.cc' -o -name '*.cpp' \) -not -path "*/tests/*" -print0)
 
 if [ ${#SRC_FILES[@]} -eq 0 ]; then
   echo "No source files found under src/ - nothing to build."
@@ -83,4 +84,21 @@ if [ -f "$CLI_SRC" ]; then
   "${CXX}" ${CXXFLAGS} "$CLI_SRC" "${ARCHIVE}" -o "${CLI_BIN}"
   echo "Build complete."
   echo "  cli:     ${CLI_BIN}"
+fi
+
+# 2. Build Pomai Benchmark (Bản tiêu chuẩn)
+BENCH_SRC="${REPO_ROOT}/benchmarks/pomai_benchmark.cc"
+BENCH_BIN="${BUILD_DIR}/pomai_benchmark"
+if [ -f "$BENCH_SRC" ]; then
+  echo "Linking Benchmark -> ${BENCH_BIN}"
+  "${CXX}" ${CXXFLAGS} "$BENCH_SRC" "${ARCHIVE}" -o "${BENCH_BIN}"
+fi
+
+# 3. Build Pomai Milestone Benchmark (Bản Q1 Paper)
+BENCH_MILESTONES="${REPO_ROOT}/benchmarks/pomai_milestone_benchmark.cc"
+BENCH_MILESTONES_BIN="${BUILD_DIR}/pomai_milestone_benchmark"
+if [ -f "$BENCH_MILESTONES" ]; then
+  echo "Linking Milestone Benchmark -> ${BENCH_MILESTONES_BIN}"
+  "${CXX}" ${CXXFLAGS} "$BENCH_MILESTONES" "${ARCHIVE}" -o "${BENCH_MILESTONES_BIN}"
+  echo "Milestone Benchmark build complete."
 fi
