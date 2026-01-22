@@ -9,7 +9,6 @@
  *
  * Notes:
  *  - This file is a self-contained server header. It depends on pomai_db and orbit APIs
- *    including budget-aware search methods (search_with_budget / search_filtered_with_budget).
  *  - Added support for: GET MEMBRANCE INFO <name>;  (returns dim, estimated num_vectors, disk size)
  */
 

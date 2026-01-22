@@ -17,7 +17,8 @@ namespace pomai::ai
         std::vector<uint8_t> pack_with_mean(const float *vec, const std::vector<float> &mean) const;
         bool unpack_to(const uint8_t *packed, size_t len, const std::vector<float> &mean, float *out) const;
         float approx_dist(const float *query, const uint8_t *packed, size_t len, const std::vector<float> &mean) const;
-
+        float approx_dist_with_cutoff(const float *q, const uint8_t *p, size_t len, const std::vector<float> &mean, float cutoff) const;
+        
         size_t dim() const noexcept { return dim_; }
 
     private:

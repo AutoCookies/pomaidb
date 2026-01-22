@@ -23,6 +23,7 @@
 #include "src/ai/zeroharmony_pack.h"
 #include "src/ai/whispergrain.h"
 #include "src/memory/wal_manager.h"
+#include "src/core/algo/echo_graph.h"
 
 namespace pomai::memory
 {
@@ -35,22 +36,18 @@ namespace pomai::ai::orbit
     struct SchemaHeader
     {
         uint32_t magic_number = 0x504F4D41;
-        uint32_t version = 2; // Bump version for new POD layout
+        uint32_t version = 2;
         uint64_t dim;
         uint64_t num_centroids;
         uint64_t total_vectors;
     };
 
-    // [CRITICAL FIX] Struct này phải là POD (Plain Old Data).
-    // Tuyệt đối KHÔNG dùng std::atomic trong struct sẽ ghi xuống đĩa.
-    // Việc truy cập atomic sẽ được thực hiện qua helper functions.
     struct BucketHeader
     {
         uint32_t centroid_id;
-        uint32_t count;              // Atomic access via helper
-        uint64_t next_bucket_offset; // Atomic access via helper
+        uint32_t count;
+        uint64_t next_bucket_offset;
         uint32_t off_mean;
-        
         uint32_t off_fingerprints;
         uint32_t off_pq_codes;
         uint32_t off_vectors;
@@ -119,11 +116,8 @@ namespace pomai::ai::orbit
         bool insert(const float *vec, uint64_t label);
         bool insert_batch(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
 
-        // Search API
         std::vector<std::pair<uint64_t, float>> search(const float *query, size_t k, size_t nprobe = 0);
-        std::vector<std::pair<uint64_t, float>> search_filtered(const float *query, size_t k, const std::vector<uint64_t> &candidates);
         std::vector<std::pair<uint64_t, float>> search_with_budget(const float *query, size_t k, const pomai::ai::Budget &budget, size_t nprobe = 0);
-        std::vector<std::pair<uint64_t, float>> search_filtered_with_budget(const float *query, size_t k, const std::vector<uint64_t> &candidates, const pomai::ai::Budget &budget);
 
         bool get(uint64_t label, std::vector<float> &out_vec);
         bool remove(uint64_t label);
@@ -146,10 +140,17 @@ namespace pomai::ai::orbit
         bool checkpoint();
         size_t packed_slot_size_ = 512;
 
+        void build_echo_graph(float beta = 1.0f, float threshold = 0.5f);
+
+        static constexpr uint32_t K_SPLIT_THRESHOLD = 2048;
+
     private:
         bool insert_batch_memory_only(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch);
         void recover_from_wal();
         void rebuild_index();
+        void check_and_split_bucket(uint32_t cid);
+
+        std::vector<uint32_t> bucket_sizes_;
 
         Config cfg_;
         ArenaView arena_;
@@ -186,7 +187,6 @@ namespace pomai::ai::orbit
         std::unordered_set<uint64_t> deleted_labels_;
         mutable std::shared_mutex del_mu_;
 
-        // Replace EternalEchoQuantizer pointer with ZeroHarmony packer pointer.
         std::unique_ptr<pomai::ai::ZeroHarmonyPacker> zeroharmony_;
         std::shared_ptr<pomai::core::MetadataIndex> metadata_index_;
         std::shared_ptr<pomai::ai::WhisperGrain> whisper_ctrl_;
@@ -204,5 +204,10 @@ namespace pomai::ai::orbit
 
         bool compute_distance_for_id_with_proj(const std::vector<std::vector<float>> &qproj, float qnorm2, uint64_t id, float &out_dist);
         mutable std::shared_mutex checkpoint_mu_;
+
+        pomai::core::algo::EchoGraph echo_graph_;
+        void scan_bucket_blitz_avx2(const float *query, uint32_t cid,
+                                    std::priority_queue<std::pair<float, uint64_t>> &heap,
+                                    size_t &scanned, size_t limit, size_t keep_k) const;
     };
-} // namespace pomai::ai::orbit
+}

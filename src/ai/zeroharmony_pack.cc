@@ -166,4 +166,69 @@ namespace pomai::ai
             return std::numeric_limits<float>::infinity();
         return ::pomai::core::kernels_internal::impl_l2sq(q, tls.data(), dim_);
     }
+
+    float ZeroHarmonyPacker::approx_dist_with_cutoff(const float *q, const uint8_t *p, size_t len, const std::vector<float> &mean, float cutoff) const
+    {
+        // compute squared L2 incrementally; early exit if acc > cutoff
+        float acc = 0.0f;
+        size_t pos = 0;
+        size_t d = 0;
+        while (pos < len && d < dim_)
+        {
+            uint8_t tag = p[pos++];
+            if (tag == 0)
+            {
+                if (pos >= len)
+                    return std::numeric_limits<float>::infinity();
+                uint8_t run = p[pos++];
+                // zeros: each increases acc by (q[d]-mean[d])^2 but delta=0 -> contribution = (q[d]-mean[d])^2
+                for (uint8_t r = 0; r < run && d < dim_; ++r, ++d)
+                {
+                    float diff = q[d] - mean[d];
+                    acc += diff * diff;
+                    if (acc > cutoff)
+                        return std::numeric_limits<float>::infinity();
+                }
+            }
+            else
+            {
+                float delta = 0.0f;
+                if (cfg_.use_half_nonzero)
+                {
+                    if (pos + 2 > len)
+                        return std::numeric_limits<float>::infinity();
+                    uint16_t h = (uint16_t)p[pos] | ((uint16_t)p[pos + 1] << 8);
+                    delta = f16_to_f32(h);
+                    pos += 2;
+                }
+                else
+                {
+                    if (pos + 4 > len)
+                        return std::numeric_limits<float>::infinity();
+                    uint32_t f = (uint32_t)p[pos] | ((uint32_t)p[pos + 1] << 8) | ((uint32_t)p[pos + 2] << 16) | ((uint32_t)p[pos + 3] << 24);
+                    std::memcpy(&delta, &f, 4);
+                    pos += 4;
+                }
+                if (d < dim_)
+                {
+                    float v = mean[d] + delta;
+                    float diff = q[d] - v;
+                    acc += diff * diff;
+                    if (acc > cutoff)
+                        return std::numeric_limits<float>::infinity();
+                }
+                ++d;
+            }
+        }
+        // finish remaining dims if any (shouldn't be many)
+        while (d < dim_)
+        {
+            float diff = q[d] - mean[d];
+            acc += diff * diff;
+            if (acc > cutoff)
+                return std::numeric_limits<float>::infinity();
+            ++d;
+        }
+        return acc;
+    }
 }

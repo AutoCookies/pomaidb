@@ -1,19 +1,16 @@
 /*
- * src/ai/whispergrain.cc
- *
- * Implementation of WhisperGrain (Adaptive Budget Controller).
+ * src/ai/whispergrain.cc - Đã sửa lỗi đứng im EMA
  */
 
 #include "src/ai/whispergrain.h"
-
 #include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <atomic>
+#include <iostream>
 
 namespace pomai::ai
 {
-
     WhisperGrain::WhisperGrain(const pomai::config::WhisperConfig &cfg)
         : cfg_(cfg), latency_ema_(-1.0f), cpu_load_(0.0f)
     {
@@ -21,31 +18,22 @@ namespace pomai::ai
 
     void WhisperGrain::observe_latency(float latency_ms)
     {
-        float alpha = cfg_.latency_ema_alpha;
-        float old_val = latency_ema_.load(std::memory_order_relaxed);
+        if (latency_ms < 0.001f)
+            latency_ms = 0.001f;
 
-        // Fast Start: If first observation, snap directly.
-        if (old_val < 0.0f)
+        float alpha = cfg_.latency_ema_alpha;
+        // Lấy giá trị cũ với memory_order_acquire để đồng bộ giữa các luồng search
+        float old_val = latency_ema_.load(std::memory_order_acquire);
+
+        // [FIX]: Nếu là lần đầu hoặc EMA đang bị âm/không hợp lệ
+        if (old_val <= 0.0f)
         {
-            if (latency_ema_.compare_exchange_strong(old_val, latency_ms,
-                                                     std::memory_order_release,
-                                                     std::memory_order_relaxed))
-            {
-                return;
-            }
-            // If CAS failed, someone else initialized it, proceed to blend.
-            old_val = latency_ema_.load(std::memory_order_relaxed);
+            latency_ema_.store(latency_ms, std::memory_order_release);
+            return;
         }
 
-        // Standard EMA update: New = Alpha * Sample + (1-Alpha) * Old
-        // CAS loop for thread safety
-        float new_val = old_val;
-        do
-        {
-            new_val = alpha * latency_ms + (1.0f - alpha) * old_val;
-        } while (!latency_ema_.compare_exchange_weak(old_val, new_val,
-                                                     std::memory_order_release,
-                                                     std::memory_order_relaxed));
+        float new_val = alpha * latency_ms + (1.0f - alpha) * old_val;
+        latency_ema_.store(new_val, std::memory_order_release);
     }
 
     void WhisperGrain::set_cpu_load(float cpu_percent)
@@ -56,76 +44,63 @@ namespace pomai::ai
     Budget WhisperGrain::compute_budget(bool is_hot) const
     {
         Budget b;
-        float ema = latency_ema_.load(std::memory_order_relaxed);
+        float ema = latency_ema_.load(std::memory_order_acquire);
         float cpu = cpu_load_.load(std::memory_order_relaxed);
 
-        // 1. Base Budget
+        // 1. Base Budget (Mặc định 5000 ops)
         float base = static_cast<float>(cfg_.base_budget_ops);
 
         // 2. Latency Feedback Control
-        // If EMA < Target: We are fast -> Scale UP (Relax budget)
-        // If EMA > Target: We are slow -> Scale DOWN (Tighten budget)
-
-        // Handle uninitialized state (ema < 0) -> treat as meeting target
-        if (ema < 0.0f)
+        // Handle uninitialized state (ema < 0 hoặc 0) -> dùng latency target làm baseline
+        if (ema <= 0.0f)
             ema = cfg_.latency_target_ms;
 
         float scale = 1.0f;
         float target = cfg_.latency_target_ms;
 
-        if (ema > target && ema > 0.001f)
+        if (ema > target)
         {
-            // Sqrt damping for smoother degradation
+            // [HARD LIMIT]: Nếu quá chậm, siết budget theo tỷ lệ bình phương
             scale = std::sqrt(target / ema);
         }
         else
         {
-            // System idle -> Allow boost (Headroom)
+            // Hệ thống rảnh rỗi -> Cho phép bung sức mạnh (Headroom = 1.2x)
             scale = cfg_.budget_headroom;
         }
 
         // 3. CPU Safety Rail (Thermal Control)
+        // Haswell/Kaby Lake trên ProBook rất nóng, cần siết mạnh khi CPU > 90%
         if (cpu >= cfg_.cpu_hard_threshold)
-        {
-            scale *= 0.25f; // Hard throttling
-        }
+            scale *= 0.25f;
         else if (cpu >= cfg_.cpu_soft_threshold)
-        {
-            scale *= 0.6f; // Soft backpressure
-        }
+            scale *= 0.6f;
 
-        // 4. Calculate Final OPS
+        // 4. Final OPS Calculation
         float ops = base * scale;
 
-        // Apply floors (Min QoS)
+        // Ép sàn (Min QoS) để không bao giờ dừng hẳn tìm kiếm
         float min_ops = static_cast<float>(is_hot ? cfg_.hot_query_floor : cfg_.min_budget_ops);
         if (ops < min_ops)
             ops = min_ops;
 
-        // Apply ceilings (Max Burst)
+        // Ép trần (Max Burst)
         float max_ops = base * cfg_.budget_headroom;
         if (ops > max_ops)
             ops = max_ops;
 
         b.ops_budget = static_cast<uint32_t>(ops);
 
-        // 5. Spatial Budget Heuristic
-        constexpr uint32_t COST_PER_BUCKET = 10;
-        b.bucket_budget = std::max<uint32_t>(1, b.ops_budget / COST_PER_BUCKET);
+        // 5. Spatial Budget (Số lượng centroids/hops tối đa)
+        // Tỷ lệ vàng: 1 hop tốn tương đương 50-100 OPS (do SIMD scan bucket)
+        // Chúng ta map budget ops sang bucket budget để EchoGraph.auto_navigate thực thi
+        constexpr uint32_t OPS_PER_BUCKET = 500;
+        b.bucket_budget = std::max<uint32_t>(16, b.ops_budget / OPS_PER_BUCKET);
 
-        // 6. Refine Policy (IO permission)
-        // Only allow exact refine if we have plenty of latency margin
-        if (ema < (target - static_cast<float>(cfg_.refine_enable_margin_ms)) &&
-            cpu < cfg_.cpu_soft_threshold)
-        {
-            b.allow_exact_refine = true;
-        }
-        else
-        {
-            b.allow_exact_refine = false;
-        }
+        // 6. Refine Policy (Chỉ cho phép đọc SSD nếu máy thực sự rảnh)
+        b.allow_exact_refine = (ema < (target - static_cast<float>(cfg_.refine_enable_margin_ms)) &&
+                                cpu < cfg_.cpu_soft_threshold);
 
         return b;
     }
-
 } // namespace pomai::ai
