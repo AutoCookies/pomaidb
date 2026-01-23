@@ -799,6 +799,11 @@ namespace pomai::ai::orbit
             float ms = std::chrono::duration<float, std::milli>(std::chrono::high_resolution_clock::now() - start).count();
             whisper_ctrl_->observe_latency(ms);
         }
+
+        PomaiMetrics::total_searches.fetch_add(1, std::memory_order_relaxed);
+        if (results.empty())
+            PomaiMetrics::searches_empty.fetch_add(1, std::memory_order_relaxed);
+
         return results;
     }
 
@@ -832,6 +837,7 @@ namespace pomai::ai::orbit
         uint64_t curr = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
         static thread_local std::vector<char> buf;
         buf.reserve(64 * 1024);
+
         while (curr != 0 && scanned < limit)
         {
             auto base = resolve_bucket_base(arena_, curr, buf);
@@ -839,6 +845,7 @@ namespace pomai::ai::orbit
                 break;
             const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(*base);
             uint32_t n = bucket_atomic_load_count(hdr);
+
             const uint64_t *ids = reinterpret_cast<const uint64_t *>(*base + hdr->off_ids);
             const uint16_t *lens = reinterpret_cast<const uint16_t *>(*base + hdr->off_pq_codes);
             const char *vecs = *base + hdr->off_vectors;
@@ -847,24 +854,19 @@ namespace pomai::ai::orbit
             {
                 if (++scanned > limit)
                     return;
-                // compute current cutoff (worst distance in top-k)
-                float worst = std::numeric_limits<float>::infinity();
-                if (heap.size() >= keep_k)
-                    worst = heap.top().first;
 
-                uint64_t lbl = IdEntry::payload_of(pomai::ai::atomic_utils::atomic_load_u64(ids + i));
-                const uint8_t *code = reinterpret_cast<const uint8_t *>(vecs + i * packed_slot_size_);
+                float worst = heap.size() >= keep_k ? heap.top().first : std::numeric_limits<float>::infinity();
+                const uint8_t *code = reinterpret_cast<const uint8_t *>(vecs + (size_t)i * packed_slot_size_);
 
-                // call new approx method with cutoff; returns value <= worst if promising
                 float d = zeroharmony_->approx_dist_with_cutoff(query, code, lens[i], centroids_[cid]->vector, worst);
-                if (!(heap.size() < keep_k || d < heap.top().first))
-                    continue;
-
-                heap.push({d, lbl});
-                if (heap.size() > keep_k)
-                    heap.pop();
+                if (heap.size() < keep_k || d < worst)
+                {
+                    heap.push({d, IdEntry::payload_of(pomai::ai::atomic_utils::atomic_load_u64(ids + i))});
+                    if (heap.size() > keep_k)
+                        heap.pop();
+                }
             }
-            curr = bucket_atomic_load_next(hdr);
+            curr = hdr->next_bucket_offset;
         }
     }
 
@@ -980,55 +982,39 @@ namespace pomai::ai::orbit
 
     void PomaiOrbit::build_echo_graph(float beta, float threshold)
     {
-        size_t num_c = centroids_.size();
-        if (num_c <= 1)
+        std::unique_lock<std::mutex> bg_lk(echo_graph_bg_mu_, std::try_to_lock);
+        if (!bg_lk)
             return;
-
-        pomai::core::algo::BlitzKernels::init();
-
-        const size_t max_degree = 32;
-        const size_t min_degree = 8;
-
-        std::vector<std::vector<pomai::core::algo::EchoEdge>> adj(num_c);
-        for (auto &v : adj)
-            v.reserve(max_degree + 1);
-
-        unsigned int num_threads = std::thread::hardware_concurrency();
-        std::atomic<size_t> next_row{0};
-
-        std::vector<std::thread> workers;
-        for (unsigned int t = 0; t < num_threads; ++t)
+        if (centroids_.empty() || (next_graph_snapshot_cid_ >= centroids_.size()))
+            return;
+        size_t begin = next_graph_snapshot_cid_;
+        size_t end = std::min(begin + 32ul, centroids_.size());
+        if (adj_snapshot_.size() != centroids_.size())
+            adj_snapshot_.resize(centroids_.size());
+        L2Func kern = get_pomai_l2sq_kernel();
+        for (size_t i = begin; i < end; ++i)
         {
-            workers.emplace_back([this, &adj, &next_row, num_c, beta, threshold, min_degree, max_degree]()
-                                 {
-                std::vector<pomai::core::algo::EchoEdge> candidates;
-                candidates.reserve(num_c);
-
-                size_t i;
-                while ((i = next_row.fetch_add(1, std::memory_order_relaxed)) < num_c) {
-                    candidates.clear();
-                    if (!centroids_[i]) continue;
-                    const float* vec_i = centroids_[i]->vector.data();
-
-                    for (uint32_t j = 0; j < (uint32_t)num_c; ++j) {
-                        if (i == j || !centroids_[j]) continue;
-                        float dist = pomai::core::algo::blitz_l2sq(vec_i, centroids_[j]->vector.data(), cfg_.dim);
-                        float weight = std::exp(-beta * dist);
-                        candidates.push_back({j, weight});
-                    }
-
-                    std::sort(candidates.begin(), candidates.end(), [](auto& a, auto& b) { return a.weight > b.weight; });
-
-                    for (size_t k = 0; k < candidates.size(); ++k) {
-                        if (k < min_degree || (candidates[k].weight > threshold && k < max_degree)) {
-                            adj[i].push_back(candidates[k]);
-                        } else { break; }
-                    }
-                } });
+            std::vector<std::pair<float, uint32_t>> dists;
+            dists.reserve(centroids_.size());
+            for (size_t j = 0; j < centroids_.size(); ++j)
+            {
+                if (i == j)
+                    continue;
+                dists.push_back({kern(centroids_[i]->vector.data(), centroids_[j]->vector.data(), cfg_.dim), static_cast<uint32_t>(j)});
+            }
+            std::sort(dists.begin(), dists.end());
+            adj_snapshot_[i].clear();
+            for (size_t k = 0; k < std::min<size_t>(dists.size(), 16); ++k)
+            {
+                adj_snapshot_[i].push_back({dists[k].second, std::exp(-beta * dists[k].first)});
+            }
         }
-        for (auto &w : workers)
-            w.join();
-        echo_graph_.build_from_adjacency(adj);
+        next_graph_snapshot_cid_ = end;
+        if (end == centroids_.size())
+        {
+            echo_graph_.build_from_adjacency(adj_snapshot_);
+            next_graph_snapshot_cid_ = 0;
+        }
     }
 
     void PomaiOrbit::check_and_split_bucket(uint32_t cid)

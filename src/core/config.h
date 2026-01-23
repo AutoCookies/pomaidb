@@ -89,9 +89,9 @@ namespace pomai::config
     struct OrbitConfig
     {
         uint32_t auto_scale_factor = 1500;
-        uint32_t min_centroids = 64;
+        uint32_t min_centroids = 1024;
         uint32_t max_centroids = 65536;
-        uint32_t num_centroids = 64;
+        uint32_t num_centroids = 1024;
         uint32_t initial_bucket_cap = 128;
     };
 

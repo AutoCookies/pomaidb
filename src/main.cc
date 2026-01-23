@@ -89,7 +89,7 @@ int main(int argc, char **argv)
 
     // 2. Init CPU Kernels
     pomai_init_cpu_kernels();
-    
+
     // 3. System tuning
     struct rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
@@ -125,15 +125,12 @@ int main(int argc, char **argv)
     {
         std::thread([&config]()
                     {
-            std::this_thread::sleep_for(std::chrono::seconds(2)); 
-            
-            while (!g_stop_requested) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(config.metrics.report_interval_ms));
-                
-                if (g_stop_requested) break;
-            
-                PomaiMetrics::print_summary();
-            } })
+        std::this_thread::sleep_for(std::chrono::seconds(2)); 
+        while (!g_stop_requested) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(config.metrics.report_interval_ms));
+            if (g_stop_requested) break;
+            PomaiMetrics::print_summary();
+        } })
             .detach();
     }
 

@@ -211,5 +211,13 @@ namespace pomai::ai::orbit
         void scan_bucket_blitz_avx2(const float *query, uint32_t cid,
                                     std::priority_queue<std::pair<float, uint64_t>> &heap,
                                     size_t &scanned, size_t limit, size_t keep_k) const;
+
+        void auto_robust_build();
+        float compute_harmony_weight(uint32_t i, uint32_t j) const;
+        uint32_t hamming_threshold_ = 32;
+        std::vector<std::vector<pomai::core::algo::EchoEdge>> adj_snapshot_;
+        size_t next_graph_snapshot_cid_ = 0;
+        std::mutex echo_graph_bg_mu_;
+        uint32_t last_centroid_dirty_ = 0;
     };
 }
