@@ -204,6 +204,8 @@ namespace pomai::ai::orbit
 
         bool compute_distance_for_id_with_proj(const std::vector<std::vector<float>> &qproj, float qnorm2, uint64_t id, float &out_dist);
         mutable std::shared_mutex checkpoint_mu_;
+        std::vector<uint64_t> split_last_ts_;
+        std::mutex split_ts_mu_;
 
         pomai::core::algo::EchoGraph echo_graph_;
         void scan_bucket_blitz_avx2(const float *query, uint32_t cid,

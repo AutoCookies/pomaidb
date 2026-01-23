@@ -127,7 +127,6 @@ int main()
 
     pomai::config::PomaiConfig cfg;
     cfg.res.data_root = "./data/milestone_bench";
-    cfg.orbit.num_centroids = 0;
     cfg.hot_tier.initial_capacity = 2'000'000;
 
     std::filesystem::remove_all(cfg.res.data_root);
@@ -149,7 +148,7 @@ int main()
     {
         auto whisper = std::make_shared<pomai::ai::WhisperGrain>(cfg.whisper);
         membr->orbit->set_whisper_grain(whisper);
-        
+
         std::cout << "[Init] Pre-training EchoGraph with 10,000 random vectors...\n";
         membr->orbit->train(train_vecs.data(), 10000);
     }
@@ -163,15 +162,14 @@ int main()
         workers.emplace_back(worker_loop, db.get(), m_name, dim, std::ref(all_stats[i]), i);
 
     std::thread cpu_monitor([&]()
-    {
+                            {
         auto *m = db->get_membrance(m_name);
         while (!stop_all.load()) {
             if (m && m->orbit && m->orbit->whisper_grain()) {
                 m->orbit->whisper_grain()->set_cpu_load(get_system_cpu_load());
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        } 
-    });
+        } });
 
     for (uint64_t target : milestones)
     {

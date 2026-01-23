@@ -444,7 +444,7 @@ namespace pomai::ai::orbit
             return false;
 
         size_t num_c = std::clamp(n / cfg_.algo.auto_scale_factor,
-                                  (size_t)1024,
+                                  (size_t)cfg_.algo.min_centroids,
                                   (size_t)cfg_.algo.max_centroids);
 
         std::clog << "[Autopilot] Initializing " << num_c << " centroids for " << n << " samples.\n";
@@ -621,7 +621,18 @@ namespace pomai::ai::orbit
     bool PomaiOrbit::insert_batch_memory_only(const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
     {
         if (centroids_.empty())
-            return false;
+        {
+            size_t seed_count = std::max<size_t>(cfg_.algo.min_centroids, std::thread::hardware_concurrency() / 2);
+            for (size_t i = 0; i < std::min(batch.size(), seed_count); ++i)
+            {
+                auto node = std::make_unique<OrbitNode>();
+                node->vector = batch[i].second;
+                node->bucket_offset.store(alloc_new_bucket(static_cast<uint32_t>(i)), std::memory_order_release);
+                centroids_.push_back(std::move(node));
+            }
+            rebuild_index();
+            build_echo_graph(1.0f, 0.01f);
+        }
 
         std::vector<Item> prepared;
         for (const auto &p : batch)
@@ -689,6 +700,7 @@ namespace pomai::ai::orbit
                 }
             }
         }
+
         return true;
     }
 
@@ -1021,36 +1033,193 @@ namespace pomai::ai::orbit
 
     void PomaiOrbit::check_and_split_bucket(uint32_t cid)
     {
+        constexpr size_t K_SPLIT_THRESHOLD = PomaiOrbit::K_SPLIT_THRESHOLD;
+        constexpr uint64_t MIN_SPLIT_INTERVAL_NS = 60ULL * 1000000000ULL;
+        if (cid >= bucket_sizes_.size())
+            return;
+        if (centroids_.size() >= cfg_.algo.max_centroids)
+            return;
         static std::atomic<bool> global_splitting_lock{false};
         if (global_splitting_lock.exchange(true))
             return;
-
-        if (pomai::ai::atomic_utils::atomic_load_u32(&bucket_sizes_[cid]) < K_SPLIT_THRESHOLD)
+        uint32_t sz = pomai::ai::atomic_utils::atomic_load_u32(&bucket_sizes_[cid]);
+        if (sz < K_SPLIT_THRESHOLD)
         {
             global_splitting_lock.store(false);
             return;
         }
-
-        std::clog << "[Auto-Split] Dividing bucket " << cid << " at runtime.\n";
-
-        auto node = std::make_unique<OrbitNode>();
-        node->vector.resize(cfg_.dim);
+        uint64_t now = static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        static std::mutex split_ts_mu;
+        static std::unordered_map<uint32_t, uint64_t> split_last_ts;
+        {
+            std::lock_guard<std::mutex> l(split_ts_mu);
+            auto it = split_last_ts.find(cid);
+            if (it != split_last_ts.end())
+            {
+                uint64_t last = it->second;
+                if (now < last + MIN_SPLIT_INTERVAL_NS)
+                {
+                    global_splitting_lock.store(false);
+                    return;
+                }
+            }
+            split_last_ts[cid] = now;
+        }
+        auto new_node = std::make_unique<OrbitNode>();
+        new_node->vector.resize(cfg_.dim);
         for (size_t i = 0; i < cfg_.dim; ++i)
-            node->vector[i] = centroids_[cid]->vector[i] * 1.01f;
-
+            new_node->vector[i] = centroids_[cid]->vector[i] * 1.01f;
         uint32_t new_cid;
         {
             std::unique_lock<std::shared_mutex> lk(checkpoint_mu_);
             new_cid = static_cast<uint32_t>(centroids_.size());
-            node->bucket_offset.store(alloc_new_bucket(new_cid), std::memory_order_release);
-            centroids_.push_back(std::move(node));
+            new_node->bucket_offset.store(alloc_new_bucket(new_cid), std::memory_order_release);
+            centroids_.push_back(std::move(new_node));
             bucket_sizes_.push_back(0);
+            std::lock_guard<std::mutex> l(split_ts_mu);
+            split_last_ts[new_cid] = now;
         }
-
+        uint64_t old_bucket_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
+        uint64_t new_bucket_off = centroids_[new_cid]->bucket_offset.load(std::memory_order_acquire);
+        ArenaView &arena = arena_;
+        std::vector<uint64_t> labels_to_move;
+        std::vector<uint64_t> src_bucket_offs;
+        std::vector<uint32_t> src_slots;
+        {
+            std::unique_lock<std::shared_mutex> lk(centroids_[cid]->mu);
+            uint64_t curr = old_bucket_off;
+            std::vector<char> tmp;
+            while (curr != 0)
+            {
+                auto base_opt = resolve_bucket_base(arena, curr, tmp);
+                if (!base_opt)
+                    break;
+                const char *body = *base_opt;
+                const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(body);
+                uint32_t n = bucket_atomic_load_count(hdr);
+                const char *vecs = body + hdr->off_vectors;
+                const uint16_t *lens = reinterpret_cast<const uint16_t *>(body + hdr->off_pq_codes);
+                const uint64_t *ids = reinterpret_cast<const uint64_t *>(body + hdr->off_ids);
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    uint64_t packed = pomai::ai::atomic_utils::atomic_load_u64(ids + i);
+                    if (IdEntry::tag_of(packed) != IdEntry::TAG_LABEL)
+                        continue;
+                    uint64_t lbl = IdEntry::payload_of(packed);
+                    uint16_t plen = lens[i];
+                    if (plen == 0 || plen > static_cast<uint16_t>(packed_slot_size_))
+                        continue;
+                    std::vector<float> unpacked(cfg_.dim);
+                    const uint8_t *pkt = reinterpret_cast<const uint8_t *>(vecs + static_cast<size_t>(i) * packed_slot_size_);
+                    if (!zeroharmony_->unpack_to(pkt, plen, centroids_[cid]->vector, unpacked.data()))
+                        continue;
+                    float d_old = get_pomai_l2sq_kernel()(unpacked.data(), centroids_[cid]->vector.data(), cfg_.dim);
+                    float d_new = get_pomai_l2sq_kernel()(unpacked.data(), centroids_[new_cid]->vector.data(), cfg_.dim);
+                    if (d_new < d_old)
+                    {
+                        labels_to_move.push_back(lbl);
+                        src_bucket_offs.push_back(curr);
+                        src_slots.push_back(i);
+                    }
+                }
+                curr = bucket_atomic_load_next(hdr);
+            }
+        }
+        if (!labels_to_move.empty())
+        {
+            std::unique_lock<std::shared_mutex> lk_old(centroids_[cid]->mu);
+            std::unique_lock<std::shared_mutex> lk_new(centroids_[new_cid]->mu);
+            for (size_t idx = 0; idx < labels_to_move.size(); ++idx)
+            {
+                uint64_t lbl = labels_to_move[idx];
+                uint64_t src_off = src_bucket_offs[idx];
+                uint32_t src_slot = src_slots[idx];
+                uint64_t cur_bucket = 0;
+                uint32_t cur_slot = 0;
+                if (!get_label_bucket(lbl, cur_bucket) || !get_label_slot(lbl, cur_slot))
+                    continue;
+                if (cur_bucket != src_off || cur_slot != src_slot)
+                    continue;
+                std::vector<char> tmp;
+                auto base_opt = resolve_bucket_base(arena, src_off, tmp);
+                if (!base_opt)
+                    continue;
+                char *src_body = const_cast<char *>(*base_opt);
+                BucketHeader *src_hdr = reinterpret_cast<BucketHeader *>(src_body);
+                const char *src_vecs = src_body + src_hdr->off_vectors;
+                const uint16_t *src_lens = reinterpret_cast<const uint16_t *>(src_body + src_hdr->off_pq_codes);
+                const uint64_t *src_ids = reinterpret_cast<const uint64_t *>(src_body + src_hdr->off_ids);
+                uint16_t plen = src_lens[src_slot];
+                if (plen == 0 || plen > static_cast<uint16_t>(packed_slot_size_))
+                    continue;
+                const uint8_t *pkt = reinterpret_cast<const uint8_t *>(src_vecs + static_cast<size_t>(src_slot) * packed_slot_size_);
+                std::vector<char> tmp2;
+                uint64_t dst_off = new_bucket_off;
+                bool inserted = false;
+                while (!inserted)
+                {
+                    auto base2_opt = resolve_bucket_base(arena, dst_off, tmp2);
+                    if (!base2_opt)
+                    {
+                        break;
+                    }
+                    char *dst_body = const_cast<char *>(*base2_opt);
+                    BucketHeader *dst_hdr = reinterpret_cast<BucketHeader *>(dst_body);
+                    uint32_t cur = bucket_atomic_load_count(dst_hdr);
+                    if (cur >= dynamic_bucket_capacity_)
+                    {
+                        uint64_t nxt = bucket_atomic_load_next(dst_hdr);
+                        if (nxt == 0)
+                        {
+                            uint64_t alloc = alloc_new_bucket(new_cid);
+                            if (alloc == 0)
+                                break;
+                            bucket_atomic_store_next(dst_hdr, alloc);
+                            dst_off = alloc;
+                            continue;
+                        }
+                        dst_off = nxt;
+                        continue;
+                    }
+                    uint32_t slot = bucket_atomic_fetch_add_count(dst_hdr, 1);
+                    if (slot + 1 > dynamic_bucket_capacity_)
+                    {
+                        bucket_atomic_sub_count(dst_hdr, 1);
+                        uint64_t nxt = bucket_atomic_load_next(dst_hdr);
+                        if (nxt == 0)
+                        {
+                            uint64_t alloc = alloc_new_bucket(new_cid);
+                            if (alloc == 0)
+                                break;
+                            bucket_atomic_store_next(dst_hdr, alloc);
+                            dst_off = alloc;
+                            continue;
+                        }
+                        dst_off = nxt;
+                        continue;
+                    }
+                    char *dst_vbase = dst_body + dst_hdr->off_vectors;
+                    uint16_t *dst_lbase = reinterpret_cast<uint16_t *>(dst_body + dst_hdr->off_pq_codes);
+                    uint64_t *dst_ibase = reinterpret_cast<uint64_t *>(dst_body + dst_hdr->off_ids);
+                    std::memcpy(dst_vbase + static_cast<size_t>(slot) * packed_slot_size_, pkt, plen);
+                    __atomic_store_n(&dst_lbase[slot], plen, __ATOMIC_RELEASE);
+                    uint64_t packed_id = IdEntry::pack_label(lbl);
+                    pomai::ai::atomic_utils::atomic_store_u64(dst_ibase + slot, packed_id);
+                    set_label_map(lbl, dst_off, slot);
+                    pomai::ai::atomic_utils::atomic_fetch_add_u32(&bucket_sizes_[new_cid], 1);
+                    inserted = true;
+                }
+                if (!inserted)
+                    continue;
+                uint16_t *w_lens = reinterpret_cast<uint16_t *>(src_body + src_hdr->off_pq_codes);
+                uint64_t *w_ids = reinterpret_cast<uint64_t *>(src_body + src_hdr->off_ids);
+                __atomic_store_n(&w_lens[src_slot], static_cast<uint16_t>(0), __ATOMIC_RELEASE);
+                pomai::ai::atomic_utils::atomic_store_u64(w_ids + src_slot, 0);
+                pomai::ai::atomic_utils::atomic_fetch_sub_u32(&src_hdr->count, 1);
+                pomai::ai::atomic_utils::atomic_fetch_sub_u32(&bucket_sizes_[cid], 1);
+            }
+        }
         build_echo_graph(1.0f, 0.01f);
-
-        pomai::ai::atomic_utils::atomic_store_u32(&bucket_sizes_[cid], K_SPLIT_THRESHOLD / 2);
         global_splitting_lock.store(false);
     }
-
 } // namespace pomai::ai::orbit
