@@ -3,10 +3,12 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <cstring>
 #include <algorithm>
 #include <queue>
 #include <cstdint>
+#include <chrono>
 
 #include "src/core/config.h"
 #include "src/core/types.h"
@@ -30,40 +32,79 @@ namespace pomai::core
     class HotTier
     {
     public:
+        enum class InsertResult : uint8_t
+        {
+            OK = 0,
+            FULL = 1,
+            INVALID = 2,
+            TIMEOUT = 3
+        };
+
         HotTier(size_t dim, const pomai::config::HotTierConfig &cfg, DataType dt = DataType::FLOAT32)
             : dim_(dim),
               data_type_(dt),
-              capacity_limit_(cfg.initial_capacity),
-              cursor_(0)
+              capacity_limit_(std::max<size_t>(1, cfg.initial_capacity)),
+              element_size_(static_cast<uint32_t>(dtype_size(dt))),
+              stride_(dim_ * element_size_),
+              head_(0),
+              tail_(0),
+              block_when_full_(true),
+              push_timeout_ms_(0)
         {
-
-            element_size_ = static_cast<uint32_t>(dtype_size(dt));
-            stride_ = dim_ * element_size_;
-
             labels_.resize(capacity_limit_);
-            data_.resize(capacity_hint() * stride_);
+            data_.resize(capacity_limit_ * stride_);
         }
 
-        // --- PUBLIC METADATA ACCESSORS (Big Tech Standard) ---
         uint32_t element_size() const noexcept { return element_size_; }
         DataType data_type() const noexcept { return data_type_; }
         std::string data_type_string() const { return dtype_name(data_type_); }
         size_t dim() const noexcept { return dim_; }
         size_t capacity_hint() const noexcept { return capacity_limit_; }
 
-        void push(uint64_t label, const float *vec)
+        void set_block_when_full(bool v) noexcept { block_when_full_ = v; }
+        void set_push_timeout_ms(uint32_t ms) noexcept { push_timeout_ms_ = ms; }
+
+        InsertResult push(uint64_t label, const float *vec)
         {
             if (!vec)
-                return;
-            std::lock_guard<std::mutex> lock(mutex_);
+                return InsertResult::INVALID;
 
-            if (cursor_ >= capacity_limit_)
+            std::unique_lock<std::mutex> lock(prod_mutex_);
+
+            auto is_full = [this]() noexcept
             {
-                dropped_count_.fetch_add(1, std::memory_order_relaxed);
-                return;
+                uint32_t next = (head_ + 1) % static_cast<uint32_t>(capacity_limit_);
+                return next == tail_;
+            };
+
+            if (!block_when_full_)
+            {
+                if (is_full())
+                {
+                    dropped_count_.fetch_add(1, std::memory_order_relaxed);
+                    return InsertResult::FULL;
+                }
+            }
+            else
+            {
+                if (push_timeout_ms_ == 0)
+                {
+                    while (is_full())
+                        not_full_cv_.wait(lock);
+                }
+                else
+                {
+                    auto timeout = std::chrono::milliseconds(push_timeout_ms_);
+                    if (!not_full_cv_.wait_for(lock, timeout, [&]
+                                               { return !is_full(); }))
+                        return InsertResult::TIMEOUT;
+                }
             }
 
-            uint32_t idx = cursor_++;
+            uint32_t idx = head_;
+            head_ = (head_ + 1) % static_cast<uint32_t>(capacity_limit_);
+
+            // write data under producer lock to avoid consumer seeing a partially-written slot
             labels_[idx] = label;
             uint8_t *dst = data_.data() + (static_cast<size_t>(idx) * stride_);
 
@@ -104,6 +145,10 @@ namespace pomai::core
                 std::memcpy(dst, vec, std::min(stride_, dim_ * sizeof(float)));
                 break;
             }
+
+            lock.unlock();
+            not_empty_cv_.notify_one();
+            return InsertResult::OK;
         }
 
         HotBatch swap_and_flush()
@@ -113,25 +158,43 @@ namespace pomai::core
             batch.element_size = element_size_;
             batch.data_type = data_type_;
 
+            std::unique_lock<std::mutex> lock(prod_mutex_);
+            if (head_ == tail_)
+                return batch;
+
+            uint32_t start = tail_;
+            uint32_t end = head_;
+            size_t count = 0;
+            if (end >= start)
+                count = static_cast<size_t>(end - start);
+            else
+                count = static_cast<size_t>(capacity_limit_ - start + end);
+
+            if (count == 0)
+                return batch;
+
+            batch.labels.resize(count);
+            batch.data.resize(count * stride_);
+
+            if (end > start)
             {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (cursor_ == 0)
-                    return batch;
-
-                size_t actual_vectors = cursor_;
-                std::vector<uint64_t> old_labels;
-                std::vector<uint8_t> old_data;
-
-                old_labels.resize(actual_vectors);
-                std::memcpy(old_labels.data(), labels_.data(), actual_vectors * sizeof(uint64_t));
-
-                old_data.resize(actual_vectors * stride_);
-                std::memcpy(old_data.data(), data_.data(), actual_vectors * stride_);
-
-                batch.labels = std::move(old_labels);
-                batch.data = std::move(old_data);
-                cursor_ = 0;
+                std::memcpy(batch.labels.data(), labels_.data() + start, count * sizeof(uint64_t));
+                std::memcpy(batch.data.data(), data_.data() + static_cast<size_t>(start) * stride_, count * stride_);
             }
+            else
+            {
+                uint32_t first = static_cast<uint32_t>(capacity_limit_ - start);
+                std::memcpy(batch.labels.data(), labels_.data() + start, first * sizeof(uint64_t));
+                std::memcpy(batch.data.data(), data_.data() + static_cast<size_t>(start) * stride_, first * stride_);
+
+                uint32_t second = end;
+                std::memcpy(batch.labels.data() + first, labels_.data(), second * sizeof(uint64_t));
+                std::memcpy(batch.data.data() + static_cast<size_t>(first) * stride_, data_.data(), static_cast<size_t>(second) * stride_);
+            }
+
+            tail_ = end;
+            lock.unlock();
+            not_full_cv_.notify_all();
             return batch;
         }
 
@@ -139,8 +202,16 @@ namespace pomai::core
         {
             if (!query || k == 0)
                 return {};
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (cursor_ == 0)
+            std::lock_guard<std::mutex> lock(prod_mutex_);
+            uint32_t start = tail_;
+            uint32_t end = head_;
+            size_t count = 0;
+            if (end >= start)
+                count = static_cast<size_t>(end - start);
+            else
+                count = static_cast<size_t>(capacity_limit_ - start + end);
+
+            if (count == 0)
                 return {};
 
             using ScorePair = std::pair<float, uint64_t>;
@@ -148,9 +219,10 @@ namespace pomai::core
             auto dist_fn = get_pomai_l2sq_kernel();
             std::vector<float> scratch(dim_);
 
-            for (uint32_t i = 0; i < cursor_; ++i)
+            for (size_t i = 0; i < count; ++i)
             {
-                const uint8_t *slot = data_.data() + (static_cast<size_t>(i) * stride_);
+                uint32_t idx = static_cast<uint32_t>((start + i) % capacity_limit_);
+                const uint8_t *slot = data_.data() + (static_cast<size_t>(idx) * stride_);
                 float dist;
                 if (data_type_ == DataType::FLOAT32)
                 {
@@ -162,11 +234,11 @@ namespace pomai::core
                     dist = dist_fn(query, scratch.data(), dim_);
                 }
                 if (pq.size() < k)
-                    pq.push({dist, labels_[i]});
+                    pq.push({dist, labels_[idx]});
                 else if (dist < pq.top().first)
                 {
                     pq.pop();
-                    pq.push({dist, labels_[i]});
+                    pq.push({dist, labels_[idx]});
                 }
             }
 
@@ -180,7 +252,15 @@ namespace pomai::core
             return res;
         }
 
-        size_t size() const { return cursor_.load(std::memory_order_relaxed); }
+        size_t size() const
+        {
+            uint32_t h = head_;
+            uint32_t t = tail_;
+            if (h >= t)
+                return static_cast<size_t>(h - t);
+            return static_cast<size_t>(capacity_limit_ - t + h);
+        }
+
         static uint64_t dropped_count() { return dropped_count_.load(std::memory_order_relaxed); }
 
     private:
@@ -226,9 +306,19 @@ namespace pomai::core
         const size_t capacity_limit_;
         uint32_t element_size_;
         size_t stride_;
-        alignas(64) std::atomic<uint32_t> cursor_;
+
+        alignas(64) uint32_t head_;
+        alignas(64) uint32_t tail_;
+
         alignas(64) static inline std::atomic<uint64_t> dropped_count_{0};
-        mutable std::mutex mutex_;
+
+        mutable std::mutex prod_mutex_;
+        std::condition_variable not_full_cv_;
+        std::condition_variable not_empty_cv_;
+
+        bool block_when_full_;
+        uint32_t push_timeout_ms_;
+
         std::vector<uint64_t> labels_;
         std::vector<uint8_t> data_;
     };

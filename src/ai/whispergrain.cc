@@ -1,39 +1,40 @@
 #include "src/ai/whispergrain.h"
-#include "src/core/metrics.h"
 #include <algorithm>
 #include <cmath>
-#include <chrono>
-#include <atomic>
-#include <iostream>
 
 namespace pomai::ai
 {
     WhisperGrain::WhisperGrain(const pomai::config::WhisperConfig &cfg)
-        : cfg_(cfg), latency_ema_(-1.0f), cpu_load_(0.0f)
+        : cfg_(cfg), latency_ema_(-1.0f), cpu_load_(0.0f), observations_(0)
     {
     }
 
     void WhisperGrain::observe_latency(float latency_ms)
     {
-        PomaiMetrics::total_searches.fetch_add(1, std::memory_order_relaxed);
-        if (latency_ms < 0.001f)
-        {
-            PomaiMetrics::searches_fast_miss.fetch_add(1, std::memory_order_relaxed);
-            latency_ms = 0.001f;
-        }
-        float alpha = cfg_.latency_ema_alpha;
-        float old_val = latency_ema_.load(std::memory_order_acquire);
-        if (old_val <= 0.0f)
+        if (!(latency_ms >= 0.0f))
+            latency_ms = 0.0f;
+        observations_.fetch_add(1, std::memory_order_relaxed);
+        float old = latency_ema_.load(std::memory_order_acquire);
+        if (old <= 0.0f)
         {
             latency_ema_.store(latency_ms, std::memory_order_release);
             return;
         }
-        float new_val = alpha * latency_ms + (1.0f - alpha) * old_val;
+        float alpha = cfg_.latency_ema_alpha;
+        if (alpha <= 0.0f || alpha > 1.0f)
+            alpha = 0.1f;
+        float new_val = alpha * latency_ms + (1.0f - alpha) * old;
+        if (!(new_val >= 0.0f))
+            new_val = old;
         latency_ema_.store(new_val, std::memory_order_release);
     }
 
     void WhisperGrain::set_cpu_load(float cpu_percent)
     {
+        if (!(cpu_percent >= 0.0f))
+            cpu_percent = 0.0f;
+        if (cpu_percent > 100.0f)
+            cpu_percent = 100.0f;
         cpu_load_.store(cpu_percent, std::memory_order_relaxed);
     }
 
@@ -43,10 +44,10 @@ namespace pomai::ai
         float ema = latency_ema_.load(std::memory_order_acquire);
         float cpu = cpu_load_.load(std::memory_order_relaxed);
         float base = static_cast<float>(cfg_.base_budget_ops);
-        if (ema <= 0.0f)
+        if (!(ema > 0.0f))
             ema = cfg_.latency_target_ms;
-        float scale = 1.0f;
         float target = cfg_.latency_target_ms;
+        float scale = 1.0f;
         if (ema > target)
             scale = std::sqrt(target / ema);
         else
@@ -62,11 +63,11 @@ namespace pomai::ai
         float max_ops = base * cfg_.budget_headroom;
         if (ops > max_ops)
             ops = max_ops;
-        b.ops_budget = static_cast<uint32_t>(ops);
+        uint32_t ops_u = static_cast<uint32_t>(std::max(1.0f, std::floor(ops + 0.5f)));
+        b.ops_budget = ops_u;
         constexpr uint32_t OPS_PER_BUCKET = 500;
-        b.bucket_budget = std::max<uint32_t>(16, b.ops_budget / OPS_PER_BUCKET);
-        b.allow_exact_refine = (ema < (target - static_cast<float>(cfg_.refine_enable_margin_ms)) &&
-                                cpu < cfg_.cpu_soft_threshold);
+        b.bucket_budget = std::max<uint32_t>(1, b.ops_budget / OPS_PER_BUCKET);
+        b.allow_exact_refine = (ema < (target - static_cast<float>(cfg_.refine_enable_margin_ms))) && (cpu < cfg_.cpu_soft_threshold);
         return b;
     }
-} // namespace pomai::ai
+}

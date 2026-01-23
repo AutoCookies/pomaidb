@@ -65,9 +65,6 @@ namespace pomai::core
         ocfg.data_path = data_path;
         ocfg.algo = global_cfg.orbit;
         ocfg.cortex_cfg = global_cfg.network;
-        // Updated: PomaiOrbit::Config now uses ZeroHarmonyConfig (named zero_harmony_cfg).
-        // Construct a default ZeroHarmonyConfig (alias EternalEchoConfig still available),
-        // but prefer explicit ZeroHarmonyConfig to avoid ambiguity.
         ocfg.zero_harmony_cfg = pomai::config::ZeroHarmonyConfig();
 
         orbit = std::make_unique<pomai::ai::orbit::PomaiOrbit>(ocfg, arena.get());
@@ -321,8 +318,8 @@ namespace pomai::core
             return false;
         if (m->hot_tier)
         {
-            m->hot_tier->push(label, vec);
-            return true;
+            auto res = m->hot_tier->push(label, vec);
+            return res == HotTier::InsertResult::OK;
         }
         return m->orbit->insert(vec, label);
     }
@@ -337,7 +334,9 @@ namespace pomai::core
         {
             for (const auto &item : batch)
             {
-                m->hot_tier->push(item.first, item.second.data());
+                auto res = m->hot_tier->push(item.first, item.second.data());
+                if (res != HotTier::InsertResult::OK)
+                    return false;
             }
             return true;
         }
@@ -510,10 +509,15 @@ namespace pomai::core
         while (bg_running_)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.db.bg_worker_interval_ms));
-            std::shared_lock<std::shared_mutex> lock(mu_);
-            for (auto &kv : membrances_)
+            std::vector<Membrance *> snapshot;
             {
-                Membrance *m = kv.second.get();
+                std::shared_lock<std::shared_mutex> lock(mu_);
+                snapshot.reserve(membrances_.size());
+                for (auto &kv : membrances_)
+                    snapshot.push_back(kv.second.get());
+            }
+            for (Membrance *m : snapshot)
+            {
                 if (!m || !m->hot_tier)
                     continue;
                 auto batch = m->hot_tier->swap_and_flush();
@@ -524,11 +528,12 @@ namespace pomai::core
                 const pomai::core::DataType bdt = batch.data_type;
                 const size_t count = batch.count();
                 const uint8_t *flat = batch.data.data();
-                std::vector<float> tmp;
-                tmp.resize(dim);
+                std::vector<std::pair<uint64_t, std::vector<float>>> to_insert;
+                to_insert.reserve(count);
                 for (size_t i = 0; i < count; ++i)
                 {
                     const uint8_t *slot = flat + i * dim * elem_size;
+                    std::vector<float> tmp(dim);
                     switch (bdt)
                     {
                     case DataType::FLOAT32:
@@ -572,13 +577,14 @@ namespace pomai::core
                         break;
                     }
                     }
-                    try
-                    {
-                        m->orbit->insert(tmp.data(), batch.labels[i]);
-                    }
-                    catch (...)
-                    {
-                    }
+                    to_insert.emplace_back(batch.labels[i], std::move(tmp));
+                }
+                try
+                {
+                    m->orbit->insert_batch(to_insert);
+                }
+                catch (...)
+                {
                 }
             }
         }

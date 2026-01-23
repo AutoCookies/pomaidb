@@ -145,7 +145,6 @@ namespace pomai::ai::orbit
         size_t pad = 16;
         size_t calc = dim * multiplier + pad;
         size_t slot = (calc < min_slot) ? min_slot : (calc > max_slot ? max_slot : calc);
-
         if (const char *env = std::getenv("POMAI_PACKED_SLOT_BYTES"))
         {
             try
@@ -402,7 +401,6 @@ namespace pomai::ai::orbit
                 const BucketHeader *hdr = reinterpret_cast<const BucketHeader *>(*base_opt);
                 uint32_t n = bucket_atomic_load_count(hdr);
 
-                // [FIXED]: Sử dụng địa chỉ phần tử vector để thực hiện thao tác atomic
                 pomai::ai::atomic_utils::atomic_fetch_add_u32(&bucket_sizes_[hdr->centroid_id], n);
 
                 const char *ids_ptr = (*base_opt) + hdr->off_ids;
@@ -635,17 +633,24 @@ namespace pomai::ai::orbit
         }
 
         std::vector<Item> prepared;
+        prepared.reserve(batch.size());
         for (const auto &p : batch)
         {
             uint32_t cid = find_nearest_centroid(p.second.data());
             std::vector<uint8_t> pk = zeroharmony_->pack_with_mean(p.second.data(), centroids_[cid]->vector);
-            Item it = {p.first, (uint8_t)pk.size(), {0}, cid};
+            Item it;
+            it.label = p.first;
+            it.size = static_cast<uint8_t>(pk.size());
+            it.cid = cid;
             std::memcpy(it.bytes, pk.data(), pk.size());
             prepared.push_back(it);
         }
 
         std::sort(prepared.begin(), prepared.end(), [](auto &a, auto &b)
                   { return a.cid < b.cid; });
+
+        std::vector<uint32_t> added_counts;
+        added_counts.assign(centroids_.size(), 0);
 
         for (size_t i = 0; i < prepared.size();)
         {
@@ -655,50 +660,95 @@ namespace pomai::ai::orbit
                 ++end;
 
             OrbitNode &node = *centroids_[cid];
-            std::unique_lock<std::shared_mutex> lk(node.mu);
-            uint64_t off = node.bucket_offset.load(std::memory_order_acquire);
-
-            for (size_t k = i; k < end; ++k)
+            size_t k = i;
+            while (k < end)
             {
+                uint64_t off = node.bucket_offset.load(std::memory_order_acquire);
                 std::vector<char> tmp;
-                auto base = resolve_bucket_base(arena_, off, tmp);
-
-                char *mutable_base = const_cast<char *>(*base);
+                auto base_opt = resolve_bucket_base(arena_, off, tmp);
+                if (!base_opt)
+                {
+                    std::unique_lock<std::shared_mutex> lk(node.mu);
+                    uint64_t cur = node.bucket_offset.load(std::memory_order_acquire);
+                    if (cur == off)
+                    {
+                        uint64_t alloc = alloc_new_bucket(cid);
+                        if (alloc == 0)
+                            break;
+                        node.bucket_offset.store(alloc, std::memory_order_release);
+                        off = alloc;
+                        base_opt = resolve_bucket_base(arena_, off, tmp);
+                        if (!base_opt)
+                            continue;
+                    }
+                    else
+                    {
+                        off = cur;
+                        continue;
+                    }
+                }
+                char *mutable_base = const_cast<char *>(*base_opt);
                 BucketHeader *hdr = reinterpret_cast<BucketHeader *>(mutable_base);
-                uint32_t slot = bucket_atomic_fetch_add_count(hdr, 1);
-
-                if (slot >= dynamic_bucket_capacity_)
+                uint32_t cur_count = bucket_atomic_load_count(hdr);
+                if (cur_count >= dynamic_bucket_capacity_)
                 {
                     uint64_t nxt = bucket_atomic_load_next(hdr);
                     if (!nxt)
                     {
-                        nxt = alloc_new_bucket(cid);
-                        bucket_atomic_store_next(hdr, nxt);
+                        uint64_t alloc = 0;
+                        {
+                            std::unique_lock<std::shared_mutex> lk(node.mu);
+                            uint64_t check = node.bucket_offset.load(std::memory_order_acquire);
+                            if (check == off)
+                                alloc = alloc_new_bucket(cid);
+                            if (alloc != 0)
+                                bucket_atomic_store_next(hdr, alloc);
+                        }
+                        uint64_t after = bucket_atomic_load_next(hdr);
+                        if (!after)
+                            break;
+                        off = after;
+                        continue;
                     }
                     off = nxt;
-                    --k;
                     continue;
                 }
-
-                std::memcpy(static_cast<void *>(mutable_base + hdr->off_vectors + (size_t)slot * packed_slot_size_), prepared[k].bytes, prepared[k].size);
-
-                __atomic_store_n(reinterpret_cast<uint16_t *>(mutable_base + hdr->off_pq_codes) + slot, (uint16_t)prepared[k].size, __ATOMIC_RELEASE);
-                pomai::ai::atomic_utils::atomic_store_u64(reinterpret_cast<uint64_t *>(mutable_base + hdr->off_ids) + slot, IdEntry::pack_label(prepared[k].label));
-
-                set_label_map(prepared[k].label, off, slot);
+                uint32_t avail = dynamic_bucket_capacity_ - cur_count;
+                size_t want = std::min<size_t>(avail, end - k);
+                uint32_t old = bucket_atomic_fetch_add_count(hdr, static_cast<uint32_t>(want));
+                if (old >= dynamic_bucket_capacity_)
+                {
+                    bucket_atomic_sub_count(hdr, static_cast<uint32_t>(want));
+                    continue;
+                }
+                uint32_t start_slot = old;
+                size_t actual = std::min<size_t>(want, dynamic_bucket_capacity_ - old);
+                uint8_t *vec_base = reinterpret_cast<uint8_t *>(mutable_base + hdr->off_vectors);
+                uint16_t *lens_base = reinterpret_cast<uint16_t *>(mutable_base + hdr->off_pq_codes);
+                uint64_t *ids_base = reinterpret_cast<uint64_t *>(mutable_base + hdr->off_ids);
+                for (size_t t = 0; t < actual; ++t)
+                {
+                    size_t idx = k + t;
+                    std::memcpy(vec_base + static_cast<size_t>(start_slot + t) * packed_slot_size_, prepared[idx].bytes, prepared[idx].size);
+                    __atomic_store_n(&lens_base[start_slot + t], static_cast<uint16_t>(prepared[idx].size), __ATOMIC_RELEASE);
+                    uint64_t packed_id = IdEntry::pack_label(prepared[idx].label);
+                    pomai::ai::atomic_utils::atomic_store_u64(ids_base + start_slot + t, packed_id);
+                    set_label_map(prepared[idx].label, off, static_cast<uint32_t>(start_slot + t));
+                }
+                added_counts[cid] = static_cast<uint32_t>(added_counts[cid] + actual);
+                k += actual;
             }
             i = end;
         }
 
-        for (const auto &it : prepared)
+        for (size_t cid = 0; cid < added_counts.size(); ++cid)
         {
-            if (it.cid < bucket_sizes_.size())
-            {
-                if (pomai::ai::atomic_utils::atomic_fetch_add_u32(&bucket_sizes_[it.cid], 1) + 1 > K_SPLIT_THRESHOLD)
-                {
-                    check_and_split_bucket(it.cid);
-                }
-            }
+            uint32_t added = added_counts[cid];
+            if (added == 0)
+                continue;
+            uint32_t prev = pomai::ai::atomic_utils::atomic_fetch_add_u32(&bucket_sizes_[cid], added);
+            if (prev + added > K_SPLIT_THRESHOLD)
+                check_and_split_bucket(static_cast<uint32_t>(cid));
         }
 
         return true;

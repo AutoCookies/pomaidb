@@ -48,6 +48,12 @@ struct MilestoneThreadStats
 std::atomic<bool> is_searching{false};
 std::atomic<bool> stop_all{false};
 std::atomic<uint64_t> global_vectors_inserted{0};
+static std::atomic<uint64_t> next_label{0};
+
+static std::mutex sampled_lock;
+static std::vector<std::pair<uint64_t, std::vector<float>>> sampled_vectors;
+static const size_t sample_per_batch = 1;
+static const size_t max_samples = 10000;
 
 void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, MilestoneThreadStats &stats, int thread_id)
 {
@@ -77,6 +83,8 @@ void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, Mileston
         }
         else
         {
+            uint64_t base_label = next_label.fetch_add(batch_sz, std::memory_order_relaxed);
+
             std::vector<std::pair<uint64_t, std::vector<float>>> batch;
             batch.reserve(batch_sz);
             for (int j = 0; j < batch_sz; ++j)
@@ -84,7 +92,7 @@ void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, Mileston
                 std::vector<float> v(dim);
                 for (auto &x : v)
                     x = dis(gen);
-                batch.emplace_back(global_vectors_inserted.load() + j, std::move(v));
+                batch.emplace_back(base_label + j, std::move(v));
             }
 
             auto start = high_resolution_clock::now();
@@ -94,6 +102,13 @@ void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, Mileston
                 stats.insert_stats.record(ns);
                 stats.vectors_inserted += batch_sz;
                 global_vectors_inserted.fetch_add(batch_sz, std::memory_order_relaxed);
+
+                std::lock_guard<std::mutex> lg(sampled_lock);
+                if (sampled_vectors.size() < max_samples)
+                {
+                    for (size_t s = 0; s < sample_per_batch && s < batch.size() && sampled_vectors.size() < max_samples; ++s)
+                        sampled_vectors.emplace_back(batch[s].first, batch[s].second);
+                }
             }
         }
     }
@@ -102,14 +117,15 @@ void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, Mileston
 void print_header()
 {
     std::cout << "\n"
-              << std::setfill('=') << std::setw(135) << "" << std::setfill(' ') << "\n";
+              << std::setfill('=') << std::setw(160) << "" << std::setfill(' ') << "\n";
     std::cout << std::left << std::setw(12) << "Milestone"
               << std::setw(18) << "Ins Thrpt(v/s)" << std::setw(12) << "Ins P99(us)"
               << " | "
               << std::setw(18) << "Sea Thrpt(q/s)" << std::setw(12) << "Sea P50(us)"
               << std::setw(12) << "Sea P99(us)" << std::setw(12) << "EMA(ms)"
-              << std::setw(12) << "Budget" << "\n";
-    std::cout << std::setfill('-') << std::setw(135) << "" << std::setfill(' ') << "\n";
+              << std::setw(10) << "Budget" << std::setw(10) << "R@1" << std::setw(10) << "R@10"
+              << std::setw(12) << "MemVecs" << "\n";
+    std::cout << std::setfill('-') << std::setw(160) << "" << std::setfill(' ') << "\n";
 }
 
 float get_system_cpu_load()
@@ -201,11 +217,68 @@ int main()
 
         float current_ema = 0.0f;
         uint32_t current_budget = 0;
+        size_t membrance_total_vectors = 0;
         if (membr && membr->orbit && membr->orbit->whisper_grain())
         {
             auto wg = membr->orbit->whisper_grain();
             current_ema = wg->latency_ema();
             current_budget = wg->compute_budget(false).ops_budget;
+        }
+        if (membr && membr->orbit)
+        {
+            try
+            {
+                auto info = membr->orbit->get_info();
+                membrance_total_vectors = info.num_vectors;
+            }
+            catch (...)
+            {
+                membrance_total_vectors = 0;
+            }
+        }
+
+        double recall_at_1 = 0.0;
+        double recall_at_10 = 0.0;
+        size_t recall_checked = 0;
+        {
+            std::vector<std::pair<uint64_t, std::vector<float>>> local_samples;
+            {
+                std::lock_guard<std::mutex> lg(sampled_lock);
+                local_samples = sampled_vectors;
+                sampled_vectors.clear();
+            }
+            size_t max_check = std::min<size_t>(1000, local_samples.size());
+            if (max_check > 0)
+            {
+                std::mt19937 rng(12345);
+                std::uniform_int_distribution<size_t> dist(0, local_samples.size() - 1);
+                size_t hits1 = 0, hits10 = 0;
+                for (size_t i = 0; i < max_check; ++i)
+                {
+                    size_t idx = (local_samples.size() <= max_check) ? i : dist(rng);
+                    auto &p = local_samples[idx];
+                    uint64_t lbl = p.first;
+                    const float *vec = p.second.data();
+                    int k = 10;
+                    auto res = db->search(m_name, vec, k);
+                    bool found = false;
+                    if (!res.empty())
+                    {
+                        if (res.front().first == lbl)
+                            hits1++;
+                        for (auto &r : res)
+                            if (r.first == lbl)
+                            {
+                                found = true;
+                                break;
+                            }
+                        if (found) hits10++;
+                    }
+                }
+                recall_checked = max_check;
+                recall_at_1 = (double)hits1 / (double)recall_checked;
+                recall_at_10 = (double)hits10 / (double)recall_checked;
+            }
         }
 
         std::cout << std::left << std::setw(12) << target
@@ -216,7 +289,27 @@ int main()
                   << std::setw(12) << combined_sea.p(50)
                   << std::setw(12) << combined_sea.p(99)
                   << std::setw(12) << current_ema
-                  << std::setw(12) << current_budget << std::endl;
+                  << std::setw(10) << current_budget
+                  << std::setw(10) << std::fixed << std::setprecision(3) << recall_at_1
+                  << std::setw(10) << std::fixed << std::setprecision(3) << recall_at_10
+                  << std::setw(12) << membrance_total_vectors << std::endl;
+
+        if (membr)
+        {
+            std::cout << "[GET MEMBRANCE INFO] name=" << membr->name << "\n";
+            try
+            {
+                auto info = membr->orbit ? membr->orbit->get_info() : pomai::ai::orbit::MembranceInfo{};
+                std::cout << " feature_dim: " << info.dim << "\n";
+                std::cout << " total_vectors: " << info.num_vectors << "\n";
+                std::cout << " disk_bytes: " << (info.disk_bytes) << "\n";
+                std::cout << " ram_mb_configured: " << membr->ram_mb << "\n";
+            }
+            catch (...)
+            {
+                std::cout << " ERR reading membrance info\n";
+            }
+        }
     }
 
     stop_all = true;
