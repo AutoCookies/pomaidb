@@ -260,7 +260,6 @@ namespace pomai::config
         FingerprintConfig fingerprint;
         NetworkCortexConfig network;
         NetworkCortexConfig cortex_cfg;
-        HotTierConfig hot_tier;
         IngestorConfig ingestor;
         MetadataConfig metadata;
         MetricsConfig metrics;

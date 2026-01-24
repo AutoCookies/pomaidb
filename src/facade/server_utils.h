@@ -1,5 +1,6 @@
-#pragma once
-
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,6 +11,8 @@
 #include <fstream>
 #include <iomanip>
 #include "src/core/metadata_index.h" // Để dùng struct Tag
+
+#pragma once
 
 namespace pomai::server::utils
 {

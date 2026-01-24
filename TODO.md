@@ -1,90 +1,137 @@
-PRIORITY ROADMAP (MUST-DO, ordered, each mục kèm lý do, rủi ro, estimated effort)
+## Lộ trình nâng PomaiDB từ single-thread lên multi-thread “true production-safe”  
+**Mục tiêu: Đảm bảo không đổi logic — chỉ tách threading chuẩn hoá, không băm bổ code.**
 
-Phase 0 — Emergency correctness fixes (1–2 engineer-weeks) These must be done before anything else.
+---
 
-A. Fix mapping publish ordering (HIGH)
+### **Nguyên tắc xương sống**
+- **Không đổi logic tài nguyên, quản lý, PomaiArena, Map, …**
+- **Mỗi thread own 1 shard/arena riêng** (no cross-thread mutation)
+- **Không cross-thread access vào hot-path data** (giữ invariant Pomai)
+- **Chỉ lock khi cần cho IO/manifest/giao tiếp (không hotpath)**
+- **Không mất debugability, không race condition**
 
-    Problem: append_only_arena.remap_locked currently publishes new mapping pointer before publishing new size; readers can observe pointer -> OOB access -> memory corruption / crash.
-    Fix: publish mapped_size_ (new_size) first (store with release), then publish map_base_ (store pointer with release). Readers must be updated to load mapped_size_ first (acquire), then map_base_. Alternatively pack {ptr,size} into single atomic struct (C++20 atomic<struct> not portable) or use seq_cst ordering with documented load/store order.
-    Files: append_only_arena.cc, append_only_arena.h, any reader helpers (offset_from_blob_ptr, blob_ptr_from_offset_for_map) — change load order to size then ptr.
-    Risk: Medium — must be carefully synchronized and tested. Measure: reduces crash/UB risk to near zero.
+---
 
-B. Eliminate UB from unaligned atomic ops (HIGH)
+## **Các bước cụ thể**
 
-    Problem: MmapFileManager::atomic_store_u64_at / write_at use __atomic_store_n on pointers that may be unaligned. This is UB on C++ standard and potentially crashes on some archs.
-    Fix: require callers to only use atomic helpers when aligned; if unaligned, perform memcpy into local aligned uint64_t and use atomic_store on that aligned temporary into the destination using memcpy with proper memory_order via atomic_utils (or use byte-wise memcpy + msync). Better: enforce alignment for atomic fields (pad file layout) or implement atomic helpers that do memcpy under io_mu_ lock for unaligned addresses.
-    Files: mmap_file_manager.cc, atomic_utils.h
-    Risk: Medium. Measurable: eliminates rare data races/torn-writes.
+---
 
-C. msync/alignment correctness (HIGH)
+### **Bước 1: Kiểm kê Ownership và HOTPATH**
 
-    Problem: ShardArena::persist_range calls msync(addr, len) with unaligned addresses; append_only_arena.persist_range aligns but ShardArena not.
-    Fix: always align msync arguments to page boundaries: page_off = floor(offset/page)*page; msync(base+page_off, page_end-page_off).
-    Files: shard_arena.cc, append_only_arena.cc ensure consistent behavior.
-    Risk: Low.
+1. **Kiểm kê các class nào chạm tới Arena, Map, Shard, Dispatcher**
+   - **Arena/Shard/Map:** Hot-path phải chỉ được gọi bởi đúng 1 thread
+   - **Dispatcher/Orchestrator:** Phân phối work (search/insert) tới đúng thread (không cross)
 
-D. Single authoritative demote worker lifecycle (HIGH)
+**=> Không cần sửa logic, chỉ cần tách context per-thread**
 
-    Problem: demote worker started in multiple places (allocate_region and demote_blob_async) — potential double-start or race.
-    Fix: centralize demote worker startup (single helper), use atomic flag + once semantics, and ensure destructor stops and joins.
-    Files: arena.cc (PomaiArena allocate_region), arena_async_demote.cc
-    Risk: Low.
+---
 
-Phase 1 — Testing/CI & safety hardening (2–4 engineer-weeks) E. Add unit tests & CI
+### **Bước 2: Refactor Orchestrator sang Worker Thread Pool**
 
-    Write unit tests for:
-        WAL: append_record, replay (including truncated/partial record cases), fsync behavior.
-        remap ordering: simulate mapping publish order with mocks.
-        MmapFileManager atomic helpers for aligned and unaligned cases.
-        ZeroHarmony pack/unpack roundtrip for various dims and use_half_nonzero true/false.
-        SimHash correctness and hamming distance.
-    Add CI (GitHub Actions) to build on Linux x86_64, run tests, and run address sanitizer + UBSAN on subset.
+- Tạo **worker pool** N thread (theo số shard/cpu core)
+- Mỗi worker:
+  - Own 1 PomaiArena, PomaiMap, hot_tier, v.v. (không share pointer hoặc mutable data qua thread)
+- Dispatcher (main thread hoặc server):
+  - **chỉ nhận request network, rồi push xuống đúng worker qua queue** (ring buffer, MPMC queue, hoặc lockfree queue nếu muốn sạch)
+    - Ví dụ: `struct Work { Request req; }`, mã hoá: search/insert/query...
+    - Gửi xuống qua `std::queue<Work>` hoặc custom lock-free nếu muốn performance
+- **Không cần đổi logic insert/search của Shard/PomaiArena**; logic vẫn như cũ, chỉ chuyển gọi từ main thread sang thread worker tương ứng.
 
-F. End-to-end integration tests
+---
 
-    Small test that starts PomaiDB instance, creates membrance, inserts a few thousand vectors, checkpoint, restart, ensure recovered vector counts and exactness.
+### **Bước 3: Giao tiếp với Worker qua Queue (Thread-Safe, No Cross-Access)**
 
-G. Add benchmarks harness
+- Mỗi worker có queue nhận request từ main thread/dispatcher.
+- Khi nhận request: worker xử lý như logic cũ, trả kết quả về qua response queue hoặc callback (không block main thread).
+- **Không bao giờ access data của worker khác**.
 
-    Provide micro-benchmarks for insert throughput and search latency (we'll provide a Python benchmark harness per your earlier note). Measure P50/P99 and memory usage.
+**[Hình dung]**
 
-Phase 2 — Performance & operational (2–6 engineer-weeks) H. Replace std::async with threadpool for global scatter-gather (medium)
+```
+┌─────────Server(Main)─────────┐
+│ ┌─────Req─────┐ ┌─────Req────┐ │
+│ │   Queue 0   │ │   Queue 1  │ │ ... (N)
+│ └──────┬──────┘ └──────┬─────┘ │
+│        │                │      │
+└────────▼────────────────▼------┘
+      ┌─────Worker 0──────┐
+      │ - PomaiArena0     │
+      │ - PomaiMap0       │
+      └───────────────────┘
 
-    File: orchestrator.h
-    Rationale: reduce per-query thread spawn cost; expect 10–30% latency/throughput improvement under concurrency.
-    Implement fixed threadpool sized to shards or CPU cores.
+      ┌─────Worker 1──────┐
+      │ - PomaiArena1     │
+      │ - PomaiMap1       │
+      └───────────────────┘
+```
 
-I. WAL batching and durable checkpoints (medium)
+---
 
-    Ensure WAL batching behavior is configurable and consistent across process exit. Add explicit fsync on graceful shutdown and durable checkpoint operation that truncates WAL only after snapshot consistent.
+### **Bước 4: Xử lý Insert/Search theo Hash/Shard**
 
-J. Observability (low-medium)
+- Dispatcher hash label/id → queue, hoặc roundrobin nếu không hash.
+- Không đổi logic insert/search; chỉ cần chuyển gọi từ main thành worker context.
 
-    Export metrics (Prometheus) and expose /health and /metrics endpoints or simple file dumps. Add periodic metrics reporter to log P99 of search latency (from WhisperGrain observation).
+---
 
-K. Documentation & ops runbook (low)
+### **Bước 5: IO/Snapshot/Async Task — Giữ hoặc refactor nếu chia sẻ file/manifest**
 
-    Add README with sizing guidelines and recovery steps.
+- Nếu IO/snapshot manifest là tài nguyên dùng chung (manifest file), giữ mutex chỉ ở đây!
+- Arena demote/snapshot của mỗi worker CHỈ xử lý blob/file/arena của chính nó.
+- Nếu có logic share manifest → lock chỗ này, còn lại BỎ lock ở Arena/PomaiMap/Shard.
 
-Phase 3 — Harder improvements (3+ weeks) L. Consider a safer remap approach for growing file-backed mapping:
+---
 
-    Use MmapFileManager abstraction everywhere; centralize mapping/resizing logic with atomic pointer+size publish (use std::atomic<uintptr_t> + size_t). Option: use a small versioned descriptor struct and publish with double-buffering semantics.
+### **Bước 6: Bỏ Mutex (Hot Path) Safe**
 
-M. NUMA and shard-worker placement improvements
+- Khi đã chia mỗi PomaiArena/PomaiMap cho đúng 1 thread và đảm bảo không ai access, **gỡ hết mutex khỏi hotpath trong Arena/Map**.
+- Mutex cho queue (MPMC), hoặc IO, hoặc manifest — VẪN GIỮ nếu còn shared resource.
+- TOÀN BỘ insert/search vector trong worker = lock-free, atomic nếu cần, không mutex!
 
-    Provide shard-manager pinning and per-shard worker threads for inserts/search to improve P99 on big machines.
+---
 
-MEASURABLE EXPECTATIONS (if roadmap applied)
+### **Bước 7: Test, Validate, Stress**
 
-    Correctness: crash/UB risk -> near zero after Phase 0 fixes (no pointer-size races; no unaligned atomics).
-    Latency stability: P50/P99 improvement mainly from threadpool change and hotspot fixes; expect P50 stable, reduce tail by 20–50% for search under concurrency.
-    Insert throughput: WAL batching + optimized hot-tier flush -> throughput increases 2x–4x for batch inserts.
-    Memory: preallocation + hot-tier non-growing policy keeps memory bounded.
+- Viết test không đổi logic query/search, chỉ test thread-safety (thread sanitizer, stress, chaos monkey)
+- Xác nhận không race, không lost update, không use-after-free.
 
-SPECIFIC BUGS / CODE LOCATIONS (evidence)
+---
 
-    append_only_arena.remap_locked: publishes pointer before size. (append_only_arena.cc, lines in remap_locked fallback)
-    MmapFileManager::write_at / atomic_load_u64_at / atomic_store_u64_at: unaligned atomic operations (mmap_file_manager.cc).
-    ShardArena::persist_range: msync called without page-align. (shard_arena.cc)
-    GlobalOrchestrator::search: uses std::async per shard (orchestrator.h)
-    In several places use of reinterpret_cast to uint64_t* for atomic_store on mmap memory that may not be 8-byte aligned. Audit required.
+## **Lợi ích/Trade-off/RAM**
+
+- **Không đổi logic dữ liệu, không sửa insert/search/map/arena code, chỉ wrap lại trong worker threads**
+- **RAM tiêu tốn nhẹ tăng nếu dùng queue buffer (không đáng kể)**
+- **Debug dễ dàng hơn vì từng thread own context và data, không có cross-access.**
+- **Performance tăng cực mạnh: mỗi thread tận dụng riêng 1 core/cpu, không contention, chỉ lock nhẹ phía network/queue**
+
+---
+
+## **Sơ đồ triển khai**
+```
+ Main Thread (Network Listener)
+      │
+      ├─> Dispatcher (Hash/Shard routing)
+      ↓            ↓             ↓
+ Worker 0    Worker 1       Worker N    ...  (Thread owns PomaiArena, PomaiMap)
+ Arena/Map   Arena/Map      Arena/Map
+
+ All insert/search are only called in assigned thread/shard context.
+ Manifest/snapshot/IO only uses mutex where unavoidable. Hotpath NO LOCKS.
+```
+
+---
+
+## **Notes cực kỳ production-safe**
+- Mutex chỉ cần cho IO/manifest, không cần cho data của từng worker.
+- Nếu có bug cross-access, lock lại chỗ đó, không lock hotpath.
+- Không thay đổi structure vector/bucket/arena/map — chỉ wrap thread context.
+
+---
+
+**Kết luận:**  
+- Đúng Pomai philosophy.
+- Đúng production-safe, không tấu hài.
+- Không đổi logic, chỉ wrap threading/queue/context.
+- Mutex ở đâu không cần phải bỏ, chỉ remove nếu chắc chắn single-thread ownership.
+
+Nếu cần, tôi sẽ draft code template/refactor rung cho worker pool + thread ownership. Debug path nào có thể crash nếu thiết kế dở, tôi sẽ chỉ mặt gọi tên cụ thể.

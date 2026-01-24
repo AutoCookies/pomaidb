@@ -1,29 +1,3 @@
-/*
- * src/facade/sql_executor.cc
- *
- * SQL/text protocol executor for Pomai server (refactored & optimized).
- *
- * Goals achieved:
- *  - Batch-first IO: use PomaiDB::fetch_batch_raw for bulk retrievals to minimize
- *    atomic ops / mmap lookups / filesystem reads and avoid per-id overhead.
- *  - Minimize allocations: pre-reserve output buffers using known sizes.
- *  - Clear, small helper functions to reduce duplication (fetch-with-fallback,
- *    append-and-pad).
- *  - Defensive input parsing and early error returns.
- *
- * Notes:
- *  - This file returns std::string responses (may contain binary payload).
- *    The caller (server) is responsible for sending the response to the client.
- *  - For extremely large responses consider switching to a streaming API (socket
- *    write from server side) to avoid keeping the whole payload in memory. The
- *    current design keeps compatibility with the existing server code path.
- *
- * Performance tips:
- *  - Ensure PomaiDB::fetch_batch_raw is implemented to group ids by bucket/arena
- *    and to reuse thread-local buffers. That is the most important lever for
- *    end-to-end throughput.
- */
-
 #include "src/facade/sql_executor.h"
 
 #include "src/facade/server_utils.h"
@@ -48,9 +22,18 @@ namespace pomai::server
     namespace utils = pomai::server::utils;
     namespace supplier = pomai::server::data_supplier;
 
-    SqlExecutor::SqlExecutor() {}
+    SqlExecutor::SqlExecutor() : insert_cb_(nullptr), search_cb_(nullptr) {}
 
-    // Helper: attempt a single batch fetch via PomaiDB and fall back to per-id supplier
+    void SqlExecutor::set_insert_callback(std::function<bool(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)> cb)
+    {
+        insert_cb_ = std::move(cb);
+    }
+
+    void SqlExecutor::set_search_callback(std::function<std::vector<std::pair<uint64_t, float>>(const std::string &membr, const std::vector<float> &q, size_t k)> cb)
+    {
+        search_cb_ = std::move(cb);
+    }
+
     static inline bool fetch_raws_with_fallback(
         pomai::core::PomaiDB *db,
         pomai::core::Membrance *m,
@@ -61,13 +44,10 @@ namespace pomai::server
         out_raws.clear();
         if (ids.empty())
             return true;
-
-        // Prefer DB-level batch fetch (fast path)
         try
         {
             if (db->fetch_batch_raw(m->name, ids, out_raws))
             {
-                // Ensure returned elements are padded to per_vec_bytes
                 for (auto &s : out_raws)
                 {
                     if (s.size() < per_vec_bytes)
@@ -80,10 +60,7 @@ namespace pomai::server
         }
         catch (...)
         {
-            // fall through to per-id fallback
         }
-
-        // Fallback: per-id supplier calls (slower, used rarely)
         out_raws.resize(ids.size());
         for (size_t i = 0; i < ids.size(); ++i)
         {
@@ -105,20 +82,15 @@ namespace pomai::server
         return true;
     }
 
-    // Append a vector of raw strings into out string (already padded to per_vec_bytes)
     static inline void append_raws_into(std::string &out, const std::vector<std::string> &raws, size_t per_vec_bytes)
     {
-        // Reserve a bit to reduce reallocations if possible
         size_t needed = raws.size() * per_vec_bytes;
         if (needed > 0)
             out.reserve(out.size() + needed);
-
         for (const auto &r : raws)
         {
             if (r.size() >= per_vec_bytes)
-            {
                 out.append(r.data(), per_vec_bytes);
-            }
             else
             {
                 out.append(r.data(), r.size());
@@ -141,7 +113,6 @@ namespace pomai::server
         std::string up = utils::to_upper(cmd);
         auto parts = utils::split_ws(cmd);
 
-        // --- 1. SHOW MEMBRANCES ---
         if (up == "SHOW MEMBRANCES")
         {
             auto list = db->list_membrances();
@@ -152,7 +123,6 @@ namespace pomai::server
             return ss.str();
         }
 
-        // --- 2. USE <name> ---
         if (up.rfind("USE ", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
@@ -165,7 +135,6 @@ namespace pomai::server
             return "ERR: USE <name>;\n";
         }
 
-        // --- 3. EXEC SPLIT ---
         if (up.rfind("EXEC SPLIT", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
@@ -194,7 +163,6 @@ namespace pomai::server
             if (!m->split_mgr)
                 return "ERR: Split manager not initialized\n";
 
-            // detect strategy
             std::string strategy = "RANDOM";
             std::string strat_key;
             if (parts2.size() >= 7)
@@ -356,7 +324,6 @@ namespace pomai::server
             return "ERR: Failed to save split file\n";
         }
 
-        // --- 4. ITERATE ---
         if (up.rfind("ITERATE", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
@@ -371,7 +338,6 @@ namespace pomai::server
 
             size_t dim = m->dim;
 
-            // parse optional split token and off/lim
             size_t off = 0;
             size_t lim = 1000000;
             const std::vector<uint64_t> *idxs_ptr = nullptr;
@@ -425,7 +391,6 @@ namespace pomai::server
                 }
             }
 
-            // optional BATCH param
             size_t batch_size_param = 0;
             for (size_t t = 3; t < parts2.size(); ++t)
             {
@@ -443,22 +408,13 @@ namespace pomai::server
                 }
             }
 
-            // helper: dtype & elem_size
+            // REPLACED: No HotTier dependency. Always use membrance-level data_type.
             auto get_membrance_dtype = [&](std::string &out_dtype_str, uint32_t &out_elem_size)
             {
-                if (m->hot_tier)
-                {
-                    out_elem_size = m->hot_tier->element_size();
-                    out_dtype_str = m->hot_tier->data_type_string();
-                }
-                else
-                {
-                    out_elem_size = static_cast<uint32_t>(pomai::core::dtype_size(m->data_type));
-                    out_dtype_str = pomai::core::dtype_name(m->data_type);
-                }
+                out_elem_size = static_cast<uint32_t>(pomai::core::dtype_size(m->data_type));
+                out_dtype_str = pomai::core::dtype_name(m->data_type);
             };
 
-            // ---- TRIPLET ----
             if (mode == "TRIPLET")
             {
                 if (!m->meta_index || !m->orbit)
@@ -527,14 +483,12 @@ namespace pomai::server
                         trip_ids[1] = ids[std::uniform_int_distribution<size_t>(0, ids.size() - 1)(rng)];
                     trip_ids[2] = ids2[std::uniform_int_distribution<size_t>(0, ids2.size() - 1)(rng)];
 
-                    // Batch fetch 3 ids
                     fetch_raws_with_fallback(db, m, trip_ids, per_vec, trip_raw);
                     append_raws_into(out, trip_raw, per_vec);
                 }
                 return out;
             }
 
-            // ---- PAIR ----
             if (mode == "PAIR")
             {
                 if (!idxs_ptr)
@@ -549,7 +503,6 @@ namespace pomai::server
                 size_t cnt = std::min(lim, idxs_ptr->size() - off);
                 size_t per = sizeof(uint64_t) + per_vec;
 
-                // Batched streaming path
                 if (batch_size_param > 0)
                 {
                     std::string out;
@@ -589,7 +542,6 @@ namespace pomai::server
                 }
                 else
                 {
-                    // Single-response path: fetch all ids at once
                     std::vector<uint64_t> ids;
                     ids.reserve(cnt);
                     for (size_t i = 0; i < cnt; ++i)
@@ -621,7 +573,6 @@ namespace pomai::server
                 }
             }
 
-            // ---- TRAIN/VAL/TEST ----
             if (mode == "TRAIN" || mode == "VAL" || mode == "TEST")
             {
                 if (!idxs_ptr)
@@ -684,7 +635,6 @@ namespace pomai::server
             return "ERR: Invalid ITERATE mode (TRAIN/VAL/TEST/TRIPLET/PAIR)\n";
         }
 
-        // CREATE MEMBRANCE ...
         if (up.rfind("CREATE MEMBRANCE", 0) == 0)
         {
             size_t pos_dim = up.find(" DIM ");
@@ -765,7 +715,6 @@ namespace pomai::server
             return "ERR: create failed (exists or invalid)\n";
         }
 
-        // SEARCH ...
         if (utils::to_upper(cmd).rfind("SEARCH ", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
@@ -812,12 +761,35 @@ namespace pomai::server
             auto *m = db->get_membrance(name);
             if (!m)
                 return "ERR: membrance not found\n";
-            if (!m->orbit)
+            if (!m->orbit && !search_cb_)
                 return "ERR: engine not ready\n";
             if (query_vec.size() != m->dim)
                 return "ERR: query dimension mismatch\n";
 
-            auto results = m->orbit->search(query_vec.data(), k);
+            std::vector<std::pair<uint64_t, float>> results;
+            if (search_cb_)
+            {
+                try
+                {
+                    results = search_cb_(name, query_vec, k);
+                }
+                catch (...)
+                {
+                    results.clear();
+                }
+            }
+            else
+            {
+                try
+                {
+                    results = m->orbit->search(query_vec.data(), k);
+                }
+                catch (...)
+                {
+                    results.clear();
+                }
+            }
+
             std::ostringstream ss;
             ss << "OK " << results.size() << "\n";
             for (const auto &p : results)
@@ -825,7 +797,6 @@ namespace pomai::server
             return ss.str();
         }
 
-        // DROP MEMBRANCE
         if (up.rfind("DROP MEMBRANCE", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
@@ -843,7 +814,6 @@ namespace pomai::server
             return "ERR: Checkpoint failed partially.\n";
         }
 
-        // GET MEMBRANCE INFO ...
         if (up.rfind("GET MEMBRANCE", 0) == 0)
         {
             auto parts2 = utils::split_ws(cmd);
@@ -938,7 +908,6 @@ namespace pomai::server
             return ss.str();
         }
 
-        // INSERT handling (unchanged behaviour: batch insert)
         {
             std::string upstart = utils::to_upper(cmd.substr(0, std::min<size_t>(cmd.size(), 16)));
             if (upstart.rfind("INSERT INTO", 0) == 0 || utils::to_upper(cmd).rfind("INSERT VALUES", 0) == 0)
@@ -1033,7 +1002,6 @@ namespace pomai::server
                     break;
                 }
 
-                // parse optional TAGS
                 std::vector<pomai::core::Tag> global_tags;
                 size_t pos_tags = utils::to_upper(body).find(" TAGS ", pos_after_values);
                 if (pos_tags != std::string::npos)
@@ -1083,7 +1051,10 @@ namespace pomai::server
                 bool ok_batch = false;
                 try
                 {
-                    ok_batch = db->insert_batch(name, batch_data);
+                    if (insert_cb_)
+                        ok_batch = insert_cb_(name, batch_data);
+                    else
+                        ok_batch = db->insert_batch(name, batch_data);
                 }
                 catch (...)
                 {
@@ -1115,30 +1086,36 @@ namespace pomai::server
 
     std::string SqlExecutor::execute_binary_insert(pomai::core::PomaiDB *db, const char *raw_data, size_t len)
     {
-        // 1. Zero-copy Header Parsing
         if (len < 13)
             return "ERR: packet too short\n";
 
-        // Đọc Metadata trực tiếp từ vùng nhớ (Mechanical Sympathy)
         uint64_t label = *reinterpret_cast<const uint64_t *>(raw_data);
         uint32_t dim = *reinterpret_cast<const uint32_t *>(raw_data + 8);
         const float *vec_data = reinterpret_cast<const float *>(raw_data + 12);
 
-        // Kiểm tra tính toàn vẹn gói tin
         if (len < 12 + (dim * sizeof(float)))
             return "ERR: incomplete vector data\n";
 
-        // 2. Chuẩn bị Batch (BigTech luôn dùng Batch ngay cả với 1 vector để tối ưu pipeline)
         std::vector<std::pair<uint64_t, std::vector<float>>> batch;
         batch.reserve(1);
 
-        // Copy trực tiếp raw memory vào vector (Sử dụng constructor vector tối ưu)
         std::vector<float> vec(vec_data, vec_data + dim);
         batch.emplace_back(label, std::move(vec));
 
-        // 3. Đẩy xuống tầng DB (AppendOnlyArena sẽ nhận raw bytes)
-        bool ok = db->insert_batch("default", batch);
+        bool ok = false;
+        try
+        {
+            if (insert_cb_)
+                ok = insert_cb_("default", batch);
+            else
+                ok = db->insert_batch("default", batch);
+        }
+        catch (...)
+        {
+            ok = false;
+        }
 
         return ok ? "OK\n" : "ERR: insert failed\n";
     }
+
 } // namespace pomai::server

@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <random>
+#include <numeric>
 
 #include "src/core/pomai_db.h"
 #include "src/core/config.h"
@@ -20,12 +21,14 @@ struct LatencyStats
     std::vector<uint64_t> ns_list;
     void record(uint64_t ns) { ns_list.push_back(ns); }
     void clear() { ns_list.clear(); }
+    // percentile in microseconds
     double p(double pct) const
     {
         if (ns_list.empty())
             return 0;
         size_t idx = static_cast<size_t>(ns_list.size() * pct / 100.0);
-        return ns_list[std::min(idx, ns_list.size() - 1)] / 1000.0;
+        idx = std::min(idx, ns_list.size() - 1);
+        return static_cast<double>(ns_list[idx]) / 1000.0;
     }
 };
 
@@ -55,18 +58,24 @@ static std::vector<std::pair<uint64_t, std::vector<float>>> sampled_vectors;
 static const size_t sample_per_batch = 1;
 static const size_t max_samples = 10000;
 
-void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, MilestoneThreadStats &stats, int thread_id)
+// Worker: produces inserts when is_searching==false, otherwise runs searches
+void worker_loop(pomai::core::PomaiDB *db, const std::string &m_name, int dim, MilestoneThreadStats &stats, int thread_id)
 {
     const int batch_sz = 100;
     const int top_k = 10;
-    std::mt19937 gen(1337 + thread_id);
+    std::mt19937 gen(1337 + static_cast<unsigned>(thread_id));
     std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+
+    // Local buffers to reduce allocation in loop
+    std::vector<std::pair<uint64_t, std::vector<float>>> batch;
+    batch.reserve(batch_sz);
+
+    std::vector<float> query(dim);
 
     while (!stop_all.load(std::memory_order_relaxed))
     {
         if (is_searching.load(std::memory_order_relaxed))
         {
-            std::vector<float> query(dim);
             for (auto &x : query)
                 x = dis(gen);
 
@@ -76,17 +85,17 @@ void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, Mileston
 
             if (!res.empty())
             {
-                stats.search_stats.record(ns);
+                stats.search_stats.record(static_cast<uint64_t>(ns));
                 stats.search_ops++;
             }
+            // Yield to avoid tight-loop burning CPU
             std::this_thread::yield();
         }
         else
         {
-            uint64_t base_label = next_label.fetch_add(batch_sz, std::memory_order_relaxed);
+            uint64_t base_label = next_label.fetch_add(static_cast<uint64_t>(batch_sz), std::memory_order_relaxed);
 
-            std::vector<std::pair<uint64_t, std::vector<float>>> batch;
-            batch.reserve(batch_sz);
+            batch.clear();
             for (int j = 0; j < batch_sz; ++j)
             {
                 std::vector<float> v(dim);
@@ -99,16 +108,25 @@ void worker_loop(pomai::core::PomaiDB *db, std::string m_name, int dim, Mileston
             if (db->insert_batch(m_name, batch))
             {
                 auto ns = duration_cast<nanoseconds>(high_resolution_clock::now() - start).count();
-                stats.insert_stats.record(ns);
-                stats.vectors_inserted += batch_sz;
-                global_vectors_inserted.fetch_add(batch_sz, std::memory_order_relaxed);
+                stats.insert_stats.record(static_cast<uint64_t>(ns));
+                stats.vectors_inserted += static_cast<uint64_t>(batch_sz);
+                global_vectors_inserted.fetch_add(static_cast<uint64_t>(batch_sz), std::memory_order_relaxed);
 
+                // sample a few for recall checks (keep under max_samples)
                 std::lock_guard<std::mutex> lg(sampled_lock);
                 if (sampled_vectors.size() < max_samples)
                 {
                     for (size_t s = 0; s < sample_per_batch && s < batch.size() && sampled_vectors.size() < max_samples; ++s)
+                    {
+                        // copy only what's necessary (we keep vector<float>)
                         sampled_vectors.emplace_back(batch[s].first, batch[s].second);
+                    }
                 }
+            }
+            else
+            {
+                // Insert failed -> backoff slightly
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
     }
@@ -128,24 +146,42 @@ void print_header()
     std::cout << std::setfill('-') << std::setw(160) << "" << std::setfill(' ') << "\n";
 }
 
+// crude system CPU proxy used by the benchmark controller
 float get_system_cpu_load()
 {
-    float load = (global_vectors_inserted.load() / 100000000.0f) * 100.0f;
+    // Keep same scaling as original for comparability
+    float load = (global_vectors_inserted.load(std::memory_order_relaxed) / 100000000.0f) * 100.0f;
     return std::min(100.0f, load);
 }
 
 int main()
 {
     const std::vector<uint64_t> milestones = {1'000'000, 5'000'000, 10'000'000, 20'000'000, 50'000'000, 100'000'000};
-    const int threads = std::thread::hardware_concurrency();
+
+    unsigned hc = std::thread::hardware_concurrency();
+    size_t threads = (hc == 0) ? 1u : static_cast<size_t>(hc); // MUST be >= 1
+
     const int dim = 128;
     const std::string m_name = "autoblitz_stress";
 
     pomai::config::PomaiConfig cfg;
     cfg.res.data_root = "./data/milestone_bench";
-    cfg.hot_tier.initial_capacity = 2'000'000;
 
-    std::filesystem::remove_all(cfg.res.data_root);
+    // ensure clean start
+    try
+    {
+        std::filesystem::remove_all(cfg.res.data_root);
+    }
+    catch (...)
+    {
+    }
+
+    // Reserve sample vector to avoid reallocation in hot path
+    {
+        std::lock_guard<std::mutex> lg(sampled_lock);
+        sampled_vectors.reserve(max_samples);
+    }
+
     auto db = std::make_unique<pomai::core::PomaiDB>(cfg);
 
     pomai::core::MembranceConfig m_cfg;
@@ -153,6 +189,7 @@ int main()
     m_cfg.ram_mb = 10240;
     db->create_membrance(m_name, m_cfg);
 
+    // lightweight pre-train data
     std::mt19937 gen_train(42);
     std::uniform_real_distribution<float> dis_train(0.0f, 1.0f);
     std::vector<float> train_vecs(dim * 10000);
@@ -174,14 +211,18 @@ int main()
 
     std::vector<MilestoneThreadStats> all_stats(threads);
     std::vector<std::thread> workers;
-    for (int i = 0; i < threads; ++i)
-        workers.emplace_back(worker_loop, db.get(), m_name, dim, std::ref(all_stats[i]), i);
+    workers.reserve(threads);
+
+    for (size_t i = 0; i < threads; ++i)
+        workers.emplace_back(worker_loop, db.get(), m_name, dim, std::ref(all_stats[i]), static_cast<int>(i));
 
     std::thread cpu_monitor([&]()
                             {
         auto *m = db->get_membrance(m_name);
-        while (!stop_all.load()) {
-            if (m && m->orbit && m->orbit->whisper_grain()) {
+        while (!stop_all.load(std::memory_order_relaxed))
+        {
+            if (m && m->orbit && m->orbit->whisper_grain())
+            {
                 m->orbit->whisper_grain()->set_cpu_load(get_system_cpu_load());
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -189,14 +230,16 @@ int main()
 
     for (uint64_t target : milestones)
     {
-        is_searching = false;
+        // Insert phase until target is reached
+        is_searching.store(false, std::memory_order_relaxed);
         auto start_time = high_resolution_clock::now();
-        while (global_vectors_inserted.load() < target)
+        while (global_vectors_inserted.load(std::memory_order_relaxed) < target)
             std::this_thread::sleep_for(milliseconds(100));
         auto end_time = high_resolution_clock::now();
         double ins_dur = duration_cast<milliseconds>(end_time - start_time).count() / 1000.0;
 
-        is_searching = true;
+        // Short search phase to measure query latency under load
+        is_searching.store(true, std::memory_order_relaxed);
         std::this_thread::sleep_for(seconds(5));
         double sea_dur = 5.0;
 
@@ -237,6 +280,7 @@ int main()
             }
         }
 
+        // recall checks on sampled vectors (bounded)
         double recall_at_1 = 0.0;
         double recall_at_10 = 0.0;
         size_t recall_checked = 0;
@@ -244,7 +288,7 @@ int main()
             std::vector<std::pair<uint64_t, std::vector<float>>> local_samples;
             {
                 std::lock_guard<std::mutex> lg(sampled_lock);
-                local_samples = sampled_vectors;
+                local_samples = sampled_vectors; // small bounded copy
                 sampled_vectors.clear();
             }
             size_t max_check = std::min<size_t>(1000, local_samples.size());
@@ -261,23 +305,24 @@ int main()
                     const float *vec = p.second.data();
                     int k = 10;
                     auto res = db->search(m_name, vec, k);
-                    bool found = false;
                     if (!res.empty())
                     {
                         if (res.front().first == lbl)
                             hits1++;
+                        bool found = false;
                         for (auto &r : res)
                             if (r.first == lbl)
                             {
                                 found = true;
                                 break;
                             }
-                        if (found) hits10++;
+                        if (found)
+                            hits10++;
                     }
                 }
                 recall_checked = max_check;
-                recall_at_1 = (double)hits1 / (double)recall_checked;
-                recall_at_10 = (double)hits10 / (double)recall_checked;
+                recall_at_1 = static_cast<double>(hits1) / static_cast<double>(recall_checked);
+                recall_at_10 = static_cast<double>(hits10) / static_cast<double>(recall_checked);
             }
         }
 
@@ -312,9 +357,11 @@ int main()
         }
     }
 
-    stop_all = true;
-    cpu_monitor.join();
+    stop_all.store(true);
+    if (cpu_monitor.joinable())
+        cpu_monitor.join();
     for (auto &t : workers)
-        t.join();
+        if (t.joinable())
+            t.join();
     return 0;
 }

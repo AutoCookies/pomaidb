@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <functional>
 #include <cctype>
+#include <iostream>
 
 namespace pomai::core
 {
@@ -58,6 +59,7 @@ namespace pomai::core
             data_path = "./data/" + name;
         }
 
+        // Use ShardArena for per-membrance storage
         arena = std::make_unique<pomai::memory::ShardArena>(0, ram_mb * 1024 * 1024, global_cfg);
 
         pomai::ai::orbit::PomaiOrbit::Config ocfg;
@@ -67,9 +69,8 @@ namespace pomai::core
         ocfg.cortex_cfg = global_cfg.network;
         ocfg.zero_harmony_cfg = pomai::config::ZeroHarmonyConfig();
 
+        // Build Orbit attached to the arena. In the simplified model we insert directly into Orbit.
         orbit = std::make_unique<pomai::ai::orbit::PomaiOrbit>(ocfg, arena.get());
-
-        hot_tier = std::make_unique<HotTier>(dim, global_cfg.hot_tier, data_type);
 
         try
         {
@@ -97,7 +98,7 @@ namespace pomai::core
     }
 
     PomaiDB::PomaiDB(const pomai::config::PomaiConfig &config)
-        : config_(config), bg_running_(false)
+        : config_(config), bg_running_(false), insert_running_(false)
     {
         try
         {
@@ -202,8 +203,40 @@ namespace pomai::core
 
         wal_.replay(apply_cb);
 
+        // Background worker remains for low-frequency maintenance (thermal policy, checkpoint)
         bg_running_ = true;
         bg_thread_ = std::thread(&PomaiDB::background_worker, this);
+
+        // Insert worker threads: keep existing logic to accept async inserts and push to orbit directly
+        size_t nworkers = config_.orchestrator.shard_count > 0 ? static_cast<size_t>(config_.orchestrator.shard_count) : std::max<size_t>(1, std::thread::hardware_concurrency());
+        insert_running_.store(true);
+        for (size_t i = 0; i < std::max<size_t>(1, nworkers); ++i)
+        {
+            insert_threads_.emplace_back([this]()
+                                         {
+            while (insert_running_.load(std::memory_order_acquire))
+            {
+                InsertJob job;
+                {
+                    std::unique_lock<std::mutex> lk(insert_mu_);
+                    insert_cv_.wait(lk, [this] { return !insert_q_.empty() || !insert_running_.load(); });
+                    if (!insert_running_.load() && insert_q_.empty())
+                        break;
+                    job = std::move(insert_q_.front());
+                    insert_q_.pop_front();
+                }
+                bool ok = false;
+                try
+                {
+                    ok = this->insert(job.membr, job.vec.data(), job.label);
+                }
+                catch (...)
+                {
+                    ok = false;
+                }
+                try { job.prom.set_value(ok); } catch (...) {}
+            } });
+        }
     }
 
     PomaiDB::~PomaiDB()
@@ -211,6 +244,16 @@ namespace pomai::core
         bg_running_ = false;
         if (bg_thread_.joinable())
             bg_thread_.join();
+
+        {
+            insert_running_.store(false);
+            insert_cv_.notify_all();
+            for (auto &t : insert_threads_)
+                if (t.joinable())
+                    t.join();
+            insert_threads_.clear();
+        }
+
         save_all_membrances();
         save_manifest();
         wal_.close();
@@ -316,12 +359,34 @@ namespace pomai::core
         Membrance *m = get_membrance(membr);
         if (!m)
             return false;
-        if (m->hot_tier)
+
+        // Direct insertion to Orbit — hot tier removed. This keeps semantics simple and deterministic:
+        // either vector is accepted by Orbit or it fails.
+        try
         {
-            auto res = m->hot_tier->push(label, vec);
-            return res == HotTier::InsertResult::OK;
+            return m->orbit->insert(vec, label);
         }
-        return m->orbit->insert(vec, label);
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    std::future<bool> PomaiDB::insert_async(const std::string &membr, std::vector<float> &&vec, uint64_t label)
+    {
+        std::promise<bool> p;
+        auto fut = p.get_future();
+        {
+            std::lock_guard<std::mutex> lk(insert_mu_);
+            InsertJob job;
+            job.membr = membr;
+            job.vec = std::move(vec);
+            job.label = label;
+            job.prom = std::move(p);
+            insert_q_.push_back(std::move(job));
+        }
+        insert_cv_.notify_one();
+        return fut;
     }
 
     bool PomaiDB::insert_batch(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)
@@ -330,19 +395,15 @@ namespace pomai::core
         if (!m)
             return false;
 
-        if (m->hot_tier)
-        {
-            for (const auto &item : batch)
-            {
-                auto res = m->hot_tier->push(item.first, item.second.data());
-                if (res != HotTier::InsertResult::OK)
-                    return false;
-            }
-            return true;
-        }
-
         std::unique_lock<std::shared_mutex> lock(mu_);
-        return m->orbit->insert_batch(batch);
+        try
+        {
+            return m->orbit->insert_batch(batch);
+        }
+        catch (...)
+        {
+            return false;
+        }
     }
 
     std::vector<std::pair<uint64_t, float>> PomaiDB::search(const std::string &membr, const float *query, size_t k)
@@ -350,23 +411,14 @@ namespace pomai::core
         Membrance *m = get_membrance(membr);
         if (!m)
             return {};
-        auto hot = m->hot_tier ? m->hot_tier->search(query, k) : std::vector<std::pair<uint64_t, float>>{};
-        auto warm = m->orbit->search(query, k);
-        if (hot.empty())
-            return warm;
-        if (warm.empty())
-            return hot;
-        std::vector<std::pair<uint64_t, float>> merged;
-        merged.reserve(k);
-        size_t i = 0, j = 0;
-        while (merged.size() < k && (i < hot.size() || j < warm.size()))
+        try
         {
-            if (i < hot.size() && (j >= warm.size() || hot[i].second < warm[j].second))
-                merged.push_back(hot[i++]);
-            else
-                merged.push_back(warm[j++]);
+            return m->orbit->search(query, k);
         }
-        return merged;
+        catch (...)
+        {
+            return {};
+        }
     }
 
     bool PomaiDB::get(const std::string &membr, uint64_t label, std::vector<float> &out)
@@ -506,6 +558,7 @@ namespace pomai::core
 
     void PomaiDB::background_worker()
     {
+        // Periodic low-frequency maintenance loop.
         while (bg_running_)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.db.bg_worker_interval_ms));
@@ -518,70 +571,20 @@ namespace pomai::core
             }
             for (Membrance *m : snapshot)
             {
-                if (!m || !m->hot_tier)
+                if (!m || !m->orbit)
                     continue;
-                auto batch = m->hot_tier->swap_and_flush();
-                if (batch.empty())
-                    continue;
-                const size_t dim = batch.dim;
-                const uint32_t elem_size = batch.element_size;
-                const pomai::core::DataType bdt = batch.data_type;
-                const size_t count = batch.count();
-                const uint8_t *flat = batch.data.data();
-                std::vector<std::pair<uint64_t, std::vector<float>>> to_insert;
-                to_insert.reserve(count);
-                for (size_t i = 0; i < count; ++i)
+                try
                 {
-                    const uint8_t *slot = flat + i * dim * elem_size;
-                    std::vector<float> tmp(dim);
-                    switch (bdt)
-                    {
-                    case DataType::FLOAT32:
-                        std::memcpy(tmp.data(), slot, dim * sizeof(float));
-                        break;
-                    case DataType::FLOAT64:
-                    {
-                        const double *dp = reinterpret_cast<const double *>(slot);
-                        for (size_t d = 0; d < dim; ++d)
-                            tmp[d] = static_cast<float>(dp[d]);
-                        break;
-                    }
-                    case DataType::INT32:
-                    {
-                        const int32_t *ip = reinterpret_cast<const int32_t *>(slot);
-                        for (size_t d = 0; d < dim; ++d)
-                            tmp[d] = static_cast<float>(ip[d]);
-                        break;
-                    }
-                    case DataType::INT8:
-                    {
-                        const int8_t *ip = reinterpret_cast<const int8_t *>(slot);
-                        for (size_t d = 0; d < dim; ++d)
-                            tmp[d] = static_cast<float>(ip[d]);
-                        break;
-                    }
-                    case DataType::FLOAT16:
-                    {
-                        const uint16_t *hp = reinterpret_cast<const uint16_t *>(slot);
-                        for (size_t d = 0; d < dim; ++d)
-                            tmp[d] = fp16_to_fp32(hp[d]);
-                        break;
-                    }
-                    default:
-                    {
-                        size_t copy_bytes = std::min<size_t>(dim * sizeof(float), dim * elem_size);
-                        std::memcpy(tmp.data(), slot, copy_bytes);
-                        if (copy_bytes < dim * sizeof(float))
-                            for (size_t d = (copy_bytes / sizeof(float)); d < dim; ++d)
-                                tmp[d] = 0.0f;
-                        break;
-                    }
-                    }
-                    to_insert.emplace_back(batch.labels[i], std::move(tmp));
+                    // Apply thermal policy / maintenance inside Orbit if implemented.
+                    m->orbit->apply_thermal_policy();
+                }
+                catch (...)
+                {
                 }
                 try
                 {
-                    m->orbit->insert_batch(to_insert);
+                    // Periodic lightweight checkpoint: schema save
+                    m->orbit->save_schema();
                 }
                 catch (...)
                 {
