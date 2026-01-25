@@ -200,8 +200,14 @@ namespace pomai::config
 
     struct WalConfig
     {
-        bool sync_on_append = true;
-        size_t batch_commit_size = 0;
+        // WARNING: default is BATCHED commits for throughput.
+        // Setting sync_on_append=true forces fsync per append and will severely degrade ingest.
+        bool sync_on_append = false;
+
+        // Batch commit threshold in bytes. When accumulated bytes since last fsync
+        // exceed this value the background flush worker will issue a durable sync.
+        // Default: 4MB (good default for bulk ingest)
+        size_t batch_commit_size = 4 * 1024 * 1024;
     };
 
     // [NEW] Cấu hình cho Data Split (Train/Val/Test)

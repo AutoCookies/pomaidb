@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <iostream>
 
 namespace pomai::server
 {
@@ -22,16 +23,21 @@ namespace pomai::server
     namespace utils = pomai::server::utils;
     namespace supplier = pomai::server::data_supplier;
 
-    SqlExecutor::SqlExecutor() : insert_cb_(nullptr), search_cb_(nullptr) {}
+    SqlExecutor::SqlExecutor() : insert_cb_(nullptr), search_cb_(nullptr)
+    {
+        std::clog << "[SqlExecutor] constructed\n";
+    }
 
     void SqlExecutor::set_insert_callback(std::function<bool(const std::string &membr, const std::vector<std::pair<uint64_t, std::vector<float>>> &batch)> cb)
     {
         insert_cb_ = std::move(cb);
+        std::clog << "[SqlExecutor] insert callback registered\n";
     }
 
     void SqlExecutor::set_search_callback(std::function<std::vector<std::pair<uint64_t, float>>(const std::string &membr, const std::vector<float> &q, size_t k)> cb)
     {
         search_cb_ = std::move(cb);
+        std::clog << "[SqlExecutor] search callback registered\n";
     }
 
     static inline bool fetch_raws_with_fallback(
@@ -104,9 +110,14 @@ namespace pomai::server
                                      ClientState &state,
                                      const std::string &raw_cmd)
     {
+        std::clog << "[SqlExecutor] execute: received command: " << (raw_cmd.empty() ? "<empty>" : raw_cmd) << "\n";
+
         std::string cmd = utils::trim(raw_cmd);
         if (cmd.empty())
+        {
+            std::clog << "[SqlExecutor] execute: empty command after trim\n";
             return "ERR empty command\n";
+        }
         if (cmd.back() == ';')
             cmd.pop_back();
 
@@ -115,6 +126,7 @@ namespace pomai::server
 
         if (up == "SHOW MEMBRANCES")
         {
+            std::clog << "[SqlExecutor] SHOW MEMBRANCES\n";
             auto list = db->list_membrances();
             std::ostringstream ss;
             ss << "MEMBRANCES: " << list.size() << "\n";
@@ -125,11 +137,13 @@ namespace pomai::server
 
         if (up.rfind("USE ", 0) == 0)
         {
+            std::clog << "[SqlExecutor] USE command\n";
             auto parts2 = utils::split_ws(cmd);
             if (parts2.size() >= 2)
             {
                 std::string name = parts2[1];
                 state.current_membrance = name;
+                std::clog << "[SqlExecutor] switched current_membrance -> " << name << "\n";
                 return std::string("OK: switched to membrance ") + name + "\n";
             }
             return "ERR: USE <name>;\n";
@@ -137,6 +151,7 @@ namespace pomai::server
 
         if (up.rfind("EXEC SPLIT", 0) == 0)
         {
+            std::clog << "[SqlExecutor] EXEC SPLIT\n";
             auto parts2 = utils::split_ws(cmd);
             if (parts2.size() < 6)
                 return "ERR: Usage: EXEC SPLIT <name> <tr%> <val%> <te%> [STRATIFIED <key> | CLUSTER]\n";
@@ -159,9 +174,15 @@ namespace pomai::server
 
             auto *m = db->get_membrance(name);
             if (!m)
+            {
+                std::clog << "[SqlExecutor] EXEC SPLIT: membrance not found: " << name << "\n";
                 return "ERR: Membrance not found\n";
+            }
             if (!m->split_mgr)
+            {
+                std::clog << "[SqlExecutor] EXEC SPLIT: split manager not initialized for " << name << "\n";
                 return "ERR: Split manager not initialized\n";
+            }
 
             std::string strategy = "RANDOM";
             std::string strat_key;
@@ -319,13 +340,16 @@ namespace pomai::server
                    << m->split_mgr->train_indices.size() << " train, "
                    << m->split_mgr->val_indices.size() << " val, "
                    << m->split_mgr->test_indices.size() << " test";
+                std::clog << "[SqlExecutor] EXEC SPLIT: saved split for " << name << " total_vectors=" << total_vectors << "\n";
                 return ss.str() + "\n";
             }
+            std::clog << "[SqlExecutor] EXEC SPLIT: failed to save split for " << name << "\n";
             return "ERR: Failed to save split file\n";
         }
 
         if (up.rfind("ITERATE", 0) == 0)
         {
+            std::clog << "[SqlExecutor] ITERATE command\n";
             auto parts2 = utils::split_ws(cmd);
             if (parts2.size() < 3)
                 return "ERR: Usage: ITERATE <name> <mode> [split] [off] [lim] [BATCH <n>]\n";
@@ -334,7 +358,10 @@ namespace pomai::server
             std::string mode = utils::to_upper(parts2[2]);
             auto *m = db->get_membrance(name);
             if (!m)
+            {
+                std::clog << "[SqlExecutor] ITERATE: membrance not found: " << name << "\n";
                 return "ERR: Membrance not found\n";
+            }
 
             size_t dim = m->dim;
 
@@ -417,6 +444,7 @@ namespace pomai::server
 
             if (mode == "TRIPLET")
             {
+                std::clog << "[SqlExecutor] ITERATE TRIPLET\n";
                 if (!m->meta_index || !m->orbit)
                     return "OK BINARY float32 0 " + std::to_string(dim) + " 0\n";
                 if (parts2.size() < 4)
@@ -491,6 +519,7 @@ namespace pomai::server
 
             if (mode == "PAIR")
             {
+                std::clog << "[SqlExecutor] ITERATE PAIR\n";
                 if (!idxs_ptr)
                     return "ERR: No split indices available for PAIR\n";
                 if (off >= idxs_ptr->size())
@@ -505,6 +534,7 @@ namespace pomai::server
 
                 if (batch_size_param > 0)
                 {
+                    std::clog << "[SqlExecutor] ITERATE PAIR batch=" << batch_size_param << " cnt=" << cnt << "\n";
                     std::string out;
                     size_t processed = 0;
                     std::vector<uint64_t> ids;
@@ -542,6 +572,7 @@ namespace pomai::server
                 }
                 else
                 {
+                    std::clog << "[SqlExecutor] ITERATE PAIR direct cnt=" << cnt << "\n";
                     std::vector<uint64_t> ids;
                     ids.reserve(cnt);
                     for (size_t i = 0; i < cnt; ++i)
@@ -575,6 +606,7 @@ namespace pomai::server
 
             if (mode == "TRAIN" || mode == "VAL" || mode == "TEST")
             {
+                std::clog << "[SqlExecutor] ITERATE " << mode << "\n";
                 if (!idxs_ptr)
                     return "ERR: No split indices available for ITERATE\n";
                 if (off >= idxs_ptr->size())
@@ -588,6 +620,7 @@ namespace pomai::server
 
                 if (batch_size_param > 0)
                 {
+                    std::clog << "[SqlExecutor] ITERATE " << mode << " batch=" << batch_size_param << " cnt=" << cnt << "\n";
                     std::string out;
                     size_t processed = 0;
                     std::vector<uint64_t> ids;
@@ -614,6 +647,7 @@ namespace pomai::server
                 }
                 else
                 {
+                    std::clog << "[SqlExecutor] ITERATE " << mode << " direct cnt=" << cnt << "\n";
                     std::vector<uint64_t> ids;
                     ids.reserve(cnt);
                     for (size_t i = 0; i < cnt; ++i)
@@ -637,6 +671,7 @@ namespace pomai::server
 
         if (up.rfind("CREATE MEMBRANCE", 0) == 0)
         {
+            std::clog << "[SqlExecutor] CREATE MEMBRANCE\n";
             size_t pos_dim = up.find(" DIM ");
             if (pos_dim == std::string::npos)
                 return "ERR: CREATE MEMBRANCE missing DIM\n";
@@ -705,18 +740,23 @@ namespace pomai::server
                 return std::string("ERR: unsupported DATA_TYPE '") + data_type + "'\n";
             }
 
+            std::clog << "[SqlExecutor] CREATE MEMBRANCE: name=" << name << " dim=" << dim << " ram_mb=" << ram_mb << " dtype=" << data_type << "\n";
+
             bool ok = db->create_membrance(name, cfg);
             if (ok)
             {
                 std::ostringstream ss;
                 ss << "OK: created membrance " << name << " dim=" << dim << " data_type=" << data_type << " ram=" << ram_mb << "MB\n";
+                std::clog << "[SqlExecutor] CREATE MEMBRANCE: success " << name << "\n";
                 return ss.str();
             }
+            std::clog << "[SqlExecutor] CREATE MEMBRANCE: failed " << name << "\n";
             return "ERR: create failed (exists or invalid)\n";
         }
 
         if (utils::to_upper(cmd).rfind("SEARCH ", 0) == 0)
         {
+            std::clog << "[SqlExecutor] SEARCH command\n";
             auto parts2 = utils::split_ws(cmd);
             if (parts2.size() < 5)
                 return "ERR: usage SEARCH <name> QUERY <vec> TOP <k>\n";
@@ -760,21 +800,32 @@ namespace pomai::server
 
             auto *m = db->get_membrance(name);
             if (!m)
+            {
+                std::clog << "[SqlExecutor] SEARCH: membrance not found: " << name << "\n";
                 return "ERR: membrance not found\n";
+            }
             if (!m->orbit && !search_cb_)
+            {
+                std::clog << "[SqlExecutor] SEARCH: engine not ready for " << name << "\n";
                 return "ERR: engine not ready\n";
+            }
             if (query_vec.size() != m->dim)
+            {
+                std::clog << "[SqlExecutor] SEARCH: dimension mismatch for " << name << " expected=" << m->dim << " got=" << query_vec.size() << "\n";
                 return "ERR: query dimension mismatch\n";
+            }
 
             std::vector<std::pair<uint64_t, float>> results;
             if (search_cb_)
             {
                 try
                 {
+                    std::clog << "[SqlExecutor] SEARCH: using search callback for membr=" << name << " k=" << k << "\n";
                     results = search_cb_(name, query_vec, k);
                 }
                 catch (...)
                 {
+                    std::clog << "[SqlExecutor] SEARCH: search callback threw for " << name << "\n";
                     results.clear();
                 }
             }
@@ -782,10 +833,12 @@ namespace pomai::server
             {
                 try
                 {
+                    std::clog << "[SqlExecutor] SEARCH: delegating to orbit for membr=" << name << " k=" << k << "\n";
                     results = m->orbit->search(query_vec.data(), k);
                 }
                 catch (...)
                 {
+                    std::clog << "[SqlExecutor] SEARCH: orbit.search threw for " << name << "\n";
                     results.clear();
                 }
             }
@@ -794,28 +847,37 @@ namespace pomai::server
             ss << "OK " << results.size() << "\n";
             for (const auto &p : results)
                 ss << p.first << " " << std::fixed << std::setprecision(6) << p.second << "\n";
+            std::clog << "[SqlExecutor] SEARCH: returned " << results.size() << " results for " << name << "\n";
             return ss.str();
         }
 
         if (up.rfind("DROP MEMBRANCE", 0) == 0)
         {
+            std::clog << "[SqlExecutor] DROP MEMBRANCE\n";
             auto parts2 = utils::split_ws(cmd);
             if (parts2.size() < 3)
                 return "ERR: DROP MEMBRANCE <name>;\n";
             std::string name = parts2[2];
             bool ok = db->drop_membrance(name);
+            std::clog << "[SqlExecutor] DROP MEMBRANCE: name=" << name << " ok=" << ok << "\n";
             return ok ? std::string("OK: dropped ") + name + "\n" : std::string("ERR: drop failed\n");
         }
 
         if (up == "EXEC CHECKPOINT")
         {
+            std::clog << "[SqlExecutor] EXEC CHECKPOINT\n";
             if (db->checkpoint_all())
+            {
+                std::clog << "[SqlExecutor] EXEC CHECKPOINT: success\n";
                 return "OK: Checkpoint completed. WAL truncated.\n";
+            }
+            std::clog << "[SqlExecutor] EXEC CHECKPOINT: failed\n";
             return "ERR: Checkpoint failed partially.\n";
         }
 
         if (up.rfind("GET MEMBRANCE", 0) == 0)
         {
+            std::clog << "[SqlExecutor] GET MEMBRANCE INFO\n";
             auto parts2 = utils::split_ws(cmd);
             std::string name;
             bool ok_parse = false;
@@ -841,7 +903,10 @@ namespace pomai::server
 
             auto *m = db->get_membrance(name);
             if (!m)
+            {
+                std::clog << "[SqlExecutor] GET MEMBRANCE INFO: not found " << name << "\n";
                 return std::string("ERR: membrance not found: ") + name + "\n";
+            }
 
             pomai::ai::orbit::MembranceInfo info;
             try
@@ -905,6 +970,7 @@ namespace pomai::server
             ss << "--- Storage Stats ---\n";
             ss << " disk_bytes: " << utils::bytes_human(info.disk_bytes) << "\n";
             ss << " ram_mb_configured: " << m->ram_mb << "\n";
+            std::clog << "[SqlExecutor] GET MEMBRANCE INFO: " << name << " vectors=" << total_vectors << " dim=" << feature_dim << "\n";
             return ss.str();
         }
 
@@ -912,6 +978,7 @@ namespace pomai::server
             std::string upstart = utils::to_upper(cmd.substr(0, std::min<size_t>(cmd.size(), 16)));
             if (upstart.rfind("INSERT INTO", 0) == 0 || utils::to_upper(cmd).rfind("INSERT VALUES", 0) == 0)
             {
+                std::clog << "[SqlExecutor] INSERT (text) detected\n";
                 std::string body = cmd;
                 std::string name;
                 bool has_explicit_into = (utils::to_upper(cmd).find("INTO") != std::string::npos);
@@ -935,7 +1002,10 @@ namespace pomai::server
 
                 auto *m = db->get_membrance(name);
                 if (!m)
+                {
+                    std::clog << "[SqlExecutor] INSERT: membrance not found: " << name << "\n";
                     return "ERR: membrance not found\n";
+                }
 
                 size_t pos_after_values = pos_values + std::string("VALUES").size();
                 size_t cur = body.find_first_not_of(" \t\r\n", pos_after_values);
@@ -986,6 +1056,7 @@ namespace pomai::server
                     {
                         std::ostringstream ss;
                         ss << "ERR: dim mismatch expected=" << m->dim << " got=" << vec_vals.size() << "\n";
+                        std::clog << "[SqlExecutor] INSERT: dim mismatch for " << name << " expected=" << m->dim << " got=" << vec_vals.size() << "\n";
                         return ss.str();
                     }
                     tuples.emplace_back(label_tok, std::move(vec_vals));
@@ -1051,6 +1122,7 @@ namespace pomai::server
                 bool ok_batch = false;
                 try
                 {
+                    std::clog << "[SqlExecutor] INSERT: executing batch insert membr=" << name << " count=" << batch_data.size() << "\n";
                     if (insert_cb_)
                         ok_batch = insert_cb_(name, batch_data);
                     else
@@ -1058,6 +1130,7 @@ namespace pomai::server
                 }
                 catch (...)
                 {
+                    std::clog << "[SqlExecutor] INSERT: exception during batch insert for membr=" << name << "\n";
                     ok_batch = false;
                 }
 
@@ -1077,6 +1150,7 @@ namespace pomai::server
 
                 std::ostringstream ss;
                 ss << "OK: inserted " << (ok_batch ? batch_data.size() : 0) << " / " << tuples.size() << (ok_batch ? " (batch)" : " (failed)") << "\n";
+                std::clog << "[SqlExecutor] INSERT: finished membr=" << name << " ok=" << ok_batch << " inserted=" << (ok_batch ? batch_data.size() : 0) << "\n";
                 return ss.str();
             }
         }
@@ -1086,15 +1160,24 @@ namespace pomai::server
 
     std::string SqlExecutor::execute_binary_insert(pomai::core::PomaiDB *db, const char *raw_data, size_t len)
     {
+        std::clog << "[SqlExecutor] execute_binary_insert: len=" << len << "\n";
         if (len < 13)
+        {
+            std::clog << "[SqlExecutor] execute_binary_insert: packet too short\n";
             return "ERR: packet too short\n";
+        }
 
         uint64_t label = *reinterpret_cast<const uint64_t *>(raw_data);
         uint32_t dim = *reinterpret_cast<const uint32_t *>(raw_data + 8);
         const float *vec_data = reinterpret_cast<const float *>(raw_data + 12);
 
+        std::clog << "[SqlExecutor] execute_binary_insert: label=" << label << " dim=" << dim << "\n";
+
         if (len < 12 + (dim * sizeof(float)))
+        {
+            std::clog << "[SqlExecutor] execute_binary_insert: incomplete vector data\n";
             return "ERR: incomplete vector data\n";
+        }
 
         std::vector<std::pair<uint64_t, std::vector<float>>> batch;
         batch.reserve(1);
@@ -1105,6 +1188,7 @@ namespace pomai::server
         bool ok = false;
         try
         {
+            std::clog << "[SqlExecutor] execute_binary_insert: delegating to DB insert_batch for label=" << label << "\n";
             if (insert_cb_)
                 ok = insert_cb_("default", batch);
             else
@@ -1112,9 +1196,11 @@ namespace pomai::server
         }
         catch (...)
         {
+            std::clog << "[SqlExecutor] execute_binary_insert: exception during insert\n";
             ok = false;
         }
 
+        std::clog << "[SqlExecutor] execute_binary_insert: result=" << ok << "\n";
         return ok ? "OK\n" : "ERR: insert failed\n";
     }
 

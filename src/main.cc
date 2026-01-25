@@ -26,7 +26,6 @@ static std::atomic<bool> g_stop_requested{false};
 static void sig_handler(int)
 {
     g_stop_requested.store(true, std::memory_order_release);
-    g_exit_cv.notify_one();
 }
 
 static void print_banner(uint16_t port)
@@ -112,8 +111,10 @@ int main(int argc, char **argv)
 
         {
             std::unique_lock<std::mutex> lk(g_exit_mu);
-            g_exit_cv.wait(lk, []
-                           { return g_stop_requested.load(std::memory_order_acquire); });
+            while (!g_stop_requested.load(std::memory_order_acquire))
+            {
+                g_exit_cv.wait_for(lk, std::chrono::milliseconds(500));
+            }
         }
 
         server.stop();

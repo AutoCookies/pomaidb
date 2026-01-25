@@ -21,6 +21,8 @@
 #include "src/core/map.h"
 #include "src/core/config.h"
 #include "src/ai/whispergrain.h"
+#include "src/facade/sql_executor.h"
+#include "src/facade/tcp_listener.h" // <- new
 
 namespace pomai::server
 {
@@ -36,6 +38,10 @@ namespace pomai::server
         std::future<bool> dispatch_insert(const std::string &membr, uint64_t label, std::vector<float> vec);
         std::future<pomai::core::ShardSearchResult> dispatch_search(const std::string &membr, std::vector<float> query, size_t k, uint64_t label_hint);
 
+        // Start/stop TCP listener (binds to config.net.port). Started automatically in constructor.
+        bool start_tcp_listener();
+        void stop_tcp_listener();
+
     private:
         void init_shard_workers();
         void start_workers();
@@ -47,6 +53,12 @@ namespace pomai::server
         pomai::config::PomaiConfig config_;
         int port_;
         pomai::ai::WhisperGrain whisper_;
+
+        // SQL executor used by TCP connections
+        pomai::server::SqlExecutor sql_exec_;
+
+        // TCP listener (owns acceptor thread + client threads)
+        std::unique_ptr<pomai::server::net::TcpListener> tcp_listener_;
 
         std::vector<std::unique_ptr<pomai::core::WorkerQueue>> worker_queues_;
         std::vector<std::thread> worker_threads_;

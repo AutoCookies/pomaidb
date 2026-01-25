@@ -24,6 +24,9 @@ namespace pomai::memory
         // [THÊM MỚI] Dùng cho vector data batch. Payload khớp với PomaiOrbit.
         WAL_REC_INSERT_BATCH = 20,
 
+        // [THÊM MỚI] Persisted label deletion (payload = uint64_t label)
+        WAL_REC_DELETE_LABEL = 21,
+
         WAL_REC_CHECKPOINT = 100
     };
 

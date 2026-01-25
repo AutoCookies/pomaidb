@@ -1,4 +1,3 @@
-/* src/memory/wal_manager.cc */
 #include "src/memory/wal_manager.h"
 
 #include <sys/types.h>
@@ -14,6 +13,7 @@
 #include <algorithm>
 #include <mutex>
 #include <atomic>
+#include <utility>
 
 namespace pomai::memory
 {
@@ -283,12 +283,26 @@ namespace pomai::memory
                 return std::nullopt;
 
             total_bytes_written_.fetch_add(rec_size, std::memory_order_relaxed);
+            total_records_written_.fetch_add(1, std::memory_order_relaxed);
+
             uint64_t acc = bytes_since_last_fsync_.fetch_add(rec_size, std::memory_order_relaxed) + rec_size;
 
             // Nếu vượt ngưỡng batch_commit_size, báo hiệu cho luồng nền nhưng KHÔNG ĐỢI (Non-blocking)
             if (cfg_.batch_commit_size > 0 && acc >= cfg_.batch_commit_size)
             {
                 flush_cv_.notify_one();
+            }
+
+            // Honor explicit sync_on_append only when user explicitly requests durability per append.
+            if (cfg_.sync_on_append)
+            {
+                if (!robust_fsync(fd_))
+                {
+                    std::cerr << "WalManager::append_record: fsync failed: " << strerror(errno) << "\n";
+                    return std::nullopt;
+                }
+                // reset accumulator on explicit fsync
+                bytes_since_last_fsync_.store(0, std::memory_order_relaxed);
             }
         }
         return rh.seq_no;
@@ -442,10 +456,16 @@ namespace pomai::memory
             flush_cv_.wait_for(lk, std::chrono::milliseconds(10), [this]
                                { return !flush_running_ || bytes_since_last_fsync_.load() >= cfg_.batch_commit_size; });
 
-            if (bytes_since_last_fsync_.load() > 0)
+            uint64_t bytes = bytes_since_last_fsync_.load(std::memory_order_relaxed);
+            if (bytes > 0 && fd_ >= 0)
             {
-                bytes_since_last_fsync_.store(0);
-                ::fdatasync(fd_); // Đẩy dữ liệu xuống đĩa không chặn luồng Reader/Writer
+                // reset accumulator before sync to avoid lost notifications counting
+                bytes_since_last_fsync_.store(0, std::memory_order_relaxed);
+                // Robust sync with retry
+                if (!robust_fsync(fd_))
+                {
+                    std::cerr << "WalManager::flush_worker_loop: fdatasync/fsync failed: " << strerror(errno) << "\n";
+                }
             }
         }
     }

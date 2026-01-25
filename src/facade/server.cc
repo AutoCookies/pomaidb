@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <utility>
 #include <cstddef>
+#include <chrono>
 
 using namespace pomai::server;
 
@@ -11,15 +12,20 @@ PomaiServer::PomaiServer(pomai::core::PomaiMap *kv_map, pomai::core::PomaiDB *po
       pomai_db_(pomai_db),
       config_(config),
       port_(static_cast<int>(config.net.port)),
-      whisper_(config.whisper)
+      whisper_(config.whisper),
+      sql_exec_()
 {
     init_shard_workers();
     start_workers();
+
+    // Start TCP listener to serve clients (required by Architect)
+    start_tcp_listener();
 }
 
 PomaiServer::~PomaiServer()
 {
     stop();
+    stop_tcp_listener();
 }
 
 void PomaiServer::stop()
@@ -75,8 +81,15 @@ std::future<bool> PomaiServer::dispatch_insert(const std::string &membr, uint64_
         return p.get_future();
     }
     size_t idx = pomai::core::shard_for_label(label, n);
-    pomai::core::Work w = pomai::core::Work::make_insert(membr, label, std::move(vec), next_req_id_.fetch_add(1, std::memory_order_relaxed));
+
+    // Acquire request id explicitly so we can log it consistently
+    uint64_t req_id = next_req_id_.fetch_add(1, std::memory_order_relaxed);
+    pomai::core::Work w = pomai::core::Work::make_insert(membr, label, std::move(vec), req_id);
     std::future<bool> fut = w.prom_insert.get_future();
+
+    // Debug log: enqueue
+    std::clog << "[Dispatch] INSERT req=" << req_id << " membr=" << membr << " label=" << label << " -> shard=" << idx << "\n";
+
     worker_queues_[idx]->push(std::move(w));
     return fut;
 }
@@ -91,8 +104,14 @@ std::future<pomai::core::ShardSearchResult> PomaiServer::dispatch_search(const s
         return p.get_future();
     }
     size_t idx = pomai::core::shard_for_label(label_hint, n);
-    pomai::core::Work w = pomai::core::Work::make_search(membr, std::move(query), k, next_req_id_.fetch_add(1, std::memory_order_relaxed));
+
+    // Acquire request id explicitly so we can log it consistently
+    uint64_t req_id = next_req_id_.fetch_add(1, std::memory_order_relaxed);
+    pomai::core::Work w = pomai::core::Work::make_search(membr, std::move(query), k, req_id);
     std::future<pomai::core::ShardSearchResult> fut = w.prom_search.get_future();
+
+    std::clog << "[Dispatch] SEARCH req=" << req_id << " membr=" << membr << " k=" << k << " -> shard=" << idx << "\n";
+
     worker_queues_[idx]->push(std::move(w));
     return fut;
 }
@@ -105,8 +124,11 @@ void PomaiServer::worker_thread_loop(size_t idx)
         pomai::core::Work w = q->pop_wait();
         if (w.kind == pomai::core::Work::Kind::STOP)
             break;
+
+        auto work_start = std::chrono::steady_clock::now();
         if (w.kind == pomai::core::Work::Kind::INSERT)
         {
+            std::clog << "[Worker " << idx << "] START INSERT req=" << w.req_id << " membr=" << w.membrance << " label=" << w.label << "\n";
             bool ok = false;
             try
             {
@@ -116,6 +138,10 @@ void PomaiServer::worker_thread_loop(size_t idx)
             {
                 ok = false;
             }
+            auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - work_start).count();
+            std::clog << "[Worker " << idx << "] DONE  INSERT req=" << w.req_id << " ok=" << (ok ? "1" : "0") << " dur_ms=" << dur << "\n";
+            if (dur > 50)
+                std::clog << "[Worker " << idx << "] WARNING: slow insert req=" << w.req_id << " dur_ms=" << dur << "\n";
             try
             {
                 w.prom_insert.set_value(ok);
@@ -126,6 +152,7 @@ void PomaiServer::worker_thread_loop(size_t idx)
         }
         else if (w.kind == pomai::core::Work::Kind::SEARCH)
         {
+            std::clog << "[Worker " << idx << "] START SEARCH req=" << w.req_id << " membr=" << w.membrance << " k=" << w.k << "\n";
             pomai::core::ShardSearchResult res;
             try
             {
@@ -135,6 +162,10 @@ void PomaiServer::worker_thread_loop(size_t idx)
             {
                 res.hits.clear();
             }
+            auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - work_start).count();
+            std::clog << "[Worker " << idx << "] DONE  SEARCH req=" << w.req_id << " hits=" << res.hits.size() << " dur_ms=" << dur << "\n";
+            if (dur > 50)
+                std::clog << "[Worker " << idx << "] WARNING: slow search req=" << w.req_id << " dur_ms=" << dur << "\n";
             try
             {
                 w.prom_search.set_value(std::move(res));
@@ -144,14 +175,19 @@ void PomaiServer::worker_thread_loop(size_t idx)
             }
         }
     }
+
+    // Drain remaining
     while (true)
     {
         auto opt = q->try_pop();
         if (!opt.has_value())
             break;
         pomai::core::Work w = std::move(*opt);
+        auto work_start = std::chrono::steady_clock::now();
+
         if (w.kind == pomai::core::Work::Kind::INSERT)
         {
+            std::clog << "[Worker " << idx << "] DRAIN INSERT req=" << w.req_id << " membr=" << w.membrance << " label=" << w.label << "\n";
             bool ok = false;
             try
             {
@@ -161,6 +197,8 @@ void PomaiServer::worker_thread_loop(size_t idx)
             {
                 ok = false;
             }
+            auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - work_start).count();
+            std::clog << "[Worker " << idx << "] DRAIN DONE INSERT req=" << w.req_id << " ok=" << (ok ? "1" : "0") << " dur_ms=" << dur << "\n";
             try
             {
                 w.prom_insert.set_value(ok);
@@ -171,6 +209,7 @@ void PomaiServer::worker_thread_loop(size_t idx)
         }
         else if (w.kind == pomai::core::Work::Kind::SEARCH)
         {
+            std::clog << "[Worker " << idx << "] DRAIN SEARCH req=" << w.req_id << " membr=" << w.membrance << " k=" << w.k << "\n";
             pomai::core::ShardSearchResult res;
             try
             {
@@ -180,6 +219,8 @@ void PomaiServer::worker_thread_loop(size_t idx)
             {
                 res.hits.clear();
             }
+            auto dur = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - work_start).count();
+            std::clog << "[Worker " << idx << "] DRAIN DONE SEARCH req=" << w.req_id << " hits=" << res.hits.size() << " dur_ms=" << dur << "\n";
             try
             {
                 w.prom_search.set_value(std::move(res));
@@ -188,5 +229,50 @@ void PomaiServer::worker_thread_loop(size_t idx)
             {
             }
         }
+    }
+}
+
+bool PomaiServer::start_tcp_listener()
+{
+    if (tcp_listener_ && tcp_listener_->running())
+        return true;
+
+    // Handler: map incoming text commands to SqlExecutor
+    auto handler = [this](const std::string &cmd) -> std::string
+    {
+        ClientState state;
+        // route to SqlExecutor which returns an ASCII response
+        try
+        {
+            return sql_exec_.execute(pomai_db_, whisper_, state, cmd);
+        }
+        catch (const std::exception &e)
+        {
+            return std::string("ERR: ") + e.what() + "\n";
+        }
+        catch (...)
+        {
+            return std::string("ERR: unknown\n");
+        }
+    };
+
+    tcp_listener_ = std::make_unique<pomai::server::net::TcpListener>(static_cast<uint16_t>(port_), std::move(handler));
+    if (!tcp_listener_->start())
+    {
+        tcp_listener_.reset();
+        std::cerr << "[PomaiServer] TCP listener failed to start on port " << port_ << "\n";
+        return false;
+    }
+    std::clog << "[PomaiServer] TCP listener started on port " << port_ << "\n";
+    return true;
+}
+
+void PomaiServer::stop_tcp_listener()
+{
+    if (tcp_listener_)
+    {
+        tcp_listener_->stop();
+        tcp_listener_.reset();
+        std::clog << "[PomaiServer] TCP listener stopped\n";
     }
 }

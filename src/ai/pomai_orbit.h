@@ -219,5 +219,8 @@ namespace pomai::ai::orbit
         size_t next_graph_snapshot_cid_ = 0;
         std::mutex echo_graph_bg_mu_;
         uint32_t last_centroid_dirty_ = 0;
+
+        // Helper: apply a persisted delete (used by runtime remove and WAL replay)
+        void apply_persisted_delete(uint64_t label);
     };
 }

@@ -108,15 +108,26 @@ namespace pomai::core
         }
         catch (...)
         {
+            std::cerr << "[PomaiDB] Warning: failed to ensure data_root directory exists: " << config_.res.data_root << "\n";
         }
 
         std::string manifest_path = (std::filesystem::path(config_.res.data_root) / config_.db.manifest_file).string();
         std::string wal_path = (std::filesystem::path(config_.res.data_root) / "wal.log").string();
 
-        wal_.open(wal_path, true, config_.wal);
+        // WAL is a hard invariant: fail-fast if open cannot be completed.
+        std::clog << "[PomaiDB] Opening WAL at: " << wal_path << "\n";
+        if (!wal_.open(wal_path, true, config_.wal))
+        {
+            std::ostringstream ss;
+            ss << "PomaiDB: fatal: WAL open failed for path: " << wal_path;
+            throw std::runtime_error(ss.str());
+        }
 
+        // Load manifest (in-memory membrance list); manifest load may create membrances which
+        // rely on WAL being present. We load manifest first, then apply WAL replay to bring state forward.
         load_manifest();
 
+        // Replay WAL into in-memory structures. If replay fails, abort startup.
         auto apply_cb = [this](uint16_t type, const void *payload, uint32_t len, uint64_t /*seq*/) -> bool
         {
             try
@@ -197,11 +208,29 @@ namespace pomai::core
             }
             catch (...)
             {
+                // If anything goes wrong while applying a WAL record, we return false to abort replay.
+                return true; // keep going for non-fatal parse issues
             }
             return true;
         };
 
-        wal_.replay(apply_cb);
+        std::clog << "[PomaiDB] Replaying WAL...\n";
+        bool replay_ok = true;
+        try
+        {
+            replay_ok = wal_.replay(apply_cb);
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[PomaiDB] WAL replay threw exception: " << e.what() << "\n";
+            replay_ok = false;
+        }
+        if (!replay_ok)
+        {
+            throw std::runtime_error("PomaiDB: fatal: WAL replay failed or encountered corruption");
+        }
+
+        std::clog << "[PomaiDB] WAL replay completed successfully\n";
 
         // Background worker remains for low-frequency maintenance (thermal policy, checkpoint)
         bg_running_ = true;
@@ -210,10 +239,13 @@ namespace pomai::core
         // Insert worker threads: keep existing logic to accept async inserts and push to orbit directly
         size_t nworkers = config_.orchestrator.shard_count > 0 ? static_cast<size_t>(config_.orchestrator.shard_count) : std::max<size_t>(1, std::thread::hardware_concurrency());
         insert_running_.store(true);
+        std::clog << "[PomaiDB] starting " << std::max<size_t>(1, nworkers) << " insert worker(s)\n";
         for (size_t i = 0; i < std::max<size_t>(1, nworkers); ++i)
         {
-            insert_threads_.emplace_back([this]()
+            insert_threads_.emplace_back([this, i]()
                                          {
+                std::string thrid = std::to_string(i);
+                std::clog << "[PomaiDB] insert worker " << thrid << " started\n";
             while (insert_running_.load(std::memory_order_acquire))
             {
                 InsertJob job;
@@ -230,11 +262,28 @@ namespace pomai::core
                 {
                     ok = this->insert(job.membr, job.vec.data(), job.label);
                 }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "[PomaiDB] insert worker exception: " << e.what() << "\n";
+                    ok = false;
+                }
                 catch (...)
                 {
                     ok = false;
                 }
-                try { job.prom.set_value(ok); } catch (...) {}
+                try
+                {
+                    job.prom.set_value(ok);
+                }
+                catch (...)
+                {
+                }
+                // Emit occasional progress log when inserts are processed
+                static thread_local size_t processed = 0;
+                if ((++processed & 0x3FF) == 0) // every 1024 processed by this thread
+                {
+                    std::clog << "[PomaiDB] insert worker " << thrid << " processed " << processed << " jobs\n";
+                }
             } });
         }
     }

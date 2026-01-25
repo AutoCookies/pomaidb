@@ -55,13 +55,13 @@ static std::atomic<uint64_t> next_label{0};
 
 static std::mutex sampled_lock;
 static std::vector<std::pair<uint64_t, std::vector<float>>> sampled_vectors;
-static const size_t sample_per_batch = 1;
+static const size_t sample_per_batch = 1000;
 static const size_t max_samples = 10000;
 
 // Worker: produces inserts when is_searching==false, otherwise runs searches
 void worker_loop(pomai::core::PomaiDB *db, const std::string &m_name, int dim, MilestoneThreadStats &stats, int thread_id)
 {
-    const int batch_sz = 100;
+    const int batch_sz = 1000;
     const int top_k = 10;
     std::mt19937 gen(1337 + static_cast<unsigned>(thread_id));
     std::uniform_real_distribution<float> dis(0.0f, 1.0f);
