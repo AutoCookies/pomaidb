@@ -643,8 +643,6 @@ namespace pomai::ai::orbit
         if (batch.empty())
             return false;
 
-        std::shared_lock<std::shared_mutex> cp_lock(checkpoint_mu_);
-
         if (wal_)
         {
             std::vector<uint8_t> buffer;
@@ -687,227 +685,233 @@ namespace pomai::ai::orbit
         if (batch.empty())
             return false;
 
-        std::shared_lock<std::shared_mutex> cp_lock(checkpoint_mu_);
-
-        if (centroids_.empty())
+        std::vector<uint32_t> split_candidates;
         {
-            size_t seed_count = std::max<size_t>(cfg_.algo.min_centroids, std::thread::hardware_concurrency() / 2);
-            for (size_t i = 0; i < std::min(batch.size(), seed_count); ++i)
+            std::shared_lock<std::shared_mutex> cp_lock(checkpoint_mu_);
+
+            if (centroids_.empty())
             {
-                auto node = std::make_unique<OrbitNode>();
-                node->vector = batch[i].second;
-                node->bucket_offset.store(alloc_new_bucket(static_cast<uint32_t>(i)), std::memory_order_release);
-                centroids_.push_back(std::move(node));
-            }
-            rebuild_index();
-            build_echo_graph(1.0f, 0.01f);
-        }
-
-        const size_t B = batch.size();
-        const size_t C = centroids_.size();
-        const size_t D = cfg_.dim;
-
-        std::vector<float> qnorm2;
-        qnorm2.resize(B);
-        std::vector<float> trans;
-        trans.assign(D * B, 0.0f);
-
-        for (size_t v = 0; v < B; ++v)
-        {
-            const float *q = batch[v].second.data();
-            float s = 0.0f;
-            for (size_t d = 0; d < D; ++d)
-            {
-                float val = q[d];
-                s += val * val;
-                trans[d * B + v] = val;
-            }
-            qnorm2[v] = s;
-        }
-
-        std::vector<float> cflat;
-        cflat.resize(C * D);
-        std::vector<float> cnorm2;
-        cnorm2.resize(C);
-        for (size_t c = 0; c < C; ++c)
-        {
-            const std::vector<float> &cv = centroids_[c]->vector;
-            float s = 0.0f;
-            for (size_t d = 0; d < D; ++d)
-            {
-                float v = cv[d];
-                cflat[c * D + d] = v;
-                s += v * v;
-            }
-            cnorm2[c] = s;
-        }
-
-        std::vector<float> best_dist(B, std::numeric_limits<float>::infinity());
-        std::vector<uint32_t> assigned_cid(B, 0);
-        std::vector<float> dot;
-        dot.assign(B, 0.0f);
-
-        for (size_t c = 0; c < C; ++c)
-        {
-            std::fill(dot.begin(), dot.end(), 0.0f);
-
-            const float *cptr = &cflat[c * D];
-
-            for (size_t d = 0; d < D; ++d)
-            {
-                float cd = cptr[d];
-                const float *trow = &trans[d * B];
-                size_t v = 0;
-                const size_t B8 = (B / 8) * 8;
-                for (; v < B8; v += 8)
+                size_t seed_count = std::max<size_t>(cfg_.algo.min_centroids, std::thread::hardware_concurrency() / 2);
+                for (size_t i = 0; i < std::min(batch.size(), seed_count); ++i)
                 {
-                    dot[v + 0] += trow[v + 0] * cd;
-                    dot[v + 1] += trow[v + 1] * cd;
-                    dot[v + 2] += trow[v + 2] * cd;
-                    dot[v + 3] += trow[v + 3] * cd;
-                    dot[v + 4] += trow[v + 4] * cd;
-                    dot[v + 5] += trow[v + 5] * cd;
-                    dot[v + 6] += trow[v + 6] * cd;
-                    dot[v + 7] += trow[v + 7] * cd;
+                    auto node = std::make_unique<OrbitNode>();
+                    node->vector = batch[i].second;
+                    node->bucket_offset.store(alloc_new_bucket(static_cast<uint32_t>(i)), std::memory_order_release);
+                    centroids_.push_back(std::move(node));
                 }
-                for (; v < B; ++v)
-                    dot[v] += trow[v] * cd;
+                rebuild_index();
+                build_echo_graph(1.0f, 0.01f);
             }
 
-            float c2 = cnorm2[c];
+            const size_t B = batch.size();
+            const size_t C = centroids_.size();
+            const size_t D = cfg_.dim;
+
+            std::vector<float> qnorm2;
+            qnorm2.resize(B);
+            std::vector<float> trans;
+            trans.assign(D * B, 0.0f);
+
             for (size_t v = 0; v < B; ++v)
             {
-                float dist = qnorm2[v] + c2 - 2.0f * dot[v];
-                if (dist < best_dist[v])
+                const float *q = batch[v].second.data();
+                float s = 0.0f;
+                for (size_t d = 0; d < D; ++d)
                 {
-                    best_dist[v] = dist;
-                    assigned_cid[v] = static_cast<uint32_t>(c);
+                    float val = q[d];
+                    s += val * val;
+                    trans[d * B + v] = val;
+                }
+                qnorm2[v] = s;
+            }
+
+            std::vector<float> cflat;
+            cflat.resize(C * D);
+            std::vector<float> cnorm2;
+            cnorm2.resize(C);
+            for (size_t c = 0; c < C; ++c)
+            {
+                const std::vector<float> &cv = centroids_[c]->vector;
+                float s = 0.0f;
+                for (size_t d = 0; d < D; ++d)
+                {
+                    float v = cv[d];
+                    cflat[c * D + d] = v;
+                    s += v * v;
+                }
+                cnorm2[c] = s;
+            }
+
+            std::vector<float> best_dist(B, std::numeric_limits<float>::infinity());
+            std::vector<uint32_t> assigned_cid(B, 0);
+            std::vector<float> dot;
+            dot.assign(B, 0.0f);
+
+            for (size_t c = 0; c < C; ++c)
+            {
+                std::fill(dot.begin(), dot.end(), 0.0f);
+
+                const float *cptr = &cflat[c * D];
+
+                for (size_t d = 0; d < D; ++d)
+                {
+                    float cd = cptr[d];
+                    const float *trow = &trans[d * B];
+                    size_t v = 0;
+                    const size_t B8 = (B / 8) * 8;
+                    for (; v < B8; v += 8)
+                    {
+                        dot[v + 0] += trow[v + 0] * cd;
+                        dot[v + 1] += trow[v + 1] * cd;
+                        dot[v + 2] += trow[v + 2] * cd;
+                        dot[v + 3] += trow[v + 3] * cd;
+                        dot[v + 4] += trow[v + 4] * cd;
+                        dot[v + 5] += trow[v + 5] * cd;
+                        dot[v + 6] += trow[v + 6] * cd;
+                        dot[v + 7] += trow[v + 7] * cd;
+                    }
+                    for (; v < B; ++v)
+                        dot[v] += trow[v] * cd;
+                }
+
+                float c2 = cnorm2[c];
+                for (size_t v = 0; v < B; ++v)
+                {
+                    float dist = qnorm2[v] + c2 - 2.0f * dot[v];
+                    if (dist < best_dist[v])
+                    {
+                        best_dist[v] = dist;
+                        assigned_cid[v] = static_cast<uint32_t>(c);
+                    }
                 }
             }
-        }
 
-        std::vector<Item> prepared;
-        prepared.reserve(B);
-        for (size_t i = 0; i < B; ++i)
-        {
-            Item it;
-            it.label = batch[i].first;
-            uint32_t cid = assigned_cid[i];
-            it.cid = cid;
-            std::vector<uint8_t> pk = zeroharmony_->pack_with_mean(batch[i].second.data(), centroids_[cid]->vector);
-            if (pk.size() > MAX_ECHO_BYTES)
-                pk.resize(MAX_ECHO_BYTES);
-            it.size = static_cast<uint8_t>(pk.size());
-            std::memcpy(it.bytes, pk.data(), pk.size());
-            prepared.push_back(it);
-        }
-
-        std::sort(prepared.begin(), prepared.end(), [](auto &a, auto &b)
-                  { return a.cid < b.cid; });
-
-        std::vector<uint32_t> added_counts;
-        added_counts.assign(centroids_.size(), 0);
-
-        for (size_t i = 0; i < prepared.size();)
-        {
-            uint32_t cid = prepared[i].cid;
-            size_t end = i;
-            while (end < prepared.size() && prepared[end].cid == cid)
-                ++end;
-
-            OrbitNode &node = *centroids_[cid];
-            size_t k = i;
-            std::vector<std::tuple<uint64_t, uint32_t, uint64_t>> deferred_maps;
-            while (k < end)
+            std::vector<Item> prepared;
+            prepared.reserve(B);
+            for (size_t i = 0; i < B; ++i)
             {
-                uint64_t off = node.bucket_offset.load(std::memory_order_acquire);
-                std::vector<char> tmp;
-                auto base_opt = resolve_bucket_base(arena_, off, tmp);
-                if (!base_opt)
+                Item it;
+                it.label = batch[i].first;
+                uint32_t cid = assigned_cid[i];
+                it.cid = cid;
+                std::vector<uint8_t> pk = zeroharmony_->pack_with_mean(batch[i].second.data(), centroids_[cid]->vector);
+                if (pk.size() > MAX_ECHO_BYTES)
+                    pk.resize(MAX_ECHO_BYTES);
+                it.size = static_cast<uint8_t>(pk.size());
+                std::memcpy(it.bytes, pk.data(), pk.size());
+                prepared.push_back(it);
+            }
+
+            std::sort(prepared.begin(), prepared.end(), [](auto &a, auto &b)
+                      { return a.cid < b.cid; });
+
+            std::vector<uint32_t> added_counts;
+            added_counts.assign(centroids_.size(), 0);
+
+            for (size_t i = 0; i < prepared.size();)
+            {
+                uint32_t cid = prepared[i].cid;
+                size_t end = i;
+                while (end < prepared.size() && prepared[end].cid == cid)
+                    ++end;
+
+                OrbitNode &node = *centroids_[cid];
+                size_t k = i;
+                std::vector<std::tuple<uint64_t, uint32_t, uint64_t>> deferred_maps;
+                while (k < end)
                 {
-                    uint64_t cur = node.bucket_offset.load(std::memory_order_acquire);
-                    if (cur == off)
+                    uint64_t off = node.bucket_offset.load(std::memory_order_acquire);
+                    std::vector<char> tmp;
+                    auto base_opt = resolve_bucket_base(arena_, off, tmp);
+                    if (!base_opt)
                     {
-                        uint64_t alloc = alloc_new_bucket(cid);
-                        if (alloc == 0)
-                            break;
-                        uint64_t expected = off;
-                        node.bucket_offset.compare_exchange_weak(expected, alloc, std::memory_order_acq_rel);
-                        off = node.bucket_offset.load(std::memory_order_acquire);
-                        base_opt = resolve_bucket_base(arena_, off, tmp);
-                        if (!base_opt)
+                        uint64_t cur = node.bucket_offset.load(std::memory_order_acquire);
+                        if (cur == off)
+                        {
+                            uint64_t alloc = alloc_new_bucket(cid);
+                            if (alloc == 0)
+                                break;
+                            uint64_t expected = off;
+                            node.bucket_offset.compare_exchange_weak(expected, alloc, std::memory_order_acq_rel);
+                            off = node.bucket_offset.load(std::memory_order_acquire);
+                            base_opt = resolve_bucket_base(arena_, off, tmp);
+                            if (!base_opt)
+                                continue;
+                        }
+                        else
+                        {
+                            off = cur;
                             continue;
+                        }
                     }
-                    else
+                    char *mutable_base = const_cast<char *>(*base_opt);
+                    BucketHeader *hdr = reinterpret_cast<BucketHeader *>(mutable_base);
+                    uint32_t cur_count = bucket_atomic_load_count(hdr);
+                    if (cur_count >= dynamic_bucket_capacity_)
                     {
-                        off = cur;
+                        uint64_t nxt = bucket_atomic_load_next(hdr);
+                        if (!nxt)
+                        {
+                            uint64_t alloc = alloc_new_bucket(cid);
+                            if (alloc == 0)
+                                break;
+                            uint64_t expected = 0;
+                            pomai::ai::atomic_utils::atomic_compare_exchange_u64(&hdr->next_bucket_offset, expected, alloc);
+                            nxt = bucket_atomic_load_next(hdr);
+                            if (!nxt)
+                                break;
+                        }
+                        off = nxt;
                         continue;
                     }
-                }
-                char *mutable_base = const_cast<char *>(*base_opt);
-                BucketHeader *hdr = reinterpret_cast<BucketHeader *>(mutable_base);
-                uint32_t cur_count = bucket_atomic_load_count(hdr);
-                if (cur_count >= dynamic_bucket_capacity_)
-                {
-                    uint64_t nxt = bucket_atomic_load_next(hdr);
-                    if (!nxt)
+                    uint32_t avail = dynamic_bucket_capacity_ - cur_count;
+                    size_t want = std::min<size_t>(avail, end - k);
+                    uint32_t old = bucket_atomic_fetch_add_count(hdr, static_cast<uint32_t>(want));
+                    if (old >= dynamic_bucket_capacity_)
                     {
-                        uint64_t alloc = alloc_new_bucket(cid);
-                        if (alloc == 0)
-                            break;
-                        uint64_t expected = 0;
-                        pomai::ai::atomic_utils::atomic_compare_exchange_u64(&hdr->next_bucket_offset, expected, alloc);
-                        nxt = bucket_atomic_load_next(hdr);
-                        if (!nxt)
-                            break;
+                        bucket_atomic_sub_count(hdr, static_cast<uint32_t>(want));
+                        continue;
                     }
-                    off = nxt;
-                    continue;
+                    uint32_t start_slot = old;
+                    size_t actual = std::min<size_t>(want, dynamic_bucket_capacity_ - old);
+                    uint8_t *vec_base = reinterpret_cast<uint8_t *>(mutable_base + hdr->off_vectors);
+                    uint16_t *lens_base = reinterpret_cast<uint16_t *>(mutable_base + hdr->off_pq_codes);
+                    uint64_t *ids_base = reinterpret_cast<uint64_t *>(mutable_base + hdr->off_ids);
+                    for (size_t t = 0; t < actual; ++t)
+                    {
+                        size_t idx = k + t;
+                        std::memcpy(vec_base + static_cast<size_t>(start_slot + t) * packed_slot_size_, prepared[idx].bytes, prepared[idx].size);
+                        __atomic_store_n(&lens_base[start_slot + t], static_cast<uint16_t>(prepared[idx].size), __ATOMIC_RELEASE);
+                        uint64_t packed_id = IdEntry::pack_label(prepared[idx].label);
+                        pomai::ai::atomic_utils::atomic_store_u64(ids_base + start_slot + t, packed_id);
+                        deferred_maps.emplace_back(prepared[idx].label, off, static_cast<uint64_t>(start_slot + t));
+                    }
+                    added_counts[cid] = static_cast<uint32_t>(added_counts[cid] + actual);
+                    k += actual;
                 }
-                uint32_t avail = dynamic_bucket_capacity_ - cur_count;
-                size_t want = std::min<size_t>(avail, end - k);
-                uint32_t old = bucket_atomic_fetch_add_count(hdr, static_cast<uint32_t>(want));
-                if (old >= dynamic_bucket_capacity_)
+                for (auto &m : deferred_maps)
                 {
-                    bucket_atomic_sub_count(hdr, static_cast<uint32_t>(want));
-                    continue;
+                    uint64_t lbl = std::get<0>(m);
+                    uint64_t boff = std::get<1>(m);
+                    uint32_t slot = static_cast<uint32_t>(std::get<2>(m));
+                    set_label_map(lbl, boff, slot);
                 }
-                uint32_t start_slot = old;
-                size_t actual = std::min<size_t>(want, dynamic_bucket_capacity_ - old);
-                uint8_t *vec_base = reinterpret_cast<uint8_t *>(mutable_base + hdr->off_vectors);
-                uint16_t *lens_base = reinterpret_cast<uint16_t *>(mutable_base + hdr->off_pq_codes);
-                uint64_t *ids_base = reinterpret_cast<uint64_t *>(mutable_base + hdr->off_ids);
-                for (size_t t = 0; t < actual; ++t)
-                {
-                    size_t idx = k + t;
-                    std::memcpy(vec_base + static_cast<size_t>(start_slot + t) * packed_slot_size_, prepared[idx].bytes, prepared[idx].size);
-                    __atomic_store_n(&lens_base[start_slot + t], static_cast<uint16_t>(prepared[idx].size), __ATOMIC_RELEASE);
-                    uint64_t packed_id = IdEntry::pack_label(prepared[idx].label);
-                    pomai::ai::atomic_utils::atomic_store_u64(ids_base + start_slot + t, packed_id);
-                    deferred_maps.emplace_back(prepared[idx].label, off, static_cast<uint64_t>(start_slot + t));
-                }
-                added_counts[cid] = static_cast<uint32_t>(added_counts[cid] + actual);
-                k += actual;
+                i = end;
             }
-            for (auto &m : deferred_maps)
+
+            for (size_t cid = 0; cid < added_counts.size(); ++cid)
             {
-                uint64_t lbl = std::get<0>(m);
-                uint64_t boff = std::get<1>(m);
-                uint32_t slot = static_cast<uint32_t>(std::get<2>(m));
-                set_label_map(lbl, boff, slot);
+                uint32_t added = added_counts[cid];
+                if (added == 0)
+                    continue;
+                uint32_t prev = pomai::ai::atomic_utils::atomic_fetch_add_u32(&bucket_sizes_[cid], added);
+                if (prev + added > K_SPLIT_THRESHOLD)
+                    split_candidates.push_back(static_cast<uint32_t>(cid));
             }
-            i = end;
         }
 
-        for (size_t cid = 0; cid < added_counts.size(); ++cid)
-        {
-            uint32_t added = added_counts[cid];
-            if (added == 0)
-                continue;
-            uint32_t prev = pomai::ai::atomic_utils::atomic_fetch_add_u32(&bucket_sizes_[cid], added);
-            if (prev + added > K_SPLIT_THRESHOLD)
-                check_and_split_bucket(static_cast<uint32_t>(cid));
-        }
+        for (uint32_t cid : split_candidates)
+            check_and_split_bucket(cid);
 
         return true;
     }

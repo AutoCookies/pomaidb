@@ -369,7 +369,6 @@ namespace pomai::core
         Membrance *m = get_membrance(membr);
         if (!m)
             return false;
-        std::unique_lock<std::shared_mutex> lock(mu_);
         try
         {
             return m->orbit->insert_batch(batch);
