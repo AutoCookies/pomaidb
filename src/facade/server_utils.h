@@ -1,233 +1,232 @@
-#include <cstddef>
+#pragma once
+
 #include <cstdint>
-#include <cstdlib>
+#include <cstddef>
+#include <charconv>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <algorithm>
-#include <cctype>
 #include <cstring>
-#include <sstream>
-#include <fstream>
+#include <cmath>
+#include <system_error>
+#include <unistd.h>
+#include <fcntl.h>
+#include <array>
 #include <iomanip>
-#include "src/core/metadata_index.h" // Để dùng struct Tag
+#include <sstream>
 
-#pragma once
+#include "src/core/metadata_index.h"
+#include "src/external/xxhash.h"
 
 namespace pomai::server::utils
 {
+    static constexpr const char *WHITESPACE = " \t\r\n";
 
-    static inline std::string trim(const std::string &s)
+    [[nodiscard]] inline std::string_view trim_sv(std::string_view v) noexcept
     {
-        const char *ws = " \t\r\n";
-        size_t b = s.find_first_not_of(ws);
-        if (b == std::string::npos)
-            return "";
-        size_t e = s.find_last_not_of(ws);
-        return s.substr(b, e - b + 1);
+        size_t b = v.find_first_not_of(WHITESPACE);
+        if (b == std::string_view::npos)
+            return {};
+        size_t e = v.find_last_not_of(WHITESPACE);
+        return v.substr(b, e - b + 1);
     }
 
-    static inline std::string_view trim_sv(std::string_view v)
+    [[nodiscard]] inline std::string trim(const std::string &s)
     {
-        const char *ws = " \t\r\n";
-        size_t b = 0;
-        while (b < v.size() && std::strchr(ws, static_cast<unsigned char>(v[b])))
-            ++b;
-        size_t e = v.size();
-        while (e > b && std::strchr(ws, static_cast<unsigned char>(v[e - 1])))
-            --e;
-        return v.substr(b, e - b);
+        return std::string(trim_sv(s));
     }
 
-    static inline std::vector<std::string> split_ws(const std::string &s)
+    [[nodiscard]] inline std::vector<std::string_view> split_ws_sv(std::string_view s)
     {
-        std::istringstream iss(s);
-        std::vector<std::string> out;
-        std::string t;
-        while (iss >> t)
-            out.push_back(t);
-        return out;
-    }
-
-    static inline std::string to_upper(const std::string &s)
-    {
-        std::string r = s;
-        for (char &c : r)
-            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        return r;
-    }
-
-    static uint64_t fnv1a_hash(const void *data, size_t len)
-    {
-        const uint8_t *bytes = reinterpret_cast<const uint8_t *>(data);
-        uint64_t h = 14695981039346656037ULL;
-        for (size_t i = 0; i < len; ++i)
+        std::vector<std::string_view> result;
+        result.reserve(8);
+        size_t start = s.find_first_not_of(WHITESPACE);
+        while (start != std::string_view::npos)
         {
-            h ^= bytes[i];
-            h *= 1099511628211ULL;
+            size_t end = s.find_first_of(WHITESPACE, start);
+            if (end == std::string_view::npos)
+            {
+                result.emplace_back(s.substr(start));
+                break;
+            }
+            result.emplace_back(s.substr(start, end - start));
+            start = s.find_first_not_of(WHITESPACE, end);
         }
-        return h;
+        return result;
     }
 
-    static inline uint64_t hash_label(const std::string &s)
+    [[nodiscard]] inline std::vector<std::string> split_ws(const std::string &s)
     {
-        uint64_t h = 14695981039346656037ULL;
-        for (char c : s)
+        auto svs = split_ws_sv(s);
+        std::vector<std::string> ret;
+        ret.reserve(svs.size());
+        for (auto sv : svs)
+            ret.emplace_back(sv);
+        return ret;
+    }
+
+    [[nodiscard]] inline std::string to_upper(std::string s)
+    {
+        for (char &c : s)
+            if (c >= 'a' && c <= 'z')
+                c -= 32;
+        return s;
+    }
+
+    [[nodiscard]] inline bool iequals(std::string_view a, std::string_view b) noexcept
+    {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); ++i)
         {
-            h ^= static_cast<uint64_t>(c);
-            h *= 1099511628211ULL;
+            char c1 = a[i] >= 'a' && a[i] <= 'z' ? a[i] - 32 : a[i];
+            char c2 = b[i] >= 'a' && b[i] <= 'z' ? b[i] - 32 : b[i];
+            if (c1 != c2)
+                return false;
         }
-        return h;
+        return true;
     }
 
-    static inline uint64_t hash_key(const std::string &k) { return fnv1a_hash(k.data(), k.size()); }
-
-    static inline void append_end_marker(std::string &s)
+    static inline uint64_t hash_key(std::string_view k)
     {
-        if (s.empty() || s.back() != '\n')
-            s.push_back('\n');
-        s += "<END>\n";
+        return XXH3_64bits(k.data(), k.size());
     }
 
-    // Fast parse helpers: use string_view and strtof into a small stack buffer.
-    // Token is a substring view representing the number text (no surrounding whitespace).
-    static inline float parse_float_token_sv(std::string_view tok)
+    static inline uint64_t hash_label(std::string_view s)
     {
-        // small stack buffer optimization
-        constexpr size_t STACK_BUF_SZ = 128;
-        if (tok.empty())
-            return 0.0f;
-        if (tok.size() < STACK_BUF_SZ)
-        {
-            char tmp[STACK_BUF_SZ];
-            std::memcpy(tmp, tok.data(), tok.size());
-            tmp[tok.size()] = '\0';
-            char *endp = nullptr;
-            float v = std::strtof(tmp, &endp);
-            (void)endp;
-            return v;
-        }
-        else
-        {
-            // fallback allocate
-            std::string tmp(tok);
-            char *endp = nullptr;
-            float v = std::strtof(tmp.c_str(), &endp);
-            (void)endp;
-            return v;
-        }
+        return XXH3_64bits(s.data(), s.size());
     }
 
-    static inline bool parse_vector(std::string s, std::vector<float> &out)
+    static inline bool parse_vector(std::string_view s, std::vector<float> &out)
     {
-        // Remove brackets if any
-        if (!s.empty() && s.front() == '[')
-            s = s.substr(1);
-        if (!s.empty() && s.back() == ']')
-            s.pop_back();
+        out.clear();
+        if (s.empty())
+            return false;
 
-        std::replace(s.begin(), s.end(), ',', ' ');
-        std::istringstream iss(s);
-        float v;
-        while (iss >> v)
+        size_t commas = std::count(s.begin(), s.end(), ',');
+        out.reserve(commas + 1);
+
+        const char *ptr = s.data();
+        const char *end = ptr + s.size();
+
+        while (ptr < end)
         {
-            out.push_back(v);
+            while (ptr < end && (*ptr <= ' ' || *ptr == ',' || *ptr == '[' || *ptr == ']'))
+            {
+                ptr++;
+            }
+            if (ptr == end)
+                break;
+
+            float val;
+            auto [next_ptr, ec] = std::from_chars(ptr, end, val);
+
+            if (ec == std::errc())
+            {
+                out.push_back(val);
+                ptr = next_ptr;
+            }
+            else
+            {
+                ptr++;
+            }
         }
         return !out.empty();
     }
 
-    // Parse CSV list of floats using string_view tokens and parse_float_token_sv.
-    static std::vector<float> parse_float_list_sv(std::string_view csv)
-    {
-        std::vector<float> out;
-        size_t i = 0;
-        while (i < csv.size())
-        {
-            // find comma
-            size_t j = csv.find(',', i);
-            std::string_view tok = (j == std::string::npos) ? csv.substr(i) : csv.substr(i, j - i);
-            tok = trim_sv(tok);
-            if (!tok.empty())
-            {
-                try
-                {
-                    float v = parse_float_token_sv(tok);
-                    out.push_back(v);
-                }
-                catch (...)
-                {
-                    // ignore parse error for this token
-                }
-            }
-            if (j == std::string::npos)
-                break;
-            i = j + 1;
-        }
-        return out;
-    }
-
-    // Parse tags in form: k1:v1,k2:v2  -> returns vector<Tag>
-    static std::vector<pomai::core::Tag> parse_tags_list(const std::string &s)
+    static inline std::vector<pomai::core::Tag> parse_tags_list(std::string_view s)
     {
         std::vector<pomai::core::Tag> out;
-        size_t i = 0;
-        while (i < s.size())
+        if (s.empty())
+            return out;
+
+        const char *ptr = s.data();
+        const char *end = ptr + s.size();
+
+        while (ptr < end)
         {
-            // find comma-separated token
-            size_t j = s.find(',', i);
-            std::string tok = (j == std::string::npos) ? s.substr(i) : s.substr(i, j - i);
-            // split by ':' first occurrence
-            size_t c = tok.find(':');
-            if (c != std::string::npos)
+            const char *token_end = ptr;
+            while (token_end < end && *token_end != ',')
+                token_end++;
+
+            std::string_view token(ptr, token_end - ptr);
+            token = trim_sv(token);
+
+            size_t colon = token.find(':');
+            if (colon != std::string_view::npos)
             {
-                std::string k = trim(tok.substr(0, c));
-                std::string v = trim(tok.substr(c + 1));
-                // strip optional quotes
-                if (v.size() >= 2 && ((v.front() == '\'' && v.back() == '\'') || (v.front() == '\"' && v.back() == '\"')))
+                std::string_view k = trim_sv(token.substr(0, colon));
+                std::string_view v = trim_sv(token.substr(colon + 1));
+
+                if (v.size() >= 2 && ((v.front() == '\'' && v.back() == '\'') ||
+                                      (v.front() == '"' && v.back() == '"')))
+                {
                     v = v.substr(1, v.size() - 2);
+                }
+
                 if (!k.empty() && !v.empty())
-                    out.push_back(pomai::core::Tag{k, v});
+                {
+                    out.emplace_back(pomai::core::Tag{std::string(k), std::string(v)});
+                }
             }
-            if (j == std::string::npos)
-                break;
-            i = j + 1;
+
+            ptr = token_end;
+            if (ptr < end)
+                ptr++;
         }
         return out;
     }
 
-    // Helper: format bytes -> GB string with 2 decimals
-    static std::string bytes_human(uint64_t bytes)
+    static inline std::string bytes_human(uint64_t bytes)
     {
-        std::ostringstream ss;
+        char buf[64];
         double gb = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
-        ss << bytes << " (" << std::fixed << std::setprecision(2) << gb << " GB)";
-        return ss.str();
+        int n = std::snprintf(buf, sizeof(buf), "%llu (%.2f GB)", (unsigned long long)bytes, gb);
+        return std::string(buf, n > 0 ? n : 0);
     }
 
-    static bool read_proc_stat(uint64_t &idle, uint64_t &total)
+    static inline bool read_proc_stat(uint64_t &idle, uint64_t &total)
     {
-        std::ifstream f("/proc/stat");
-        if (!f.good())
+        int fd = open("/proc/stat", O_RDONLY);
+        if (fd < 0)
             return false;
-        std::string line;
-        std::getline(f, line);
-        f.close();
-        // line format: cpu  user nice system idle iowait irq softirq steal guest guest_nice
-        std::istringstream iss(line);
-        std::string cpu_label;
-        iss >> cpu_label;
-        uint64_t value;
+
+        char buffer[1024];
+        ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+        close(fd);
+
+        if (n <= 0)
+            return false;
+        buffer[n] = '\0';
+
+        if (strncmp(buffer, "cpu ", 4) != 0)
+            return false;
+
+        const char *p = buffer + 4;
         uint64_t sum = 0;
         idle = 0;
-        for (int i = 0; iss >> value; ++i)
+
+        for (int i = 0; i < 10; ++i)
         {
-            sum += value;
-            // idle is value at position 3 (0-based: user(0),nice(1),system(2),idle(3))
+            while (*p == ' ')
+                p++;
+            if (*p < '0' || *p > '9')
+                break;
+
+            uint64_t val = 0;
+            auto res = std::from_chars(p, buffer + n, val);
+            if (res.ec != std::errc())
+                break;
+
+            sum += val;
             if (i == 3)
-                idle = value;
+                idle = val;
+
+            p = res.ptr;
         }
+
         total = sum;
         return true;
     }
-
-} // namespace pomai::server::utils
+}

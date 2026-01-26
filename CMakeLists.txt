@@ -1,6 +1,9 @@
 # Top-level CMake for the repository.
 cmake_minimum_required(VERSION 3.16)
 project(pomai_cache LANGUAGES CXX)
+extern "C" {
+  include(CheckCXXCompilerFlag)
+}
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

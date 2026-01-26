@@ -1,51 +1,58 @@
-// src/facade/tcp_listener.cc
-//
-// Implementation of TcpListener: minimal, production-minded, predictable behavior.
-//
-// Design notes:
-// - Accept loop uses poll() with short timeout so stop() can interrupt quickly.
-// - Each client handled in its own thread (detached-joinable via vector) to keep logic simple
-//   and avoid complex epoll per-connection state while preserving isolation.
-// - Per-connection thread reads from socket into fixed buffer and dispatches newline-terminated
-//   commands to handler. Response is sent back as-is (handler output).
-// - Uses blocking read on client FD (no busy-loop) — threads are cheap for connections in typical DB use.
-// - All resources are closed cleanly on stop().
-
 #include "src/facade/tcp_listener.h"
 #include "src/facade/net_io.h"
-
+#include <netinet/tcp.h>
+#include <netinet/in.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
 #include <errno.h>
 #include <cstring>
 #include <iostream>
-#include <mutex>
+#include <algorithm>
+#include <vector>
+#include <poll.h>
 
-              namespace pomai::server::net
+namespace pomai::server::net
 {
-
-    static inline void set_socket_reuseaddr(int fd)
+    static bool send_all_safe(int fd, const void *data, size_t len)
     {
-        int v = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &v, sizeof(v));
+        const char *ptr = static_cast<const char *>(data);
+        size_t remaining = len;
+        while (remaining > 0)
+        {
+            ssize_t n = ::send(fd, ptr, remaining, MSG_NOSIGNAL);
+            if (n <= 0)
+            {
+                if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+                {
+                    continue;
+                }
+                return false;
+            }
+            ptr += n;
+            remaining -= n;
+        }
+        return true;
+    }
+
+    static void prepare_socket(int fd)
+    {
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 #ifdef SO_REUSEPORT
-        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &v, sizeof(v));
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 #endif
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
 
-    TcpListener::TcpListener(uint16_t port, CmdHandler handler) noexcept
-        : port_(port), handler_(std::move(handler)), listen_fd_(-1)
-    {
-    }
+    TcpListener::TcpListener(uint16_t port, StreamHandler handler) noexcept
+        : port_(port), handler_(std::move(handler)) {}
 
-    TcpListener::~TcpListener()
-    {
-        stop();
-    }
+    TcpListener::~TcpListener() { stop(); }
 
     bool TcpListener::start()
     {
@@ -54,42 +61,63 @@
 
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0)
-        {
-            std::cerr << "[TcpListener] socket() failed: " << strerror(errno) << "\n";
             return false;
-        }
 
-        set_socket_reuseaddr(listen_fd_);
+        prepare_socket(listen_fd_);
 
-        // Bind to 0.0.0.0:port
-        struct sockaddr_in addr{};
+        sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons(port_);
 
-        if (bind(listen_fd_, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0)
+        if (::bind(listen_fd_, (struct sockaddr *)&addr, sizeof(addr)) != 0)
         {
-            std::cerr << "[TcpListener] bind() failed: " << strerror(errno) << "\n";
             ::close(listen_fd_);
             listen_fd_ = -1;
             return false;
         }
 
-        if (listen(listen_fd_, 128) != 0)
+        if (::listen(listen_fd_, 4096) != 0)
         {
-            std::cerr << "[TcpListener] listen() failed: " << strerror(errno) << "\n";
             ::close(listen_fd_);
             listen_fd_ = -1;
             return false;
         }
 
-        // Set non-blocking accept so poll can be used.
-        int flags = fcntl(listen_fd_, F_GETFL, 0);
-        if (flags >= 0)
-            fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK);
+        epoll_fd_ = epoll_create1(0);
+        if (epoll_fd_ < 0)
+        {
+            ::close(listen_fd_);
+            listen_fd_ = -1;
+            return false;
+        }
 
-        running_.store(true, std::memory_order_release);
-        accept_thread_ = std::thread(&TcpListener::accept_loop, this);
+        struct epoll_event ev{};
+        ev.events = EPOLLIN | EPOLLEXCLUSIVE;
+        ev.data.fd = listen_fd_;
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0)
+        {
+            ::close(epoll_fd_);
+            ::close(listen_fd_);
+            epoll_fd_ = -1;
+            listen_fd_ = -1;
+            return false;
+        }
+
+        running_.store(true);
+        try
+        {
+            accept_thread_ = std::thread(&TcpListener::accept_loop, this);
+        }
+        catch (...)
+        {
+            running_.store(false);
+            ::close(epoll_fd_);
+            ::close(listen_fd_);
+            epoll_fd_ = -1;
+            listen_fd_ = -1;
+            return false;
+        }
         return true;
     }
 
@@ -97,165 +125,173 @@
     {
         bool expected = true;
         if (!running_.compare_exchange_strong(expected, false))
+            return;
+
+        try
         {
-            // already stopped
+            if (epoll_fd_ >= 0)
+            {
+                ::close(epoll_fd_);
+                epoll_fd_ = -1;
+            }
+
             if (listen_fd_ >= 0)
             {
+                ::shutdown(listen_fd_, SHUT_RDWR);
                 ::close(listen_fd_);
                 listen_fd_ = -1;
             }
-            return;
-        }
 
-        // Close listening socket to wake up poll/accept
-        if (listen_fd_ >= 0)
-        {
-            ::close(listen_fd_);
-            listen_fd_ = -1;
-        }
+            if (accept_thread_.joinable())
+                accept_thread_.join();
 
-        // join accept thread
-        if (accept_thread_.joinable())
-            accept_thread_.join();
-
-        // join client threads
-        {
-            std::lock_guard<std::mutex> lk(clients_mu_);
-            for (auto &t : client_threads_)
+            while (active_clients_.load() > 0)
             {
-                if (t.joinable())
-                    t.join();
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            client_threads_.clear();
+        }
+        catch (...)
+        {
         }
     }
 
     void TcpListener::accept_loop()
     {
-        const int POLL_TIMEOUT_MS = 250; // short, responsive shutdown
-        while (running_.load(std::memory_order_acquire))
+        struct epoll_event events[16];
+        while (running_.load())
         {
-            struct pollfd pfd;
-            pfd.fd = listen_fd_;
-            pfd.events = POLLIN;
-
-            int ret = poll(&pfd, 1, POLL_TIMEOUT_MS);
-            if (ret < 0)
+            int nfds = epoll_wait(epoll_fd_, events, 16, 500);
+            if (nfds < 0)
             {
                 if (errno == EINTR)
                     continue;
-                std::cerr << "[TcpListener] poll() failed: " << strerror(errno) << "\n";
                 break;
             }
-            if (ret == 0)
-                continue; // timeout
-
-            if (pfd.revents & POLLIN)
+            for (int i = 0; i < nfds; ++i)
             {
-                struct sockaddr_in peer;
-                socklen_t plen = sizeof(peer);
-                int client_fd = ::accept(listen_fd_, reinterpret_cast<struct sockaddr *>(&peer), &plen);
-                if (client_fd < 0)
+                if (events[i].data.fd == listen_fd_)
                 {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                        continue;
-                    std::cerr << "[TcpListener] accept() failed: " << strerror(errno) << "\n";
-                    continue;
+                    while (running_.load())
+                    {
+                        sockaddr_in client_addr;
+                        socklen_t client_len = sizeof(client_addr);
+                        int client_fd = ::accept4(listen_fd_, (struct sockaddr *)&client_addr, &client_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+                        if (client_fd < 0)
+                        {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                                break;
+                            if (errno == EINTR)
+                                continue;
+                            break;
+                        }
+
+                        int flag = 1;
+                        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(int));
+
+                        try
+                        {
+                            active_clients_.fetch_add(1);
+                            std::thread(&TcpListener::client_worker, this, client_fd).detach();
+                        }
+                        catch (...)
+                        {
+                            ::close(client_fd);
+                            active_clients_.fetch_sub(1);
+                        }
+                    }
                 }
-
-                // Make client socket blocking (simpler per-thread model)
-                int cflags = fcntl(client_fd, F_GETFL, 0);
-                if (cflags >= 0)
-                    fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
-
-                // Spawn client worker thread
-                std::lock_guard<std::mutex> lk(clients_mu_);
-                client_threads_.emplace_back(&TcpListener::client_worker, this, client_fd);
             }
         }
     }
 
-    void TcpListener::client_worker(int client_fd)
+    void TcpListener::client_worker(int fd)
     {
-        // Ensure socket closed at end
-        int fd = client_fd;
-        constexpr size_t BUF_SZ = 8192;
-        std::string inbuf;
-        inbuf.reserve(4096);
-        char tmp[BUF_SZ];
+        const size_t CAP = 8 * 1024 * 1024;
+        std::vector<char> buf(CAP);
+        size_t rpos = 0;
+        size_t wpos = 0;
 
-        while (true)
+        try
         {
-            ssize_t n = ::recv(fd, tmp, BUF_SZ, 0);
-            if (n == 0)
+            while (running_.load())
             {
-                // connection closed by peer
-                break;
-            }
-            if (n < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                if (rpos > 0)
                 {
-                    // no data; continue
-                    continue;
+                    if (rpos >= wpos)
+                    {
+                        rpos = wpos = 0;
+                    }
+                    else if (CAP - wpos < 4096)
+                    {
+                        size_t len = wpos - rpos;
+                        std::memmove(buf.data(), buf.data() + rpos, len);
+                        rpos = 0;
+                        wpos = len;
+                    }
                 }
-                // fatal error
-                break;
-            }
 
-            inbuf.append(tmp, static_cast<size_t>(n));
+                if (wpos == CAP && rpos == 0)
+                    break;
 
-            // Process newline-terminated commands
-            size_t pos = 0;
-            while (true)
-            {
-                size_t nl = inbuf.find('\n', pos);
-                if (nl == std::string::npos)
+                struct pollfd pfd{fd, POLLIN, 0};
+                int ret = poll(&pfd, 1, 1000);
+                if (ret < 0)
                 {
-                    // keep remainder; break to read more
-                    if (pos > 0)
-                        inbuf.erase(0, pos);
+                    if (errno == EINTR)
+                        continue;
                     break;
                 }
+                if (ret == 0)
+                    continue;
 
-                std::string line = inbuf.substr(0, nl);
-                // remove optional '\r'
-                if (!line.empty() && line.back() == '\r')
-                    line.pop_back();
+                ssize_t n = ::recv(fd, buf.data() + wpos, CAP - wpos, 0);
+                if (n <= 0)
+                    break;
+                wpos += n;
 
-                // Dispatch handler (safely)
-                std::string resp;
-                try
+                while (rpos < wpos)
                 {
-                    resp = handler_(line);
-                }
-                catch (const std::exception &e)
-                {
-                    resp = std::string("ERR: ") + e.what() + "\n";
-                }
-                catch (...)
-                {
-                    resp = std::string("ERR: unknown\n");
-                }
+                    std::string_view view(buf.data() + rpos, wpos - rpos);
+                    size_t consumed = 0;
+                    std::string resp;
+                    try
+                    {
+                        auto out = handler_(view);
+                        consumed = out.first;
+                        resp = std::move(out.second);
+                    }
+                    catch (...)
+                    {
+                        consumed = wpos - rpos;
+                        resp = "";
+                    }
 
-                // Ensure trailing newline in response
-                if (resp.empty() || resp.back() != '\n')
-                    resp.push_back('\n');
+                    if (consumed == 0)
+                        break;
 
-                // Best-effort send (blocking). Use send_all helper to handle partial writes.
-                ssize_t sent = send_all(fd, resp.data(), resp.size());
-                (void)sent;
-
-                // erase processed part including newline
-                inbuf.erase(0, nl + 1);
-                pos = 0;
+                    if (!resp.empty())
+                    {
+                        if (!send_all_safe(fd, resp.data(), resp.size()))
+                            goto cleanup;
+                    }
+                    rpos += consumed;
+                }
             }
         }
+        catch (...)
+        {
+        }
 
-        ::shutdown(fd, SHUT_RDWR);
+    cleanup:
+        try
+        {
+            ::shutdown(fd, SHUT_RDWR);
+        }
+        catch (...)
+        {
+        }
         ::close(fd);
+        active_clients_.fetch_sub(1);
     }
-
-} // namespace pomai::server::net
+}

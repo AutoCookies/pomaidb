@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # build.sh - build libsrc.a and server binary (build/pomai_server)
-#
-# Usage:
-#   ./build.sh            # builds libsrc.a and server (prefers src/main.cc, falls back to examples/main.cc)
-#   ./build.sh clean      # remove build/ artifacts
+# FIX: Added support for .c files (crc64.c, xxhash.c) using GCC
 #
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,8 +10,15 @@ EXAMPLES_DIR="${REPO_ROOT}/examples"
 BUILD_DIR="${REPO_ROOT}/build"
 OBJ_DIR="${BUILD_DIR}/obj"
 
+# Toolchain
+CC=${CC:-gcc}
 CXX=${CXX:-g++}
+
+# Flags
+# C++: C++17
 CXXFLAGS="-std=c++17 -O2 -g -I${REPO_ROOT} -I${SRC_DIR} -pthread -Wall -Wextra"
+# C: C99 or C11
+CFLAGS="-std=c99 -O2 -g -I${REPO_ROOT} -I${SRC_DIR} -pthread -Wall -Wextra"
 
 mkdir -p "${BUILD_DIR}" "${OBJ_DIR}"
 
@@ -24,36 +28,54 @@ if [ "${1:-}" = "clean" ]; then
   exit 0
 fi
 
-echo "Compiler: ${CXX}"
-echo "CXXFLAGS: ${CXXFLAGS}"
+echo "CXX: ${CXX}"
+echo "CC:  ${CC}"
 
-# Find source files under src/ (exclude tests/)
-mapfile -d '' SRC_FILES < <(find "${SRC_DIR}" -type f \( -name '*.cc' -o -name '*.cpp' \) -not -path "${SRC_DIR}/tests/*" -print0)
-mapfile -d '' SRC_FILES < <(find "${SRC_DIR}" "${REPO_ROOT}/benchmarks" -type f \( -name '*.cc' -o -name '*.cpp' \) -not -path "*/tests/*" -print0)
+# 1. Find C++ Sources (.cc, .cpp)
+mapfile -d '' CPP_FILES < <(find "${SRC_DIR}" -type f \( -name '*.cc' -o -name '*.cpp' \) -not -path "${SRC_DIR}/tests/*" -print0)
 
-if [ ${#SRC_FILES[@]} -eq 0 ]; then
-  echo "No source files found under src/ - nothing to build."
+# 2. Find C Sources (.c)
+mapfile -d '' C_FILES < <(find "${SRC_DIR}" -type f \( -name '*.c' \) -not -path "${SRC_DIR}/tests/*" -print0)
+
+if [ ${#CPP_FILES[@]} -eq 0 ] && [ ${#C_FILES[@]} -eq 0 ]; then
+  echo "No source files found in ${SRC_DIR}."
   exit 1
 fi
 
-# Compile each source file into object file with deterministic sanitized name
 OBJS=()
-for src in "${SRC_FILES[@]}"; do
+
+# Compile C++
+for src in "${CPP_FILES[@]}"; do
+  # Determine relative path for unique object name
   rel="$(realpath --relative-to="${REPO_ROOT}" "$src")"
-  out="${OBJ_DIR}/$(echo "$rel" | tr '/' '_' | sed -E 's/\.c(pp)?$/.o/')"
-  echo "Compiling: ${rel} -> ${out}"
-  mkdir -p "$(dirname "$out")"
+  # Flatten path: src/core/main.cc -> src_core_main.o
+  obj_name="$(echo "$rel" | tr '/' '_' | sed -E 's/\.(cc|cpp)$/.o/')"
+  out="${OBJ_DIR}/${obj_name}"
+  
+  # Only compile if needed (simple timestamp check could go here, but we rebuild for safety)
+  echo "Compiling C++: ${rel} -> ${out}"
   "${CXX}" ${CXXFLAGS} -c "$src" -o "$out"
   OBJS+=("$out")
 done
 
-# Create static archive
+# Compile C (CRC64, XXHASH...)
+for src in "${C_FILES[@]}"; do
+  rel="$(realpath --relative-to="${REPO_ROOT}" "$src")"
+  obj_name="$(echo "$rel" | tr '/' '_' | sed -E 's/\.c$/.o/')"
+  out="${OBJ_DIR}/${obj_name}"
+  
+  echo "Compiling C  : ${rel} -> ${out}"
+  "${CC}" ${CFLAGS} -c "$src" -o "$out"
+  OBJS+=("$out")
+done
+
+# Create Archive
 ARCHIVE="${BUILD_DIR}/libsrc.a"
 echo "Creating archive ${ARCHIVE}"
 rm -f "${ARCHIVE}"
 ar rcs "${ARCHIVE}" "${OBJS[@]}"
 
-# Determine which main source to link (prefer src/main.cc)
+# Link Server
 SERVER_SRC_CANDIDATES=("${SRC_DIR}/main.cc" "${EXAMPLES_DIR}/main.cc")
 SERVER_SRC=""
 for c in "${SERVER_SRC_CANDIDATES[@]}"; do
@@ -63,42 +85,21 @@ for c in "${SERVER_SRC_CANDIDATES[@]}"; do
   fi
 done
 
-if [ -z "${SERVER_SRC}" ]; then
-  echo "No main.cc found in src/ or examples/; built archive only: ${ARCHIVE}"
-  exit 0
+if [ -n "${SERVER_SRC}" ]; then
+  OUT_BIN="${BUILD_DIR}/pomai_server"
+  echo "Linking server from ${SERVER_SRC} -> ${OUT_BIN}"
+  # Note: Use CXX to link since we have C++ code
+  "${CXX}" ${CXXFLAGS} "${SERVER_SRC}" "${ARCHIVE}" -o "${OUT_BIN}"
+  echo "Server built: ${OUT_BIN}"
+else
+  echo "No main.cc found, skipped server build."
 fi
 
-OUT_BIN="${BUILD_DIR}/pomai_server"
-echo "Linking server from ${SERVER_SRC} -> ${OUT_BIN}"
-"${CXX}" ${CXXFLAGS} "${SERVER_SRC}" "${ARCHIVE}" -o "${OUT_BIN}"
-
-echo "Build complete."
-echo "  archive: ${ARCHIVE}"
-echo "  server:  ${OUT_BIN}"
-
-# Build Pomai CLI if present
+# Link CLI (Optional)
 CLI_SRC="${SRC_DIR}/pomai_cli.cc"
 CLI_BIN="${BUILD_DIR}/pomai_cli"
 if [ -f "$CLI_SRC" ]; then
   echo "Linking CLI from ${CLI_SRC} -> ${CLI_BIN}"
   "${CXX}" ${CXXFLAGS} "$CLI_SRC" "${ARCHIVE}" -o "${CLI_BIN}"
-  echo "Build complete."
-  echo "  cli:     ${CLI_BIN}"
-fi
-
-# 2. Build Pomai Benchmark (Bản tiêu chuẩn)
-BENCH_SRC="${REPO_ROOT}/benchmarks/pomai_benchmark.cc"
-BENCH_BIN="${BUILD_DIR}/pomai_benchmark"
-if [ -f "$BENCH_SRC" ]; then
-  echo "Linking Benchmark -> ${BENCH_BIN}"
-  "${CXX}" ${CXXFLAGS} "$BENCH_SRC" "${ARCHIVE}" -o "${BENCH_BIN}"
-fi
-
-# 3. Build Pomai Milestone Benchmark (Bản Q1 Paper)
-BENCH_MILESTONES="${REPO_ROOT}/benchmarks/pomai_milestone_benchmark.cc"
-BENCH_MILESTONES_BIN="${BUILD_DIR}/pomai_milestone_benchmark"
-if [ -f "$BENCH_MILESTONES" ]; then
-  echo "Linking Milestone Benchmark -> ${BENCH_MILESTONES_BIN}"
-  "${CXX}" ${CXXFLAGS} "$BENCH_MILESTONES" "${ARCHIVE}" -o "${BENCH_MILESTONES_BIN}"
-  echo "Milestone Benchmark build complete."
+  echo "CLI built:    ${CLI_BIN}"
 fi

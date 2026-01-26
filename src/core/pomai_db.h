@@ -111,12 +111,12 @@ namespace pomai::core
         pomai::memory::WalManager wal_;
 
         std::thread bg_thread_;
-        std::atomic<bool> bg_running_;
+        std::atomic<bool> bg_running_{false};
 
         std::deque<InsertJob> insert_q_;
         std::mutex insert_mu_;
         std::condition_variable insert_cv_;
         std::vector<std::thread> insert_threads_;
-        std::atomic<bool> insert_running_;
+        std::atomic<bool> insert_running_{false};
     };
 }

@@ -1,337 +1,270 @@
 #!/usr/bin/env python3
 """
-benchmark_client.py
+benchmark_client.py - DIAGNOSTIC VERSION
+High-Resolution Logging & Error Tracing for PomaiDB Binary Protocol.
 
-Asynchronous TCP benchmark client for Pomai server (text SQL protocol).
-
-Modes:
- - insert : sends "INSERT INTO <membr> VALUES (<label>, [v1, v2, ...])"
- - search : sends "SEARCH <membr> QUERY ([v1,v2,...]) TOP <k>"
-
-Notes:
- - Keeps one persistent connection per worker.
- - Measures per-request latency and prints p50/p95/p99 and throughput.
- - Response reading: tries to read until "<END>" marker (server may append),
-   otherwise uses a short timeout.
- - Verbose mode prints full server responses as they arrive.
+Usage:
+  python3 benchmarks/benchmark_client.py --mode insert --batch-size 10 --total 100 --conns 1 --verbose
 """
 
 import argparse
 import asyncio
+import struct
 import random
 import time
 import statistics
 import logging
-from typing import List, Optional, Tuple
+import numpy as np
+import binascii
+from typing import List
 
-DEFAULT_PORT = 7777
+# ---- Protocol Constants ----
+OP_INSERT       = 0x01
+OP_SEARCH       = 0x02
+OP_INSERT_BATCH = 0x04
+RESP_OK         = 0x01
+RESP_FAIL       = 0x00
 
-# Response read timeout (sec) when server does not provide explicit marker.
-RESP_TIMEOUT = 2.0
+class BinaryStats:
+    def __init__(self):
+        self.latencies = []
+        self.connect_times = []
+        self.send_times = []
+        self.recv_times = []
+        self.success = 0
+        self.fail = 0
+        self.bytes_sent = 0
 
-# When the server doesn't emit <END>, allow this many extra seconds before giving up
-MAX_RESP_FALLBACK = 2.0
+    def add(self, t_conn, t_send, t_recv, total, ok, size):
+        self.connect_times.append(t_conn)
+        self.send_times.append(t_send)
+        self.recv_times.append(t_recv)
+        self.latencies.append(total)
+        if ok: self.success += 1
+        else: self.fail += 1
+        self.bytes_sent += size
 
-PROGRESS_INTERVAL_S = 2.0
+    def merge(self, other):
+        self.latencies.extend(other.latencies)
+        self.connect_times.extend(other.connect_times)
+        self.send_times.extend(other.send_times)
+        self.recv_times.extend(other.recv_times)
+        self.success += other.success
+        self.fail += other.fail
+        self.bytes_sent += other.bytes_sent
 
+def gen_batch_vectors(count: int, dim: int) -> bytes:
+    arr = np.random.rand(count, dim).astype(np.float32)
+    return arr.tobytes()
 
-def gen_vector(dim: int, rng: random.Random) -> str:
-    # Generate compact representation e.g. [0.123, -0.23, ...]
-    vals = (f"{rng.uniform(-1.0, 1.0):.6f}" for _ in range(dim))
-    return "[" + ",".join(vals) + "]"
-
-
-async def read_response(
-    reader: asyncio.StreamReader, require_end_marker: bool = False
-) -> str:
-    """
-    Read server response. Prefer stopping when "<END>" line observed.
-    Fallback: accumulate until RESP_TIMEOUT expires (short).
-    Returns the full textual response.
-    """
-    buf_lines: List[str] = []
-    end_marker = "<END>"
-    start = time.monotonic()
-    while True:
-        # compute remaining timeout for this loop
-        elapsed = time.monotonic() - start
-        timeout = max(0.001, RESP_TIMEOUT - elapsed)
-        try:
-            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-        except asyncio.TimeoutError:
-            # If we've read anything, return it; otherwise allow a longer fallback
-            if buf_lines:
-                return "".join(buf_lines)
-            if not require_end_marker:
-                # give a small additional window
-                try:
-                    line = await asyncio.wait_for(reader.readline(), timeout=MAX_RESP_FALLBACK)
-                except asyncio.TimeoutError:
-                    return "".join(buf_lines)
-                if not line:
-                    return "".join(buf_lines)
-            else:
-                return "".join(buf_lines)
-
-        if not line:
-            return "".join(buf_lines)
-
-        try:
-            s = line.decode("utf-8", errors="replace")
-        except Exception:
-            s = line.decode("latin-1", errors="replace")
-        buf_lines.append(s)
-
-        # strip trailing newline/CR
-        if s.rstrip("\r\n") == end_marker:
-            return "".join(buf_lines)
-
-        # Heuristic: if first line starts with "OK " or "ERR" and there's no marker,
-        # return after first line so interactive flows don't stall forever.
-        if len(buf_lines) == 1 and (s.startswith("OK") or s.startswith("ERR")) and not require_end_marker:
-            # give a short chance for multiline replies, otherwise return
-            try:
-                peek = await asyncio.wait_for(reader.readline(), timeout=0.05)
-                if not peek:
-                    return "".join(buf_lines)
-                # we got more; push into buffer and continue loop
-                try:
-                    ps = peek.decode("utf-8", errors="replace")
-                except Exception:
-                    ps = peek.decode("latin-1", errors="replace")
-                buf_lines.append(ps)
-                # if that line was the end marker, return
-                if ps.rstrip("\r\n") == end_marker:
-                    return "".join(buf_lines)
-                # else continue reading until timeout / marker
-            except asyncio.TimeoutError:
-                return "".join(buf_lines)
-
-
-async def worker_task(
-    worker_id: int,
-    host: str,
-    port: int,
-    mode: str,
-    membr: str,
-    dim: int,
-    requests_per_worker: int,
-    label_start: int,
-    topk: int,
-    rng_seed: int,
-    latencies: List[float],
-    success_counter: List[int],
-    verbose: bool,
-    require_end_marker: bool,
+async def worker_insert(
+    worker_id: int, host: str, port: int,
+    total: int, batch_size: int, dim: int,
+    label_start: int, stats: BinaryStats, verbose: bool
 ):
-    rng = random.Random(rng_seed + worker_id)
+    # 1. Measure Connect Time
+    t0 = time.perf_counter()
+    try:
+        reader, writer = await asyncio.open_connection(host, port)
+        # Tweak socket for low latency
+        sock = writer.get_extra_info('socket')
+        if sock:
+            import socket
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception as e:
+        logging.error(f"[Worker {worker_id}] Connection Failed: {e}")
+        return
+    t_conn = time.perf_counter() - t0
+
+    if verbose:
+        logging.debug(f"[Worker {worker_id}] Connected in {t_conn*1000:.3f}ms")
+
+    head_fmt = struct.Struct("<BII") 
+    lbl_fmt = struct.Struct("<Q")
+
+    remaining = total
+    curr_label = label_start
+    
+    while remaining > 0:
+        count = min(batch_size, remaining)
+        
+        # Prepare Data
+        packet = bytearray()
+        packet.extend(head_fmt.pack(OP_INSERT_BATCH, count, dim))
+        vec_bytes = gen_batch_vectors(count, dim)
+        vec_size = dim * 4
+        
+        for i in range(count):
+            packet.extend(lbl_fmt.pack(curr_label + i))
+            start = i * vec_size
+            packet.extend(vec_bytes[start : start + vec_size])
+            
+        if verbose and len(packet) < 200:
+            logging.debug(f"[Worker {worker_id}] Sending {len(packet)} bytes: {binascii.hexlify(packet)}")
+        elif verbose:
+            logging.debug(f"[Worker {worker_id}] Sending {len(packet)} bytes (Header: {binascii.hexlify(packet[:9])}...)")
+
+        # 2. Measure Send Time
+        t_start_send = time.perf_counter()
+        try:
+            writer.write(packet)
+            await writer.drain()
+        except Exception as e:
+            logging.error(f"[Worker {worker_id}] Send Failed: {e}")
+            break
+        t_sent = time.perf_counter()
+
+        # 3. Measure Receive Time (Wait for ACK)
+        try:
+            resp = await reader.readexactly(1)
+        except asyncio.IncompleteReadError:
+            logging.error(f"[Worker {worker_id}] Server closed connection unexpectedly!")
+            break
+        except Exception as e:
+            logging.error(f"[Worker {worker_id}] Recv Error: {e}")
+            break
+        
+        t_end = time.perf_counter()
+        
+        t_send_dur = t_sent - t_start_send
+        t_recv_dur = t_end - t_sent
+        t_total = t_end - t_start_send
+        
+        ok = (resp[0] == RESP_OK)
+        stats.add(t_conn, t_send_dur, t_recv_dur, t_total, ok, len(packet))
+        
+        if not ok:
+            logging.warning(f"[Worker {worker_id}] Server sent FAIL (0x00). Membrance missing?")
+        elif verbose:
+            logging.debug(f"[Worker {worker_id}] OK. Send={t_send_dur*1000:.3f}ms, ServerWait={t_recv_dur*1000:.3f}ms")
+            
+        remaining -= count
+        curr_label += count
+
+    writer.close()
+    await writer.wait_closed()
+
+async def worker_search(
+    worker_id: int, host: str, port: int,
+    requests: int, dim: int, topk: int,
+    stats: BinaryStats, verbose: bool
+):
+    t0 = time.perf_counter()
     try:
         reader, writer = await asyncio.open_connection(host, port)
     except Exception as e:
-        logging.error("[worker %d] connection failed: %s", worker_id, e)
+        logging.error(f"[Worker {worker_id}] Connect Failed: {e}")
         return
+    t_conn = time.perf_counter() - t0
 
-    peername = writer.get_extra_info("peername")
-    logging.info("[worker %d] connected to %s", worker_id, peername)
-
-    for i in range(requests_per_worker):
-        label = label_start + i
-        if mode == "insert":
-            vec = gen_vector(dim, rng)
-            cmd = f"INSERT INTO {membr} VALUES ({label}, {vec})\n"
-        else:  # search
-            qvec = gen_vector(dim, rng)
-            cmd = f"SEARCH {membr} QUERY {qvec} TOP {topk}\n"
-
-        start = time.perf_counter()
+    head_fmt = struct.Struct("<BII")
+    
+    for _ in range(requests):
+        vec_bytes = gen_batch_vectors(1, dim)
+        packet = head_fmt.pack(OP_SEARCH, topk, dim) + vec_bytes
+        
+        t_start_send = time.perf_counter()
         try:
-            writer.write(cmd.encode("utf-8"))
+            writer.write(packet)
             await writer.drain()
+            
+            # Read Count
+            raw_cnt = await reader.readexactly(4)
+            (count,) = struct.unpack("<I", raw_cnt)
+            
+            # Read Hits
+            if count > 0:
+                await reader.readexactly(count * 12) # 8+4
+            
+            t_end = time.perf_counter()
+            
+            t_send_dur = 0 # approximated
+            t_recv_dur = t_end - t_start_send
+            
+            stats.add(t_conn, t_send_dur, t_recv_dur, t_recv_dur, True, len(packet))
+            
         except Exception as e:
-            logging.error("[worker %d] write error: %s", worker_id, e)
+            logging.error(f"[Worker {worker_id}] Search IO Error: {e}")
             break
 
-        try:
-            resp = await read_response(reader, require_end_marker=require_end_marker)
-            dur = time.perf_counter() - start
-            latencies.append(dur)
-            success_counter[0] += 1
-            if verbose:
-                logging.debug("[worker %d] response: %s", worker_id, resp.replace("\n", "\\n"))
-        except Exception as e:
-            dur = time.perf_counter() - start
-            latencies.append(dur)
-            logging.warning("[worker %d] read error: %s", worker_id, e)
-            # Try to continue; small backoff to avoid hammering broken connection
-            await asyncio.sleep(0.001)
+    writer.close()
+    await writer.wait_closed()
 
-    try:
-        writer.close()
-        await writer.wait_closed()
-    except Exception:
-        pass
-    logging.info("[worker %d] finished", worker_id)
-
-
-def humanize_rate(count: int, elapsed: float) -> str:
-    if elapsed <= 0:
-        return f"{count} reqs"
-    r = count / elapsed
-    if r >= 1e6:
-        return f"{r/1e6:.2f} Mreq/s"
-    if r >= 1e3:
-        return f"{r/1e3:.2f} Kreq/s"
-    return f"{r:.2f} req/s"
-
-
-def summarize(latencies: List[float], total_sent: int, elapsed: float):
-    if not latencies:
-        print("No recorded latencies.")
-        return
-    l50 = statistics.median(latencies)
-    quantiles = statistics.quantiles(latencies, n=100)
-    l95 = quantiles[94]
-    l99 = quantiles[98]
-    print("=== Results ===")
-    print(f"Total requests configured: {total_sent}")
-    print(f"Total successes recorded: {len(latencies)}")
-    print(f"Elapsed time: {elapsed:.3f} s")
-    print(f"Throughput: {humanize_rate(len(latencies), elapsed)}")
-    print(f"Latency p50: {l50*1000:.3f} ms")
-    print(f"Latency p95: {l95*1000:.3f} ms")
-    print(f"Latency p99: {l99*1000:.3f} ms")
-    print(f"Mean latency: {statistics.mean(latencies)*1000:.3f} ms")
-    if len(latencies) > 1:
-        print(f"Stddev latency: {statistics.stdev(latencies)*1000:.3f} ms")
-
-
-async def run_benchmark(
-    host: str,
-    port: int,
-    mode: str,
-    membr: str,
-    dim: int,
-    conns: int,
-    requests: int,
-    label_base: int,
-    topk: int,
-    seed: int,
-    verbose: bool,
-    require_end_marker: bool,
-):
-    total = requests
-    if conns <= 0:
-        conns = 1
-    per_worker = total // conns
-    extra = total % conns
-
-    latencies: List[float] = []
-    success_counter = [0]  # simple mutable counter container
-
+async def run(args):
+    print(f"=== POMAI DIAGNOSTIC BENCHMARK ===")
+    print(f"Mode: {args.mode.upper()} | Workers: {args.conns} | Batch: {args.batch_size}")
+    
+    stats_list = [BinaryStats() for _ in range(args.conns)]
     tasks = []
-    label_base = label_base
-    t0 = time.perf_counter()
-    for w in range(conns):
-        nreq = per_worker + (1 if w < extra else 0)
-        if nreq == 0:
-            continue
-        label_start = label_base + w * (per_worker) + min(w, extra)
-        task = asyncio.create_task(
-            worker_task(
-                w,
-                host,
-                port,
-                mode,
-                membr,
-                dim,
-                nreq,
-                label_start,
-                topk,
-                seed,
-                latencies,
-                success_counter,
-                verbose,
-                require_end_marker,
-            )
-        )
-        tasks.append(task)
-
-    # progress reporter
-    async def progress_loop():
-        last_count = 0
-        last_time = t0
-        while not all(t.done() for t in tasks):
-            await asyncio.sleep(PROGRESS_INTERVAL_S)
-            now = time.perf_counter()
-            done = len(latencies)
-            delta = done - last_count
-            dt = now - last_time
-            last_count = done
-            last_time = now
-            logging.info("Progress: %.1f%% (%d/%d) | recent throughput: %s", (done/total*100 if total>0 else 0), done, total, humanize_rate(delta, dt) if dt>0 else "0 req/s")
-        return
-
-    if tasks:
-        reporter = asyncio.create_task(progress_loop())
-        await asyncio.gather(*tasks)
-        # ensure reporter finishes
-        await reporter
-
-    elapsed = time.perf_counter() - t0
-    summarize(latencies, total, elapsed)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Async benchmark client for Pomai TCP server")
-    p.add_argument("--host", type=str, default="127.0.0.1", help="server host")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help="server port")
-    p.add_argument("--mode", choices=("insert", "search"), default="insert", help="benchmark mode")
-    p.add_argument("--membr", type=str, default="default", help="membrance name")
-    p.add_argument("--dim", type=int, default=128, help="vector dimension")
-    p.add_argument("--conns", type=int, default=4, help="number of concurrent connections/workers")
-    p.add_argument("--requests", type=int, default=10000, help="total requests to send")
-    p.add_argument("--label-base", type=int, default=1, help="starting label id for inserts")
-    p.add_argument("--topk", type=int, default=10, help="k for SEARCH")
-    p.add_argument("--seed", type=int, default=12345, help="random seed")
-    p.add_argument("--verbose", action="store_true", help="print debug responses")
-    p.add_argument("--require-end-marker", action="store_true", help="require <END> marker in responses (safer for multi-line)")
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    # basic validation
-    if args.mode == "insert" and args.dim <= 0:
-        print("dim must be > 0 for insert")
-        return
-    if args.requests <= 0:
-        print("requests must be > 0")
-        return
-
-    # configure logging
-    level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(message)s")
-
-    try:
-        asyncio.run(
-            run_benchmark(
-                args.host,
-                args.port,
-                args.mode,
-                args.membr,
-                args.dim,
-                args.conns,
-                args.requests,
-                args.label_base,
-                args.topk,
-                args.seed,
-                args.verbose,
-                args.require_end_marker,
-            )
-        )
-    except KeyboardInterrupt:
-        logging.info("Interrupted by user")
-
+    
+    t_start = time.perf_counter()
+    
+    for i in range(args.conns):
+        if args.mode == "insert":
+            per_worker = args.total // args.conns
+            label_base = 1 + i * per_worker
+            tasks.append(worker_insert(
+                i, args.host, args.port, per_worker, args.batch_size, 
+                args.dim, label_base, stats_list[i], args.verbose
+            ))
+        else:
+            per_worker = args.requests // args.conns
+            tasks.append(worker_search(
+                i, args.host, args.port, per_worker, 
+                args.dim, args.topk, stats_list[i], args.verbose
+            ))
+            
+    await asyncio.gather(*tasks)
+    dur = time.perf_counter() - t_start
+    
+    # Aggregation
+    agg = BinaryStats()
+    for s in stats_list: agg.merge(s)
+    
+    print("\n" + "="*30)
+    print(f"  Execution Time:   {dur:.4f} s")
+    print(f"  Total Requests:   {len(agg.latencies)}")
+    print(f"  Success / Fail:   \033[92m{agg.success}\033[0m / \033[91m{agg.fail}\033[0m")
+    
+    if len(agg.latencies) > 0:
+        avg_conn = statistics.mean(agg.connect_times) * 1000
+        avg_send = statistics.mean(agg.send_times) * 1000
+        avg_wait = statistics.mean(agg.recv_times) * 1000
+        
+        print("\n  [TIMING BREAKDOWN (avg)]")
+        print(f"  1. Connect:       {avg_conn:.3f} ms")
+        print(f"  2. Data Send:     {avg_send:.3f} ms  (Client CPU/Net)")
+        print(f"  3. Server Wait:   {avg_wait:.3f} ms  (Server Processing)")
+        
+        print("\n  [LATENCY PERCENTILES]")
+        lats = sorted(agg.latencies)
+        print(f"  P50:              {lats[int(len(lats)*0.5)]*1000:.3f} ms")
+        print(f"  P99:              {lats[int(len(lats)*0.99)]*1000:.3f} ms")
+        
+        throughput = len(agg.latencies) / dur
+        print(f"\n  [THROUGHPUT]")
+        print(f"  Ops/sec:          {throughput:.2f}")
+        if args.mode == "insert":
+            vec_rate = (agg.success * args.batch_size) / dur
+            print(f"  Vectors/sec:      {vec_rate:.2f}")
+            
+    else:
+        print("\n  [ERROR] No requests completed.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7777)
+    parser.add_argument("--mode", default="insert", choices=["insert", "search"])
+    parser.add_argument("--total", type=int, default=1000)
+    parser.add_argument("--requests", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--conns", type=int, default=1)
+    parser.add_argument("--dim", type=int, default=128)
+    parser.add_argument("--topk", type=int, default=10)
+    parser.add_argument("--verbose", action="store_true", help="Log detailed packet info")
+    
+    try:
+        asyncio.run(run(parser.parse_args()))
+    except KeyboardInterrupt:
+        pass

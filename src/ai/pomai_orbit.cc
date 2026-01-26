@@ -1,29 +1,3 @@
-// NOTE: file adapted in-place. Only insert_batch_memory_only and a local
-// helper inside it have been rewritten to perform cache-friendly, batched
-// centroid assignment using a transpose-then-block approach.
-//
-// This keeps the surrounding architecture intact while removing the
-// per-vector per-centroid repeated work and improves throughput for
-// large batches and many centroids.
-//
-// Implementation decisions:
-// - We transpose the batch (dim x B) to make per-dimension access over
-//   the batch sequential and cache friendly.
-// - We precompute centroid norms and query norms to evaluate L2 via:
-//       ||q - c||^2 = ||q||^2 + ||c||^2 - 2 * q·c
-// - We compute q·c by iterating dimensions and accumulating into a per-batch
-//   dot array; this minimizes reloading centroid elements and is SIMD-friendly
-//   for typical small batch sizes.
-// - All allocations for temporaries use std::vector<float> (contiguous).
-//
-// Cost model: O(C * dim * B) arithmetic ops (same asymptotic), but memory
-// traffic is reorganized to favor sequential reads of centroids and the
-// transposed batch; this gives large practical speedups for typical
-// CPU cache hierarchies vs. the previous inner-loop per-vector-per-centroid
-// approach which had poor locality.
-//
-// Safety: If centroids_ is empty we keep previous seeding behavior unchanged.
-
 #include "src/ai/pomai_orbit.h"
 #include "src/ai/atomic_utils.h"
 #include "src/ai/ids_block.h"
@@ -226,7 +200,7 @@ namespace pomai::ai::orbit
         pomai::memory::WalManager::WalConfig wcfg;
         wcfg.sync_on_append = true;
         std::string wal_path = cfg_.data_path + "/orbit.wal";
-        if (!wal_->open(wal_path, true, wcfg))
+        if (!wal_->open(wal_path, wcfg))
             std::cerr << "[Orbit] FATAL: Wal open failed\n";
         else
             recover_from_wal();
@@ -271,7 +245,7 @@ namespace pomai::ai::orbit
         pomai::memory::WalManager::WalConfig wcfg;
         wcfg.sync_on_append = true;
         std::string wal_path = cfg_.data_path + "/orbit.wal";
-        if (!wal_->open(wal_path, true, wcfg))
+        if (!wal_->open(wal_path, wcfg))
             std::cerr << "[Orbit] FATAL: Wal open failed\n";
         else
             recover_from_wal();
@@ -288,18 +262,18 @@ namespace pomai::ai::orbit
     void PomaiOrbit::recover_from_wal()
     {
         size_t replayed_count = 0;
-        auto replayer = [&](uint16_t type, const void *payload, uint32_t len, uint64_t) -> bool
+        auto replayer = [&](uint64_t seq, uint16_t type, const std::vector<uint8_t> &data)
         {
-            if (type == static_cast<uint16_t>(pomai::memory::WAL_REC_INSERT_BATCH) && len >= 4)
+            if (type == static_cast<uint16_t>(pomai::memory::WAL_REC_INSERT_BATCH) && data.size() >= 4)
             {
-                const uint8_t *ptr = static_cast<const uint8_t *>(payload);
+                const uint8_t *ptr = data.data();
                 uint32_t count = 0;
                 std::memcpy(&count, ptr, 4);
                 ptr += 4;
-                std::vector<std::pair<uint64_t, std::vector<float>>> batch;
                 size_t vec_bytes = cfg_.dim * sizeof(float);
-                if (len < 4 + count * (8 + vec_bytes))
-                    return true;
+                if (data.size() < 4 + static_cast<size_t>(count) * (8 + vec_bytes))
+                    return;
+                std::vector<std::pair<uint64_t, std::vector<float>>> batch;
                 batch.reserve(count);
                 for (uint32_t i = 0; i < count; ++i)
                 {
@@ -314,11 +288,10 @@ namespace pomai::ai::orbit
                 if (!batch.empty() && insert_batch_memory_only(batch))
                     replayed_count += batch.size();
             }
-            else if (type == static_cast<uint16_t>(pomai::memory::WAL_REC_DELETE_LABEL) && len >= static_cast<uint32_t>(sizeof(uint64_t)))
+            else if (type == static_cast<uint16_t>(pomai::memory::WAL_REC_DELETE_LABEL) && data.size() >= sizeof(uint64_t))
             {
                 uint64_t label = 0;
-                std::memcpy(&label, payload, sizeof(label));
-                // apply deletion (persisted delete)
+                std::memcpy(&label, data.data(), sizeof(label));
                 try
                 {
                     apply_persisted_delete(label);
@@ -327,9 +300,8 @@ namespace pomai::ai::orbit
                 {
                 }
             }
-            return true;
         };
-        wal_->replay(replayer);
+        wal_->recover(replayer);
         if (replayed_count > 0)
             std::clog << "[Orbit] Recovered " << replayed_count << " vectors from WAL.\n";
     }
@@ -368,24 +340,20 @@ namespace pomai::ai::orbit
 
     void PomaiOrbit::apply_persisted_delete(uint64_t label)
     {
-        // Mark deleted and remove mapping if present. This function is idempotent.
         {
             std::unique_lock<std::shared_mutex> dl(del_mu_);
             deleted_labels_.insert(label);
         }
 
-        // Remove mapping from label shards (if exists) and zero out the slot in the bucket
         uint64_t b = 0;
         uint32_t s = 0;
         if (!get_label_bucket(label, b) || !get_label_slot(label, s))
             return;
 
-        // Resolve bucket body
         std::vector<char> tmp;
         auto base_opt = resolve_bucket_base(arena_, b, tmp);
         if (!base_opt)
         {
-            // Even if we can't resolve the bucket body, we should remove the label_shard entry.
             auto &sh = label_shards_[label_shard_index(label)];
             std::unique_lock<std::shared_mutex> lk(sh.mu);
             sh.bucket.erase(label);
@@ -396,7 +364,6 @@ namespace pomai::ai::orbit
         char *mutable_base = const_cast<char *>(*base_opt);
         BucketHeader *hdr = reinterpret_cast<BucketHeader *>(mutable_base);
 
-        // Validate slot range
         if (s >= dynamic_bucket_capacity_)
         {
             auto &sh = label_shards_[label_shard_index(label)];
@@ -406,22 +373,18 @@ namespace pomai::ai::orbit
             return;
         }
 
-        // Zero the id entry and PQ code len atomically
         uint64_t *ids_base = reinterpret_cast<uint64_t *>(mutable_base + hdr->off_ids);
         uint16_t *lens_base = reinterpret_cast<uint16_t *>(mutable_base + hdr->off_pq_codes);
 
         pomai::ai::atomic_utils::atomic_store_u64(ids_base + s, 0);
         __atomic_store_n(lens_base + s, static_cast<uint16_t>(0), __ATOMIC_RELEASE);
 
-        // Decrement bucket header count (best-effort atomic)
         pomai::ai::atomic_utils::atomic_fetch_sub_u32(&hdr->count, 1u);
 
-        // Decrement global bucket_sizes_ for centroid if possible
         uint32_t cid = hdr->centroid_id;
         if (cid < bucket_sizes_.size())
             pomai::ai::atomic_utils::atomic_fetch_sub_u32(&bucket_sizes_[cid], 1u);
 
-        // Finally remove mapping from label shard
         auto &sh = label_shards_[label_shard_index(label)];
         {
             std::unique_lock<std::shared_mutex> lk(sh.mu);
@@ -478,7 +441,6 @@ namespace pomai::ai::orbit
             in.read(reinterpret_cast<char *>(node->vector.data()), cfg_.dim * sizeof(float));
             uint64_t off_disk = 0;
             in.read(reinterpret_cast<char *>(&off_disk), sizeof(off_disk));
-            // Restore persisted bucket offset (was previously cleared erroneously)
             node->bucket_offset.store(off_disk, std::memory_order_relaxed);
             centroids_[i] = std::move(node);
         }
@@ -708,7 +670,9 @@ namespace pomai::ai::orbit
 
             try
             {
-                wal_->append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_INSERT_BATCH), buffer.data(), static_cast<uint32_t>(buffer.size()));
+                uint64_t seq = wal_->append(static_cast<uint16_t>(pomai::memory::WAL_REC_INSERT_BATCH), buffer.data(), static_cast<size_t>(buffer.size()), 0);
+                if (seq == 0)
+                    std::cerr << "[Orbit] WAL append failed for insert batch\n";
             }
             catch (...)
             {
@@ -725,7 +689,6 @@ namespace pomai::ai::orbit
 
         std::shared_lock<std::shared_mutex> cp_lock(checkpoint_mu_);
 
-        // --- Seeding if centroids empty (unchanged behavior) ---
         if (centroids_.empty())
         {
             size_t seed_count = std::max<size_t>(cfg_.algo.min_centroids, std::thread::hardware_concurrency() / 2);
@@ -740,15 +703,13 @@ namespace pomai::ai::orbit
             build_echo_graph(1.0f, 0.01f);
         }
 
-        // --- Batch centroid assignment (cache-friendly) ---
         const size_t B = batch.size();
         const size_t C = centroids_.size();
         const size_t D = cfg_.dim;
 
-        // Precompute query norms and transpose queries to [D x B]
         std::vector<float> qnorm2;
         qnorm2.resize(B);
-        std::vector<float> trans; // size D * B, trans[d*B + v] = batch[v].second[d]
+        std::vector<float> trans;
         trans.assign(D * B, 0.0f);
 
         for (size_t v = 0; v < B; ++v)
@@ -764,7 +725,6 @@ namespace pomai::ai::orbit
             qnorm2[v] = s;
         }
 
-        // Flatten centroids and precompute centroid norms
         std::vector<float> cflat;
         cflat.resize(C * D);
         std::vector<float> cnorm2;
@@ -782,26 +742,21 @@ namespace pomai::ai::orbit
             cnorm2[c] = s;
         }
 
-        // Best-so-far distances and assigned cid per vector
         std::vector<float> best_dist(B, std::numeric_limits<float>::infinity());
         std::vector<uint32_t> assigned_cid(B, 0);
         std::vector<float> dot;
         dot.assign(B, 0.0f);
 
-        // For each centroid compute dot products with all queries by iterating dims
         for (size_t c = 0; c < C; ++c)
         {
-            // zero dot
             std::fill(dot.begin(), dot.end(), 0.0f);
 
             const float *cptr = &cflat[c * D];
 
-            // accumulate dot[v] += cptr[d] * trans[d*B + v]  (for all d)
             for (size_t d = 0; d < D; ++d)
             {
                 float cd = cptr[d];
                 const float *trow = &trans[d * B];
-                // unrolled inner loop for speed (simple unroll)
                 size_t v = 0;
                 const size_t B8 = (B / 8) * 8;
                 for (; v < B8; v += 8)
@@ -819,7 +774,6 @@ namespace pomai::ai::orbit
                     dot[v] += trow[v] * cd;
             }
 
-            // evaluate distances and update bests
             float c2 = cnorm2[c];
             for (size_t v = 0; v < B; ++v)
             {
@@ -832,7 +786,6 @@ namespace pomai::ai::orbit
             }
         }
 
-        // --- Build prepared items using assigned centroids and pack them ---
         std::vector<Item> prepared;
         prepared.reserve(B);
         for (size_t i = 0; i < B; ++i)
@@ -841,23 +794,20 @@ namespace pomai::ai::orbit
             it.label = batch[i].first;
             uint32_t cid = assigned_cid[i];
             it.cid = cid;
-            // pack with centroid mean
             std::vector<uint8_t> pk = zeroharmony_->pack_with_mean(batch[i].second.data(), centroids_[cid]->vector);
             if (pk.size() > MAX_ECHO_BYTES)
-                pk.resize(MAX_ECHO_BYTES); // defensive; should not happen with proper packer
+                pk.resize(MAX_ECHO_BYTES);
             it.size = static_cast<uint8_t>(pk.size());
             std::memcpy(it.bytes, pk.data(), pk.size());
             prepared.push_back(it);
         }
 
-        // --- Sort prepared by cid (existing logic) ---
         std::sort(prepared.begin(), prepared.end(), [](auto &a, auto &b)
                   { return a.cid < b.cid; });
 
         std::vector<uint32_t> added_counts;
         added_counts.assign(centroids_.size(), 0);
 
-        // --- Existing bucket insertion logic (unchanged) ---
         for (size_t i = 0; i < prepared.size();)
         {
             uint32_t cid = prepared[i].cid;
@@ -867,6 +817,7 @@ namespace pomai::ai::orbit
 
             OrbitNode &node = *centroids_[cid];
             size_t k = i;
+            std::vector<std::tuple<uint64_t, uint32_t, uint64_t>> deferred_maps;
             while (k < end)
             {
                 uint64_t off = node.bucket_offset.load(std::memory_order_acquire);
@@ -874,15 +825,15 @@ namespace pomai::ai::orbit
                 auto base_opt = resolve_bucket_base(arena_, off, tmp);
                 if (!base_opt)
                 {
-                    std::unique_lock<std::shared_mutex> lk(node.mu);
                     uint64_t cur = node.bucket_offset.load(std::memory_order_acquire);
                     if (cur == off)
                     {
                         uint64_t alloc = alloc_new_bucket(cid);
                         if (alloc == 0)
                             break;
-                        node.bucket_offset.store(alloc, std::memory_order_release);
-                        off = alloc;
+                        uint64_t expected = off;
+                        node.bucket_offset.compare_exchange_weak(expected, alloc, std::memory_order_acq_rel);
+                        off = node.bucket_offset.load(std::memory_order_acquire);
                         base_opt = resolve_bucket_base(arena_, off, tmp);
                         if (!base_opt)
                             continue;
@@ -901,20 +852,14 @@ namespace pomai::ai::orbit
                     uint64_t nxt = bucket_atomic_load_next(hdr);
                     if (!nxt)
                     {
-                        uint64_t alloc = 0;
-                        {
-                            std::unique_lock<std::shared_mutex> lk(node.mu);
-                            uint64_t check = node.bucket_offset.load(std::memory_order_acquire);
-                            if (check == off)
-                                alloc = alloc_new_bucket(cid);
-                            if (alloc != 0)
-                                bucket_atomic_store_next(hdr, alloc);
-                        }
-                        uint64_t after = bucket_atomic_load_next(hdr);
-                        if (!after)
+                        uint64_t alloc = alloc_new_bucket(cid);
+                        if (alloc == 0)
                             break;
-                        off = after;
-                        continue;
+                        uint64_t expected = 0;
+                        pomai::ai::atomic_utils::atomic_compare_exchange_u64(&hdr->next_bucket_offset, expected, alloc);
+                        nxt = bucket_atomic_load_next(hdr);
+                        if (!nxt)
+                            break;
                     }
                     off = nxt;
                     continue;
@@ -939,10 +884,17 @@ namespace pomai::ai::orbit
                     __atomic_store_n(&lens_base[start_slot + t], static_cast<uint16_t>(prepared[idx].size), __ATOMIC_RELEASE);
                     uint64_t packed_id = IdEntry::pack_label(prepared[idx].label);
                     pomai::ai::atomic_utils::atomic_store_u64(ids_base + start_slot + t, packed_id);
-                    set_label_map(prepared[idx].label, off, static_cast<uint32_t>(start_slot + t));
+                    deferred_maps.emplace_back(prepared[idx].label, off, static_cast<uint64_t>(start_slot + t));
                 }
                 added_counts[cid] = static_cast<uint32_t>(added_counts[cid] + actual);
                 k += actual;
+            }
+            for (auto &m : deferred_maps)
+            {
+                uint64_t lbl = std::get<0>(m);
+                uint64_t boff = std::get<1>(m);
+                uint32_t slot = static_cast<uint32_t>(std::get<2>(m));
+                set_label_map(lbl, boff, slot);
             }
             i = end;
         }
@@ -1042,12 +994,11 @@ namespace pomai::ai::orbit
                 return false;
         }
 
-        // Persist deletion so it survives restarts
         bool wal_ok = true;
         if (wal_)
         {
-            auto seq = wal_->append_record(static_cast<uint16_t>(pomai::memory::WAL_REC_DELETE_LABEL), &label, static_cast<uint32_t>(sizeof(label)));
-            if (!seq.has_value())
+            uint64_t seq = wal_->append(static_cast<uint16_t>(pomai::memory::WAL_REC_DELETE_LABEL), &label, static_cast<size_t>(sizeof(label)), 0);
+            if (seq == 0)
             {
                 std::cerr << "[Orbit] WAL append (delete) failed for label " << label << "\n";
                 wal_ok = false;
@@ -1060,7 +1011,6 @@ namespace pomai::ai::orbit
         }
         catch (...)
         {
-            // best-effort; caller gets wal_ok to know if persistence succeeded
         }
         return wal_ok;
     }
@@ -1249,8 +1199,6 @@ namespace pomai::ai::orbit
                     off = hdr.next_bucket_offset;
                 }
             }
-            if (wal_)
-                wal_->fsync_log();
             ::sync();
             return true;
         }
@@ -1342,8 +1290,6 @@ namespace pomai::ai::orbit
             new_node->bucket_offset.store(alloc_new_bucket(new_cid), std::memory_order_release);
             centroids_.push_back(std::move(new_node));
             bucket_sizes_.push_back(0);
-            std::lock_guard<std::mutex> l(split_ts_mu);
-            split_last_ts[new_cid] = now;
         }
         uint64_t old_bucket_off = centroids_[cid]->bucket_offset.load(std::memory_order_acquire);
         uint64_t new_bucket_off = centroids_[new_cid]->bucket_offset.load(std::memory_order_acquire);
@@ -1352,7 +1298,6 @@ namespace pomai::ai::orbit
         std::vector<uint64_t> src_bucket_offs;
         std::vector<uint32_t> src_slots;
         {
-            std::unique_lock<std::shared_mutex> lk(centroids_[cid]->mu);
             uint64_t curr = old_bucket_off;
             std::vector<char> tmp;
             while (curr != 0)
@@ -1393,8 +1338,6 @@ namespace pomai::ai::orbit
         }
         if (!labels_to_move.empty())
         {
-            std::unique_lock<std::shared_mutex> lk_old(centroids_[cid]->mu);
-            std::unique_lock<std::shared_mutex> lk_new(centroids_[new_cid]->mu);
             for (size_t idx = 0; idx < labels_to_move.size(); ++idx)
             {
                 uint64_t lbl = labels_to_move[idx];
@@ -1419,11 +1362,11 @@ namespace pomai::ai::orbit
                 if (plen == 0 || plen > static_cast<uint16_t>(packed_slot_size_))
                     continue;
                 const uint8_t *pkt = reinterpret_cast<const uint8_t *>(src_vecs + static_cast<size_t>(src_slot) * packed_slot_size_);
-                std::vector<char> tmp2;
                 uint64_t dst_off = new_bucket_off;
                 bool inserted = false;
                 while (!inserted)
                 {
+                    std::vector<char> tmp2;
                     auto base2_opt = resolve_bucket_base(arena, dst_off, tmp2);
                     if (!base2_opt)
                     {
@@ -1440,8 +1383,11 @@ namespace pomai::ai::orbit
                             uint64_t alloc = alloc_new_bucket(new_cid);
                             if (alloc == 0)
                                 break;
-                            bucket_atomic_store_next(dst_hdr, alloc);
-                            dst_off = alloc;
+                            uint64_t expected = 0;
+                            pomai::ai::atomic_utils::atomic_compare_exchange_u64(&dst_hdr->next_bucket_offset, expected, alloc);
+                            dst_off = bucket_atomic_load_next(dst_hdr);
+                            if (!dst_off)
+                                break;
                             continue;
                         }
                         dst_off = nxt;
@@ -1457,8 +1403,11 @@ namespace pomai::ai::orbit
                             uint64_t alloc = alloc_new_bucket(new_cid);
                             if (alloc == 0)
                                 break;
-                            bucket_atomic_store_next(dst_hdr, alloc);
-                            dst_off = alloc;
+                            uint64_t expected = 0;
+                            pomai::ai::atomic_utils::atomic_compare_exchange_u64(&dst_hdr->next_bucket_offset, expected, alloc);
+                            dst_off = bucket_atomic_load_next(dst_hdr);
+                            if (!dst_off)
+                                break;
                             continue;
                         }
                         dst_off = nxt;
@@ -1488,4 +1437,5 @@ namespace pomai::ai::orbit
         build_echo_graph(1.0f, 0.01f);
         global_splitting_lock.store(false);
     }
+
 } // namespace pomai::ai::orbit

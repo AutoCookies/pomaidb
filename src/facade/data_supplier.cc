@@ -119,7 +119,7 @@ namespace pomai::server::data_supplier
             size_t expected_bytes = dim * elem_size;
 
             size_t old_sz = out.size();
-            
+
             if (payload_len >= expected_bytes)
             {
                 // Zero-copy append via resize + memcpy
@@ -148,14 +148,14 @@ namespace pomai::server::data_supplier
             {
                 std::vector<std::string> outs; // TODO: Optimize Orbit API to avoid std::string allocation here
                 std::vector<uint64_t> ids{id_or_offset};
-                
+
                 if (m->orbit->get_vectors_raw(ids, outs) && !outs.empty() && !outs[0].empty())
                 {
-                    const std::string& raw_orbit = outs[0];
+                    const std::string &raw_orbit = outs[0];
                     uint32_t elem_size = static_cast<uint32_t>(pomai::core::dtype_size(m->data_type));
                     size_t expected_bytes = dim * elem_size;
                     size_t float_bytes = dim * sizeof(float);
-                    
+
                     size_t old_sz = out.size();
 
                     // Case A: Orbit returns native format
@@ -177,14 +177,14 @@ namespace pomai::server::data_supplier
                         return true;
                     }
                     // Case C: Partial data fallback
-                    else 
+                    else
                     {
-                         out.resize(old_sz + float_bytes); // Default to float32 container
-                         std::memcpy(out.data() + old_sz, raw_orbit.data(), raw_orbit.size());
-                         std::memset(out.data() + old_sz + raw_orbit.size(), 0, float_bytes - raw_orbit.size());
-                         out_dtype = pomai::core::DataType::FLOAT32;
-                         out_elem_size = sizeof(float);
-                         return true;
+                        out.resize(old_sz + float_bytes); // Default to float32 container
+                        std::memcpy(out.data() + old_sz, raw_orbit.data(), raw_orbit.size());
+                        std::memset(out.data() + old_sz + raw_orbit.size(), 0, float_bytes - raw_orbit.size());
+                        out_dtype = pomai::core::DataType::FLOAT32;
+                        out_elem_size = sizeof(float);
+                        return true;
                     }
                 }
             }
@@ -199,7 +199,7 @@ namespace pomai::server::data_supplier
         {
             if (m->orbit)
             {
-                // Reuse thread_local buffer if possible to avoid allocation? 
+                // Reuse thread_local buffer if possible to avoid allocation?
                 // For now, standard vector to be safe.
                 std::vector<float> tmp(dim, 0.0f);
                 if (m->orbit->get(id_or_offset, tmp))
@@ -230,37 +230,42 @@ namespace pomai::server::data_supplier
     {
         pomai::core::DataType dtype;
         uint32_t elem_size = 0;
-        
+
         // Use a temp buffer to check result before converting
         // (In optimized version we could decode directly into 'out' if we knew the format ahead of time)
         size_t start_idx = out.size();
         bool ok = fetch_vector_raw(m, id_or_offset, out, dim, dtype, elem_size);
 
-        if (!ok) return false;
+        if (!ok)
+            return false;
 
         // Check if we need conversion to Float32
-        if (dtype == pomai::core::DataType::FLOAT32 && elem_size == sizeof(float)) {
-             // Already float32, data is in 'out' correctly
-             return true;
+        if (dtype == pomai::core::DataType::FLOAT32 && elem_size == sizeof(float))
+        {
+            // Already float32, data is in 'out' correctly
+            return true;
         }
 
         // Needs conversion: The raw bytes are at out[start_idx...]
         // We need to decode them to float32, effectively replacing the raw bytes with float bytes.
-        
+
         // 1. Extract raw bytes
         size_t raw_len = out.size() - start_idx;
         std::vector<char> raw_copy(out.begin() + start_idx, out.end());
-        
+
         // 2. Resize out to hold floats
         size_t float_len = dim * sizeof(float);
         out.resize(start_idx + float_len);
 
         // 3. Decode
-        if (elem_size > 0 && raw_copy.size() >= dim * elem_size) {
-            decode_slot_to_float(raw_copy.data(), dim, dtype, reinterpret_cast<float*>(out.data() + start_idx));
-        } else {
-             // Partial/Invalid: Zero fill
-             std::memset(out.data() + start_idx, 0, float_len);
+        if (elem_size > 0 && raw_copy.size() >= dim * elem_size)
+        {
+            decode_slot_to_float(raw_copy.data(), dim, dtype, reinterpret_cast<float *>(out.data() + start_idx));
+        }
+        else
+        {
+            // Partial/Invalid: Zero fill
+            std::memset(out.data() + start_idx, 0, float_len);
         }
 
         return true;
@@ -276,12 +281,17 @@ namespace pomai::server::data_supplier
         }
 
         size_t dim = out_vec.size();
-        
+
         // 1) Try arena offset path
         const char *ptr = nullptr;
-        try {
+        try
+        {
             ptr = m->arena ? m->arena->blob_ptr_from_offset_for_map(id_or_offset) : nullptr;
-        } catch (...) { ptr = nullptr; }
+        }
+        catch (...)
+        {
+            ptr = nullptr;
+        }
 
         if (ptr)
         {
@@ -295,34 +305,48 @@ namespace pomai::server::data_supplier
                 return true;
             }
             // Partial payload fallback
-            if (payload_len > 0) {
+            if (payload_len > 0)
+            {
                 size_t copy_bytes = std::min(payload_len, dim * sizeof(float));
-                if (copy_bytes > 0) std::memcpy(out_vec.data(), payload, copy_bytes);
+                if (copy_bytes > 0)
+                    std::memcpy(out_vec.data(), payload, copy_bytes);
                 std::fill(out_vec.begin() + (copy_bytes / sizeof(float)), out_vec.end(), 0.0f);
                 return true;
             }
         }
 
         // 2) Try orbit decoded get (preferred)
-        try {
-            if (m->orbit && m->orbit->get(id_or_offset, out_vec)) return true;
-        } catch (...) {}
+        try
+        {
+            if (m->orbit && m->orbit->get(id_or_offset, out_vec))
+                return true;
+        }
+        catch (...)
+        {
+        }
 
         // 3) Try orbit raw path + decode
-        try {
-            if (m->orbit) {
+        try
+        {
+            if (m->orbit)
+            {
                 std::vector<std::string> outs;
                 std::vector<uint64_t> ids{id_or_offset};
-                if (m->orbit->get_vectors_raw(ids, outs) && !outs.empty() && !outs[0].empty()) {
-                     if (outs[0].size() >= dim * sizeof(float)) {
-                         std::memcpy(out_vec.data(), outs[0].data(), dim * sizeof(float));
-                         return true;
-                     }
-                     decode_slot_to_float(outs[0].data(), dim, m->data_type, out_vec.data());
-                     return true;
+                if (m->orbit->get_vectors_raw(ids, outs) && !outs.empty() && !outs[0].empty())
+                {
+                    if (outs[0].size() >= dim * sizeof(float))
+                    {
+                        std::memcpy(out_vec.data(), outs[0].data(), dim * sizeof(float));
+                        return true;
+                    }
+                    decode_slot_to_float(outs[0].data(), dim, m->data_type, out_vec.data());
+                    return true;
                 }
             }
-        } catch (...) {}
+        }
+        catch (...)
+        {
+        }
 
         std::fill(out_vec.begin(), out_vec.end(), 0.0f);
         return false;
