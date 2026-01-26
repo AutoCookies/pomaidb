@@ -44,7 +44,13 @@ namespace pomai::config
 
         // 2. Env Overrides
         if (auto v = env_u64("POMAI_PORT"))
+        {
             cfg.net.port = static_cast<uint16_t>(*v);
+        }
+        else if (auto v = env_u64("PORT"))
+        {
+            cfg.net.port = static_cast<uint16_t>(*v);
+        }
 
         if (auto v = env_u64("POMAI_MEM_MB"))
             cfg.res.arena_mb_per_shard = *v;

@@ -22,12 +22,18 @@ SERVER_PID=$!
 echo "[run.sh] Pomai server PID: $SERVER_PID (logs: $SERVER_LOG)"
 
 # Wait for server to be up (simple port wait, e.g. 7777)
-POMAI_PORT=${POMAI_PORT:-7777}
+if [ -n "${POMAI_PORT:-}" ]; then
+  PORT_TO_CHECK="$POMAI_PORT"
+elif [ -n "${PORT:-}" ]; then
+  PORT_TO_CHECK="$PORT"
+else
+  PORT_TO_CHECK="7777"
+fi
 MAX_WAIT=10
 wait_time=0
-while ! nc -z 127.0.0.1 $POMAI_PORT >/dev/null 2>&1; do
+while ! nc -z 127.0.0.1 $PORT_TO_CHECK >/dev/null 2>&1; do
   if [ $wait_time -ge $MAX_WAIT ]; then
-    echo "Error: Pomai server did not start on port $POMAI_PORT within $MAX_WAIT seconds."
+    echo "Error: Pomai server did not start on port $PORT_TO_CHECK within $MAX_WAIT seconds."
     kill $SERVER_PID
     exit 2
   fi
@@ -35,7 +41,7 @@ while ! nc -z 127.0.0.1 $POMAI_PORT >/dev/null 2>&1; do
   wait_time=$((wait_time + 1))
 done
 
-echo "[run.sh] Pomai server is up on port $POMAI_PORT."
+echo "[run.sh] Pomai server is up on port $PORT_TO_CHECK."
 
 # Check cli binary
 if [ ! -x "$CLI_BIN" ]; then
