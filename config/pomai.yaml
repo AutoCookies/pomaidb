@@ -1,0 +1,15 @@
+data_dir: ./data
+listen_host: 127.0.0.1
+listen_port: 7744
+
+# single-user binary server
+single_user: true
+
+# db defaults
+shards: 4
+shard_queue_capacity: 4096
+default_dim: 128
+default_metric: cosine
+
+log_path: ./pomai.log
+log_level: info
