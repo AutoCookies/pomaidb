@@ -1,3 +1,4 @@
+// Full wal.cpp with synchronous fdatasync fast-path in AppendUpserts
 #include "wal.h"
 #include "seed.h"
 #include "crc64.h"
@@ -12,7 +13,7 @@
 #include <vector>
 #include <iostream>
 #include <algorithm>
-#include <endian.h> // for htobe/htole helpers on glibc
+#include <endian.h> // for byte-order helpers on glibc
 
 namespace pomai
 {
@@ -115,9 +116,7 @@ namespace pomai
         if (running_.exchange(true))
             return;
 
-        // Init CRC table
         crc64_init();
-
         OpenOrCreateForAppend();
         fsync_th_ = std::thread(&Wal::FsyncLoop, this);
     }
@@ -136,28 +135,23 @@ namespace pomai
         CloseFd();
     }
 
-    // Append writes payload+footer in a single contiguous write to reduce syscall window.
-    Lsn Wal::AppendUpserts(const std::vector<UpsertRequest> &batch)
+    // New: synchronous fast-path optional flag
+    Lsn Wal::AppendUpserts(const std::vector<UpsertRequest> &batch, bool wait_durable)
     {
         if (batch.empty())
             return 0;
 
-        // Acquire LSN upfront
         Lsn lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed);
 
-        // Serialize payload into a contiguous buffer
-        // payload = lsn(u64) + count(u32) + dim(u16) + for each: id(u64) + vec(f32 * dim)
         const uint32_t count = static_cast<uint32_t>(batch.size());
         const uint16_t dim16 = static_cast<uint16_t>(dim_);
 
         const std::size_t payload_size =
-            sizeof(uint64_t) + // lsn
-            sizeof(uint32_t) + // count
-            sizeof(uint16_t) + // dim
+            sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t) +
             count * (sizeof(uint64_t) + dim_ * sizeof(float));
 
         std::vector<uint8_t> buf;
-        buf.reserve(payload_size + 24); // footer ~24 bytes
+        buf.reserve(payload_size + 24);
 
         auto push_le = [&](const void *ptr, std::size_t n)
         {
@@ -169,8 +163,6 @@ namespace pomai
         uint32_t count_le = (uint32_t)count;
         uint16_t dim_le = (uint16_t)dim16;
 
-        // Ensure little-endian on-disk encoding
-        // Convert if host is big endian
 #if __BYTE_ORDER == __BIG_ENDIAN
         lsn_le = __builtin_bswap64(lsn_le);
         count_le = __builtin_bswap32(count_le);
@@ -191,15 +183,12 @@ namespace pomai
             id_le = __builtin_bswap64(id_le);
 #endif
             push_le(&id_le, sizeof(id_le));
-            // vectors are f32 in IEEE754; store raw bytes (we assume same float size)
             const uint8_t *vf = reinterpret_cast<const uint8_t *>(it.vec.data.data());
             push_le(vf, dim_ * sizeof(float));
         }
 
-        // Compute CRC64 over payload
         uint64_t crc = crc64(0, buf.data(), buf.size());
 
-        // Build footer: payload_size(u32 LE) + reserved(u32=0) + crc(u64 LE) + magic(u64 LE)
         uint32_t payload_size_u32 = static_cast<uint32_t>(buf.size());
         uint32_t reserved = 0;
         uint64_t crc_le = crc;
@@ -217,20 +206,41 @@ namespace pomai
         push_le(&crc_le, sizeof(crc_le));
         push_le(&magic_le, sizeof(magic_le));
 
-        // Write buffer atomically (as a single write loop) under mutex to keep ordering with written_lsn_
+        // Write buffer (single write loop)
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (fd_ < 0)
                 throw std::runtime_error("WAL not started");
             WriteAll(fd_, buf.data(), buf.size());
+            // Announce written lsn for background thread and waiters
             written_lsn_ = lsn;
             cv_.notify_all();
+        }
+
+        // If caller requested synchronous durability, perform fdatasync now.
+        if (wait_durable)
+        {
+            if (fd_ >= 0)
+            {
+                if (::fdatasync(fd_) != 0)
+                {
+                    // Critical: if fdatasync fails, throw so caller knows write wasn't durable.
+                    ThrowSys("fdatasync failed in AppendUpserts (wait_durable)");
+                }
+            }
+
+            // Update durable_lsn_ and notify waiters
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (durable_lsn_ < lsn)
+                    durable_lsn_ = lsn;
+                cv_.notify_all();
+            }
         }
 
         return lsn;
     }
 
-    // Wait durable: if background hasn't fsynced yet, perform a synchronous fdatasync to speed up.
     void Wal::WaitDurable(Lsn lsn)
     {
         if (lsn == 0)
@@ -238,26 +248,22 @@ namespace pomai
 
         {
             std::unique_lock<std::mutex> lk(mu_);
-            // If already durable or we're stopping, return
             if (!running_.load() || durable_lsn_ >= lsn)
                 return;
         }
 
-        // Fast-path synchronous sync outside of lock to avoid blocking Append writers.
-        // This helps callers that require immediate durability (common for small systems).
+        // If durable_lsn_ hasn't yet caught up, attempt an immediate fdatasync as fallback.
         if (fd_ >= 0)
         {
             if (::fdatasync(fd_) != 0)
                 ThrowSys("fdatasync failed in WaitDurable");
         }
 
-        // Now wait until durable_lsn_ catches up (background thread will update durable_lsn_)
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&]
                  { return !running_.load() || durable_lsn_ >= lsn; });
     }
 
-    // Background fsync thread: periodically fdatasync the file if new data is written.
     void Wal::FsyncLoop()
     {
         using namespace std::chrono_literals;
@@ -288,25 +294,22 @@ namespace pomai
         }
     }
 
-    // Replay: read sequentially and verify CRC/footer. Truncate trailing partial/corrupt record if possible.
-    Lsn Wal::ReplayToSeed(Seed &seed)
+    WalReplayStats Wal::ReplayToSeed(Seed &seed)
     {
-        // Ensure CRC table is ready even if Start() hasn't been called.
         crc64_init();
 
         if (seed.Dim() != dim_)
             throw std::runtime_error("Replay seed dim mismatch");
 
-        // If no file, nothing to do.
         struct stat st;
         if (::stat(wal_path_.c_str(), &st) != 0)
         {
             if (errno == ENOENT)
-                return 0;
+                return WalReplayStats{};
             ThrowSys("stat WAL failed");
         }
         if (!S_ISREG(st.st_mode))
-            return 0;
+            return WalReplayStats{};
 
         int rfd = ::open(wal_path_.c_str(), O_RDONLY | O_CLOEXEC);
         if (rfd < 0)
@@ -314,19 +317,18 @@ namespace pomai
 
         Lsn last_lsn = 0;
         off_t good_offset = 0;
-        size_t total_replayed = 0;
+        std::size_t total_replayed = 0;
+        std::size_t total_vectors = 0;
+        const off_t original_size = st.st_size;
 
         while (true)
         {
-            // 1) Read payload header: lsn (8) + count (4) + dim (2)
             uint8_t head_buf[sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t)];
             if (!ReadExact(rfd, head_buf, sizeof(head_buf)))
             {
-                // EOF or truncated read -> stop
                 break;
             }
 
-            // Decode little-endian
             const uint8_t *p = head_buf;
             uint64_t lsn_le;
             uint32_t count_le;
@@ -349,17 +351,14 @@ namespace pomai
             uint32_t count = count_le;
             uint16_t dim16 = dim_le;
 
-            // sanity check dim
             if (dim16 != dim_)
             {
                 std::cerr << "[WAL] Error: dimension mismatch in record. Stopping replay.\n";
                 break;
             }
 
-            // compute bytes to read for rest of payload (ids + vectors)
             const std::size_t rest_payload_bytes = static_cast<std::size_t>(count) * (sizeof(uint64_t) + dim_ * sizeof(float));
 
-            // read remaining payload
             std::vector<uint8_t> payload_rest;
             payload_rest.resize(rest_payload_bytes);
             if (rest_payload_bytes > 0)
@@ -371,7 +370,6 @@ namespace pomai
                 }
             }
 
-            // read footer (payload_size u32 + reserved u32 + crc u64 + magic u64) = 4+4+8+8 = 24 bytes
             uint8_t footer_buf[24];
             if (!ReadExact(rfd, footer_buf, sizeof(footer_buf)))
             {
@@ -379,7 +377,6 @@ namespace pomai
                 break;
             }
 
-            // parse footer
             const uint8_t *f = footer_buf;
             uint32_t payload_size_le;
             uint32_t reserved_le;
@@ -405,7 +402,6 @@ namespace pomai
             uint64_t crc = crc_le;
             uint64_t magic = magic_le;
 
-            // Reconstruct payload bytes to compute CRC: header bytes + payload_rest
             std::vector<uint8_t> whole_payload;
             whole_payload.reserve(sizeof(head_buf) + payload_rest.size());
             whole_payload.insert(whole_payload.end(), head_buf, head_buf + sizeof(head_buf));
@@ -418,14 +414,12 @@ namespace pomai
                 break;
             }
 
-            // verify magic
             if (magic != FOOTER_MAGIC)
             {
                 std::cerr << "[WAL] Error: footer magic mismatch. Stopping replay.\n";
                 break;
             }
 
-            // verify checksum
             uint64_t calc = crc64(0, whole_payload.data(), whole_payload.size());
             if (calc != crc)
             {
@@ -433,13 +427,10 @@ namespace pomai
                 break;
             }
 
-            // All good -> deserialize batch and apply
-            // parse payload_rest to reconstruct UpsertRequest vector
             std::vector<UpsertRequest> batch;
             batch.reserve(count);
 
             const uint8_t *qptr = whole_payload.data();
-            // skip lsn,u32,count,u16, we've already parsed them (but they are in little-endian)
             qptr += sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t);
 
             for (uint32_t i = 0; i < count; ++i)
@@ -455,13 +446,11 @@ namespace pomai
                 UpsertRequest r;
                 r.id = static_cast<Id>(id);
                 r.vec.data.resize(dim_);
-                // copy float bytes
                 std::memcpy(r.vec.data.data(), qptr, dim_ * sizeof(float));
                 qptr += dim_ * sizeof(float);
                 batch.push_back(std::move(r));
             }
 
-            // Apply into seed
             try
             {
                 seed.ApplyUpserts(batch);
@@ -474,8 +463,8 @@ namespace pomai
 
             last_lsn = lsn64;
             total_replayed++;
+            total_vectors += count;
 
-            // compute good offset: we can compute by ftell relative to start
             off_t cur = lseek(rfd, 0, SEEK_CUR);
             if (cur == -1)
                 good_offset = -1;
@@ -483,11 +472,9 @@ namespace pomai
                 good_offset = cur;
         }
 
-        std::cout << "[WAL] Replay finished. Records applied: " << total_replayed << ", Last LSN: " << last_lsn << "\n";
-
         ::close(rfd);
 
-        // Attempt to truncate file to last good offset (best-effort).
+        off_t truncated = 0;
         if (good_offset > 0)
         {
             int wfd = ::open(wal_path_.c_str(), O_WRONLY | O_CLOEXEC);
@@ -497,17 +484,48 @@ namespace pomai
                 {
                     std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
                 }
+                else
+                {
+                    if (::fdatasync(wfd) != 0)
+                    {
+                        std::cerr << "[WAL] Warning: fdatasync(wal) after truncate failed: " << std::strerror(errno) << "\n";
+                    }
+
+                    int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                    if (dfd >= 0)
+                    {
+                        if (::fsync(dfd) != 0)
+                        {
+                            std::cerr << "[WAL] Warning: fsync(dir) after truncate failed: " << std::strerror(errno) << "\n";
+                        }
+                        ::close(dfd);
+                    }
+                    else
+                    {
+                        std::cerr << "[WAL] Warning: open(dir) failed for fsync: " << std::strerror(errno) << "\n";
+                    }
+                    truncated = original_size > good_offset ? (original_size - good_offset) : 0;
+                }
                 ::close(wfd);
+            }
+            else
+            {
+                std::cerr << "[WAL] Warning: open(wal) for truncate fsync failed: " << std::strerror(errno) << "\n";
             }
         }
 
-        // Ensure next_lsn_ is larger than last_lsn
         Lsn want = last_lsn + 1;
         Lsn cur = next_lsn_.load(std::memory_order_relaxed);
         if (want > cur)
             next_lsn_.store(want, std::memory_order_relaxed);
 
-        return last_lsn;
+        WalReplayStats stats;
+        stats.last_lsn = last_lsn;
+        stats.records_applied = total_replayed;
+        stats.vectors_applied = total_vectors;
+        stats.truncated_bytes = truncated;
+
+        return stats;
     }
 
 } // namespace pomai

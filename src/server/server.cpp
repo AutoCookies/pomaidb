@@ -702,6 +702,12 @@ namespace pomai::server
             return true;
         }
 
+        // Optional per-request durability flag (u8). Default preserved as 'true' for backward compatibility.
+        std::uint8_t wait_u8 = 1; // default true (existing behavior)
+        // Try to read an extra byte; if absent, keep default.
+        (void)rd.ReadU8(wait_u8);
+        bool wait_durable = (wait_u8 != 0);
+
         std::shared_ptr<pomai::PomaiDB> db;
         {
             std::lock_guard<std::mutex> lk(cols_mu_);
@@ -753,7 +759,8 @@ namespace pomai::server
 
         try
         {
-            auto fut = db->UpsertBatch(std::move(batch), true);
+            // Forward the per-request wait_durable flag into the DB call.
+            auto fut = db->UpsertBatch(std::move(batch), wait_durable);
             pomai::Lsn lsn = fut.get();
 
             Buf b;

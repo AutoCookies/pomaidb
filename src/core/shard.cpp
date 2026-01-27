@@ -38,23 +38,40 @@ namespace pomai
         // the append/fsync thread.
         try
         {
-            Lsn last_lsn = wal_.ReplayToSeed(seed_);
+            WalReplayStats stats = wal_.ReplayToSeed(seed_);
+
             // Log outcome so operator knows whether WAL recovery happened
             if (log_info_)
             {
-                if (last_lsn == 0)
+                if (stats.records_applied == 0)
+                {
                     log_info_("[" + name_ + "] WAL replay: no records recovered or wal missing");
+                }
                 else
-                    log_info_("[" + name_ + "] WAL replay: last LSN = " + std::to_string(last_lsn) +
-                              ", total vectors after replay = " + std::to_string(seed_.Count()));
+                {
+                    std::string msg = "[" + name_ + "] WAL replay: records=" + std::to_string(stats.records_applied) +
+                                      ", vectors=" + std::to_string(stats.vectors_applied) +
+                                      ", last_lsn=" + std::to_string(stats.last_lsn);
+                    if (stats.truncated_bytes > 0)
+                        msg += ", truncated_bytes=" + std::to_string(stats.truncated_bytes);
+                    log_info_(msg);
+                }
             }
             else
             {
-                if (last_lsn == 0)
+                if (stats.records_applied == 0)
+                {
                     std::cout << "[" << name_ << "] WAL replay: no records recovered or wal missing\n";
+                }
                 else
-                    std::cout << "[" << name_ << "] WAL replay: last LSN = " << last_lsn
-                              << ", total vectors after replay = " << seed_.Count() << "\n";
+                {
+                    std::cout << "[" << name_ << "] WAL replay: records=" << stats.records_applied
+                              << ", vectors=" << stats.vectors_applied
+                              << ", last_lsn=" << stats.last_lsn;
+                    if (stats.truncated_bytes > 0)
+                        std::cout << ", truncated_bytes=" << stats.truncated_bytes;
+                    std::cout << "\n";
+                }
             }
         }
         catch (const std::exception &e)
@@ -214,8 +231,8 @@ namespace pomai
 
             UpsertTask task = std::move(*opt);
 
-            // 1) WAL
-            Lsn lsn = wal_.AppendUpserts(task.batch);
+            // 1) WAL: pass through wait_durable flag so AppendUpserts can optionally fsync immediately.
+            Lsn lsn = wal_.AppendUpserts(task.batch, task.wait_durable);
 
             // 2) Seed apply
             seed_.ApplyUpserts(task.batch);
@@ -238,7 +255,7 @@ namespace pomai
                 MaybeFreezeSegment();
             }
 
-            // 5) durable wait if requested
+            // 5) durable wait if requested (usually fast because AppendUpserts already fdatasync'd)
             if (task.wait_durable)
                 wal_.WaitDurable(lsn);
 

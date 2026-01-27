@@ -13,36 +13,20 @@
 /*
   Production-ready WAL (append-only, checksummed, replay-safe).
 
-  On-disk record layout (little-endian, portable fields):
-    [payload]
-    [footer]
-
-  payload:
-    LSN (u64)
-    count (u32)
-    dim   (u16)
-    for each record:
-      id  (u64)
-      vec (dim * f32)
-
-  footer (fixed size, written right after payload):
-    payload_size (u32)    -- number of bytes in payload
-    reserved      (u32)    -- reserved for future use (alignment)
-    crc64         (u64)    -- CRC64 of payload (not including footer)
-    magic         (u64)    -- fixed magic marker to identify footer / integrity
-
-  Notes:
-  - Replay scans sequentially by reading payload header (lsn/count/dim) then the
-    rest of the payload and then the footer. If any read fails, or checksum/magic
-    mismatch, replay stops at the last good record and returns that LSN.
-  - Append writes payload+footer together in a single contiguous write to reduce
-    syscall window. Durability is provided asynchronously by a background fdatasync
-    thread; however WaitDurable() will perform a synchronous fdatasync if required.
-  - All multithreading access is protected by mutexes/atomics.
+  AppendUpserts now supports an optional per-append synchronous durability flag.
+  ReplayToSeed returns WalReplayStats describing the replay operation.
 */
 
 namespace pomai
 {
+
+  struct WalReplayStats
+  {
+    Lsn last_lsn{0};                // last applied LSN
+    std::size_t records_applied{0}; // number of WAL records (append batches) applied
+    std::size_t vectors_applied{0}; // number of vectors applied into seed
+    off_t truncated_bytes{0};       // bytes truncated off the WAL (0 if no truncation)
+  };
 
   class Wal
   {
@@ -53,29 +37,26 @@ namespace pomai
     Wal(const Wal &) = delete;
     Wal &operator=(const Wal &) = delete;
 
-    // Start background threads and open file for append.
     void Start();
-    // Stop background thread, ensure durable, close file.
     void Stop();
 
-    // Append a batch to WAL. Returns LSN assigned (0 if empty).
-    // Append writes to the OS (append) but does not guarantee durability unless WaitDurable is used.
-    Lsn AppendUpserts(const std::vector<UpsertRequest> &batch);
+    // AppendUpserts writes the batch to the WAL and returns the assigned LSN.
+    // If wait_durable==true, AppendUpserts will synchronously fdatasync the WAL
+    // before returning and update durable_lsn_ so the append is durable on return.
+    Lsn AppendUpserts(const std::vector<UpsertRequest> &batch, bool wait_durable = false);
 
-    // Wait until given LSN is durable on disk. Performs synchronous fdatasync if needed.
+    // Wait until the given LSN is durable (fsynced). This may perform an fdatasync
+    // if the background thread hasn't yet advanced durable_lsn_.
     void WaitDurable(Lsn lsn);
 
-    // Replay WAL into the provided seed. Returns last applied LSN.
-    // On replay, any trailing partial/corrupt record is ignored and the file may be truncated
-    // to the last good offset (attempted, best-effort).
-    Lsn ReplayToSeed(class Seed &seed);
+    // Replay WAL into the provided seed and return replay statistics.
+    WalReplayStats ReplayToSeed(class Seed &seed);
 
   private:
     void OpenOrCreateForAppend();
     void CloseFd();
     void FsyncLoop();
 
-    // low level helpers
     static void WriteAll(int fd, const void *buf, std::size_t n);
     static bool ReadExact(int fd, void *buf, std::size_t n);
 

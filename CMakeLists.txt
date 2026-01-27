@@ -54,3 +54,17 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_embedded.cpp")
     add_executable(bench_embedded benchmarks/bench_embedded.cpp)
     target_link_libraries(bench_embedded pomai_core)
 endif()
+
+# ==========================================
+# 6. TESTS
+# ==========================================
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests")
+    add_executable(wal_unit_tests tests/wal_unit_tests.cpp)
+    target_link_libraries(wal_unit_tests pomai_core)
+
+    add_executable(wal_integration_writer tests/wal_integration_writer.cpp)
+    target_link_libraries(wal_integration_writer pomai_core)
+
+    add_executable(wal_replay_inspect tests/wal_replay_inspect.cpp)
+    target_link_libraries(wal_replay_inspect pomai_core)
+endif()
