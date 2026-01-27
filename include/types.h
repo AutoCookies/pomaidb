@@ -42,5 +42,4 @@ namespace pomai
     {
         std::vector<SearchResultItem> items;
     };
-
 } // namespace pomai

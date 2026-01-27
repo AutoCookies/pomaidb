@@ -1,12 +1,14 @@
+// Full server.cpp with DbOptions.allow_sync_on_append passed into created DbOptions
 #include "server/server.h"
 #include "server/protocol.h"
+#include "types.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/un.h> // Header cho Unix Domain Sockets
+#include <sys/un.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -350,6 +352,9 @@ namespace pomai::server
                 opt.shard_queue_capacity = cfg_.shard_queue_capacity;
                 opt.wal_dir = entry.path().string();
 
+                // IMPORTANT: carry over global server-level allow_sync_on_append into collection options
+                opt.allow_sync_on_append = cfg_.allow_sync_on_append;
+
                 // Persist meta so we don't have to re-infer next time
                 SaveCollectionMeta(name, opt);
                 if (log_)
@@ -392,6 +397,9 @@ namespace pomai::server
             opt.shards = shards;
             opt.shard_queue_capacity = cap;
             opt.wal_dir = entry.path().string();
+
+            // Carry global server-level policy into the DbOptions as a default unless the meta specifies otherwise.
+            opt.allow_sync_on_append = cfg_.allow_sync_on_append;
 
             if (log_)
                 log_->Info("Recovering collection: " + name + " (dim=" + std::to_string(dim) + ")");
@@ -656,6 +664,10 @@ namespace pomai::server
         opt.shards = shards ? (std::size_t)shards : (std::size_t)cfg_.shards;
         opt.shard_queue_capacity = cap ? (std::size_t)cap : (std::size_t)cfg_.shard_queue_capacity;
         opt.wal_dir = cfg_.data_dir + "/" + name;
+
+        // carry server-level policy into the new collection's options
+        opt.allow_sync_on_append = cfg_.allow_sync_on_append;
+
         (void)EnsureDir(opt.wal_dir);
 
         // SAVE META
@@ -760,6 +772,8 @@ namespace pomai::server
         try
         {
             // Forward the per-request wait_durable flag into the DB call.
+            // PomaiDB is expected to consult its DbOptions.allow_sync_on_append
+            // and decide whether to honor per-request synchronous durability.
             auto fut = db->UpsertBatch(std::move(batch), wait_durable);
             pomai::Lsn lsn = fut.get();
 

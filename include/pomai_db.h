@@ -24,6 +24,7 @@ namespace pomai
 
         // New: index build pool threads (0 = auto)
         std::size_t index_build_threads{0};
+        bool allow_sync_on_append{true};
     };
 
     class PomaiDB

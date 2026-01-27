@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <cstring>
 
 // This main provides a simple, safe signal handling pattern:
@@ -62,10 +63,12 @@ static pomai::server::ServerConfig LoadConfigOrDefault(const std::string &path)
     cfg.shard_queue_capacity = 65536;
     cfg.default_dim = 128;
 
+    // NEW: default server-level policy for allowing per-append synchronous fdatasync
+    cfg.allow_sync_on_append = true;
+
     if (std::filesystem::exists(path))
     {
         // If you have a YAML config parser in-tree, use it instead.
-        // For now we only print the path we attempted to load.
         std::cout << "[init] Loading config from: " << path << "\n";
         // TODO: hook into your real parser here, e.g. cfg = ParseConfig(path);
     }
@@ -73,6 +76,8 @@ static pomai::server::ServerConfig LoadConfigOrDefault(const std::string &path)
     {
         std::cout << "[init] Config file not found: " << path << " — using defaults\n";
     }
+
+    std::cout << "[init] allow_sync_on_append = " << (cfg.allow_sync_on_append ? "true" : "false") << "\n";
 
     return cfg;
 }

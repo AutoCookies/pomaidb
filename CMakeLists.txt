@@ -67,4 +67,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests")
 
     add_executable(wal_replay_inspect tests/wal_replay_inspect.cpp)
     target_link_libraries(wal_replay_inspect pomai_core)
+
+    add_executable(pomai_db_writer tests/pomai_db_writer.cpp)
+    target_link_libraries(pomai_db_writer pomai_core)
 endif()

@@ -95,12 +95,30 @@ namespace pomai
 
     std::future<Lsn> PomaiDB::Upsert(Id id, Vector vec, bool wait_durable)
     {
-        return membrane_->Upsert(id, std::move(vec), wait_durable);
+        // Enforce collection-level policy: if the collection disallows sync-on-append,
+        // ignore client's request for synchronous durability.
+        bool effective_wait = wait_durable && opt_.allow_sync_on_append;
+        if (log_info_)
+        {
+            // Optional debug log; keep concise in production
+            // log_info_("Upsert: client_wait=" + std::to_string(wait_durable) +
+            //           " effective_wait=" + std::to_string(effective_wait));
+        }
+        return membrane_->Upsert(id, std::move(vec), effective_wait);
     }
 
     std::future<Lsn> PomaiDB::UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable)
     {
-        return membrane_->UpsertBatch(std::move(batch), wait_durable);
+        // Enforce collection-level policy as above.
+        bool effective_wait = wait_durable && opt_.allow_sync_on_append;
+        if (log_info_)
+        {
+            // Optional debug log
+            // log_info_("UpsertBatch: client_wait=" + std::to_string(wait_durable) +
+            //           " effective_wait=" + std::to_string(effective_wait) +
+            //           " batch_size=" + std::to_string(batch.size()));
+        }
+        return membrane_->UpsertBatch(std::move(batch), effective_wait);
     }
 
     SearchResponse PomaiDB::Search(const SearchRequest &req) const

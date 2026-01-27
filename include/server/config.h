@@ -35,6 +35,7 @@ namespace pomai::server
         std::string log_level{"info"};
 
         WhisperConfig whisper;
+        bool allow_sync_on_append{true};
     };
 
     ServerConfig LoadConfigFile(const std::string &path);
