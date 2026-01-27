@@ -1,5 +1,5 @@
-#include "pomai/wal.h"
-#include "pomai/seed.h"
+#include "wal.h"
+#include "seed.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>

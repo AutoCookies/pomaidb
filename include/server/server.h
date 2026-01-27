@@ -5,9 +5,9 @@
 #include <string>
 #include <unordered_map>
 
-#include "pomai/pomai_db.h"
-#include "pomai/server/config.h"
-#include "pomai/server/logger.h"
+#include "pomai_db.h"
+#include "server/config.h"
+#include "server/logger.h"
 
 namespace pomai::server
 {

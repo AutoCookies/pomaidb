@@ -6,6 +6,7 @@
 
 #include "membrane.h"
 #include "types.h"
+#include "server/config.h"
 
 namespace pomai
 {
@@ -16,8 +17,8 @@ namespace pomai
         Metric metric{Metric::Cosine};
         std::size_t shards{4};
         std::size_t shard_queue_capacity{1024};
-
         std::string wal_dir{"./data"};
+        pomai::server::WhisperConfig whisper;
     };
 
     class PomaiDB
@@ -39,4 +40,4 @@ namespace pomai
         std::unique_ptr<MembraneRouter> membrane_;
     };
 
-} // namespace pomai
+}

@@ -1,4 +1,4 @@
-#include "pomai/pomai_db.h"
+#include "pomai_db.h"
 #include <sstream>
 #include <utility>
 
@@ -19,11 +19,10 @@ namespace pomai
                 ss.str(),
                 opt_.dim,
                 opt_.shard_queue_capacity,
-                opt_.wal_dir 
-                ));
+                opt_.wal_dir));
         }
 
-        membrane_ = std::make_unique<MembraneRouter>(std::move(shards));
+        membrane_ = std::make_unique<MembraneRouter>(std::move(shards), opt_.whisper);
     }
 
     void PomaiDB::Start() { membrane_->Start(); }
@@ -49,4 +48,4 @@ namespace pomai
         return membrane_->TotalApproxCountUnsafe();
     }
 
-} // namespace pomai
+}

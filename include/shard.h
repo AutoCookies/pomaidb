@@ -9,7 +9,9 @@
 #include "bounded_queue.h"
 #include "seed.h"
 #include "wal.h"
-
+#include "types.h"
+#include "orbit_index.h"
+#include "whispergrain.h"
 namespace pomai
 {
 
@@ -23,7 +25,6 @@ namespace pomai
     class Shard
     {
     public:
-        // ✅ wal_dir is required now
         Shard(std::string name, std::size_t dim, std::size_t queue_cap, std::string wal_dir);
         ~Shard();
 
@@ -35,14 +36,14 @@ namespace pomai
 
         std::future<Lsn> EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable);
 
-        // Safe read: uses published snapshot.
-        SearchResponse Search(const SearchRequest &req) const;
+        SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
 
         std::size_t ApproxCountUnsafe() const;
 
     private:
         void RunLoop();
         void PublishSnapshot();
+        void TryBuildIndex();
 
         std::string name_;
         std::string wal_dir_;
@@ -52,12 +53,14 @@ namespace pomai
         BoundedQueue<UpsertTask> ingest_q_;
         std::thread owner_;
 
-        // Published immutable read view (RCU-like).
-        std::atomic<std::shared_ptr<const Seed::Store>> published_{nullptr};
+        std::atomic<std::shared_ptr<const SeedSnapshot>> published_{nullptr};
+        std::atomic<std::shared_ptr<pomai::core::OrbitIndex>> index_{nullptr};
 
-        // Publish every N batches (tune later).
         std::size_t batch_since_publish_{0};
-        static constexpr std::size_t kPublishEvery = 64;
+        static constexpr std::size_t kPublishEvery = 10;
+
+        std::size_t last_index_build_size_{0};
+        static constexpr std::size_t kIndexBuildThreshold = 5000;
     };
 
-} // namespace pomai
+}

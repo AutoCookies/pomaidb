@@ -1,9 +1,9 @@
-#include "pomai/server/server.h"
-#include "pomai/server/protocol.h"
+#include "server/server.h"
+#include "server/protocol.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h> // TCP_NODELAY
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>

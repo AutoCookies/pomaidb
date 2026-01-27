@@ -1,9 +1,23 @@
-#include "pomai/server/config.h"
-#include "pomai/server/logger.h"
-#include "pomai/server/server.h"
+#include "server/config.h"
+#include "server/logger.h"
+#include "server/server.h"
 
 #include <iostream>
 #include <string>
+
+static void PrintBanner()
+{
+    // ASCII Art: ANSI Shadow font
+    std::cout << R"(
+  ____  ____  __  __    _    ___ 
+ |  _ \|  _ \|  \/  |  / \  |_ _|
+ | |_) | | | | |\/| | / _ \  | | 
+ |  __/| |_| | |  | |/ ___ \ | | 
+ |_|   |____/|_|  |_/_/   \_\___|
+
+ :: Pomai Vector DB ::   (v0.1.0-alpha)
+    )" << std::endl;
+}
 
 static pomai::server::LogLevel ParseLevel(const std::string &s)
 {
@@ -21,6 +35,8 @@ static pomai::server::LogLevel ParseLevel(const std::string &s)
 
 int main(int argc, char **argv)
 {
+    PrintBanner();
+
     std::string config_path = "config/pomai.yaml";
 
     for (int i = 1; i < argc; ++i)
@@ -30,6 +46,8 @@ int main(int argc, char **argv)
             config_path = argv[++i];
     }
 
+    std::cout << "[init] Loading config from: " << config_path << std::endl;
+
     pomai::server::ServerConfig cfg;
     try
     {
@@ -37,7 +55,7 @@ int main(int argc, char **argv)
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Failed to load config: " << e.what() << "\n";
+        std::cerr << "[error] Failed to load config: " << e.what() << "\n";
         return 1;
     }
 
@@ -46,6 +64,8 @@ int main(int argc, char **argv)
     log.SetLevel(ParseLevel(cfg.log_level));
 
     pomai::server::PomaiServer server(cfg, &log);
+
+    // Start blocking
     if (!server.Start())
         return 1;
 

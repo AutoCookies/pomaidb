@@ -1,4 +1,4 @@
-#include "pomai/server/config.h"
+#include "server/config.h"
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -20,9 +20,17 @@ namespace pomai::server
     ServerConfig LoadConfigFile(const std::string &path)
     {
         ServerConfig cfg;
+
+        // --- TUNING MẶC ĐỊNH MỚI (HIGH RECALL) ---
+        cfg.whisper.base_budget_ops = 30000; // Tăng gấp 3 (cũ 10k) để quét sâu hơn
+        cfg.whisper.min_budget_ops = 5000;   // Đáy cứng cao hơn
+        cfg.whisper.budget_headroom = 10.0f; // Cho phép bung lụa khi CPU rảnh
+        // ------------------------------------------
+
         std::ifstream in(path);
         if (!in)
-            throw std::runtime_error("cannot open config: " + path);
+            // Nếu không có file config, trả về default đã tune ở trên
+            return cfg;
 
         std::string line;
         while (std::getline(in, line))
@@ -38,7 +46,6 @@ namespace pomai::server
             std::string key = Trim(line.substr(0, pos));
             std::string val = Trim(line.substr(pos + 1));
 
-            // Remove optional quotes
             if (!val.empty() && val.front() == '"' && val.back() == '"' && val.size() >= 2)
             {
                 val = val.substr(1, val.size() - 2);
@@ -52,24 +59,29 @@ namespace pomai::server
                 cfg.listen_port = static_cast<std::uint16_t>(std::stoul(val));
             else if (key == "unix_socket")
                 cfg.unix_socket = val;
-
             else if (key == "shards")
                 cfg.shards = static_cast<std::size_t>(std::stoull(val));
             else if (key == "shard_queue_capacity")
                 cfg.shard_queue_capacity = static_cast<std::size_t>(std::stoull(val));
-
             else if (key == "default_dim")
                 cfg.default_dim = static_cast<std::size_t>(std::stoull(val));
             else if (key == "default_metric")
                 cfg.default_metric = val;
-
             else if (key == "log_path")
                 cfg.log_path = val;
             else if (key == "log_level")
                 cfg.log_level = val;
+
+            // Whisper Config Override
+            else if (key == "whisper_latency_target_ms")
+                cfg.whisper.latency_target_ms = std::stof(val);
+            else if (key == "whisper_base_ops")
+                cfg.whisper.base_budget_ops = static_cast<std::uint32_t>(std::stoul(val));
+            else if (key == "whisper_min_ops")
+                cfg.whisper.min_budget_ops = static_cast<std::uint32_t>(std::stoul(val));
         }
 
         return cfg;
     }
 
-} // namespace pomai::server
+}
