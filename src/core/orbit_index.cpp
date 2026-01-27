@@ -152,18 +152,39 @@ namespace pomai::core
     void OrbitIndex::Prune(uint32_t node_idx)
     {
         auto &links = graph_[node_idx];
+
+        // Nếu số lượng kết nối chưa vượt quá giới hạn -> Không làm gì cả
+        // Giữ graph dày nhất có thể trong quá trình build
+        if (links.size() <= M_)
+            return;
+
         const float *vec = data_.data() + node_idx * dim_;
 
+        // 1. Sắp xếp tất cả theo khoảng cách tăng dần
         std::sort(links.begin(), links.end(), [&](uint32_t a, uint32_t b)
                   {
             float da = kernels::L2Sqr(vec, data_.data() + a * dim_, dim_);
             float db = kernels::L2Sqr(vec, data_.data() + b * dim_, dim_);
             return da < db; });
 
-        if (links.size() > M_)
+        // 2. CHIẾN THUẬT BẢO VỆ CAO TỐC (Highway Protection)
+        // Ta giữ lại M_ kết nối.
+        // - 50% đầu tiên: Giữ những thằng gần nhất (Local Cluster).
+        // - 50% còn lại: Random hóa để giữ lại các kết nối xa (Global Navigation).
+
+        size_t keep_closest = M_ / 2;
+
+        // Đoạn từ [keep_closest ... end] sẽ được xáo trộn ngẫu nhiên
+        // Để khi ta resize về M_, ta sẽ giữ lại một số thằng ở xa ngẫu nhiên
+        if (keep_closest < links.size())
         {
-            links.resize(M_);
+            // Dùng default_random_engine nhẹ nhàng
+            static thread_local std::minstd_rand g_rng(std::random_device{}());
+            std::shuffle(links.begin() + keep_closest, links.end(), g_rng);
         }
+
+        // 3. Cắt về kích thước chuẩn
+        links.resize(M_);
     }
 
     std::vector<uint32_t> OrbitIndex::FindNeighbors(const float *vec, size_t ef, uint32_t skip_id,

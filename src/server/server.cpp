@@ -6,15 +6,24 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h> // Header cho Unix Domain Sockets
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <cerrno>
 #include <cstring>
 #include <vector>
+#include <thread>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+
+namespace fs = std::filesystem;
 
 namespace pomai::server
 {
 
+    // --- Static Helpers ---
     static bool ReadExact(int fd, void *buf, std::size_t n)
     {
         auto *p = reinterpret_cast<std::uint8_t *>(buf);
@@ -41,7 +50,8 @@ namespace pomai::server
         std::size_t sent = 0;
         while (sent < n)
         {
-            ssize_t w = ::send(fd, p + sent, n - sent, 0);
+            // MSG_NOSIGNAL để tránh crash process khi client ngắt kết nối
+            ssize_t w = ::send(fd, p + sent, n - sent, MSG_NOSIGNAL);
             if (w <= 0)
             {
                 if (w < 0 && errno == EINTR)
@@ -52,6 +62,8 @@ namespace pomai::server
         }
         return true;
     }
+
+    // --- Server Implementation ---
 
     bool PomaiServer::EnsureDir(const std::string &path)
     {
@@ -77,11 +89,68 @@ namespace pomai::server
             return false;
         }
 
+        // 1. Recover Data from Disk
+        LoadCatalog();
+
+        // 2. Setup Unix Domain Socket (IPC) - High Performance Local
+        if (!cfg_.unix_socket.empty())
+        {
+            // Xóa socket file cũ nếu còn sót lại
+            ::unlink(cfg_.unix_socket.c_str());
+
+            ipc_fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+            if (ipc_fd_ < 0)
+            {
+                if (log_)
+                    log_->Error("IPC socket creation failed: " + std::string(std::strerror(errno)));
+            }
+            else
+            {
+                sockaddr_un addr_un{};
+                addr_un.sun_family = AF_UNIX;
+                // Copy path an toàn
+                std::strncpy(addr_un.sun_path, cfg_.unix_socket.c_str(), sizeof(addr_un.sun_path) - 1);
+
+                if (::bind(ipc_fd_, (sockaddr *)&addr_un, sizeof(addr_un)) != 0)
+                {
+                    if (log_)
+                        log_->Error("IPC bind failed: " + cfg_.unix_socket + " (" + std::strerror(errno) + ")");
+                    ::close(ipc_fd_);
+                    ipc_fd_ = -1;
+                }
+                else
+                {
+                    // Set permission rộng rãi để dễ dev (777)
+                    // Trong production nên dùng 660 và group ownership
+                    ::chmod(cfg_.unix_socket.c_str(), 0777);
+
+                    if (::listen(ipc_fd_, 128) != 0)
+                    {
+                        if (log_)
+                            log_->Error("IPC listen failed");
+                        ::close(ipc_fd_);
+                        ipc_fd_ = -1;
+                    }
+                    else
+                    {
+                        if (log_)
+                            log_->Info("IPC Listening on " + cfg_.unix_socket);
+                        // Chạy AcceptLoopIPC trên thread riêng
+                        std::thread([this]()
+                                    { this->AcceptLoopIPC(); })
+                            .detach();
+                    }
+                }
+            }
+        }
+
+        // 3. Setup TCP Socket - Remote Access
         listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd_ < 0)
         {
             if (log_)
-                log_->Error("socket failed: " + std::string(std::strerror(errno)));
+                log_->Error("TCP socket failed: " + std::string(std::strerror(errno)));
+            // Nếu TCP lỗi nhưng IPC chạy thì vẫn OK? Thôi cứ coi như lỗi nghiêm trọng.
             running_ = false;
             return false;
         }
@@ -108,7 +177,7 @@ namespace pomai::server
             return false;
         }
 
-        if (listen(listen_fd_, 1) != 0)
+        if (listen(listen_fd_, 128) != 0)
         {
             if (log_)
                 log_->Error("listen failed: " + std::string(std::strerror(errno)));
@@ -117,11 +186,10 @@ namespace pomai::server
         }
 
         if (log_)
-        {
-            log_->Info("PomaiServer listening on " + cfg_.listen_host + ":" + std::to_string(cfg_.listen_port));
-        }
+            log_->Info("TCP Listening on " + cfg_.listen_host + ":" + std::to_string(cfg_.listen_port));
 
-        AcceptOnce();
+        // Chạy AcceptLoop TCP trên thread hiện tại (blocking main thread)
+        AcceptLoop();
         return true;
     }
 
@@ -130,46 +198,238 @@ namespace pomai::server
         if (!running_.exchange(false))
             return;
 
+        // Đóng TCP Socket
         if (listen_fd_ >= 0)
         {
+            ::shutdown(listen_fd_, SHUT_RDWR);
             ::close(listen_fd_);
             listen_fd_ = -1;
         }
 
-        for (auto &kv : cols_)
+        // Đóng IPC Socket
+        if (ipc_fd_ >= 0)
         {
-            if (kv.second.db)
-                kv.second.db->Stop();
+            ::shutdown(ipc_fd_, SHUT_RDWR);
+            ::close(ipc_fd_);
+            ipc_fd_ = -1;
+            // Xóa file socket khi tắt server
+            if (!cfg_.unix_socket.empty())
+            {
+                ::unlink(cfg_.unix_socket.c_str());
+            }
         }
-        cols_.clear();
+
+        // Chờ Client thoát
+        int retries = 50;
+        while (active_connections_ > 0 && retries-- > 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+
+        // Dọn dẹp DB Resources
+        {
+            std::lock_guard<std::mutex> lk(cols_mu_);
+            for (auto &kv : cols_)
+            {
+                if (kv.second.db)
+                    kv.second.db->Stop();
+            }
+            cols_.clear();
+            name_to_id_.clear();
+        }
 
         if (log_)
             log_->Info("PomaiServer stopped");
     }
 
-    void PomaiServer::AcceptOnce()
+    void PomaiServer::LoadCatalog()
     {
-        int c = ::accept(listen_fd_, nullptr, nullptr);
-        if (c < 0)
+        if (log_)
+            log_->Info("Scanning catalog in: " + cfg_.data_dir);
+
+        for (const auto &entry : fs::directory_iterator(cfg_.data_dir))
         {
+            if (!entry.is_directory())
+                continue;
+
+            std::string name = entry.path().filename().string();
+            std::string meta_path = entry.path().string() + "/meta.bin";
+
+            if (!fs::exists(meta_path))
+                continue;
+
+            std::ifstream in(meta_path, std::ios::binary);
+            if (!in)
+                continue;
+
+            uint16_t dim;
+            uint8_t metric_u8;
+            uint32_t shards;
+            uint32_t cap;
+
+            in.read((char *)&dim, 2);
+            in.read((char *)&metric_u8, 1);
+            in.read((char *)&shards, 4);
+            in.read((char *)&cap, 4);
+
+            if (!in)
+            {
+                if (log_)
+                    log_->Error("Corrupt meta for collection: " + name);
+                continue;
+            }
+
+            pomai::DbOptions opt;
+            opt.dim = dim;
+            opt.metric = (metric_u8 == 0) ? pomai::Metric::L2 : pomai::Metric::Cosine;
+            opt.shards = shards;
+            opt.shard_queue_capacity = cap;
+            opt.wal_dir = entry.path().string();
+
             if (log_)
-                log_->Error("accept failed: " + std::string(std::strerror(errno)));
-            return;
+                log_->Info("Recovering collection: " + name + " (dim=" + std::to_string(dim) + ")");
+
+            auto db = std::make_shared<pomai::PomaiDB>(opt);
+            db->Start();
+
+            std::lock_guard<std::mutex> lk(cols_mu_);
+            std::uint32_t id = next_col_id_++;
+            cols_[id] = Col{name, dim, opt.metric, db};
+            name_to_id_[name] = id;
         }
-
-        // Critical fix: disable Nagle on the accepted socket.
-        int yes = 1;
-        ::setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-
-        if (log_)
-            log_->Info("Client connected (single-user)");
-
-        ClientLoop(c);
-
-        ::close(c);
-        if (log_)
-            log_->Info("Client disconnected");
     }
+
+    void PomaiServer::SaveCollectionMeta(const std::string &name, const DbOptions &opt)
+    {
+        std::string path = opt.wal_dir + "/meta.bin";
+        std::ofstream out(path, std::ios::binary);
+        if (!out)
+            return;
+
+        uint16_t dim = opt.dim;
+        uint8_t metric_u8 = (opt.metric == pomai::Metric::L2) ? 0 : 1;
+        uint32_t shards = (uint32_t)opt.shards;
+        uint32_t cap = (uint32_t)opt.shard_queue_capacity;
+
+        out.write((const char *)&dim, 2);
+        out.write((const char *)&metric_u8, 1);
+        out.write((const char *)&shards, 4);
+        out.write((const char *)&cap, 4);
+        out.flush();
+    }
+
+    // --- TCP Accept Loop ---
+    void PomaiServer::AcceptLoop()
+    {
+        while (running_)
+        {
+            sockaddr_in client_addr{};
+            socklen_t len = sizeof(client_addr);
+            int client_fd = ::accept(listen_fd_, (sockaddr *)&client_addr, &len);
+
+            if (client_fd < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                if (!running_)
+                    break;
+                if (log_)
+                    log_->Error("TCP accept failed: " + std::string(std::strerror(errno)));
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            if (active_connections_ >= MAX_CONNECTIONS)
+            {
+                if (log_)
+                    log_->Warn("Max connections reached. Rejecting TCP client.");
+                ::close(client_fd);
+                continue;
+            }
+
+            // TCP Optimize
+            int yes = 1;
+            ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+
+            active_connections_++;
+            std::thread([this, client_fd]()
+                        { this->ClientSession(client_fd); })
+                .detach();
+        }
+    }
+
+    // --- IPC (Unix Domain Socket) Accept Loop ---
+    void PomaiServer::AcceptLoopIPC()
+    {
+        while (running_)
+        {
+            int client_fd = ::accept(ipc_fd_, nullptr, nullptr);
+            if (client_fd < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                if (!running_)
+                    break;
+                // Không log lỗi quá nhiều ở loop phụ
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            if (active_connections_ >= MAX_CONNECTIONS)
+            {
+                // Backpressure
+                ::close(client_fd);
+                continue;
+            }
+
+            active_connections_++;
+            // Spawn thread xử lý y hệt như TCP, chỉ khác là không cần set TCP_NODELAY
+            std::thread([this, client_fd]()
+                        { this->ClientSession(client_fd); })
+                .detach();
+        }
+    }
+
+    void PomaiServer::ClientSession(int fd)
+    {
+        struct Guard
+        {
+            PomaiServer *s;
+            int fd;
+            ~Guard()
+            {
+                ::close(fd);
+                s->active_connections_--;
+            }
+        } guard{this, fd};
+
+        if (log_)
+            log_->Debug("Client connected. Active: " + std::to_string(active_connections_));
+
+        std::vector<std::uint8_t> payload, out_payload;
+        while (running_)
+        {
+            if (!ReadFrame(fd, payload))
+                break;
+
+            out_payload.clear();
+            try
+            {
+                HandlePayload(payload, out_payload);
+            }
+            catch (const std::exception &e)
+            {
+                if (log_)
+                    log_->Error(std::string("Exception in handler: ") + e.what());
+                break;
+            }
+
+            if (!WriteFrame(fd, out_payload))
+                break;
+        }
+    }
+
+    // --- Protocol Implementations ---
 
     bool PomaiServer::ReadFrame(int fd, std::vector<std::uint8_t> &payload)
     {
@@ -178,7 +438,7 @@ namespace pomai::server
             return false;
 
         std::uint32_t len = LoadU32LE(len_le);
-        if (len == 0 || len > 256u * 1024u * 1024u)
+        if (len == 0 || len > 64 * 1024 * 1024)
             return false;
 
         payload.resize(len);
@@ -246,7 +506,6 @@ namespace pomai::server
         std::string name;
         std::uint16_t dim = 0;
         std::uint8_t metric_u8 = 1;
-
         std::uint32_t shards = (std::uint32_t)cfg_.shards;
         std::uint32_t cap = (std::uint32_t)cfg_.shard_queue_capacity;
 
@@ -255,30 +514,41 @@ namespace pomai::server
             RespErr(out_payload, "bad create payload");
             return true;
         }
-
-        // Optional overrides if present
         rd.ReadU32(shards);
         rd.ReadU32(cap);
 
         if (dim == 0)
             dim = (std::uint16_t)cfg_.default_dim;
 
+        // Check exists
+        std::lock_guard<std::mutex> lk(cols_mu_);
+        if (name_to_id_.count(name))
+        {
+            uint32_t existing_id = name_to_id_[name];
+            Buf b;
+            PutU8(b, 1);
+            PutU32(b, existing_id);
+            out_payload = std::move(b.data);
+            return true;
+        }
+
         pomai::DbOptions opt;
         opt.dim = dim;
         opt.metric = (metric_u8 == 0) ? pomai::Metric::L2 : pomai::Metric::Cosine;
         opt.shards = shards ? (std::size_t)shards : (std::size_t)cfg_.shards;
         opt.shard_queue_capacity = cap ? (std::size_t)cap : (std::size_t)cfg_.shard_queue_capacity;
-
-        // Important: put WAL under data_dir/<collection_name>
-        // Keep it simple and deterministic.
         opt.wal_dir = cfg_.data_dir + "/" + name;
         (void)EnsureDir(opt.wal_dir);
+
+        // SAVE META
+        SaveCollectionMeta(name, opt);
 
         auto db = std::make_shared<pomai::PomaiDB>(opt);
         db->Start();
 
         std::uint32_t id = next_col_id_++;
-        cols_[id] = Col{dim, opt.metric, db};
+        cols_[id] = Col{name, dim, opt.metric, db};
+        name_to_id_[name] = id;
 
         Buf b;
         PutU8(b, 1);
@@ -286,12 +556,7 @@ namespace pomai::server
         out_payload = std::move(b.data);
 
         if (log_)
-        {
-            log_->Info("Created collection '" + name + "' id=" + std::to_string(id) +
-                       " dim=" + std::to_string(dim) +
-                       " shards=" + std::to_string(opt.shards) +
-                       " wal_dir=" + opt.wal_dir);
-        }
+            log_->Info("Created collection '" + name + "' id=" + std::to_string(id));
         return true;
     }
 
@@ -308,17 +573,23 @@ namespace pomai::server
             return true;
         }
 
-        auto it = cols_.find(col_id);
-        if (it == cols_.end())
+        std::shared_ptr<pomai::PomaiDB> db;
         {
-            RespErr(out_payload, "collection not found");
-            return true;
+            std::lock_guard<std::mutex> lk(cols_mu_);
+            auto it = cols_.find(col_id);
+            if (it == cols_.end())
+            {
+                RespErr(out_payload, "collection not found");
+                return true;
+            }
+            if (it->second.dim != dim)
+            {
+                RespErr(out_payload, "dim mismatch");
+                return true;
+            }
+            db = it->second.db;
         }
-        if (it->second.dim != dim)
-        {
-            RespErr(out_payload, "dim mismatch");
-            return true;
-        }
+
         if (n == 0)
         {
             RespErr(out_payload, "empty batch");
@@ -340,7 +611,6 @@ namespace pomai::server
             return true;
         }
 
-        // Still allocates per item. Next step is UpsertBatchRaw to remove this.
         std::vector<pomai::UpsertRequest> batch;
         batch.reserve(n);
         for (std::uint32_t i = 0; i < n; ++i)
@@ -354,7 +624,7 @@ namespace pomai::server
 
         try
         {
-            auto fut = it->second.db->UpsertBatch(std::move(batch), true);
+            auto fut = db->UpsertBatch(std::move(batch), true);
             pomai::Lsn lsn = fut.get();
 
             Buf b;
@@ -383,16 +653,21 @@ namespace pomai::server
             return true;
         }
 
-        auto it = cols_.find(col_id);
-        if (it == cols_.end())
+        std::shared_ptr<pomai::PomaiDB> db;
         {
-            RespErr(out_payload, "collection not found");
-            return true;
-        }
-        if (it->second.dim != dim)
-        {
-            RespErr(out_payload, "dim mismatch");
-            return true;
+            std::lock_guard<std::mutex> lk(cols_mu_);
+            auto it = cols_.find(col_id);
+            if (it == cols_.end())
+            {
+                RespErr(out_payload, "collection not found");
+                return true;
+            }
+            if (it->second.dim != dim)
+            {
+                RespErr(out_payload, "dim mismatch");
+                return true;
+            }
+            db = it->second.db;
         }
 
         std::vector<float> q(dim);
@@ -406,7 +681,7 @@ namespace pomai::server
         req.topk = topk;
         req.query.data = std::move(q);
 
-        pomai::SearchResponse resp = it->second.db->Search(req);
+        pomai::SearchResponse resp = db->Search(req);
 
         Buf b;
         PutU8(b, 1);
@@ -418,20 +693,6 @@ namespace pomai::server
 
         out_payload = std::move(b.data);
         return true;
-    }
-
-    void PomaiServer::ClientLoop(int fd)
-    {
-        std::vector<std::uint8_t> payload, out_payload;
-        while (running_)
-        {
-            if (!ReadFrame(fd, payload))
-                break;
-            out_payload.clear();
-            HandlePayload(payload, out_payload);
-            if (!WriteFrame(fd, out_payload))
-                break;
-        }
     }
 
 } // namespace pomai::server

@@ -1,47 +1,56 @@
 cmake_minimum_required(VERSION 3.10)
-project(pomai CXX C)
+project(pomai)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# --- 1. PERFORMANCE FLAGS (CRITICAL FOR AVX2) ---
-# Tự động phát hiện kiến trúc CPU (Haswell, Skylake, etc.) để bật AVX2/AVX-512
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    # -march=native: Bật tất cả tập lệnh mà CPU hiện tại hỗ trợ (AVX2, FMA, SSE4.2...)
-    # -O3: Tối ưu hóa tối đa
-    add_compile_options(-march=native -O3 -Wall -Wextra -pthread)
-elseif(MSVC)
-    add_compile_options(/O2 /arch:AVX2)
+# --- 1. TÌM THƯ VIỆN THREADS TRƯỚC (QUAN TRỌNG) ---
+find_package(Threads REQUIRED)
+
+# --- 2. CẤU HÌNH COMPILER ---
+if(CMAKE_BUILD_TYPE MATCHES Release)
+    add_compile_options(-O3 -march=native -ffast-math -funroll-loops)
+else()
+    add_compile_options(-O0 -g)
 endif()
 
-# --- 2. INCLUDE PATHS ---
-# Vì bạn đã chuyển file header vào cùng source hoặc ra ngoài include/pomai
-# Ta thêm trực tiếp các thư mục src vào đường dẫn tìm header.
 include_directories(
-    src
-    src/core
-    include # Fallback nếu vẫn còn file trong này
+    include       
+    src 
+    src/core 
+    src/server 
+    .
 )
 
-# --- 3. SOURCE FILES ---
-# Quét toàn bộ file source. 
-# Lưu ý: Trong Production lớn, ta nên liệt kê từng file. 
-# Nhưng với Pomai hiện tại, GLOB_RECURSE giúp bạn refactor file thoải mái không cần sửa cmake.
-file(GLOB_RECURSE SOURCES 
-    "src/*.cpp" 
-    "src/*.cc" 
-    "src/*.c"
+# ==========================================
+# 3. CORE LIBRARY (Embedded Mode)
+# ==========================================
+file(GLOB CORE_SOURCES 
+    "src/core/*.cpp"
+    "src/core/crc64.c"
 )
 
-# --- 4. EXECUTABLE ---
-add_executable(pomai-server ${SOURCES})
+# Tạo thư viện tĩnh
+add_library(pomai_core STATIC ${CORE_SOURCES})
+# Link Threads vào Core (Lúc này Threads::Threads đã được tìm thấy ở bước 1)
+target_link_libraries(pomai_core Threads::Threads)
 
-# Link thư viện (nếu cần, hiện tại pthread đã được add qua compile options)
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_link_libraries(pomai-server atomic) 
+# ==========================================
+# 4. SERVER DAEMON
+# ==========================================
+file(GLOB SERVER_SOURCES 
+    "src/server/*.cpp"
+)
+
+add_executable(pomai-server ${SERVER_SOURCES})
+# Link Server với Core
+target_link_libraries(pomai-server pomai_core)
+
+# ==========================================
+# 5. EMBEDDED BENCHMARK
+# ==========================================
+# Kiểm tra nếu file tồn tại thì mới build benchmark
+if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_embedded.cpp")
+    add_executable(bench_embedded benchmarks/bench_embedded.cpp)
+    target_link_libraries(bench_embedded pomai_core)
 endif()
-
-message(STATUS "Pomai Build Configured.")
-message(STATUS "  - AVX2/FMA: Auto-enabled via -march=native")
-message(STATUS "  - Sources found: ${SOURCES}")

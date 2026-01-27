@@ -16,7 +16,7 @@ namespace pomai::core
     {
     public:
         // M=48, ef=100 là cấu hình tốt.
-        explicit OrbitIndex(std::size_t dim, std::size_t M = 48, std::size_t ef_construction = 100);
+        explicit OrbitIndex(std::size_t dim, std::size_t M = 48, std::size_t ef_construction = 200);
 
         void InsertBatch(const std::vector<float> &new_data, const std::vector<Id> &new_ids);
         SearchResponse Search(const Vector &query, const pomai::ai::Budget &budget) const;

@@ -1,5 +1,6 @@
 #include "wal.h"
 #include "seed.h"
+#include "crc64.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -8,6 +9,8 @@
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
+#include <iostream>
 
 namespace pomai
 {
@@ -89,6 +92,7 @@ namespace pomai
     {
         EnsureDirExists(wal_dir_);
 
+        // O_APPEND đảm bảo atomicity ở mức OS khi ghi vào cuối file
         fd_ = ::open(wal_path_.c_str(),
                      O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC,
                      0644);
@@ -109,6 +113,10 @@ namespace pomai
     {
         if (running_.exchange(true))
             return;
+
+        // Khởi tạo bảng CRC64 ngay khi start
+        crc64_init();
+
         OpenOrCreateForAppend();
         fsync_th_ = std::thread(&Wal::FsyncLoop, this);
     }
@@ -122,7 +130,6 @@ namespace pomai
         if (fsync_th_.joinable())
             fsync_th_.join();
 
-        // final flush
         if (fd_ >= 0)
             ::fdatasync(fd_);
         CloseFd();
@@ -133,6 +140,7 @@ namespace pomai
         if (batch.empty())
             return 0;
 
+        // Lấy LSN tiếp theo
         Lsn lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed);
 
         std::lock_guard<std::mutex> lk(mu_);
@@ -154,36 +162,61 @@ namespace pomai
                  { return !running_.load() || durable_lsn_ >= lsn; });
     }
 
+    // Ghi với Checksum CRC64
     void Wal::WriteRecordLocked(Lsn lsn, const std::vector<UpsertRequest> &batch)
     {
-        for (const auto &it : batch)
-        {
-            if (it.vec.data.size() != dim_)
-                throw std::runtime_error("WAL dim mismatch in batch");
-        }
+        // 1. Tính toán kích thước Payload
+        // Payload Structure:
+        // [LSN (8)] + [Count (4)] + [Dim (2)] + N * ( [ID (8)] + [VectorData (Dim*4)] )
 
         const std::uint32_t count = (std::uint32_t)batch.size();
         const std::uint16_t dim16 = (std::uint16_t)dim_;
 
-        // body bytes (excluding rec_bytes field)
-        const std::uint32_t body_bytes =
-            (std::uint32_t)(sizeof(std::uint64_t) + sizeof(std::uint32_t) + sizeof(std::uint16_t) +
-                            count * (sizeof(std::uint64_t) + (std::uint32_t)dim_ * sizeof(float)));
+        const std::size_t payload_size =
+            sizeof(uint64_t) + // lsn
+            sizeof(uint32_t) + // count
+            sizeof(uint16_t) + // dim
+            count * (sizeof(uint64_t) + dim_ * sizeof(float));
 
-        // header: rec_bytes + lsn + count + dim
-        WriteAll(fd_, &body_bytes, sizeof(body_bytes));
-        const std::uint64_t lsn64 = (std::uint64_t)lsn;
-        WriteAll(fd_, &lsn64, sizeof(lsn64));
-        WriteAll(fd_, &count, sizeof(count));
-        WriteAll(fd_, &dim16, sizeof(dim16));
+        // 2. Serialize Payload vào Buffer tạm (Memory)
+        // Việc này tốn thêm 1 chút RAM nhưng đảm bảo tính toàn vẹn khi tính CRC
+        std::vector<uint8_t> payload_buf;
+        payload_buf.reserve(payload_size);
 
-        // items
+        // Helper để push data vào vector
+        auto push_val = [&](const void *ptr, size_t size)
+        {
+            const uint8_t *p = static_cast<const uint8_t *>(ptr);
+            payload_buf.insert(payload_buf.end(), p, p + size);
+        };
+
+        uint64_t lsn64 = (uint64_t)lsn;
+        push_val(&lsn64, sizeof(lsn64));
+        push_val(&count, sizeof(count));
+        push_val(&dim16, sizeof(dim16));
+
         for (const auto &it : batch)
         {
-            const std::uint64_t id64 = (std::uint64_t)it.id;
-            WriteAll(fd_, &id64, sizeof(id64));
-            WriteAll(fd_, it.vec.data.data(), dim_ * sizeof(float));
+            if (it.vec.data.size() != dim_)
+                throw std::runtime_error("WAL dim mismatch in batch write");
+
+            uint64_t id64 = (uint64_t)it.id;
+            push_val(&id64, sizeof(id64));
+            push_val(it.vec.data.data(), dim_ * sizeof(float));
         }
+
+        // 3. Tính CRC64 của Payload
+        uint64_t checksum = crc64(0, payload_buf.data(), payload_buf.size());
+
+        // 4. Chuẩn bị Header và Ghi xuống đĩa
+        WalRecordHeader header;
+        header.payload_size = (uint32_t)payload_size;
+        header.checksum = checksum;
+
+        // Ghi Header
+        WriteAll(fd_, &header, sizeof(header));
+        // Ghi Payload
+        WriteAll(fd_, payload_buf.data(), payload_buf.size());
     }
 
     void Wal::FsyncLoop()
@@ -213,81 +246,108 @@ namespace pomai
         }
     }
 
-    // ✅ Replay WAL into Seed
+    // Replay với tính năng Verify Checksum
     Lsn Wal::ReplayToSeed(Seed &seed)
     {
         if (seed.Dim() != dim_)
             throw std::runtime_error("Replay seed dim mismatch");
 
         if (!FileExists(wal_path_))
-        {
             return 0;
-        }
 
         int rfd = ::open(wal_path_.c_str(), O_RDONLY | O_CLOEXEC);
         if (rfd < 0)
             ThrowSys("open WAL for replay failed: " + wal_path_);
 
         Lsn last_lsn = 0;
+        size_t total_replayed = 0;
 
         while (true)
         {
-            std::uint32_t body_bytes = 0;
-            if (!ReadExact(rfd, &body_bytes, sizeof(body_bytes)))
-                break; // EOF clean
-
-            std::uint64_t lsn64 = 0;
-            std::uint32_t count = 0;
-            std::uint16_t dim16 = 0;
-
-            if (!ReadExact(rfd, &lsn64, sizeof(lsn64)))
-                break;
-            if (!ReadExact(rfd, &count, sizeof(count)))
-                break;
-            if (!ReadExact(rfd, &dim16, sizeof(dim16)))
-                break;
-
-            if ((std::size_t)dim16 != dim_)
+            // 1. Đọc Header
+            WalRecordHeader header;
+            if (!ReadExact(rfd, &header, sizeof(header)))
             {
-                ::close(rfd);
-                throw std::runtime_error("WAL replay dim mismatch in file: " + wal_path_);
+                // EOF sạch sẽ (hoặc file rỗng)
+                break;
             }
 
-            // read items
+            // Sanity Check: Payload size không được quá vô lý (vd > 64MB)
+            if (header.payload_size > 64 * 1024 * 1024)
+            {
+                std::cerr << "[WAL] Error: Record size too large (" << header.payload_size << "). Corruption detected. Stopping replay.\n";
+                break;
+            }
+
+            // 2. Đọc Payload vào buffer
+            std::vector<uint8_t> payload_buf(header.payload_size);
+            if (!ReadExact(rfd, payload_buf.data(), header.payload_size))
+            {
+                std::cerr << "[WAL] Error: Unexpected EOF reading payload. Truncated record detected. Stopping replay.\n";
+                break;
+            }
+
+            // 3. Verify Checksum
+            uint64_t calculated_crc = crc64(0, payload_buf.data(), header.payload_size);
+            if (calculated_crc != header.checksum)
+            {
+                std::cerr << "[WAL] Error: CRC Checksum Failed! Disk corrupted or partial write. Stopping replay.\n";
+                // Dừng replay tại đây để bảo vệ tính toàn vẹn dữ liệu
+                break;
+            }
+
+            // 4. Deserialize (Parse dữ liệu từ buffer)
+            const uint8_t *ptr = payload_buf.data();
+
+            uint64_t lsn64;
+            uint32_t count;
+            uint16_t dim16;
+
+            std::memcpy(&lsn64, ptr, sizeof(lsn64));
+            ptr += sizeof(lsn64);
+            std::memcpy(&count, ptr, sizeof(count));
+            ptr += sizeof(count);
+            std::memcpy(&dim16, ptr, sizeof(dim16));
+            ptr += sizeof(dim16);
+
+            if ((size_t)dim16 != dim_)
+            {
+                std::cerr << "[WAL] Error: Dimension mismatch in record. Stopping replay.\n";
+                break;
+            }
+
             std::vector<UpsertRequest> batch;
             batch.reserve(count);
+            std::vector<float> tmp_vec(dim_);
 
-            std::vector<float> tmp(dim_);
-            for (std::uint32_t i = 0; i < count; ++i)
+            for (uint32_t i = 0; i < count; ++i)
             {
-                std::uint64_t id64 = 0;
-                if (!ReadExact(rfd, &id64, sizeof(id64)))
-                {
-                    ::close(rfd);
-                    throw std::runtime_error("WAL truncated");
-                }
-                if (!ReadExact(rfd, tmp.data(), dim_ * sizeof(float)))
-                {
-                    ::close(rfd);
-                    throw std::runtime_error("WAL truncated");
-                }
-
                 UpsertRequest r;
+                uint64_t id64;
+
+                std::memcpy(&id64, ptr, sizeof(id64));
+                ptr += sizeof(id64);
+                std::memcpy(tmp_vec.data(), ptr, dim_ * sizeof(float));
+                ptr += dim_ * sizeof(float);
+
                 r.id = (Id)id64;
-                r.vec.data = tmp; // copy dim floats
+                r.vec.data = tmp_vec;
                 batch.push_back(std::move(r));
             }
 
+            // 5. Apply vào Memory
             seed.ApplyUpserts(batch);
             last_lsn = (Lsn)lsn64;
+            total_replayed++;
 
-            // Keep next_lsn in sync so new appends don’t reuse old LSN.
+            // Đồng bộ bộ đếm LSN
             Lsn want = last_lsn + 1;
             Lsn cur = next_lsn_.load(std::memory_order_relaxed);
             if (want > cur)
                 next_lsn_.store(want, std::memory_order_relaxed);
         }
 
+        std::cout << "[WAL] Replay finished. Records: " << total_replayed << ", Last LSN: " << last_lsn << "\n";
         ::close(rfd);
         return last_lsn;
     }
