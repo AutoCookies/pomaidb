@@ -63,6 +63,63 @@ namespace pomai::server
         return true;
     }
 
+    // Read exactly n bytes from a file descriptor (regular file). Returns false on EOF/error.
+    static bool ReadExactFd(int fd, void *buf, std::size_t n)
+    {
+        auto *p = reinterpret_cast<std::uint8_t *>(buf);
+        std::size_t got = 0;
+        while (got < n)
+        {
+            ssize_t r = ::read(fd, p + got, n - got);
+            if (r == 0)
+                return false;
+            if (r < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                return false;
+            }
+            got += (std::size_t)r;
+        }
+        return true;
+    }
+
+    // Try to infer vector dimension by reading the first WAL record header.
+    // WAL payload layout begins with: LSN (u64) | count (u32) | dim (u16)
+    // Returns 0 on failure or inferred dim (>0) on success.
+    static uint16_t InferDimFromWal(const std::string &wal_path)
+    {
+        int fd = ::open(wal_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+            return 0;
+
+        uint8_t header[sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t)];
+        bool ok = ReadExactFd(fd, header, sizeof(header));
+        ::close(fd);
+        if (!ok)
+            return 0;
+
+        const uint8_t *p = header;
+        uint64_t lsn_le;
+        uint32_t count_le;
+        uint16_t dim_le;
+        std::memcpy(&lsn_le, p, sizeof(lsn_le));
+        p += sizeof(lsn_le);
+        std::memcpy(&count_le, p, sizeof(count_le));
+        p += sizeof(count_le);
+        std::memcpy(&dim_le, p, sizeof(dim_le));
+
+#if __BYTE_ORDER == __BIG_ENDIAN
+        dim_le = __builtin_bswap16(dim_le);
+#endif
+
+        // Basic sanity check
+        if (dim_le == 0 || dim_le > 10'000)
+            return 0;
+
+        return dim_le;
+    }
+
     // --- Server Implementation ---
 
     bool PomaiServer::EnsureDir(const std::string &path)
@@ -255,8 +312,58 @@ namespace pomai::server
             std::string name = entry.path().filename().string();
             std::string meta_path = entry.path().string() + "/meta.bin";
 
+            // If meta.bin exists, we parse it. If not, try to auto-detect WAL files and synthesize meta.
             if (!fs::exists(meta_path))
+            {
+                // Look for shard-*.wal files in this directory
+                bool found_any_wal = false;
+                uint16_t inferred_dim = 0;
+                for (std::size_t i = 0; i < cfg_.shards; ++i)
+                {
+                    std::string wp = entry.path().string() + "/shard-" + std::to_string(i) + ".wal";
+                    if (fs::exists(wp))
+                    {
+                        found_any_wal = true;
+                        inferred_dim = InferDimFromWal(wp);
+                        if (inferred_dim != 0)
+                            break; // good enough
+                    }
+                }
+
+                if (!found_any_wal)
+                {
+                    // No meta and no wal files -> skip
+                    if (log_)
+                        log_->Debug("Skipping directory (no meta.bin, no wal files): " + entry.path().string());
+                    continue;
+                }
+
+                // Found WAL files. If we couldn't infer dim, fall back to default server config.
+                if (inferred_dim == 0)
+                    inferred_dim = static_cast<uint16_t>(cfg_.default_dim);
+
+                // Synthesize DbOptions and persist meta.bin for future runs.
+                pomai::DbOptions opt;
+                opt.dim = inferred_dim;
+                opt.metric = pomai::Metric::L2; // conservative default; operator can change later
+                opt.shards = cfg_.shards;
+                opt.shard_queue_capacity = cfg_.shard_queue_capacity;
+                opt.wal_dir = entry.path().string();
+
+                // Persist meta so we don't have to re-infer next time
+                SaveCollectionMeta(name, opt);
+                if (log_)
+                    log_->Info("Synthesized meta.bin for collection '" + name +
+                               "' (inferred dim=" + std::to_string(opt.dim) +
+                               ", shards=" + std::to_string(opt.shards) + ")");
+            }
+
+            // Re-check presence of meta.bin after possible synthesis
+            if (!fs::exists(meta_path))
+            {
+                // still not present -> skip
                 continue;
+            }
 
             std::ifstream in(meta_path, std::ios::binary);
             if (!in)
@@ -289,7 +396,18 @@ namespace pomai::server
             if (log_)
                 log_->Info("Recovering collection: " + name + " (dim=" + std::to_string(dim) + ")");
 
-            auto db = std::make_shared<pomai::PomaiDB>(opt);
+            // Build small forwarding lambdas into server logger (server owns Logger symbols)
+            pomai::PomaiDB::LogFn info_cb;
+            pomai::PomaiDB::LogFn error_cb;
+            if (log_)
+            {
+                info_cb = [this](const std::string &m)
+                { log_->Info(m); };
+                error_cb = [this](const std::string &m)
+                { log_->Error(m); };
+            }
+
+            auto db = std::make_shared<pomai::PomaiDB>(opt, info_cb, error_cb);
             db->Start();
 
             std::lock_guard<std::mutex> lk(cols_mu_);
@@ -543,7 +661,18 @@ namespace pomai::server
         // SAVE META
         SaveCollectionMeta(name, opt);
 
-        auto db = std::make_shared<pomai::PomaiDB>(opt);
+        // Pass logging callbacks so shard/db can log WAL replay outcome during Start()
+        pomai::PomaiDB::LogFn info_cb;
+        pomai::PomaiDB::LogFn error_cb;
+        if (log_)
+        {
+            info_cb = [this](const std::string &m)
+            { log_->Info(m); };
+            error_cb = [this](const std::string &m)
+            { log_->Error(m); };
+        }
+
+        auto db = std::make_shared<pomai::PomaiDB>(opt, info_cb, error_cb);
         db->Start();
 
         std::uint32_t id = next_col_id_++;

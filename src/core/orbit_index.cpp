@@ -1,299 +1,414 @@
 #include "orbit_index.h"
 #include "cpu_kernels.h"
+
 #include <algorithm>
 #include <queue>
-#include <cmath>
 #include <random>
-#include <iostream>
-#include <mutex>
-#include <shared_mutex>
-#include <unordered_set>
-#include <cstring>
+#include <stdexcept>
+#include <utility>
 
 namespace pomai::core
 {
-    // Thread-local storage để tránh malloc liên tục
-    // Mỗi thread (Shard) sẽ có một vùng nhớ riêng để đánh dấu visited
-    struct ThreadScratch
+
+    namespace
     {
-        std::vector<uint32_t> visited_list; // Lưu token
-        uint32_t visited_token = 0;
 
-        void Reset(size_t size)
+        // Thread-local scratch to avoid allocations in Search / neighbor expansion.
+        struct ThreadScratch
         {
-            if (visited_list.size() < size)
+            std::vector<std::uint32_t> visited; // token per node
+            std::uint32_t token{1};
+
+            void Reset(std::size_t n)
             {
-                visited_list.resize(size, 0);
+                if (visited.size() < n)
+                    visited.resize(n, 0);
+                ++token;
+                if (token == 0)
+                { // overflow (extremely rare)
+                    std::fill(visited.begin(), visited.end(), 0);
+                    token = 1;
+                }
             }
-            visited_token++;
-            if (visited_token == 0)
-            { // Tràn số (rất hiếm), reset toàn bộ
-                std::fill(visited_list.begin(), visited_list.end(), 0);
-                visited_token = 1;
+
+            bool IsVisited(std::uint32_t i) const { return visited[i] == token; }
+            void Mark(std::uint32_t i) { visited[i] = token; }
+        };
+
+        thread_local ThreadScratch tls;
+
+        // Min-heap for candidates by dist (smallest first).
+        struct MinCmp
+        {
+            bool operator()(const std::pair<float, std::uint32_t> &a,
+                            const std::pair<float, std::uint32_t> &b) const
+            {
+                return a.first > b.first;
             }
-        }
+        };
 
-        bool IsVisited(uint32_t idx) const
+        // Max-heap for current best (largest dist on top).
+        struct MaxCmp
         {
-            return visited_list[idx] == visited_token;
-        }
+            bool operator()(const std::pair<float, std::uint32_t> &a,
+                            const std::pair<float, std::uint32_t> &b) const
+            {
+                return a.first < b.first;
+            }
+        };
 
-        void Mark(uint32_t idx)
-        {
-            visited_list[idx] = visited_token;
-        }
-    };
-
-    static thread_local ThreadScratch scratch;
+    } // namespace
 
     OrbitIndex::OrbitIndex(std::size_t dim, std::size_t M, std::size_t ef_construction)
         : dim_(dim), M_(M), ef_construction_(ef_construction)
     {
+        if (dim_ == 0)
+            throw std::runtime_error("OrbitIndex dim must be > 0");
+        if (M_ == 0)
+            throw std::runtime_error("OrbitIndex M must be > 0");
+        if (ef_construction_ == 0)
+            ef_construction_ = 64;
     }
 
     void OrbitIndex::Build(const std::vector<float> &flat_data, const std::vector<Id> &flat_ids)
     {
-        InsertBatch(flat_data, flat_ids);
-    }
-
-    void OrbitIndex::InsertBatch(const std::vector<float> &new_data, const std::vector<Id> &new_ids)
-    {
-        std::unique_lock<std::shared_mutex> lock(mu_);
-
-        size_t batch_size = new_ids.size();
-        size_t start_idx = total_vectors_;
-
-        data_.insert(data_.end(), new_data.begin(), new_data.end());
-        ids_.insert(ids_.end(), new_ids.begin(), new_ids.end());
-        graph_.resize(start_idx + batch_size);
-
-        for (size_t i = 0; i < batch_size; ++i)
+        if (built_.load(std::memory_order_acquire))
         {
-            graph_[start_idx + i].reserve(M_ + 1);
+            throw std::runtime_error("OrbitIndex::Build called twice");
+        }
+        if (flat_ids.empty())
+        {
+            // Empty index is valid
+            data_.clear();
+            ids_.clear();
+            graph_.clear();
+            total_vectors_.store(0, std::memory_order_release);
+            built_.store(true, std::memory_order_release);
+            return;
+        }
+        if (flat_data.size() != flat_ids.size() * dim_)
+        {
+            throw std::runtime_error("OrbitIndex::Build flat_data size mismatch");
         }
 
-        // RNG cho Random Links
-        std::mt19937 rng(123 + total_vectors_);
+        const std::size_t N = flat_ids.size();
 
-        for (size_t i = 0; i < batch_size; ++i)
+        // Copy data/ids once. This index owns its storage (immutable afterward).
+        data_ = flat_data;
+        ids_ = flat_ids;
+        graph_.clear();
+        graph_.resize(N);
+        for (auto &g : graph_)
+            g.reserve(M_ + 1);
+
+        total_vectors_.store(N, std::memory_order_release);
+
+        // Deterministic-ish RNG for adding a couple of long edges ("wormholes")
+        std::mt19937 rng(123);
+
+        // Build graph incrementally: for each node i, find neighbors among [0..i-1] and connect.
+        // This is not full HNSW, but a pragmatic navigable small-world graph.
+        for (std::uint32_t i = 0; i < (std::uint32_t)N; ++i)
         {
-            uint32_t curr_idx = start_idx + i;
-            const float *vec_ptr = data_.data() + curr_idx * dim_;
-
-            // Chuẩn bị visited buffer (O(1) cost)
-            total_vectors_++;
-            scratch.Reset(total_vectors_);
-
-            if (curr_idx == 0)
+            if (i == 0)
                 continue;
 
-            // 1. Tìm hàng xóm (Exploitation)
-            std::vector<uint32_t> neighbors = FindNeighbors(vec_ptr, ef_construction_, curr_idx, scratch.visited_list, scratch.visited_token);
+            const float *vec = data_.data() + (std::size_t)i * dim_;
 
-            // 2. Thêm Random Links (Exploration - Chữa bệnh Recall thấp)
-            // Bắt buộc kết nối với 2 điểm ngẫu nhiên để tạo "Wormholes"
-            if (total_vectors_ > 10)
+            // Find neighbors using current graph (among previous nodes only)
+            std::vector<std::uint32_t> neigh = FindNeighborsBuild(vec, i, ef_construction_);
+
+            // Add 2 random long edges for global navigation when enough nodes exist
+            if (i > 32)
             {
-                std::uniform_int_distribution<uint32_t> dist(0, total_vectors_ - 2);
+                std::uniform_int_distribution<std::uint32_t> dist(0, i - 1);
                 for (int r = 0; r < 2; ++r)
                 {
-                    uint32_t rnd = dist(rng);
-                    if (rnd == curr_idx)
-                        rnd = (rnd + 1) % total_vectors_;
-                    neighbors.push_back(rnd);
+                    std::uint32_t rnd = dist(rng);
+                    if (rnd != i)
+                        neigh.push_back(rnd);
                 }
             }
 
-            // 3. Kết nối
-            size_t connect_count = std::min(neighbors.size(), M_);
-            for (size_t k = 0; k < connect_count; ++k)
+            // Connect to up to M_ neighbors
+            if (!neigh.empty())
             {
-                Connect(curr_idx, neighbors[k]);
+                // Sort by distance to prefer closer connections first
+                std::sort(neigh.begin(), neigh.end());
+                neigh.erase(std::unique(neigh.begin(), neigh.end()), neigh.end());
+
+                // Choose best-by-distance among candidates
+                std::vector<std::pair<float, std::uint32_t>> scored;
+                scored.reserve(neigh.size());
+                for (auto nb : neigh)
+                {
+                    const float *v2 = data_.data() + (std::size_t)nb * dim_;
+                    float d = pomai::kernels::L2Sqr(vec, v2, dim_);
+                    scored.push_back({d, nb});
+                }
+                std::sort(scored.begin(), scored.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.first < b.first; });
+
+                const std::size_t take = std::min<std::size_t>(M_, scored.size());
+                for (std::size_t k = 0; k < take; ++k)
+                {
+                    Connect(i, scored[k].second);
+                }
             }
         }
+
+        built_.store(true, std::memory_order_release);
     }
 
-    void OrbitIndex::Connect(uint32_t node_a, uint32_t node_b)
+    std::vector<std::uint32_t> OrbitIndex::FindNeighborsBuild(const float *vec, std::uint32_t curr_idx, std::size_t ef) const
     {
-        if (node_a == node_b)
-            return;
+        // Search among [0..curr_idx-1]
+        const std::uint32_t maxN = curr_idx;
+        if (maxN == 0)
+            return {};
 
-        // A -> B (Check duplicate thủ công để tiết kiệm memory so với set)
-        bool exists_a = false;
-        for (auto n : graph_[node_a])
-            if (n == node_b)
-            {
-                exists_a = true;
-                break;
-            }
-        if (!exists_a)
+        tls.Reset(maxN);
+
+        std::priority_queue<std::pair<float, std::uint32_t>,
+                            std::vector<std::pair<float, std::uint32_t>>,
+                            MinCmp>
+            candidates;
+
+        std::priority_queue<std::pair<float, std::uint32_t>,
+                            std::vector<std::pair<float, std::uint32_t>>,
+                            MaxCmp>
+            best;
+
+        // Entry points: 0, mid, last
+        std::uint32_t eps[3] = {0u, maxN / 2u, maxN - 1u};
+        for (std::uint32_t ep : eps)
         {
-            graph_[node_a].push_back(node_b);
-            if (graph_[node_a].size() > M_ * 1.5)
-                Prune(node_a); // Prune lười (Lazy)
-        }
-
-        // B -> A
-        bool exists_b = false;
-        for (auto n : graph_[node_b])
-            if (n == node_a)
-            {
-                exists_b = true;
-                break;
-            }
-        if (!exists_b)
-        {
-            graph_[node_b].push_back(node_a);
-            if (graph_[node_b].size() > M_ * 1.5)
-                Prune(node_b);
-        }
-    }
-
-    void OrbitIndex::Prune(uint32_t node_idx)
-    {
-        auto &links = graph_[node_idx];
-
-        // Nếu số lượng kết nối chưa vượt quá giới hạn -> Không làm gì cả
-        // Giữ graph dày nhất có thể trong quá trình build
-        if (links.size() <= M_)
-            return;
-
-        const float *vec = data_.data() + node_idx * dim_;
-
-        // 1. Sắp xếp tất cả theo khoảng cách tăng dần
-        std::sort(links.begin(), links.end(), [&](uint32_t a, uint32_t b)
-                  {
-            float da = kernels::L2Sqr(vec, data_.data() + a * dim_, dim_);
-            float db = kernels::L2Sqr(vec, data_.data() + b * dim_, dim_);
-            return da < db; });
-
-        // 2. CHIẾN THUẬT BẢO VỆ CAO TỐC (Highway Protection)
-        // Ta giữ lại M_ kết nối.
-        // - 50% đầu tiên: Giữ những thằng gần nhất (Local Cluster).
-        // - 50% còn lại: Random hóa để giữ lại các kết nối xa (Global Navigation).
-
-        size_t keep_closest = M_ / 2;
-
-        // Đoạn từ [keep_closest ... end] sẽ được xáo trộn ngẫu nhiên
-        // Để khi ta resize về M_, ta sẽ giữ lại một số thằng ở xa ngẫu nhiên
-        if (keep_closest < links.size())
-        {
-            // Dùng default_random_engine nhẹ nhàng
-            static thread_local std::minstd_rand g_rng(std::random_device{}());
-            std::shuffle(links.begin() + keep_closest, links.end(), g_rng);
-        }
-
-        // 3. Cắt về kích thước chuẩn
-        links.resize(M_);
-    }
-
-    std::vector<uint32_t> OrbitIndex::FindNeighbors(const float *vec, size_t ef, uint32_t skip_id,
-                                                    std::vector<uint32_t> &visited_list,
-                                                    uint32_t &visited_token)
-    {
-        using Node = std::pair<float, uint32_t>;
-        auto cmp = [](const Node &a, const Node &b)
-        { return a.first > b.first; };
-        std::priority_queue<Node, std::vector<Node>, decltype(cmp)> candidates(cmp);
-        std::priority_queue<Node> top_k;
-
-        size_t current_N = total_vectors_;
-
-        // Entry points: 0 và vài điểm random
-        // Điều này cực quan trọng để tránh bị kẹt ở local optima
-        std::vector<uint32_t> eps;
-        eps.push_back(0);
-        if (current_N > 50)
-        {
-            eps.push_back(current_N / 2);
-            eps.push_back(current_N - 1);
-        }
-
-        for (uint32_t ep : eps)
-        {
-            if (ep >= current_N || ep == skip_id)
+            if (ep >= maxN)
                 continue;
-            if (visited_list[ep] == visited_token)
+            if (tls.IsVisited(ep))
                 continue;
+            tls.Mark(ep);
 
-            float d = kernels::L2Sqr(vec, data_.data() + ep * dim_, dim_);
+            const float *v2 = data_.data() + (std::size_t)ep * dim_;
+            float d = pomai::kernels::L2Sqr(vec, v2, dim_);
             candidates.push({d, ep});
-            top_k.push({d, ep});
-            visited_list[ep] = visited_token;
+            best.push({d, ep});
+            if (best.size() > ef)
+                best.pop();
         }
 
         while (!candidates.empty())
         {
-            Node curr = candidates.top();
+            auto cur = candidates.top();
             candidates.pop();
 
-            if (top_k.size() >= ef && curr.first > top_k.top().first)
+            // If current is worse than the worst in best and best is full, stop.
+            if (best.size() >= ef && cur.first > best.top().first)
                 break;
 
-            for (uint32_t neighbor : graph_[curr.second])
+            for (std::uint32_t nb : graph_[cur.second])
             {
-                if (neighbor >= current_N || neighbor == skip_id)
+                if (nb >= maxN)
                     continue;
-                if (visited_list[neighbor] == visited_token)
+                if (tls.IsVisited(nb))
                     continue;
+                tls.Mark(nb);
 
-                visited_list[neighbor] = visited_token;
+                const float *v2 = data_.data() + (std::size_t)nb * dim_;
+                float d = pomai::kernels::L2Sqr(vec, v2, dim_);
 
-                float dist = kernels::L2Sqr(vec, data_.data() + neighbor * dim_, dim_);
-
-                if (top_k.size() < ef || dist < top_k.top().first)
-                {
-                    candidates.push({dist, neighbor});
-                    top_k.push({dist, neighbor});
-                    if (top_k.size() > ef)
-                        top_k.pop();
-                }
+                candidates.push({d, nb});
+                best.push({d, nb});
+                if (best.size() > ef)
+                    best.pop();
             }
         }
 
-        std::vector<uint32_t> result;
-        while (!top_k.empty())
+        std::vector<std::uint32_t> out;
+        out.reserve(best.size());
+        while (!best.empty())
         {
-            result.push_back(top_k.top().second);
-            top_k.pop();
+            out.push_back(best.top().second);
+            best.pop();
         }
-        return result;
+        return out;
     }
 
-    SearchResponse OrbitIndex::Search(const Vector &query, const pomai::ai::Budget & /*budget*/) const
+    void OrbitIndex::Connect(std::uint32_t a, std::uint32_t b)
     {
-        std::shared_lock<std::shared_mutex> lock(mu_);
+        if (a == b)
+            return;
+
+        auto &ga = graph_[a];
+        if (std::find(ga.begin(), ga.end(), b) == ga.end())
+        {
+            ga.push_back(b);
+            if (ga.size() > (std::size_t)(M_ * 3 / 2))
+                Prune(a);
+        }
+
+        auto &gb = graph_[b];
+        if (std::find(gb.begin(), gb.end(), a) == gb.end())
+        {
+            gb.push_back(a);
+            if (gb.size() > (std::size_t)(M_ * 3 / 2))
+                Prune(b);
+        }
+    }
+
+    void OrbitIndex::Prune(std::uint32_t node)
+    {
+        auto &links = graph_[node];
+        if (links.size() <= M_)
+            return;
+
+        const float *vec = data_.data() + (std::size_t)node * dim_;
+
+        // Sort by distance to node
+        std::sort(links.begin(), links.end(), [&](std::uint32_t x, std::uint32_t y)
+                  {
+        const float* vx = data_.data() + (std::size_t)x * dim_;
+        const float* vy = data_.data() + (std::size_t)y * dim_;
+        float dx = pomai::kernels::L2Sqr(vec, vx, dim_);
+        float dy = pomai::kernels::L2Sqr(vec, vy, dim_);
+        return dx < dy; });
+
+        // Keep half closest, half randomized for navigation diversity
+        const std::size_t keep_closest = M_ / 2;
+        if (keep_closest < links.size())
+        {
+            static thread_local std::minstd_rand rrng(std::random_device{}());
+            std::shuffle(links.begin() + keep_closest, links.end(), rrng);
+        }
+        links.resize(M_);
+    }
+
+    std::vector<std::uint32_t> OrbitIndex::FindNeighborsSearch(const float *q, std::size_t ops_budget) const
+    {
+        const std::size_t N = total_vectors_.load(std::memory_order_acquire);
+        if (N == 0)
+            return {};
+
+        tls.Reset(N);
+
+        std::priority_queue<std::pair<float, std::uint32_t>,
+                            std::vector<std::pair<float, std::uint32_t>>,
+                            MinCmp>
+            candidates;
+
+        std::priority_queue<std::pair<float, std::uint32_t>,
+                            std::vector<std::pair<float, std::uint32_t>>,
+                            MaxCmp>
+            best;
+
+        // Entry points
+        std::uint32_t ep0 = 0;
+        std::uint32_t ep1 = (N > 1) ? (std::uint32_t)(N / 2) : 0;
+        std::uint32_t ep2 = (N > 2) ? (std::uint32_t)(N - 1) : 0;
+
+        auto push_ep = [&](std::uint32_t ep)
+        {
+            if (ep >= N)
+                return;
+            if (tls.IsVisited(ep))
+                return;
+            tls.Mark(ep);
+            const float *v = data_.data() + (std::size_t)ep * dim_;
+            float d = pomai::kernels::L2Sqr(q, v, dim_);
+            candidates.push({d, ep});
+            best.push({d, ep});
+        };
+
+        push_ep(ep0);
+        push_ep(ep1);
+        push_ep(ep2);
+
+        // ops_budget limits expansions (not exact dist calls, but close enough)
+        std::size_t expansions = 0;
+        const std::size_t ef = std::max<std::size_t>(64, std::min<std::size_t>(256, ops_budget ? ops_budget : 128));
+
+        while (!candidates.empty() && expansions < ef)
+        {
+            auto cur = candidates.top();
+            candidates.pop();
+            ++expansions;
+
+            if (best.size() >= ef && cur.first > best.top().first)
+                break;
+
+            for (std::uint32_t nb : graph_[cur.second])
+            {
+                if (nb >= N)
+                    continue;
+                if (tls.IsVisited(nb))
+                    continue;
+                tls.Mark(nb);
+
+                const float *v = data_.data() + (std::size_t)nb * dim_;
+                float d = pomai::kernels::L2Sqr(q, v, dim_);
+
+                candidates.push({d, nb});
+                best.push({d, nb});
+                if (best.size() > ef)
+                    best.pop();
+            }
+        }
+
+        std::vector<std::uint32_t> out;
+        out.reserve(best.size());
+        while (!best.empty())
+        {
+            out.push_back(best.top().second);
+            best.pop();
+        }
+        return out;
+    }
+
+    SearchResponse OrbitIndex::Search(const Vector &query, const pomai::ai::Budget &budget) const
+    {
         SearchResponse resp;
-        if (total_vectors_ == 0)
+
+        if (!built_.load(std::memory_order_acquire))
+            return resp;
+        if (query.data.size() != dim_)
             return resp;
 
-        // Reset scratch cho Search Thread
-        scratch.Reset(total_vectors_);
+        const std::size_t N = total_vectors_.load(std::memory_order_acquire);
+        if (N == 0)
+            return resp;
 
-        size_t ef = 128;
-        auto neighbors = const_cast<OrbitIndex *>(this)->FindNeighbors(
-            query.data.data(), ef, (uint32_t)-1, scratch.visited_list, scratch.visited_token);
+        const std::size_t ops_budget = (budget.ops_budget == 0) ? 128u : (std::size_t)budget.ops_budget;
 
-        // Sort và lấy kết quả
-        std::vector<std::pair<float, uint32_t>> final_sorted;
-        for (auto idx : neighbors)
+        // Get candidate nodes
+        const float *q = query.data.data();
+        std::vector<std::uint32_t> cand = FindNeighborsSearch(q, ops_budget);
+
+        // Score candidates exactly and return top results
+        std::vector<std::pair<float, std::uint32_t>> scored;
+        scored.reserve(cand.size());
+        for (auto idx : cand)
         {
-            float d = kernels::L2Sqr(query.data.data(), data_.data() + idx * dim_, dim_);
-            final_sorted.push_back({d, idx});
+            const float *v = data_.data() + (std::size_t)idx * dim_;
+            float d = pomai::kernels::L2Sqr(q, v, dim_);
+            scored.push_back({d, idx});
         }
-        std::sort(final_sorted.begin(), final_sorted.end(), [](auto &a, auto &b)
+
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto &a, const auto &b)
                   { return a.first < b.first; });
 
-        size_t limit = 20;
-        if (final_sorted.size() > limit)
-            final_sorted.resize(limit);
+        // OrbitIndex returns top-20 by default (caller merges & trims to req.topk at shard/router level)
+        const std::size_t limit = std::min<std::size_t>(20, scored.size());
+        resp.items.resize(limit);
 
-        resp.items.resize(final_sorted.size());
-        for (size_t i = 0; i < final_sorted.size(); ++i)
+        for (std::size_t i = 0; i < limit; ++i)
         {
-            resp.items[i] = {ids_[final_sorted[i].second], -final_sorted[i].first};
+            const auto idx = scored[i].second;
+            resp.items[i] = {ids_[idx], -scored[i].first};
         }
 
         return resp;
     }
-}
+
+} // namespace pomai::core

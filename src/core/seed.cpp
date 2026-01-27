@@ -1,155 +1,150 @@
 #include "seed.h"
-#include "cpu_kernels.h" // Sửa include path cho phù hợp với CMake (src/core/)
+#include "cpu_kernels.h"
 
-#include <cmath>
-#include <queue>
 #include <algorithm>
-#include <mutex>
-#include <cstring>
+#include <queue>
+#include <stdexcept>
 
 namespace pomai
 {
 
     Seed::Seed(std::size_t dim) : dim_(dim)
     {
-        ids_.reserve(4096);
-        id_to_loc_.reserve(4096);
-        chunks_.push_back(std::make_shared<Chunk>());
-        chunks_.back()->reserve(kVectorsPerChunk * dim_);
+        if (dim_ == 0)
+            throw std::runtime_error("Seed dim must be > 0");
+        // Reasonable initial reserve to reduce early reallocs; tune later.
+        ids_.reserve(1024);
+        data_.reserve(1024 * dim_);
+        pos_.reserve(1024);
+    }
+
+    void Seed::ReserveForAppend(std::size_t add_rows)
+    {
+        const std::size_t need_rows = ids_.size() + add_rows;
+        if (ids_.capacity() < need_rows)
+        {
+            // Growth policy: 1.5x to reduce realloc frequency.
+            std::size_t new_cap = std::max<std::size_t>(need_rows, ids_.capacity() + ids_.capacity() / 2 + 1024);
+            ids_.reserve(new_cap);
+            data_.reserve(new_cap * dim_);
+            pos_.reserve(new_cap);
+        }
     }
 
     void Seed::ApplyUpserts(const std::vector<UpsertRequest> &batch)
     {
-        std::unique_lock<std::shared_mutex> lock(mu_);
+        if (batch.empty())
+            return;
 
-        for (const auto &req : batch)
+        // Count how many are new to reserve once.
+        std::size_t new_cnt = 0;
+        for (const auto &r : batch)
         {
-            if (req.vec.data.size() != dim_)
+            if (r.vec.data.size() != dim_)
+                continue;
+            if (pos_.find(r.id) == pos_.end())
+                ++new_cnt;
+        }
+        if (new_cnt)
+            ReserveForAppend(new_cnt);
+
+        for (const auto &r : batch)
+        {
+            if (r.vec.data.size() != dim_)
                 continue;
 
-            auto it = id_to_loc_.find(req.id);
-            if (it != id_to_loc_.end())
+            auto it = pos_.find(r.id);
+            if (it == pos_.end())
             {
-                std::uint32_t c_idx = it->second.first;
-                std::uint32_t offset = it->second.second;
+                // Append new row
+                const std::uint32_t row = static_cast<std::uint32_t>(ids_.size());
+                ids_.push_back(r.id);
+                pos_.emplace(r.id, row);
 
-                Chunk &chunk = *chunks_[c_idx];
-                std::memcpy(chunk.data() + offset, req.vec.data.data(), dim_ * sizeof(float));
+                const std::size_t base = static_cast<std::size_t>(row) * dim_;
+                data_.resize(base + dim_);
+                std::copy(r.vec.data.begin(), r.vec.data.end(), data_.begin() + base);
             }
             else
             {
-                Chunk *current_chunk = chunks_.back().get();
-
-                if (current_chunk->size() >= kVectorsPerChunk * dim_)
-                {
-                    chunks_.push_back(std::make_shared<Chunk>());
-                    current_chunk = chunks_.back().get();
-                    current_chunk->reserve(kVectorsPerChunk * dim_);
-                }
-
-                std::size_t offset = current_chunk->size();
-                current_chunk->insert(current_chunk->end(), req.vec.data.begin(), req.vec.data.end());
-
-                std::uint32_t c_idx = static_cast<std::uint32_t>(chunks_.size() - 1);
-
-                ids_.push_back(req.id);
-                id_to_loc_[req.id] = {c_idx, static_cast<std::uint32_t>(offset)};
+                // Overwrite existing row
+                const std::uint32_t row = it->second;
+                const std::size_t base = static_cast<std::size_t>(row) * dim_;
+                std::copy(r.vec.data.begin(), r.vec.data.end(), data_.begin() + base);
             }
         }
     }
 
-    std::shared_ptr<const SeedSnapshot> Seed::MakeSnapshot() const
+    Seed::Snapshot Seed::MakeSnapshot() const
     {
-        std::shared_lock<std::shared_mutex> lock(mu_);
-
-        auto snap = std::make_shared<SeedSnapshot>();
-        snap->dim = dim_;
-        snap->ids = ids_;
-        snap->chunks = chunks_;
-
-        return snap;
+        // Immutable snapshot: copy contiguous buffers (much cheaper than copying a hashmap of vectors).
+        auto out = std::make_shared<Store>();
+        out->dim = dim_;
+        out->ids = ids_;
+        out->data = data_;
+        return out;
     }
 
-    std::size_t Seed::Count() const
-    {
-        std::shared_lock<std::shared_mutex> lock(mu_);
-        return ids_.size();
-    }
-
-    std::vector<float> Seed::GetFlatData() const
-    {
-        std::shared_lock<std::shared_mutex> lock(mu_);
-        std::vector<float> flat;
-        flat.reserve(ids_.size() * dim_);
-        for (const auto &chunk : chunks_)
-        {
-            flat.insert(flat.end(), chunk->begin(), chunk->end());
-        }
-        return flat;
-    }
-
-    std::vector<Id> Seed::GetFlatIds() const
-    {
-        std::shared_lock<std::shared_mutex> lock(mu_);
-        return ids_;
-    }
-
-    SearchResponse Seed::SearchSnapshot(const std::shared_ptr<const SeedSnapshot> &snap, const SearchRequest &req)
+    SearchResponse Seed::SearchSnapshot(const Snapshot &snap, const SearchRequest &req)
     {
         SearchResponse resp;
-        if (!snap || snap->ids.empty() || req.query.data.empty())
+        if (!snap)
+            return resp;
+        if (snap->dim == 0)
+            return resp;
+        if (req.query.data.size() != snap->dim)
             return resp;
 
         const std::size_t dim = snap->dim;
-        const float *query_ptr = req.query.data.data();
+        const std::size_t n = snap->ids.size();
+        if (n == 0)
+            return resp;
 
-        using Pair = std::pair<float, Id>;
-        auto cmp = [](const Pair &a, const Pair &b)
-        { return a.first > b.first; };
-        std::priority_queue<Pair, std::vector<Pair>, decltype(cmp)> min_heap(cmp);
+        const std::size_t k = std::min<std::size_t>(req.topk, n);
+        if (k == 0)
+            return resp;
 
-        std::size_t global_idx = 0;
-        const std::size_t total_ids = snap->ids.size();
+        const float *q = req.query.data.data();
 
-        for (const auto &chunk_ptr : snap->chunks)
+        struct Node
         {
-            const std::vector<float> &chunk = *chunk_ptr;
-            const float *chunk_data = chunk.data();
+            float score; // -dist
+            Id id;
+        };
+        // Min-heap by score (worst element on top), so we can pop/replace.
+        auto cmp = [](const Node &a, const Node &b)
+        { return a.score > b.score; };
+        std::priority_queue<Node, std::vector<Node>, decltype(cmp)> heap(cmp);
 
-            // FIX: Sử dụng '.' thay vì '->' vì chunk là reference
-            const std::size_t num_vecs_in_chunk = chunk.size() / dim;
+        const float *base = snap->data.data();
 
-            for (std::size_t k = 0; k < num_vecs_in_chunk; ++k)
+        for (std::size_t row = 0; row < n; ++row)
+        {
+            const float *v = base + row * dim;
+
+            // Use AVX2 L2 squared
+            float dist = pomai::kernels::L2Sqr(v, q, dim);
+            float score = -dist;
+
+            if (heap.size() < k)
             {
-                if (global_idx >= total_ids)
-                    break;
-
-                const float *vec_ptr = chunk_data + (k * dim);
-                float dist_sq = kernels::L2Sqr(vec_ptr, query_ptr, dim);
-                float score = -dist_sq;
-
-                if (min_heap.size() < req.topk)
-                {
-                    min_heap.push({score, snap->ids[global_idx]});
-                }
-                else if (score > min_heap.top().first)
-                {
-                    min_heap.pop();
-                    min_heap.push({score, snap->ids[global_idx]});
-                }
-
-                global_idx++;
+                heap.push(Node{score, snap->ids[row]});
+            }
+            else if (score > heap.top().score)
+            {
+                heap.pop();
+                heap.push(Node{score, snap->ids[row]});
             }
         }
 
-        resp.items.resize(min_heap.size());
-        for (int i = static_cast<int>(min_heap.size()) - 1; i >= 0; --i)
+        resp.items.reserve(heap.size());
+        while (!heap.empty())
         {
-            resp.items[i] = {min_heap.top().second, min_heap.top().first};
-            min_heap.pop();
+            resp.items.push_back(SearchResultItem{heap.top().id, heap.top().score});
+            heap.pop();
         }
-
+        std::reverse(resp.items.begin(), resp.items.end());
         return resp;
     }
 
-}
+} // namespace pomai

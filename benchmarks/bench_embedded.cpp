@@ -18,7 +18,7 @@ int main()
     opt.metric = Metric::L2;
     opt.shards = 4; // Tận dụng đa luồng CPU
     opt.shard_queue_capacity = 65536;
-    opt.wal_dir = "./data_bench_embedded";
+    opt.wal_dir = "./data/bench";
 
     // Clean start
     std::filesystem::remove_all(opt.wal_dir);

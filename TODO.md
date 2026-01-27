@@ -1,137 +1,33 @@
-## Lộ trình nâng PomaiDB từ single-thread lên multi-thread “true production-safe”  
-**Mục tiêu: Đảm bảo không đổi logic — chỉ tách threading chuẩn hoá, không băm bổ code.**
+Concrete high-priority fixes (P0) — implement these first
 
----
+    Make durability semantics explicit:
+        Option A: Offer an immediate synchronous fdatasync path in AppendUpserts when wait_durable==true (do fdatasync while holding mutex or with careful ordering).
+        Option B: Document that writes may be lost until WaitDurable returns, and recommend wait_durable=true for critical writes.
+    Ensure truncation is durable:
+        After ftruncate(wal), call fdatasync(wal_fd) and fsync the directory (open(dir) + fsync(dirfd)).
+    Add graceful shutdown handler:
+        Trap SIGINT/SIGTERM in main to call server.Stop() so Ctrl+C attempts to flush WAL before exit.
+    Add unit + integration tests for WAL replay:
+        Good records, truncated record at EOF, bad CRC, kill-9 during append, restart and assert recovery and truncation behavior.
+    Add a small ReplayStats return value from Wal::ReplayToSeed (records_applied, vectors_applied, last_lsn, truncated_bytes) and log it from Shard::Start.
 
-### **Nguyên tắc xương sống**
-- **Không đổi logic tài nguyên, quản lý, PomaiArena, Map, …**
-- **Mỗi thread own 1 shard/arena riêng** (no cross-thread mutation)
-- **Không cross-thread access vào hot-path data** (giữ invariant Pomai)
-- **Chỉ lock khi cần cho IO/manifest/giao tiếp (không hotpath)**
-- **Không mất debugability, không race condition**
+Important operational items (P1)
 
----
+    Snapshot + WAL rotation:
+        Implement periodic snapshot (persist a snapshot of seed store), perform fsync of snapshot file, then rotate wal: rename wal to wal.N or start new wal, fsync directory, and delete old wal safely.
+    Metrics & telemetry:
+        Expose metrics (written_lsn, durable_lsn, replayed_records, wal_size, queue sizes) via a /metrics HTTP endpoint or Prometheus client.
+    Health & status API:
+        Add admin endpoints returning last LSN, durable LSN, memtable size, index build backlog.
+    Add logging improvements:
+        Structured logs with severity, timestamp, component and include ReplayStats and truncation offsets.
 
-## **Các bước cụ thể**
+Resilience & scaling (P2)
 
----
+    Add HA/replication (async/sync or integrate Raft) if you need no-single-point-of-failure.
+    Add tests under heavy load, run benchmarks with different fsync strategies, measure tail latencies.
 
-### **Bước 1: Kiểm kê Ownership và HOTPATH**
+Security & deployment (P2)
 
-1. **Kiểm kê các class nào chạm tới Arena, Map, Shard, Dispatcher**
-   - **Arena/Shard/Map:** Hot-path phải chỉ được gọi bởi đúng 1 thread
-   - **Dispatcher/Orchestrator:** Phân phối work (search/insert) tới đúng thread (không cross)
-
-**=> Không cần sửa logic, chỉ cần tách context per-thread**
-
----
-
-### **Bước 2: Refactor Orchestrator sang Worker Thread Pool**
-
-- Tạo **worker pool** N thread (theo số shard/cpu core)
-- Mỗi worker:
-  - Own 1 PomaiArena, PomaiMap, hot_tier, v.v. (không share pointer hoặc mutable data qua thread)
-- Dispatcher (main thread hoặc server):
-  - **chỉ nhận request network, rồi push xuống đúng worker qua queue** (ring buffer, MPMC queue, hoặc lockfree queue nếu muốn sạch)
-    - Ví dụ: `struct Work { Request req; }`, mã hoá: search/insert/query...
-    - Gửi xuống qua `std::queue<Work>` hoặc custom lock-free nếu muốn performance
-- **Không cần đổi logic insert/search của Shard/PomaiArena**; logic vẫn như cũ, chỉ chuyển gọi từ main thread sang thread worker tương ứng.
-
----
-
-### **Bước 3: Giao tiếp với Worker qua Queue (Thread-Safe, No Cross-Access)**
-
-- Mỗi worker có queue nhận request từ main thread/dispatcher.
-- Khi nhận request: worker xử lý như logic cũ, trả kết quả về qua response queue hoặc callback (không block main thread).
-- **Không bao giờ access data của worker khác**.
-
-**[Hình dung]**
-
-```
-┌─────────Server(Main)─────────┐
-│ ┌─────Req─────┐ ┌─────Req────┐ │
-│ │   Queue 0   │ │   Queue 1  │ │ ... (N)
-│ └──────┬──────┘ └──────┬─────┘ │
-│        │                │      │
-└────────▼────────────────▼------┘
-      ┌─────Worker 0──────┐
-      │ - PomaiArena0     │
-      │ - PomaiMap0       │
-      └───────────────────┘
-
-      ┌─────Worker 1──────┐
-      │ - PomaiArena1     │
-      │ - PomaiMap1       │
-      └───────────────────┘
-```
-
----
-
-### **Bước 4: Xử lý Insert/Search theo Hash/Shard**
-
-- Dispatcher hash label/id → queue, hoặc roundrobin nếu không hash.
-- Không đổi logic insert/search; chỉ cần chuyển gọi từ main thành worker context.
-
----
-
-### **Bước 5: IO/Snapshot/Async Task — Giữ hoặc refactor nếu chia sẻ file/manifest**
-
-- Nếu IO/snapshot manifest là tài nguyên dùng chung (manifest file), giữ mutex chỉ ở đây!
-- Arena demote/snapshot của mỗi worker CHỈ xử lý blob/file/arena của chính nó.
-- Nếu có logic share manifest → lock chỗ này, còn lại BỎ lock ở Arena/PomaiMap/Shard.
-
----
-
-### **Bước 6: Bỏ Mutex (Hot Path) Safe**
-
-- Khi đã chia mỗi PomaiArena/PomaiMap cho đúng 1 thread và đảm bảo không ai access, **gỡ hết mutex khỏi hotpath trong Arena/Map**.
-- Mutex cho queue (MPMC), hoặc IO, hoặc manifest — VẪN GIỮ nếu còn shared resource.
-- TOÀN BỘ insert/search vector trong worker = lock-free, atomic nếu cần, không mutex!
-
----
-
-### **Bước 7: Test, Validate, Stress**
-
-- Viết test không đổi logic query/search, chỉ test thread-safety (thread sanitizer, stress, chaos monkey)
-- Xác nhận không race, không lost update, không use-after-free.
-
----
-
-## **Lợi ích/Trade-off/RAM**
-
-- **Không đổi logic dữ liệu, không sửa insert/search/map/arena code, chỉ wrap lại trong worker threads**
-- **RAM tiêu tốn nhẹ tăng nếu dùng queue buffer (không đáng kể)**
-- **Debug dễ dàng hơn vì từng thread own context và data, không có cross-access.**
-- **Performance tăng cực mạnh: mỗi thread tận dụng riêng 1 core/cpu, không contention, chỉ lock nhẹ phía network/queue**
-
----
-
-## **Sơ đồ triển khai**
-```
- Main Thread (Network Listener)
-      │
-      ├─> Dispatcher (Hash/Shard routing)
-      ↓            ↓             ↓
- Worker 0    Worker 1       Worker N    ...  (Thread owns PomaiArena, PomaiMap)
- Arena/Map   Arena/Map      Arena/Map
-
- All insert/search are only called in assigned thread/shard context.
- Manifest/snapshot/IO only uses mutex where unavoidable. Hotpath NO LOCKS.
-```
-
----
-
-## **Notes cực kỳ production-safe**
-- Mutex chỉ cần cho IO/manifest, không cần cho data của từng worker.
-- Nếu có bug cross-access, lock lại chỗ đó, không lock hotpath.
-- Không thay đổi structure vector/bucket/arena/map — chỉ wrap thread context.
-
----
-
-**Kết luận:**  
-- Đúng Pomai philosophy.
-- Đúng production-safe, không tấu hài.
-- Không đổi logic, chỉ wrap threading/queue/context.
-- Mutex ở đâu không cần phải bỏ, chỉ remove nếu chắc chắn single-thread ownership.
-
-Nếu cần, tôi sẽ draft code template/refactor rung cho worker pool + thread ownership. Debug path nào có thể crash nếu thiết kế dở, tôi sẽ chỉ mặt gọi tên cụ thể.
+    TLS+auth for server RPCs, secure default unix socket perms, file ownership, sensitive data policy.
+    Container builds, systemd unit, resource limits and liveness/readiness probes.

@@ -1,55 +1,51 @@
 #pragma once
-#include <vector>
-#include <shared_mutex>
-#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
-#include <cstring>
 #include <unordered_map>
+#include <vector>
+
 #include "types.h"
 
 namespace pomai
 {
 
-    constexpr std::size_t kVectorsPerChunk = 1024;
-
-    struct SeedSnapshot;
-
     class Seed
     {
     public:
+        // Immutable snapshot payload for readers.
+        struct Store
+        {
+            std::size_t dim{0};
+            std::vector<Id> ids;     // row ids [N]
+            std::vector<float> data; // row-major vectors [N * dim]
+        };
+
+        using Snapshot = std::shared_ptr<const Store>;
+
         explicit Seed(std::size_t dim);
 
-        Seed(const Seed &) = delete;
-        Seed &operator=(const Seed &) = delete;
-
+        // Apply a batch of upserts (owner thread only).
         void ApplyUpserts(const std::vector<UpsertRequest> &batch);
-        std::shared_ptr<const SeedSnapshot> MakeSnapshot() const;
 
-        static SearchResponse SearchSnapshot(const std::shared_ptr<const SeedSnapshot> &snap, const SearchRequest &req);
+        // Create an immutable snapshot for concurrent readers.
+        Snapshot MakeSnapshot() const;
 
-        std::size_t Count() const;
+        // Exact scan using snapshot (L2 squared), returns best K with score = -dist.
+        static SearchResponse SearchSnapshot(const Snapshot &snap, const SearchRequest &req);
+
+        std::size_t Count() const { return ids_.size(); }
         std::size_t Dim() const { return dim_; }
 
-        // API QUAN TRỌNG CHO INDEX BUILDER (KMEANS)
-        std::vector<float> GetFlatData() const;
-        std::vector<Id> GetFlatIds() const;
-
     private:
-        std::size_t dim_;
-        mutable std::shared_mutex mu_;
+        std::size_t dim_{0};
 
-        std::vector<Id> ids_;
-        std::unordered_map<Id, std::pair<std::uint32_t, std::uint32_t>> id_to_loc_;
+        // Mutable hot store (owner thread only):
+        std::vector<Id> ids_;                       // [N]
+        std::vector<float> data_;                   // [N * dim]
+        std::unordered_map<Id, std::uint32_t> pos_; // id -> row index
 
-        using Chunk = std::vector<float>;
-        std::vector<std::shared_ptr<Chunk>> chunks_;
+        void ReserveForAppend(std::size_t add_rows);
     };
 
-    struct SeedSnapshot
-    {
-        std::vector<Id> ids;
-        std::vector<std::shared_ptr<std::vector<float>>> chunks;
-        std::size_t dim;
-    };
-
-}
+} // namespace pomai
