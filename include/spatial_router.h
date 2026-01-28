@@ -55,5 +55,8 @@ namespace pomai
         std::size_t num_centroids_{0};
 
         static constexpr std::size_t kHierarchicalThreshold = 256;
+        static constexpr float kProbeRadiusMultiplier = 1.25f;
+        static constexpr float kProbeRadiusBias = 1.0f;
+        static constexpr std::size_t kProbeCapMultiplier = 4;
     };
 }

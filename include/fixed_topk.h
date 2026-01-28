@@ -21,20 +21,46 @@ namespace pomai
         };
 
         explicit FixedTopK(std::size_t k)
-            : k_(k)
+            : k_(k),
+              capacity_(k)
         {
             if (k_ <= kStackCapacity)
             {
                 data_ = stack_.data();
+                capacity_ = kStackCapacity;
             }
             else
             {
                 heap_.reset(new Node[k_]);
                 data_ = heap_.get();
+                capacity_ = k_;
             }
         }
 
         std::size_t Size() const noexcept { return size_; }
+
+        void Reset(std::size_t k)
+        {
+            k_ = k;
+            size_ = 0;
+            min_index_ = 0;
+            min_score_ = 0.0f;
+
+            if (k_ <= kStackCapacity)
+            {
+                data_ = stack_.data();
+                capacity_ = kStackCapacity;
+                heap_.reset();
+                return;
+            }
+
+            if (!heap_ || capacity_ < k_)
+            {
+                heap_.reset(new Node[k_]);
+                capacity_ = k_;
+            }
+            data_ = heap_.get();
+        }
 
         void Push(float score, Id id)
         {
@@ -68,6 +94,20 @@ namespace pomai
                       { return a.score > b.score; });
         }
 
+        void FillSortedNodes(std::vector<Node> &out) const
+        {
+            out.clear();
+            if (size_ == 0)
+                return;
+
+            out.reserve(size_);
+            for (std::size_t i = 0; i < size_; ++i)
+                out.push_back(data_[i]);
+
+            std::sort(out.begin(), out.end(), [](const Node &a, const Node &b)
+                      { return a.score > b.score; });
+        }
+
     private:
         void RebuildMin()
         {
@@ -83,9 +123,10 @@ namespace pomai
             }
         }
 
-        static constexpr std::size_t kStackCapacity = 64;
+        static constexpr std::size_t kStackCapacity = 128;
 
         std::size_t k_{0};
+        std::size_t capacity_{0};
         std::size_t size_{0};
         std::size_t min_index_{0};
         float min_score_{0.0f};
