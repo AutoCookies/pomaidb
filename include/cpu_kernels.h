@@ -5,6 +5,8 @@
 #include <cmath>
 #include <cstdint>
 
+#include "types.h"
+
 namespace pomai::kernels
 {
     static inline float L2SqrKernel(const float *a, const float *b, std::size_t dim)
@@ -16,8 +18,15 @@ namespace pomai::kernels
 
         std::size_t i = 0;
 
+        constexpr std::size_t kPrefetchFloats = 64;
         for (; i + 32 <= dim; i += 32)
         {
+            if (i + kPrefetchFloats < dim)
+            {
+                _mm_prefetch(reinterpret_cast<const char *>(a + i + kPrefetchFloats), _MM_HINT_T0);
+                _mm_prefetch(reinterpret_cast<const char *>(b + i + kPrefetchFloats), _MM_HINT_T0);
+            }
+
             __m256 v1 = _mm256_loadu_ps(a + i);
             __m256 q1 = _mm256_loadu_ps(b + i);
             __m256 d1 = _mm256_sub_ps(v1, q1);
@@ -94,8 +103,13 @@ namespace pomai::kernels
                                       std::size_t count,
                                       float *out_distances)
     {
+        constexpr std::size_t kPrefetchDistance = 2;
         for (std::size_t i = 0; i < count; ++i)
         {
+            if (i + kPrefetchDistance < count)
+            {
+                _mm_prefetch(reinterpret_cast<const char *>(base + (i + kPrefetchDistance) * dim), _MM_HINT_T0);
+            }
             const float *v = base + i * dim;
             out_distances[i] = L2SqrKernel(v, query, dim);
         }
@@ -117,7 +131,33 @@ namespace pomai::kernels
         const __m256i ones = _mm256_set1_epi16(1);
 
         std::size_t i = 0;
-        for (; i + 32 <= dim; i += 32)
+        constexpr std::size_t kBlock = 32;
+        constexpr std::size_t kUnroll = 8;
+        constexpr std::size_t kUnrolledBytes = kBlock * kUnroll;
+        constexpr std::size_t kPrefetchBytes = 512;
+        for (; i + kUnrolledBytes <= dim; i += kUnrolledBytes)
+        {
+            _mm_prefetch(reinterpret_cast<const char *>(qdata + i + kPrefetchBytes), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char *>(qquery + i + kPrefetchBytes), _MM_HINT_T0);
+
+            for (std::size_t u = 0; u < kUnroll; ++u)
+            {
+                const std::size_t offset = i + u * kBlock;
+                __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qdata + offset));
+                __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qquery + offset));
+
+                __m256i diff1 = _mm256_subs_epu8(a, b);
+                __m256i diff2 = _mm256_subs_epu8(b, a);
+                __m256i diff = _mm256_adds_epu8(diff1, diff2);
+                __m256i diff_clamped = _mm256_min_epu8(diff, clamp);
+
+                __m256i squares16 = _mm256_maddubs_epi16(diff_clamped, diff_clamped);
+                __m256i squares32 = _mm256_madd_epi16(squares16, ones);
+                acc32 = _mm256_add_epi32(acc32, squares32);
+            }
+        }
+
+        for (; i + kBlock <= dim; i += kBlock)
         {
             __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qdata + i));
             __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qquery + i));
@@ -145,6 +185,43 @@ namespace pomai::kernels
         }
 
         return static_cast<float>(total);
+    }
+
+    static inline void L2Sqr8CentroidsAVX2(const Vector *centroids,
+                                           const std::size_t *indices,
+                                           std::size_t count,
+                                           const float *query,
+                                           std::size_t dim,
+                                           float *out)
+    {
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8)
+        {
+            __m256 sum = _mm256_setzero_ps();
+            for (std::size_t d = 0; d < dim; ++d)
+            {
+                float qv = query[d];
+                __m256 c = _mm256_set_ps(
+                    centroids[indices[i + 7]].data[d],
+                    centroids[indices[i + 6]].data[d],
+                    centroids[indices[i + 5]].data[d],
+                    centroids[indices[i + 4]].data[d],
+                    centroids[indices[i + 3]].data[d],
+                    centroids[indices[i + 2]].data[d],
+                    centroids[indices[i + 1]].data[d],
+                    centroids[indices[i + 0]].data[d]);
+                __m256 q = _mm256_set1_ps(qv);
+                __m256 diff = _mm256_sub_ps(c, q);
+                sum = _mm256_fmadd_ps(diff, diff, sum);
+            }
+            _mm256_storeu_ps(out + i, sum);
+        }
+
+        for (; i < count; ++i)
+        {
+            const auto &v = centroids[indices[i]];
+            out[i] = L2Sqr(query, v.data.data(), dim);
+        }
     }
 
 } // namespace pomai::kernels
