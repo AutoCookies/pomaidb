@@ -2,6 +2,7 @@
 #include <vector>
 #include <memory>
 #include <future>
+#include <string>
 #include "shard.h"
 #include "server/config.h"
 #include "whispergrain.h"
@@ -13,7 +14,17 @@ namespace pomai
     class MembraneRouter
     {
     public:
-        explicit MembraneRouter(std::vector<std::unique_ptr<Shard>> shards, pomai::server::WhisperConfig w_cfg);
+        enum class CentroidsLoadMode
+        {
+            Auto,
+            Sync,
+            Async,
+            None
+        };
+
+        explicit MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
+                                pomai::server::WhisperConfig w_cfg,
+                                std::size_t dim);
 
         void Start();
         void Stop();
@@ -31,12 +42,19 @@ namespace pomai
         // - SetProbeCount: number of centroid probes per query (multi-probe).
         void ConfigureCentroids(const std::vector<Vector> &centroids);
         void SetProbeCount(std::size_t p);
+        std::vector<Vector> SnapshotCentroids() const;
 
         // Compute centroids from samples across shards and install them atomically.
         // - k: number of centroids to produce.
         // - total_samples: target total number of sample vectors aggregated across all shards.
         // Returns true on success.
         bool ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples = 4096);
+
+        bool LoadCentroidsFromFile(const std::string &path);
+        bool SaveCentroidsToFile(const std::string &path) const;
+        void SetCentroidsFilePath(const std::string &path);
+        void SetCentroidsLoadMode(CentroidsLoadMode mode);
+        bool HasCentroids() const;
 
     private:
         // Legacy id-based pick (used as fallback)
@@ -56,6 +74,10 @@ namespace pomai
 
         // How many centroid neighbors to probe per query. Default 2 (multi-probe).
         std::size_t probe_P_{2};
+
+        std::string centroids_path_;
+        CentroidsLoadMode centroids_load_mode_{CentroidsLoadMode::Auto};
+        std::size_t dim_{0};
     };
 
 }

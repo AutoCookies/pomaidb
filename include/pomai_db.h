@@ -25,6 +25,10 @@ namespace pomai
         // New: index build pool threads (0 = auto)
         std::size_t index_build_threads{0};
         bool allow_sync_on_append{true};
+
+        // Centroid persistence
+        std::string centroids_path{};
+        MembraneRouter::CentroidsLoadMode centroids_load_mode{MembraneRouter::CentroidsLoadMode::Auto};
     };
 
     class PomaiDB
