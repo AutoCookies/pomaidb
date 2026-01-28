@@ -1,0 +1,13 @@
+[Unit]
+Description=PomaiDB Vector Database Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pomai-server --config /etc/pomai/pomai.yaml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

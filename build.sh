@@ -1,86 +1,92 @@
 #!/usr/bin/env bash
-# build.sh - build libsrc.a and server binary (build/pomai_server)
-#
-# Usage:
-#   ./build.sh            # builds libsrc.a and server (prefers src/main.cc, falls back to examples/main.cc)
-#   ./build.sh clean      # remove build/ artifacts
-#
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$SCRIPT_DIR"
-SRC_DIR="${REPO_ROOT}/src"
-EXAMPLES_DIR="${REPO_ROOT}/examples"
-BUILD_DIR="${REPO_ROOT}/build"
-OBJ_DIR="${BUILD_DIR}/obj"
 
-CXX=${CXX:-g++}
-CXXFLAGS="-std=c++17 -O2 -g -I${REPO_ROOT} -I${SRC_DIR} -pthread -Wall -Wextra"
+# Usage:
+#   ./build.sh              # Build toàn bộ (Server + Benchmark)
+#   ./build.sh clean        # Xóa sạch thư mục build
+#   ./build.sh run          # Build xong chạy Server
+#   ./build.sh bench        # Build xong chạy Benchmark Embedded
 
-mkdir -p "${BUILD_DIR}" "${OBJ_DIR}"
+ACTION="${1:-build}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="${ROOT_DIR}/build"
+CONFIG="${ROOT_DIR}/config/pomai.yaml"
 
-if [ "${1:-}" = "clean" ]; then
-  echo "Cleaning ${BUILD_DIR}"
-  rm -rf "${BUILD_DIR}"
-  exit 0
+# Màu mè chuyên nghiệp
+GREEN='\033[1;32m'
+BLUE='\033[1;34m'
+RED='\033[1;31m'
+NC='\033[0m' # No Color
+
+log() {
+    echo -e "${GREEN}[pomai]${NC} $1"
+}
+
+info() {
+    echo -e "${BLUE}[info]${NC} $1"
+}
+
+err() {
+    echo -e "${RED}[error]${NC} $1"
+}
+
+# --- 1. CLEANUP ---
+if [[ "${ACTION}" == "clean" ]]; then
+    log "Cleaning build directory..."
+    rm -rf "${BUILD_DIR}"
+    log "Clean complete."
+    exit 0
 fi
 
-echo "Compiler: ${CXX}"
-echo "CXXFLAGS: ${CXXFLAGS}"
+# --- 2. BUILD SYSTEM ---
+log "Build Environment:"
+info "  Root: ${ROOT_DIR}"
+info "  Mode: Release (Optimized -O3 -march=native)"
 
-# Find source files under src/ (exclude tests/)
-mapfile -d '' SRC_FILES < <(find "${SRC_DIR}" -type f \( -name '*.cc' -o -name '*.cpp' \) -not -path "${SRC_DIR}/tests/*" -print0)
+mkdir -p "${BUILD_DIR}"
 
-if [ ${#SRC_FILES[@]} -eq 0 ]; then
-  echo "No source files found under src/ - nothing to build."
-  exit 1
+log "Configuring CMake..."
+# -DCMAKE_BUILD_TYPE=Release: Bật tối ưu hóa CPU
+cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -Wno-dev
+
+log "Compiling Sources..."
+# Build TẤT CẢ các target (Core, Server, Bench)
+# -j"$(nproc)": Sử dụng tối đa số core CPU để compile nhanh gấp 4-8 lần
+if cmake --build "${BUILD_DIR}" -j"$(nproc)"; then
+    log "Build SUCCESS."
+else
+    err "Build FAILED."
+    exit 1
 fi
 
-# Compile each source file into object file with deterministic sanitized name
-OBJS=()
-for src in "${SRC_FILES[@]}"; do
-  rel="$(realpath --relative-to="${REPO_ROOT}" "$src")"
-  out="${OBJ_DIR}/$(echo "$rel" | tr '/' '_' | sed -E 's/\.c(pp)?$/.o/')"
-  echo "Compiling: ${rel} -> ${out}"
-  mkdir -p "$(dirname "$out")"
-  "${CXX}" ${CXXFLAGS} -c "$src" -o "$out"
-  OBJS+=("$out")
-done
+SERVER_BIN="${BUILD_DIR}/pomai-server"
+BENCH_BIN="${BUILD_DIR}/bench_embedded"
 
-# Create static archive
-ARCHIVE="${BUILD_DIR}/libsrc.a"
-echo "Creating archive ${ARCHIVE}"
-rm -f "${ARCHIVE}"
-ar rcs "${ARCHIVE}" "${OBJS[@]}"
+# --- 3. RUN ACTIONS ---
 
-# Determine which main source to link (prefer src/main.cc)
-SERVER_SRC_CANDIDATES=("${SRC_DIR}/main.cc" "${EXAMPLES_DIR}/main.cc")
-SERVER_SRC=""
-for c in "${SERVER_SRC_CANDIDATES[@]}"; do
-  if [ -f "${c}" ]; then
-    SERVER_SRC="${c}"
-    break
-  fi
-done
+if [[ "${ACTION}" == "run" ]]; then
+    # Chế độ chạy Server (Network Mode)
+    if [[ ! -f "${SERVER_BIN}" ]]; then
+        err "Server binary not found at: ${SERVER_BIN}"
+        exit 1
+    fi
+    if [[ ! -f "${CONFIG}" ]]; then
+        err "Config file missing at: ${CONFIG}"
+        exit 1
+    fi
+    
+    log "🚀 Launching Pomai Server..."
+    exec "${SERVER_BIN}" --config "${CONFIG}"
 
-if [ -z "${SERVER_SRC}" ]; then
-  echo "No main.cc found in src/ or examples/; built archive only: ${ARCHIVE}"
-  exit 0
-fi
+elif [[ "${ACTION}" == "bench" ]]; then
+    # Chế độ chạy Benchmark (Embedded Mode)
+    if [[ ! -f "${BENCH_BIN}" ]]; then
+        err "Benchmark binary not found at: ${BENCH_BIN}"
+        exit 1
+    fi
 
-OUT_BIN="${BUILD_DIR}/pomai_server"
-echo "Linking server from ${SERVER_SRC} -> ${OUT_BIN}"
-"${CXX}" ${CXXFLAGS} "${SERVER_SRC}" "${ARCHIVE}" -o "${OUT_BIN}"
-
-echo "Build complete."
-echo "  archive: ${ARCHIVE}"
-echo "  server:  ${OUT_BIN}"
-
-# Build Pomai CLI if present
-CLI_SRC="${SRC_DIR}/pomai_cli.cc"
-CLI_BIN="${BUILD_DIR}/pomai_cli"
-if [ -f "$CLI_SRC" ]; then
-  echo "Linking CLI from ${CLI_SRC} -> ${CLI_BIN}"
-  "${CXX}" ${CXXFLAGS} "$CLI_SRC" "${ARCHIVE}" -o "${CLI_BIN}"
-  echo "Build complete."
-  echo "  cli:     ${CLI_BIN}"
+    log "Running Embedded Core Benchmark..."
+    exec "${BENCH_BIN}"
 fi

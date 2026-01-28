@@ -1,39 +1,73 @@
-# Top-level CMake for the repository.
-cmake_minimum_required(VERSION 3.16)
-project(pomai_cache LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.10)
+project(pomai)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Optionally allow building tests and apps
-option(BUILD_TESTS "Build tests" ON)
-option(BUILD_APPS "Build apps/binaries" ON)
+# --- 1. TÌM THƯ VIỆN THREADS TRƯỚC (QUAN TRỌNG) ---
+find_package(Threads REQUIRED)
 
-# Add top-level subdirectories if they exist. This keeps the top-level
-# CMakeLists small while allowing per-module CMake files.
-if(EXISTS "${CMAKE_SOURCE_DIR}/src/ai/CMakeLists.txt")
-  add_subdirectory(src/ai)
+# --- 2. CẤU HÌNH COMPILER ---
+if(CMAKE_BUILD_TYPE MATCHES Release)
+    add_compile_options(-O3 -march=native -ffast-math -funroll-loops)
+else()
+    add_compile_options(-O0 -g)
 endif()
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/src/core/CMakeLists.txt")
-  add_subdirectory(src/core)
+include_directories(
+    include       
+    src 
+    src/core 
+    src/server 
+    .
+)
+
+# ==========================================
+# 3. CORE LIBRARY (Embedded Mode)
+# ==========================================
+file(GLOB CORE_SOURCES 
+    "src/core/*.cpp"
+    "src/core/crc64.c"
+)
+
+# Tạo thư viện tĩnh
+add_library(pomai_core STATIC ${CORE_SOURCES})
+# Link Threads vào Core (Lúc này Threads::Threads đã được tìm thấy ở bước 1)
+target_link_libraries(pomai_core Threads::Threads)
+
+# ==========================================
+# 4. SERVER DAEMON
+# ==========================================
+file(GLOB SERVER_SOURCES 
+    "src/server/*.cpp"
+)
+
+add_executable(pomai-server ${SERVER_SOURCES})
+# Link Server với Core
+target_link_libraries(pomai-server pomai_core)
+
+# ==========================================
+# 5. EMBEDDED BENCHMARK
+# ==========================================
+# Kiểm tra nếu file tồn tại thì mới build benchmark
+if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_embedded.cpp")
+    add_executable(bench_embedded benchmarks/bench_embedded.cpp)
+    target_link_libraries(bench_embedded pomai_core)
 endif()
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/src/memory/CMakeLists.txt")
-  add_subdirectory(src/memory)
-endif()
+# ==========================================
+# 6. TESTS
+# ==========================================
+if(EXISTS "${CMAKE_SOURCE_DIR}/tests")
+    add_executable(wal_unit_tests tests/wal_unit_tests.cpp)
+    target_link_libraries(wal_unit_tests pomai_core)
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/src/facade/CMakeLists.txt")
-  add_subdirectory(src/facade)
-endif()
+    add_executable(wal_integration_writer tests/wal_integration_writer.cpp)
+    target_link_libraries(wal_integration_writer pomai_core)
 
-if(BUILD_APPS AND EXISTS "${CMAKE_SOURCE_DIR}/apps/CMakeLists.txt")
-  add_subdirectory(apps)
-endif()
+    add_executable(wal_replay_inspect tests/wal_replay_inspect.cpp)
+    target_link_libraries(wal_replay_inspect pomai_core)
 
-if(BUILD_TESTS AND EXISTS "${CMAKE_SOURCE_DIR}/tests/CMakeLists.txt")
-  add_subdirectory(tests)
+    add_executable(pomai_db_writer tests/pomai_db_writer.cpp)
+    target_link_libraries(pomai_db_writer pomai_core)
 endif()
-
-# Install rules, packaging, etc. could go here.
