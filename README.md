@@ -118,6 +118,21 @@ Why?
 
 ---
 
+### 7. **Centroid Persistence (centroids.bin)**
+PomaiDB can persist routing centroids to disk and load them synchronously on startup so routing is
+available immediately without recomputing k-means each restart. The file is saved atomically and
+fsynced for durability.
+
+**Defaults & configuration:**
+- Default path: `<wal_dir>/centroids.bin` (override with `DbOptions::centroids_path`).
+- Load behavior: `DbOptions::centroids_load_mode` (`Auto`, `Sync`, `Async`, `None`).
+- After a successful recompute, centroids are written to disk automatically.
+
+Why?  
+**To avoid expensive recomputation and speed up cold starts with reliable, durable routing data.**
+
+---
+
 ### 7. **WhisperGrain: Energy Operating System**
 
 PomaiDB is not another “dumb” search engine hard-coded to eat RAM.  

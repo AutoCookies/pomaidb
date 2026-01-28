@@ -35,6 +35,11 @@ namespace pomai
     PomaiDB::PomaiDB(DbOptions opt, LogFn info, LogFn error)
         : opt_(std::move(opt)), log_info_(std::move(info)), log_error_(std::move(error))
     {
+        if (opt_.centroids_path.empty() && opt_.centroids_load_mode != MembraneRouter::CentroidsLoadMode::None)
+        {
+            opt_.centroids_path = opt_.wal_dir + "/centroids.bin";
+        }
+
         // Create global index build pool (not started yet)
         std::size_t workers = opt_.index_build_threads;
         if (workers == 0)
@@ -66,7 +71,9 @@ namespace pomai
             shards.push_back(std::move(sh));
         }
 
-        membrane_ = std::make_unique<MembraneRouter>(std::move(shards), opt_.whisper);
+        membrane_ = std::make_unique<MembraneRouter>(std::move(shards), opt_.whisper, opt_.dim);
+        membrane_->SetCentroidsFilePath(opt_.centroids_path);
+        membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
     }
 
     void PomaiDB::Start()
@@ -79,6 +86,17 @@ namespace pomai
         if (build_pool_)
             build_pool_->Start();
         membrane_->Start();
+
+        if (opt_.centroids_load_mode == MembraneRouter::CentroidsLoadMode::None)
+            return;
+
+        if (opt_.centroids_load_mode != MembraneRouter::CentroidsLoadMode::Async &&
+            membrane_->HasCentroids())
+        {
+            if (log_info_)
+                log_info_("Centroids already loaded; skipping background recompute");
+            return;
+        }
 
         // Spawn a background non-blocking centroid recompute after startup to avoid blocking Start().
         // This provides a reasonable default: k = shards * 8, samples = shards * 1024.
