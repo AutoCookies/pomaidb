@@ -450,6 +450,9 @@ namespace pomai
         if (segment_pos < segments_.size() && segments_[segment_pos].snap == snap)
         {
             segments_[segment_pos].index = std::move(idx);
+            // Release the snapshot to free memory — index now holds the searchable data.
+            segments_[segment_pos].snap.reset();
+
             if (log_info_)
                 log_info_("[" + name_ + "] Indexed segment: " + std::to_string(snap->ids.size()) + " vectors");
             else
@@ -463,6 +466,8 @@ namespace pomai
             if (s.snap == snap)
             {
                 s.index = std::move(idx);
+                s.snap.reset();
+
                 if (log_info_)
                     log_info_("[" + name_ + "] Indexed segment: " + std::to_string(snap->ids.size()) + " vectors");
                 else

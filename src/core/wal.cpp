@@ -14,12 +14,17 @@
 #include <algorithm>
 #include <endian.h>
 #include <mutex>
+#include <limits>
 
 namespace pomai
 {
 
     // Footer magic (8 bytes). Chosen mnemonic ASCII 'pomaiwal'
     static constexpr uint64_t FOOTER_MAGIC = UINT64_C(0x706f6d616977616c); // "pomaiwal" little-endian
+
+    // Defensive caps to avoid server-side OOM caused by overly large client batches
+    static constexpr std::size_t MAX_WAL_PAYLOAD_BYTES = 64ULL * 1024ULL * 1024ULL; // 64 MiB
+    static constexpr std::size_t MAX_BATCH_ROWS = 50'000;                           // reasonable row cap
 
     static void ThrowSys(const std::string &what)
     {
@@ -141,14 +146,35 @@ namespace pomai
         if (batch.empty())
             return 0;
 
-        Lsn lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed);
+        // Defensive: cap number of rows a client may submit in one batch.
+        if (batch.size() > MAX_BATCH_ROWS)
+            throw std::runtime_error("WAL append rejected: batch too large; split into smaller batches (max rows = " + std::to_string(MAX_BATCH_ROWS) + ")");
 
-        const uint32_t count = static_cast<uint32_t>(batch.size());
-        const uint16_t dim16 = static_cast<uint16_t>(dim_);
+        // Compute per-entry bytes and check for overflow before building buffers.
+        const uint64_t per_entry_bytes = static_cast<uint64_t>(sizeof(uint64_t) + dim_ * sizeof(float));
+        if (per_entry_bytes == 0)
+            throw std::runtime_error("WAL append failed: invalid per-entry size");
 
+        const uint64_t count = static_cast<uint64_t>(batch.size());
+        if (count > 0 && per_entry_bytes > 0 && count > (UINT64_MAX / per_entry_bytes))
+            throw std::runtime_error("WAL append rejected: batch size would overflow payload calculations");
+
+        // Calculate payload_size and check against caps and uint32_t footer field.
         const std::size_t payload_size =
             sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t) +
-            count * (sizeof(uint64_t) + dim_ * sizeof(float));
+            static_cast<std::size_t>(count * per_entry_bytes);
+
+        if (payload_size > MAX_WAL_PAYLOAD_BYTES)
+            throw std::runtime_error("WAL append rejected: payload too large; split batch into smaller chunks (max payload bytes = " + std::to_string(MAX_WAL_PAYLOAD_BYTES) + ")");
+
+        if (payload_size > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()))
+            throw std::runtime_error("WAL append rejected: payload larger than 4GB (unsupported)");
+
+        // Assign LSN early
+        Lsn lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed);
+
+        const uint32_t count_u32 = static_cast<uint32_t>(batch.size());
+        const uint16_t dim16 = static_cast<uint16_t>(dim_);
 
         std::vector<uint8_t> buf;
         buf.reserve(payload_size + 24);
@@ -160,7 +186,7 @@ namespace pomai
         };
 
         uint64_t lsn_le = (uint64_t)lsn;
-        uint32_t count_le = (uint32_t)count;
+        uint32_t count_le = (uint32_t)count_u32;
         uint16_t dim_le = (uint16_t)dim16;
 
 #if __BYTE_ORDER == __BIG_ENDIAN
@@ -371,7 +397,7 @@ namespace pomai
 
         const std::size_t header_size = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t);
         const std::size_t footer_size = 24;
-        const std::size_t max_payload_allowed = 64U * 1024U * 1024U; // 64 MB cap for whole_payload
+        const std::size_t max_payload_allowed = MAX_WAL_PAYLOAD_BYTES; // use same cap as append
 
         while (true)
         {

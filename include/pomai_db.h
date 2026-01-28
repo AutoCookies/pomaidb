@@ -29,6 +29,9 @@ namespace pomai
         // Centroid persistence
         std::string centroids_path{};
         MembraneRouter::CentroidsLoadMode centroids_load_mode{MembraneRouter::CentroidsLoadMode::Auto};
+
+        // NEW: search pool worker count (0 = auto)
+        std::size_t search_pool_workers{0};
     };
 
     class PomaiDB

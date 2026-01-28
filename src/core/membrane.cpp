@@ -1,5 +1,6 @@
 #include "membrane.h"
 #include "spatial_router.h"
+#include "search_fanout.h"
 
 #include <stdexcept>
 #include <algorithm>
@@ -27,6 +28,43 @@ namespace pomai
         constexpr std::size_t kCentroidsHeaderSize = 8 + 4 + 2 + 8;
         constexpr std::uint32_t kCentroidsVersion = 1;
         constexpr char kCentroidsMagic[8] = {'P', 'O', 'M', 'C', 'E', 'N', '0', '7'};
+
+        // Choose worker count for SearchThreadPool based on requested knob and shard count.
+        // - requested == 0 means auto choose based on hardware_concurrency and shard_count.
+        // - clamp result to [1, max_cap].
+        static std::size_t ChooseSearchPoolWorkers(std::size_t requested, std::size_t shard_count)
+        {
+            const std::size_t MIN_WORKERS = 1;
+            const std::size_t DEFAULT_MAX = 8; // safe cap for small devices
+
+            unsigned hc = std::thread::hardware_concurrency();
+            if (hc == 0)
+                hc = 2;
+
+            std::size_t suggested = static_cast<std::size_t>(hc);
+            if (suggested < MIN_WORKERS)
+                suggested = MIN_WORKERS;
+
+            std::size_t w = 0;
+            if (requested == 0)
+            {
+                // auto: choose min(hardware, shard_count) but at least 1
+                if (shard_count == 0)
+                    w = suggested;
+                else
+                    w = std::min<std::size_t>(suggested, std::max<std::size_t>(MIN_WORKERS, shard_count));
+            }
+            else
+            {
+                w = requested;
+            }
+
+            if (w < MIN_WORKERS)
+                w = MIN_WORKERS;
+            if (w > DEFAULT_MAX)
+                w = DEFAULT_MAX;
+            return w;
+        }
 
         bool WriteFull(int fd, const void *buf, std::size_t len)
         {
@@ -172,11 +210,25 @@ namespace pomai
         }
     } // namespace
 
+    // Constructor updated to accept search_pool_workers knob.
     MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                    pomai::server::WhisperConfig w_cfg,
-                                   std::size_t dim)
-        : shards_(std::move(shards)), brain_(w_cfg), probe_P_(2), dim_(dim)
+                                   std::size_t dim,
+                                   std::size_t search_pool_workers)
+        : shards_(std::move(shards)),
+          brain_(w_cfg),
+          probe_P_(2),
+          centroids_path_(),
+          centroids_load_mode_(CentroidsLoadMode::Auto),
+          dim_(dim),
+          // initialize search_pool_ using helper and constructor parameter 'shards' size (use param shards size for decision)
+          search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size()))
     {
+        // Log chosen worker count for observability
+        std::cout << "[Router] search pool workers = " << search_pool_.WorkerCount()
+                  << " (requested=" << search_pool_workers << ", hw_concurrency=" << std::thread::hardware_concurrency()
+                  << ", shards=" << shards_.size() << ")\n";
+
         if (shards_.empty())
             throw std::runtime_error("must have at least 1 shard");
     }
@@ -227,6 +279,9 @@ namespace pomai
         // Stop cũng nên song song để tắt nhanh, nhưng tuần tự cho an toàn cũng được
         for (auto &s : shards_)
             s->Stop();
+
+        // Stop search pool after shards stopped
+        search_pool_.Stop();
     }
 
     // Legacy id-based fallback
@@ -370,16 +425,21 @@ namespace pomai
             std::iota(target_shard_ids.begin(), target_shard_ids.end(), 0);
         }
 
-        std::vector<std::future<SearchResponse>> futs;
-        futs.reserve(target_shard_ids.size());
+        // Use thread-pool based bounded fanout instead of std::async to avoid thread explosion.
+        std::vector<std::function<SearchResponse()>> jobs;
+        jobs.reserve(target_shard_ids.size());
+
+        // Capture request via shared_ptr to avoid copying heavy vectors per job.
+        auto req_ptr = std::make_shared<SearchRequest>(req);
 
         for (auto sid : target_shard_ids)
         {
-            // avoid capturing member expressions in lambda capture list; take raw pointer first
             pomai::Shard *shard_ptr = shards_[sid].get();
-            futs.push_back(std::async(std::launch::async, [&req, &budget, shard_ptr]()
-                                      { return shard_ptr->Search(req, budget); }));
+            jobs.emplace_back([req_ptr, budget, shard_ptr]()
+                              { return shard_ptr->Search(*req_ptr, budget); });
         }
+
+        auto futs = ParallelSubmit(search_pool_, std::move(jobs));
 
         std::vector<SearchResultItem> all;
         for (auto &f : futs)
