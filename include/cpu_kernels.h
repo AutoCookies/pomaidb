@@ -102,52 +102,49 @@ namespace pomai::kernels
     }
 
     /**
-     * @brief Computes squared L2 distance between a float query and SQ8 quantized vector.
+     * @brief Computes squared L2 distance between two SQ8 quantized vectors.
      * @param qdata Pointer to quantized vector (uint8_t per dimension).
-     * @param query Pointer to float query vector.
-     * @param mins Per-dimension min values.
-     * @param scales Per-dimension scale values (range/255).
+     * @param qquery Pointer to quantized query vector (uint8_t per dimension).
      * @param dim Dimension of vectors.
      * @return float Squared Euclidean distance.
      */
     static inline float L2Sqr_SQ8_AVX2(const std::uint8_t *qdata,
-                                      const float *query,
-                                      const float *mins,
-                                      const float *scales,
+                                      const std::uint8_t *qquery,
                                       std::size_t dim)
     {
-        __m256 sum = _mm256_setzero_ps();
+        __m256i acc32 = _mm256_setzero_si256();
+        const __m256i clamp = _mm256_set1_epi8(127);
+        const __m256i ones = _mm256_set1_epi16(1);
+
         std::size_t i = 0;
-
-        for (; i + 8 <= dim; i += 8)
+        for (; i + 32 <= dim; i += 32)
         {
-            __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qdata + i));
-            __m256i expanded = _mm256_cvtepu8_epi32(packed);
-            __m256 qvals = _mm256_cvtepi32_ps(expanded);
+            __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qdata + i));
+            __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qquery + i));
 
-            __m256 scale = _mm256_loadu_ps(scales + i);
-            __m256 minv = _mm256_loadu_ps(mins + i);
-            __m256 dequant = _mm256_fmadd_ps(qvals, scale, minv);
+            __m256i diff1 = _mm256_subs_epu8(a, b);
+            __m256i diff2 = _mm256_subs_epu8(b, a);
+            __m256i diff = _mm256_adds_epu8(diff1, diff2);
+            __m256i diff_clamped = _mm256_min_epu8(diff, clamp);
 
-            __m256 q = _mm256_loadu_ps(query + i);
-            __m256 diff = _mm256_sub_ps(dequant, q);
-            sum = _mm256_fmadd_ps(diff, diff, sum);
+            __m256i squares16 = _mm256_maddubs_epi16(diff_clamped, diff_clamped);
+            __m256i squares32 = _mm256_madd_epi16(squares16, ones);
+            acc32 = _mm256_add_epi32(acc32, squares32);
         }
 
-        alignas(32) float temp[8];
-        _mm256_storeu_ps(temp, sum);
-        float total = 0.0f;
+        alignas(32) std::uint32_t temp[8];
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(temp), acc32);
+        std::uint64_t total = 0;
         for (int k = 0; k < 8; ++k)
             total += temp[k];
 
         for (; i < dim; ++i)
         {
-            float dequant = mins[i] + scales[i] * static_cast<float>(qdata[i]);
-            float diff = dequant - query[i];
-            total += diff * diff;
+            int diff = static_cast<int>(qdata[i]) - static_cast<int>(qquery[i]);
+            total += static_cast<std::uint64_t>(diff * diff);
         }
 
-        return total;
+        return static_cast<float>(total);
     }
 
 } // namespace pomai::kernels
