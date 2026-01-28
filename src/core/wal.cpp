@@ -146,10 +146,6 @@ namespace pomai
         if (batch.empty())
             return 0;
 
-        // Defensive: cap number of rows a client may submit in one batch.
-        if (batch.size() > MAX_BATCH_ROWS)
-            throw std::runtime_error("WAL append rejected: batch too large; split into smaller batches (max rows = " + std::to_string(MAX_BATCH_ROWS) + ")");
-
         // Compute per-entry bytes and check for overflow before building buffers.
         const uint64_t per_entry_bytes = static_cast<uint64_t>(sizeof(uint64_t) + dim_ * sizeof(float));
         if (per_entry_bytes == 0)
@@ -164,8 +160,8 @@ namespace pomai
             sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t) +
             static_cast<std::size_t>(count * per_entry_bytes);
 
-        if (payload_size > MAX_WAL_PAYLOAD_BYTES)
-            throw std::runtime_error("WAL append rejected: payload too large; split batch into smaller chunks (max payload bytes = " + std::to_string(MAX_WAL_PAYLOAD_BYTES) + ")");
+        if (batch.size() > MAX_BATCH_ROWS || payload_size > MAX_WAL_PAYLOAD_BYTES)
+            throw std::runtime_error("WAL append rejected: payload too large (" + std::to_string(payload_size) + " bytes); split batch or reduce vector dimensions.");
 
         if (payload_size > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()))
             throw std::runtime_error("WAL append rejected: payload larger than 4GB (unsupported)");

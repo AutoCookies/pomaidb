@@ -39,6 +39,7 @@ namespace pomai
     class Shard
     {
     public:
+        friend struct ShardTestAccessor;
         // Logging callback type: accept a single formatted message string.
         using LogFn = std::function<void(const std::string &msg)>;
 
