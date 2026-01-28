@@ -62,7 +62,7 @@ int main(int argc, char **argv)
     std::cout << ":: POMAI EMBEDDED SAFE BENCHMARK (FIXED) ::\n";
 
     // Configurable parameters (tune for your machine)
-    size_t N = 5'000'000;  // total vectors to ingest
+    size_t N = 1'000'000;  // total vectors to ingest
     std::size_t dim = 512; // vector dim
     std::size_t shards = 8;
     std::size_t chunk_size = 2'000;
