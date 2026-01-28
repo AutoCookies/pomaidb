@@ -18,8 +18,8 @@ namespace pomai
         {
             std::size_t dim{0};
             std::vector<Id> ids;     // row ids [N]
-            std::vector<float> data; // row-major vectors [N * dim]
-            std::vector<std::uint8_t> qdata; // SQ8 row-major vectors [N * dim]
+            std::vector<float> data; // refinement store (float32) [N * dim]
+            std::vector<std::uint8_t> qdata; // SQ8 hot store [N * dim]
             std::vector<float> qmins;  // per-dimension min
             std::vector<float> qscales; // per-dimension scale
             std::size_t accounted_bytes{0};

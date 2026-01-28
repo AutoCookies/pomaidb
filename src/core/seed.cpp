@@ -241,13 +241,13 @@ namespace pomai
         if (n == 0)
             return resp;
 
-        const std::size_t k = std::min<std::size_t>(req.topk, n);
+        constexpr std::size_t kOversample = 128;
+        const std::size_t k = std::min<std::size_t>(std::min(req.topk, kOversample), n);
         if (k == 0)
             return resp;
 
         const float *q = req.query.data.data();
 
-        constexpr std::size_t kOversample = 128;
         const std::size_t candidate_k = std::min<std::size_t>(kOversample, n);
 
         constexpr std::size_t kUnroll = 8;
@@ -294,10 +294,7 @@ namespace pomai
             qquant[d] = static_cast<std::uint8_t>(qi);
         }
 
-        thread_local std::unique_ptr<FixedTopK> candidate_topk;
-        if (!candidate_topk)
-            candidate_topk = std::make_unique<FixedTopK>(candidate_k);
-        candidate_topk->Reset(candidate_k);
+        FixedTopK candidate_topk(candidate_k);
 
         std::size_t row = 0;
         for (; row + kUnroll <= n; row += kUnroll)
@@ -319,36 +316,33 @@ namespace pomai
             float d6 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 6) * dim, qquant, dim);
             float d7 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 7) * dim, qquant, dim);
 
-            candidate_topk->Push(-d0, static_cast<Id>(row + 0));
-            candidate_topk->Push(-d1, static_cast<Id>(row + 1));
-            candidate_topk->Push(-d2, static_cast<Id>(row + 2));
-            candidate_topk->Push(-d3, static_cast<Id>(row + 3));
-            candidate_topk->Push(-d4, static_cast<Id>(row + 4));
-            candidate_topk->Push(-d5, static_cast<Id>(row + 5));
-            candidate_topk->Push(-d6, static_cast<Id>(row + 6));
-            candidate_topk->Push(-d7, static_cast<Id>(row + 7));
+            candidate_topk.Push(-d0, static_cast<Id>(row + 0));
+            candidate_topk.Push(-d1, static_cast<Id>(row + 1));
+            candidate_topk.Push(-d2, static_cast<Id>(row + 2));
+            candidate_topk.Push(-d3, static_cast<Id>(row + 3));
+            candidate_topk.Push(-d4, static_cast<Id>(row + 4));
+            candidate_topk.Push(-d5, static_cast<Id>(row + 5));
+            candidate_topk.Push(-d6, static_cast<Id>(row + 6));
+            candidate_topk.Push(-d7, static_cast<Id>(row + 7));
         }
 
         for (; row < n; ++row)
         {
             float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, qquant, dim);
-            candidate_topk->Push(-d, static_cast<Id>(row));
+            candidate_topk.Push(-d, static_cast<Id>(row));
         }
 
-        thread_local std::unique_ptr<FixedTopK> final_topk;
-        if (!final_topk)
-            final_topk = std::make_unique<FixedTopK>(k);
-        final_topk->Reset(k);
+        FixedTopK final_topk(k);
         const float *base = snap->data.data();
-        const auto *candidates = candidate_topk->Data();
-        const std::size_t candidate_count = candidate_topk->Size();
+        const auto *candidates = candidate_topk.Data();
+        const std::size_t candidate_count = candidate_topk.Size();
         for (std::size_t i = 0; i < candidate_count; ++i)
         {
             std::size_t cand_row = static_cast<std::size_t>(candidates[i].id);
             float d = kernels::L2Sqr(base + cand_row * dim, q, dim);
-            final_topk->Push(-d, snap->ids[cand_row]);
+            final_topk.Push(-d, snap->ids[cand_row]);
         }
-        final_topk->FillSorted(resp.items);
+        final_topk.FillSorted(resp.items);
         return resp;
     }
 

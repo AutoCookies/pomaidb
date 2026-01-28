@@ -187,6 +187,28 @@ namespace pomai::kernels
         return static_cast<float>(total);
     }
 
+    /**
+     * @brief Computes squared L2 distances for a bucket of SQ8 vectors against a quantized query.
+     * Uses prefetching of the (i+4)-th vector to hide memory latency.
+     */
+    static inline void ScanBucketSQ8_AVX2(const std::uint8_t *base,
+                                          const std::uint8_t *qquery,
+                                          std::size_t dim,
+                                          std::size_t count,
+                                          float *out_distances)
+    {
+        constexpr std::size_t kPrefetchDistance = 4;
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            if (i + kPrefetchDistance < count)
+            {
+                _mm_prefetch(reinterpret_cast<const char *>(base + (i + kPrefetchDistance) * dim), _MM_HINT_T0);
+            }
+            const std::uint8_t *v = base + i * dim;
+            out_distances[i] = L2Sqr_SQ8_AVX2(v, qquery, dim);
+        }
+    }
+
     static inline void L2Sqr8CentroidsAVX2(const Vector *centroids,
                                            const std::size_t *indices,
                                            std::size_t count,

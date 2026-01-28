@@ -36,7 +36,17 @@ namespace pomai
 
     struct IndexedSegment
     {
+        struct GrainIndex
+        {
+            std::size_t dim{0};
+            std::size_t count{0};
+            std::vector<Vector> centroids;
+            std::vector<std::uint32_t> offsets;
+            std::vector<std::uint32_t> postings;
+        };
+
         Seed::Snapshot snap;
+        std::shared_ptr<GrainIndex> grains;
         std::shared_ptr<pomai::core::OrbitIndex> index; // null until built
     };
 
@@ -78,6 +88,11 @@ namespace pomai
     private:
         void RunLoop();
         void MaybeFreezeSegment();
+        std::shared_ptr<IndexedSegment::GrainIndex> BuildGrainIndex(const Seed::Snapshot &snap) const;
+        SearchResponse SearchGrains(const Seed::Snapshot &snap,
+                                    const IndexedSegment::GrainIndex &grains,
+                                    const SearchRequest &req,
+                                    const pomai::ai::Budget &budget) const;
 
         void AttachIndex(std::size_t segment_pos,
                          Seed::Snapshot snap,
@@ -102,6 +117,7 @@ namespace pomai
         mutable std::mutex state_mu_;
         std::vector<IndexedSegment> segments_;
         Seed::Snapshot live_snap_;
+        std::shared_ptr<IndexedSegment::GrainIndex> live_grains_;
 
         std::thread owner_;
 

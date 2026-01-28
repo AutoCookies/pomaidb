@@ -12,11 +12,51 @@
 #include <unistd.h>
 #include <cstring>
 #include <random>
+#include <limits>
+#include <cmath>
 
 #include "fixed_topk.h"
+#include "cpu_kernels.h"
+#include "spatial_router.h"
 
 namespace pomai
 {
+    namespace
+    {
+        constexpr std::size_t kTargetGrainSize = 1000;
+        constexpr std::size_t kMaxProbe = 128;
+        constexpr std::size_t kOversample = 128;
+
+        std::size_t TargetCentroidCount(std::size_t n)
+        {
+            if (n == 0)
+                return 0;
+            std::size_t k = n / kTargetGrainSize;
+            if (k == 0)
+                k = 1;
+            if (k > n)
+                k = n;
+            return k;
+        }
+
+        std::vector<Vector> SnapshotToVectors(const Seed::Snapshot &snap)
+        {
+            std::vector<Vector> out;
+            if (!snap || snap->ids.empty())
+                return out;
+            const std::size_t n = snap->ids.size();
+            const std::size_t dim = snap->dim;
+            out.reserve(n);
+            for (std::size_t row = 0; row < n; ++row)
+            {
+                Vector v;
+                const float *src = snap->data.data() + row * dim;
+                v.data.assign(src, src + dim);
+                out.push_back(std::move(v));
+            }
+            return out;
+        }
+    }
 
     Shard::Shard(std::string name,
                  std::size_t dim,
@@ -92,9 +132,16 @@ namespace pomai
             // Continue startup; seed remains as-is (empty or partially restored).
         }
 
+        Seed::Snapshot boot_snap;
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             live_snap_ = seed_.MakeSnapshot();
+            boot_snap = live_snap_;
+        }
+        auto grains = BuildGrainIndex(boot_snap);
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            live_grains_ = std::move(grains);
         }
 
         // If replay loaded data, freeze it so it can be indexed
@@ -196,15 +243,183 @@ namespace pomai
         topk.FillSorted(out.items);
     }
 
+    std::shared_ptr<IndexedSegment::GrainIndex> Shard::BuildGrainIndex(const Seed::Snapshot &snap) const
+    {
+        if (!snap || snap->ids.empty())
+            return nullptr;
+
+        const std::size_t n = snap->ids.size();
+        const std::size_t k = TargetCentroidCount(n);
+        if (k == 0)
+            return nullptr;
+
+        std::vector<Vector> data = SnapshotToVectors(snap);
+        if (data.empty())
+            return nullptr;
+
+        std::vector<Vector> centroids;
+        try
+        {
+            centroids = SpatialRouter::BuildKMeans(data, k, 4);
+        }
+        catch (...)
+        {
+            centroids.clear();
+        }
+
+        if (centroids.empty())
+        {
+            centroids.push_back(data.front());
+        }
+
+        const std::size_t ccount = centroids.size();
+        std::vector<std::uint32_t> counts(ccount, 0);
+        std::vector<std::uint32_t> assignments(n, 0);
+        const std::size_t dim = snap->dim;
+        for (std::size_t row = 0; row < n; ++row)
+        {
+            const float *src = snap->data.data() + row * dim;
+            float best_d = std::numeric_limits<float>::infinity();
+            std::size_t best = 0;
+            for (std::size_t c = 0; c < ccount; ++c)
+            {
+                float d = kernels::L2Sqr(src, centroids[c].data.data(), dim);
+                if (d < best_d)
+                {
+                    best_d = d;
+                    best = c;
+                }
+            }
+            assignments[row] = static_cast<std::uint32_t>(best);
+            counts[best]++;
+        }
+
+        auto grains = std::make_shared<IndexedSegment::GrainIndex>();
+        grains->dim = dim;
+        grains->count = n;
+        grains->centroids = std::move(centroids);
+        grains->offsets.resize(ccount + 1, 0);
+        for (std::size_t c = 0; c < ccount; ++c)
+        {
+            grains->offsets[c + 1] = grains->offsets[c] + counts[c];
+        }
+        grains->postings.resize(n, 0);
+        std::vector<std::uint32_t> cursor = grains->offsets;
+        for (std::size_t row = 0; row < n; ++row)
+        {
+            std::size_t c = assignments[row];
+            std::uint32_t pos = cursor[c]++;
+            grains->postings[pos] = static_cast<std::uint32_t>(row);
+        }
+
+        return grains;
+    }
+
+    SearchResponse Shard::SearchGrains(const Seed::Snapshot &snap,
+                                       const IndexedSegment::GrainIndex &grains,
+                                       const SearchRequest &req,
+                                       const pomai::ai::Budget &budget) const
+    {
+        SearchResponse resp;
+        if (!snap)
+            return resp;
+        if (snap->dim == 0 || req.query.data.size() != snap->dim)
+            return resp;
+        if (snap->ids.empty() || grains.centroids.empty())
+            return resp;
+
+        const std::size_t dim = snap->dim;
+        const std::size_t n = snap->ids.size();
+
+        const std::size_t topk = std::min<std::size_t>(req.topk, kOversample);
+        if (topk == 0)
+            return resp;
+
+        std::size_t probe = budget.bucket_budget > 0 ? budget.bucket_budget : std::min<std::size_t>(8, grains.centroids.size());
+        probe = std::min<std::size_t>(probe, grains.centroids.size());
+        probe = std::min<std::size_t>(probe, kMaxProbe);
+        if (probe == 0)
+            probe = 1;
+
+        FixedTopK centroid_topk(probe);
+        const float *q = req.query.data.data();
+        for (std::size_t c = 0; c < grains.centroids.size(); ++c)
+        {
+            float d = kernels::L2Sqr(q, grains.centroids[c].data.data(), dim);
+            centroid_topk.Push(-d, static_cast<Id>(c));
+        }
+
+        if (snap->qdata.size() != n * dim || snap->qmins.size() != dim || snap->qscales.size() != dim)
+        {
+            return Seed::SearchSnapshot(snap, req);
+        }
+
+        thread_local std::vector<std::uint8_t> qquant;
+        if (qquant.size() < dim)
+            qquant.resize(dim);
+        const float *mins = snap->qmins.data();
+        const float *scales = snap->qscales.data();
+        for (std::size_t d = 0; d < dim; ++d)
+        {
+            float scale = scales[d];
+            float qv = (scale > 0.0f) ? ((q[d] - mins[d]) / scale) : 0.0f;
+            int qi = static_cast<int>(std::nearbyint(qv));
+            qi = std::min(255, std::max(0, qi));
+            qquant[d] = static_cast<std::uint8_t>(qi);
+        }
+
+        FixedTopK candidate_topk(kOversample);
+        const auto *centroid_candidates = centroid_topk.Data();
+        const std::size_t centroid_count = centroid_topk.Size();
+        const std::uint8_t *qbase = snap->qdata.data();
+        constexpr std::size_t kPrefetchDistance = 4;
+        for (std::size_t i = 0; i < centroid_count; ++i)
+        {
+            std::size_t c = static_cast<std::size_t>(centroid_candidates[i].id);
+            if (c >= grains.offsets.size() - 1)
+                continue;
+            std::size_t start = grains.offsets[c];
+            std::size_t end = grains.offsets[c + 1];
+            for (std::size_t j = start; j < end; ++j)
+            {
+                std::size_t row = grains.postings[j];
+                std::size_t prefetch_idx = j + kPrefetchDistance;
+                if (prefetch_idx < end)
+                {
+                    std::size_t prefetch_row = grains.postings[prefetch_idx];
+                    _mm_prefetch(reinterpret_cast<const char *>(qbase + prefetch_row * dim), _MM_HINT_T0);
+                }
+                float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, qquant.data(), dim);
+                candidate_topk.Push(-d, static_cast<Id>(row));
+            }
+        }
+
+        FixedTopK final_topk(topk);
+        const float *base = snap->data.data();
+        const auto *candidates = candidate_topk.Data();
+        const std::size_t candidate_count = candidate_topk.Size();
+        for (std::size_t i = 0; i < candidate_count; ++i)
+        {
+            std::size_t row = static_cast<std::size_t>(candidates[i].id);
+            float d = kernels::L2Sqr(base + row * dim, q, dim);
+            final_topk.Push(-d, snap->ids[row]);
+        }
+        final_topk.FillSorted(resp.items);
+        return resp;
+    }
+
     SearchResponse Shard::Search(const SearchRequest &req, const pomai::ai::Budget &budget) const
     {
+        const auto start = std::chrono::steady_clock::now();
         std::vector<IndexedSegment> segs;
         Seed::Snapshot live;
+        std::shared_ptr<IndexedSegment::GrainIndex> live_grains;
 
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             segs = segments_;
             live = live_snap_;
+            live_grains = live_grains_;
         }
 
         SearchResponse out;
@@ -212,23 +427,42 @@ namespace pomai
         // 1) frozen segments
         for (const auto &s : segs)
         {
+            if (s.grains && s.snap)
+            {
+                auto r = SearchGrains(s.snap, *s.grains, req, budget);
+                MergeTopK(out, r, std::min<std::size_t>(req.topk, kOversample));
+                continue;
+            }
             if (s.index)
             {
                 auto r = s.index->Search(req.query, budget);
                 MergeTopK(out, r, req.topk);
+                continue;
             }
-            else if (s.snap)
+            if (s.snap)
             {
                 auto r = Seed::SearchSnapshot(s.snap, req);
-                MergeTopK(out, r, req.topk);
+                MergeTopK(out, r, std::min<std::size_t>(req.topk, kOversample));
             }
         }
 
         // 2) live memtable snapshot
-        if (live)
+        if (live && live_grains)
+        {
+            auto r = SearchGrains(live, *live_grains, req, budget);
+            MergeTopK(out, r, std::min<std::size_t>(req.topk, kOversample));
+        }
+        else if (live)
         {
             auto r = Seed::SearchSnapshot(live, req);
-            MergeTopK(out, r, req.topk);
+            MergeTopK(out, r, std::min<std::size_t>(req.topk, kOversample));
+        }
+
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+        if (elapsed.count() > 40)
+        {
+            const_cast<Shard *>(this)->RequestEmergencyFreeze();
         }
 
         return out;
@@ -370,8 +604,10 @@ namespace pomai
                 {
                     since_live_publish_ = 0;
                     auto snap = seed_.MakeSnapshot();
+                    auto grains = BuildGrainIndex(snap);
                     std::lock_guard<std::mutex> lk(state_mu_);
                     live_snap_ = std::move(snap);
+                    live_grains_ = std::move(grains);
                 }
 
                 // 4) freeze to segment sometimes
@@ -410,11 +646,12 @@ namespace pomai
         if (!snap || snap->ids.empty())
             return;
 
+        auto grains = BuildGrainIndex(snap);
         std::size_t seg_pos = 0;
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             live_snap_ = snap;
-            segments_.push_back(IndexedSegment{snap, nullptr});
+            segments_.push_back(IndexedSegment{snap, std::move(grains), nullptr});
             seg_pos = segments_.size() - 1;
         }
 
@@ -439,9 +676,16 @@ namespace pomai
 
         // reset memtable
         seed_ = Seed(seed_.Dim());
+        Seed::Snapshot reset_snap;
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             live_snap_ = seed_.MakeSnapshot();
+            reset_snap = live_snap_;
+        }
+        auto reset_grains = BuildGrainIndex(reset_snap);
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            live_grains_ = std::move(reset_grains);
         }
     }
 
@@ -459,11 +703,9 @@ namespace pomai
         {
             const std::size_t indexed = snap->ids.size();
             segments_[segment_pos].index = std::move(idx);
-            // Release the snapshot to free memory — index now holds the searchable data.
-            segments_[segment_pos].snap.reset();
 
             if (log_info_)
-                log_info_("[" + name_ + "] Snapshot released. Vectors indexed: " + std::to_string(indexed));
+                log_info_("[" + name_ + "] Snapshot indexed. Vectors indexed: " + std::to_string(indexed));
             return;
         }
 
@@ -474,10 +716,9 @@ namespace pomai
             {
                 const std::size_t indexed = snap->ids.size();
                 s.index = std::move(idx);
-                s.snap.reset();
 
                 if (log_info_)
-                    log_info_("[" + name_ + "] Snapshot released. Vectors indexed: " + std::to_string(indexed));
+                    log_info_("[" + name_ + "] Snapshot indexed. Vectors indexed: " + std::to_string(indexed));
                 return;
             }
         }
