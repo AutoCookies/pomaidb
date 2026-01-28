@@ -6,6 +6,8 @@
 #include <future>
 #include <chrono>
 
+#include "memory_manager.h"
+
 namespace pomai
 {
 
@@ -76,7 +78,11 @@ namespace pomai
                                                      opt_.whisper,
                                                      opt_.dim,
                                                      opt_.search_pool_workers,
-                                                     opt_.search_timeout_ms);
+                                                     opt_.search_timeout_ms,
+                                                     [this]()
+                                                     {
+                                                         metrics_.rejected_upsert_batches_total.fetch_add(1, std::memory_order_relaxed);
+                                                     });
         membrane_->SetCentroidsFilePath(opt_.centroids_path);
         membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
     }
@@ -193,6 +199,47 @@ namespace pomai
     std::future<bool> PomaiDB::RequestCheckpoint()
     {
         return membrane_->RequestCheckpoint();
+    }
+
+    void PomaiDB::SetProbeCount(std::size_t p)
+    {
+        membrane_->SetProbeCount(p);
+    }
+
+    std::string PomaiDB::GetStats() const
+    {
+        std::ostringstream ss;
+        ss << "{";
+        ss << "\"rejected_upsert_batches_total\":" << metrics_.rejected_upsert_batches_total.load(std::memory_order_relaxed);
+        ss << ",\"search_queue_avg_latency_ms\":" << membrane_->SearchQueueAvgLatencyMs();
+        ss << ",\"active_index_builds\":" << (build_pool_ ? build_pool_->ActiveBuilds() : 0);
+
+        const std::size_t snapshot_bytes = MemoryManager::Instance().Usage(MemoryManager::Pool::Search);
+        const std::size_t index_bytes = MemoryManager::Instance().Usage(MemoryManager::Pool::Indexing);
+        const std::size_t memtable_bytes = MemoryManager::Instance().Usage(MemoryManager::Pool::Memtable);
+        ss << ",\"memory_usage_bytes\":{";
+        ss << "\"snapshot\":" << snapshot_bytes;
+        ss << ",\"index\":" << index_bytes;
+        ss << ",\"memtable\":" << memtable_bytes;
+        ss << ",\"total\":" << (snapshot_bytes + index_bytes + memtable_bytes);
+        ss << "}";
+
+        auto hotspot = membrane_->CurrentHotspot();
+        ss << ",\"hotspot\":{";
+        if (hotspot)
+        {
+            ss << "\"detected\":true";
+            ss << ",\"shard_id\":" << hotspot->shard_id;
+            ss << ",\"centroid_idx\":" << hotspot->centroid_idx;
+            ss << ",\"ratio\":" << hotspot->ratio;
+        }
+        else
+        {
+            ss << "\"detected\":false";
+        }
+        ss << "}";
+        ss << "}";
+        return ss.str();
     }
 
     // Trigger recompute of centroids (samples shards, runs k-means, installs centroids).

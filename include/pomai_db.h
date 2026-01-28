@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <atomic>
 
 #include "membrane.h"
 #include "types.h"
@@ -38,6 +39,11 @@ namespace pomai
     class PomaiDB
     {
     public:
+        struct Metrics
+        {
+            std::atomic<std::uint64_t> rejected_upsert_batches_total{0};
+        };
+
         // Accept optional logging callbacks so caller (server) can forward logs.
         using LogFn = std::function<void(const std::string &)>;
 
@@ -53,6 +59,8 @@ namespace pomai
         SearchResponse Search(const SearchRequest &req) const;
         std::size_t TotalApproxCountUnsafe() const;
         std::future<bool> RequestCheckpoint();
+        void SetProbeCount(std::size_t p);
+        std::string GetStats() const;
 
         // Trigger recompute of routing centroids across shards.
         // - k: desired number of centroids (e.g., shards * 8)
@@ -73,6 +81,8 @@ namespace pomai
         // optional logging callbacks (forwarded into Shards)
         LogFn log_info_;
         LogFn log_error_;
+
+        Metrics metrics_{};
     };
 
 } // namespace pomai

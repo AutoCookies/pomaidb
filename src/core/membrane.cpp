@@ -204,7 +204,8 @@ namespace pomai
                                    pomai::server::WhisperConfig w_cfg,
                                    std::size_t dim,
                                    std::size_t search_pool_workers,
-                                   std::size_t search_timeout_ms)
+                                   std::size_t search_timeout_ms,
+                                   std::function<void()> on_rejected_upsert)
         : shards_(std::move(shards)),
           brain_(w_cfg),
           probe_P_(2),
@@ -213,7 +214,8 @@ namespace pomai
           dim_(dim),
           search_timeout_ms_(search_timeout_ms),
           // initialize search_pool_ using helper and constructor parameter 'shards' size (use param shards size for decision)
-          search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size()))
+          search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size())),
+          on_rejected_upsert_(std::move(on_rejected_upsert))
     {
         // Log chosen worker count for observability
         std::cout << "[Router] search_pool_workers=" << search_pool_.WorkerCount() << "\n";
@@ -331,6 +333,8 @@ namespace pomai
 
         if (!MemoryManager::Instance().CanAllocate(estimated_bytes))
         {
+            if (on_rejected_upsert_)
+                on_rejected_upsert_();
             std::promise<Lsn> p;
             auto f = p.get_future();
             p.set_exception(std::make_exception_ptr(
@@ -390,12 +394,18 @@ namespace pomai
         auto start = std::chrono::steady_clock::now();
 
         auto budget = brain_.compute_budget(false);
+        auto health = brain_.health();
+        std::size_t adaptive_probe = probe_P_;
+        if (health == pomai::ai::WhisperGrain::BudgetHealth::Tight)
+            adaptive_probe = std::max<std::size_t>(1, probe_P_ / 2);
+        else
+            adaptive_probe = std::min<std::size_t>(probe_P_ + 1, shards_.size());
 
         // If router has no centroids configured, fallback to broadcasting all shards (legacy behavior)
         std::vector<std::size_t> target_shard_ids;
         try
         {
-            auto centroid_idxs = router_.CandidateShardsForQuery(req.query, probe_P_);
+            auto centroid_idxs = router_.CandidateShardsForQuery(req.query, adaptive_probe);
             if (centroid_idxs.empty())
             {
                 // fallback: probe all shards
@@ -473,6 +483,30 @@ namespace pomai
         float latency_ms = std::chrono::duration<float, std::milli>(end - start).count();
         brain_.observe_latency(latency_ms);
 
+        const std::uint64_t searches = search_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((searches % 128) == 0)
+        {
+            auto hotspot = router_.DetectHotspot();
+            std::lock_guard<std::mutex> lk(hotspot_mu_);
+            if (hotspot)
+            {
+                const std::size_t shard_id = (!centroid_to_shard_.empty())
+                                                 ? centroid_to_shard_[hotspot->centroid_idx % centroid_to_shard_.size()]
+                                                 : (hotspot->centroid_idx % shards_.size());
+                hotspot_ = HotspotInfo{shard_id, hotspot->centroid_idx, hotspot->ratio};
+                if (shard_id != last_hotspot_shard_)
+                {
+                    last_hotspot_shard_ = shard_id;
+                    std::cout << "[Router] Hotspot detected on Shard " << shard_id
+                              << ". Consider RecomputeCentroids with higher K.\n";
+                }
+            }
+            else
+            {
+                hotspot_.reset();
+            }
+        }
+
         return out;
     }
 
@@ -541,6 +575,17 @@ namespace pomai
     void MembraneRouter::SetProbeCount(std::size_t p)
     {
         probe_P_ = (p == 0 ? 1 : p);
+    }
+
+    double MembraneRouter::SearchQueueAvgLatencyMs() const
+    {
+        return search_pool_.QueueWaitEmaMs();
+    }
+
+    std::optional<MembraneRouter::HotspotInfo> MembraneRouter::CurrentHotspot() const
+    {
+        std::lock_guard<std::mutex> lk(hotspot_mu_);
+        return hotspot_;
     }
 
     std::vector<Vector> MembraneRouter::SnapshotCentroids() const

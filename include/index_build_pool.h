@@ -106,6 +106,11 @@ namespace pomai
             return q_.size();
         }
 
+        std::size_t ActiveBuilds() const
+        {
+            return active_builds_.load(std::memory_order_acquire);
+        }
+
     private:
         void WorkerLoop()
         {

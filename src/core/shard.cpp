@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <iostream>
-#include <queue>
 #include <stdexcept>
 #include <utility>
 #include <chrono>
@@ -13,6 +12,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <random>
+
+#include "fixed_topk.h"
 
 namespace pomai
 {
@@ -165,47 +166,19 @@ namespace pomai
         if (in.items.empty())
             return;
 
-        struct Node
-        {
-            float score;
-            Id id;
-        };
-
-        // min-heap where top() is worst kept
-        auto cmp = [](const Node &a, const Node &b)
-        { return a.score > b.score; };
-        std::priority_queue<Node, std::vector<Node>, decltype(cmp)> heap(cmp);
+        FixedTopK topk(k);
 
         auto feed = [&](const std::vector<SearchResultItem> &items)
         {
             for (const auto &it : items)
-            {
-                if (heap.size() < k)
-                {
-                    heap.push(Node{it.score, it.id});
-                }
-                else if (it.score > heap.top().score)
-                {
-                    heap.pop();
-                    heap.push(Node{it.score, it.id});
-                }
-            }
+                topk.Push(it.score, it.id);
         };
 
         if (!out.items.empty())
             feed(out.items);
         feed(in.items);
 
-        std::vector<SearchResultItem> merged;
-        merged.reserve(heap.size());
-        while (!heap.empty())
-        {
-            auto n = heap.top();
-            heap.pop();
-            merged.push_back(SearchResultItem{n.id, n.score});
-        }
-        std::reverse(merged.begin(), merged.end());
-        out.items = std::move(merged);
+        topk.FillSorted(out.items);
     }
 
     SearchResponse Shard::Search(const SearchRequest &req, const pomai::ai::Budget &budget) const

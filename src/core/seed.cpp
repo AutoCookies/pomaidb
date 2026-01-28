@@ -1,9 +1,10 @@
 #include "seed.h"
 #include "cpu_kernels.h"
+#include "fixed_topk.h"
 #include "memory_manager.h"
 
 #include <algorithm>
-#include <queue>
+#include <array>
 #include <stdexcept>
 
 namespace pomai
@@ -193,44 +194,25 @@ namespace pomai
 
         const float *q = req.query.data.data();
 
-        struct Node
-        {
-            float score; // -dist
-            Id id;
-        };
-        // Min-heap by score (worst element on top), so we can pop/replace.
-        auto cmp = [](const Node &a, const Node &b)
-        { return a.score > b.score; };
-        std::priority_queue<Node, std::vector<Node>, decltype(cmp)> heap(cmp);
-
         const float *base = snap->data.data();
+        FixedTopK topk(k);
 
-        for (std::size_t row = 0; row < n; ++row)
+        constexpr std::size_t kBlock = 16;
+        std::array<float, kBlock> distances{};
+
+        for (std::size_t row = 0; row < n; row += kBlock)
         {
-            const float *v = base + row * dim;
+            const std::size_t count = std::min(kBlock, n - row);
+            kernels::ScanBucketAVX2(base + row * dim, q, dim, count, distances.data());
 
-            // Use AVX2 L2 squared
-            float dist = pomai::kernels::L2Sqr(v, q, dim);
-            float score = -dist;
-
-            if (heap.size() < k)
+            for (std::size_t i = 0; i < count; ++i)
             {
-                heap.push(Node{score, snap->ids[row]});
-            }
-            else if (score > heap.top().score)
-            {
-                heap.pop();
-                heap.push(Node{score, snap->ids[row]});
+                float score = -distances[i];
+                topk.Push(score, snap->ids[row + i]);
             }
         }
 
-        resp.items.reserve(heap.size());
-        while (!heap.empty())
-        {
-            resp.items.push_back(SearchResultItem{heap.top().id, heap.top().score});
-            heap.pop();
-        }
-        std::reverse(resp.items.begin(), resp.items.end());
+        topk.FillSorted(resp.items);
         return resp;
     }
 
