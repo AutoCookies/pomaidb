@@ -17,6 +17,12 @@ namespace pomai::ai
     class WhisperGrain
     {
     public:
+        enum class BudgetHealth
+        {
+            Tight,
+            Healthy
+        };
+
         // FIX: Dùng namespace pomai::server
         explicit WhisperGrain(const pomai::server::WhisperConfig &cfg);
 
@@ -27,6 +33,7 @@ namespace pomai::ai
         void observe_latency(float latency_ms);
         void set_cpu_load(float cpu_percent);
         Budget compute_budget(bool is_hot = false) const;
+        BudgetHealth health() const;
 
         float latency_ema() const noexcept { return latency_ema_.load(std::memory_order_acquire); }
         float cpu_load() const noexcept { return cpu_load_.load(std::memory_order_relaxed); }

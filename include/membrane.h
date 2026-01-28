@@ -3,6 +3,11 @@
 #include <memory>
 #include <future>
 #include <string>
+#include <optional>
+#include <functional>
+#include <atomic>
+#include <mutex>
+#include <cstdint>
 #include "shard.h"
 #include "server/config.h"
 #include "whispergrain.h"
@@ -30,7 +35,8 @@ namespace pomai
                                 pomai::server::WhisperConfig w_cfg,
                                 std::size_t dim,
                                 std::size_t search_pool_workers = 0,
-                                std::size_t search_timeout_ms = 500);
+                                std::size_t search_timeout_ms = 500,
+                                std::function<void()> on_rejected_upsert = {});
 
         void Start();
         void Stop();
@@ -49,6 +55,16 @@ namespace pomai
         void ConfigureCentroids(const std::vector<Vector> &centroids);
         void SetProbeCount(std::size_t p);
         std::vector<Vector> SnapshotCentroids() const;
+        double SearchQueueAvgLatencyMs() const;
+
+        struct HotspotInfo
+        {
+            std::size_t shard_id{0};
+            std::size_t centroid_idx{0};
+            double ratio{0.0};
+        };
+
+        std::optional<HotspotInfo> CurrentHotspot() const;
 
         // Compute centroids from samples across shards and install them atomically.
         // - k: number of centroids to produce.
@@ -88,6 +104,13 @@ namespace pomai
 
         // Thread-pool for bounded parallel search fanout. Mutable so Search() can be const.
         mutable SearchThreadPool search_pool_;
+
+        std::function<void()> on_rejected_upsert_;
+
+        mutable std::mutex hotspot_mu_;
+        mutable std::optional<HotspotInfo> hotspot_;
+        mutable std::size_t last_hotspot_shard_{static_cast<std::size_t>(-1)};
+        mutable std::atomic<std::uint64_t> search_count_{0};
     };
 
 }

@@ -6,23 +6,8 @@
 
 namespace pomai::kernels
 {
-
-    /**
-     * @brief Computes Squared L2 distance between two vectors using AVX2.
-     * * Optimizations:
-     * - Loop unrolling (4x) to maximize instruction pipelining and hide latency.
-     * - Fused Multiply-Add (FMA) for throughput.
-     * - Unaligned loads (loadu) to accept arbitrary memory addresses (safe on Haswell+).
-     * * @param a Pointer to first vector (aligned or unaligned).
-     * @param b Pointer to second vector (aligned or unaligned).
-     * @param dim Dimension of vectors.
-     * @return float Squared Euclidean distance.
-     */
-    static inline float L2Sqr(const float *a, const float *b, std::size_t dim)
+    static inline float L2SqrKernel(const float *a, const float *b, std::size_t dim)
     {
-        // Accumulators for parallel dependency chains.
-        // We use 4 accumulators to break data dependency on 'sum' register,
-        // allowing CPU to execute multiple FMA instructions per cycle.
         __m256 sum1 = _mm256_setzero_ps();
         __m256 sum2 = _mm256_setzero_ps();
         __m256 sum3 = _mm256_setzero_ps();
@@ -30,7 +15,6 @@ namespace pomai::kernels
 
         std::size_t i = 0;
 
-        // Main loop: Process 32 floats (4 AVX registers) per iteration.
         for (; i + 32 <= dim; i += 32)
         {
             __m256 v1 = _mm256_loadu_ps(a + i);
@@ -54,10 +38,8 @@ namespace pomai::kernels
             sum4 = _mm256_fmadd_ps(d4, d4, sum4);
         }
 
-        // Reduce 4 accumulators into 1
         __m256 sum = _mm256_add_ps(_mm256_add_ps(sum1, sum2), _mm256_add_ps(sum3, sum4));
 
-        // Handle remaining blocks of 8
         for (; i + 8 <= dim; i += 8)
         {
             __m256 v = _mm256_loadu_ps(a + i);
@@ -66,15 +48,12 @@ namespace pomai::kernels
             sum = _mm256_fmadd_ps(d, d, sum);
         }
 
-        // Horizontal reduction: Sum 8 floats inside the YMM register
-        // This is slow, but done only once per vector.
-        float temp[8];
+        alignas(32) float temp[8];
         _mm256_storeu_ps(temp, sum);
         float total = 0.0f;
         for (int k = 0; k < 8; ++k)
             total += temp[k];
 
-        // Scalar tail for dimensions not divisible by 8
         for (; i < dim; ++i)
         {
             float d = a[i] - b[i];
@@ -82,6 +61,43 @@ namespace pomai::kernels
         }
 
         return total;
+    }
+
+    /**
+     * @brief Computes Squared L2 distance between two vectors using AVX2.
+     * * Optimizations:
+     * - Loop unrolling (4x) to maximize instruction pipelining and hide latency.
+     * - Fused Multiply-Add (FMA) for throughput.
+     * - Unaligned loads (loadu) to accept arbitrary memory addresses (safe on Haswell+).
+     * * @param a Pointer to first vector (aligned or unaligned).
+     * @param b Pointer to second vector (aligned or unaligned).
+     * @param dim Dimension of vectors.
+     * @return float Squared Euclidean distance.
+     */
+    static inline float L2Sqr(const float *a, const float *b, std::size_t dim)
+    {
+        return L2SqrKernel(a, b, dim);
+    }
+
+    /**
+     * @brief Computes squared L2 distances for a bucket of vectors against a query.
+     * @param base Pointer to the first vector in the bucket (row-major).
+     * @param query Pointer to query vector.
+     * @param dim Vector dimension.
+     * @param count Number of vectors in the bucket.
+     * @param out_distances Output buffer of length `count`.
+     */
+    static inline void ScanBucketAVX2(const float *base,
+                                      const float *query,
+                                      std::size_t dim,
+                                      std::size_t count,
+                                      float *out_distances)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const float *v = base + i * dim;
+            out_distances[i] = L2SqrKernel(v, query, dim);
+        }
     }
 
 } // namespace pomai::kernels

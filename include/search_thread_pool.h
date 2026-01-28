@@ -13,6 +13,7 @@
 // - This implementation is intentionally small and dependency-free (header-only).
 // - It throws std::runtime_error if Submit() is called after Stop() / destruction.
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -64,12 +65,14 @@ namespace pomai
             auto task = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
             std::future<R> fut = task->get_future();
 
+            const auto queued_at = std::chrono::steady_clock::now();
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 if (stop_.load(std::memory_order_acquire))
                     throw std::runtime_error("SearchThreadPool: submit on stopped pool");
-                tasks_.emplace_back([task]()
-                                    { (*task)(); });
+                tasks_.push_back(QueuedTask{[task]()
+                                            { (*task)(); },
+                                            queued_at});
             }
             cv_.notify_one();
             return fut;
@@ -96,13 +99,20 @@ namespace pomai
         }
 
         std::size_t WorkerCount() const noexcept { return workers_; }
+        double QueueWaitEmaMs() const noexcept { return queue_wait_ema_ms_.load(std::memory_order_relaxed); }
 
     private:
+        struct QueuedTask
+        {
+            std::function<void()> fn;
+            std::chrono::steady_clock::time_point queued_at;
+        };
+
         void WorkerLoop()
         {
             while (true)
             {
-                std::function<void()> job;
+                QueuedTask job;
                 {
                     std::unique_lock<std::mutex> lk(mu_);
                     cv_.wait(lk, [this]
@@ -112,9 +122,12 @@ namespace pomai
                     job = std::move(tasks_.front());
                     tasks_.pop_front();
                 }
+                const auto start = std::chrono::steady_clock::now();
+                const std::chrono::duration<double, std::milli> wait_ms = start - job.queued_at;
+                UpdateQueueWaitEma(wait_ms.count());
                 try
                 {
-                    job();
+                    job.fn();
                 }
                 catch (...)
                 {
@@ -123,12 +136,26 @@ namespace pomai
             }
         }
 
+        void UpdateQueueWaitEma(double wait_ms)
+        {
+            constexpr double kAlpha = 0.1;
+            double old = queue_wait_ema_ms_.load(std::memory_order_relaxed);
+            if (old <= 0.0)
+            {
+                queue_wait_ema_ms_.store(wait_ms, std::memory_order_relaxed);
+                return;
+            }
+            double next = kAlpha * wait_ms + (1.0 - kAlpha) * old;
+            queue_wait_ema_ms_.store(next, std::memory_order_relaxed);
+        }
+
         std::size_t workers_{0};
         std::vector<std::thread> threads_;
-        std::deque<std::function<void()>> tasks_;
+        std::deque<QueuedTask> tasks_;
         mutable std::mutex mu_;
         std::condition_variable cv_;
         std::atomic<bool> stop_{false};
+        std::atomic<double> queue_wait_ema_ms_{0.0};
     };
 
 } // namespace pomai

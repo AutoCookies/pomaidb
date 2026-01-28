@@ -54,6 +54,10 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_embedded.cpp")
     add_executable(bench_embedded benchmarks/bench_embedded.cpp)
     target_link_libraries(bench_embedded pomai_core)
 endif()
+if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_phase3.cpp")
+    add_executable(bench_phase3 benchmarks/bench_phase3.cpp)
+    target_link_libraries(bench_phase3 pomai_core)
+endif()
 
 # ==========================================
 # 6. TESTS

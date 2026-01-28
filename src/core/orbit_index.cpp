@@ -3,6 +3,7 @@
 #include "memory_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <queue>
 #include <random>
 #include <stdexcept>
@@ -500,11 +501,12 @@ namespace pomai::core
         // Score candidates exactly and return top results
         std::vector<std::pair<float, std::uint32_t>> scored;
         scored.reserve(cand.size());
+        std::array<float, 1> distance{};
         for (auto idx : cand)
         {
             const float *v = data_.data() + (std::size_t)idx * dim_;
-            float d = pomai::kernels::L2Sqr(q, v, dim_);
-            scored.push_back({d, idx});
+            pomai::kernels::ScanBucketAVX2(v, q, dim_, 1, distance.data());
+            scored.push_back({distance[0], idx});
         }
 
         std::sort(scored.begin(), scored.end(),
