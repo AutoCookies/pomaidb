@@ -483,39 +483,153 @@ namespace pomai
     // Compute centroids from samples across shards and install them atomically.
     bool MembraneRouter::ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples)
     {
-        if (k == 0 || shards_.empty())
+        if (shards_.empty())
             return false;
 
-        // per-shard sample budget (at least 1)
-        std::size_t per_shard = std::max<std::size_t>(1, total_samples / shards_.size());
+        // Autoscaler parameters (tunable)
+        const std::size_t target_bucket_size = 50'000; // B: desired vectors per centroid
+        const std::size_t min_centroids_per_shard = 16;
+        const std::size_t max_centroids_per_shard = 8192;
+        const std::size_t max_sample = 200'000;
+        const std::size_t k_index_threshold = 512; // if K > threshold, consider building centroid index
 
-        // Collect samples concurrently from shards
-        std::vector<std::future<std::vector<Vector>>> futs;
-        futs.reserve(shards_.size());
-        for (auto &s : shards_)
+        // 1) Measure per-shard sizes
+        const std::size_t S = shards_.size();
+        std::vector<std::size_t> shard_counts(S);
+        std::size_t total_vectors = 0;
+        for (std::size_t i = 0; i < S; ++i)
         {
-            futs.push_back(std::async(std::launch::async, [s = s.get(), per_shard]()
-                                      { return s->SampleVectors(per_shard); }));
+            shard_counts[i] = shards_[i]->ApproxCountUnsafe();
+            total_vectors += shard_counts[i];
+        }
+
+        // If user provided k==0, run autoscaler to pick K
+        std::vector<std::size_t> per_shard_C(S, 0);
+        if (k == 0)
+        {
+            // Compute per-shard centroids C_s = clamp(ceil(V_s / B), min, max)
+            std::size_t K = 0;
+            for (std::size_t i = 0; i < S; ++i)
+            {
+                std::size_t cs = 0;
+                if (shard_counts[i] > 0)
+                {
+                    cs = (shard_counts[i] + target_bucket_size - 1) / target_bucket_size;
+                    if (cs < min_centroids_per_shard)
+                        cs = min_centroids_per_shard;
+                    if (cs > max_centroids_per_shard)
+                        cs = max_centroids_per_shard;
+                }
+                else
+                {
+                    cs = min_centroids_per_shard;
+                }
+                per_shard_C[i] = cs;
+                K += cs;
+            }
+            k = K;
+            if (k == 0)
+                k = S * min_centroids_per_shard;
+        }
+        else
+        {
+            // If explicit k given, distribute roughly evenly (can be improved later)
+            std::size_t base = k / S;
+            std::size_t rem = k % S;
+            for (std::size_t i = 0; i < S; ++i)
+            {
+                per_shard_C[i] = base + (i < rem ? 1 : 0);
+                if (per_shard_C[i] < min_centroids_per_shard)
+                    per_shard_C[i] = min_centroids_per_shard;
+                if (per_shard_C[i] > max_centroids_per_shard)
+                    per_shard_C[i] = max_centroids_per_shard;
+            }
+            // recompute k from distribution
+            std::size_t K = 0;
+            for (auto c : per_shard_C)
+                K += c;
+            k = K;
+        }
+
+        if (k == 0)
+            return false;
+
+        // 2) Choose sample size S_kmeans (relative to k)
+        std::size_t sample_size = std::max<std::size_t>(10 * k, 50'000);
+        if (sample_size > max_sample)
+            sample_size = max_sample;
+        // If user provided total_samples and it's larger, honor it (but cap by max_sample)
+        if (total_samples > sample_size)
+            sample_size = std::min<std::size_t>(total_samples, max_sample);
+
+        // 3) Allocate per-shard sample budgets proportional to per_shard_C (so shards with more centroids get more samples)
+        std::vector<std::size_t> per_shard_budget(S, 1);
+        {
+            std::size_t sumC = 0;
+            for (auto c : per_shard_C)
+                sumC += c;
+            if (sumC == 0)
+            {
+                // uniform allocation
+                for (std::size_t i = 0; i < S; ++i)
+                    per_shard_budget[i] = std::max<std::size_t>(1, sample_size / S);
+            }
+            else
+            {
+                std::size_t assigned = 0;
+                for (std::size_t i = 0; i < S; ++i)
+                {
+                    per_shard_budget[i] = (per_shard_C[i] * sample_size) / sumC;
+                    if (per_shard_budget[i] == 0)
+                        per_shard_budget[i] = 1;
+                    assigned += per_shard_budget[i];
+                }
+                // distribute remainder
+                std::size_t idx = 0;
+                while (assigned < sample_size)
+                {
+                    per_shard_budget[idx % S]++;
+                    assigned++;
+                    idx++;
+                }
+            }
+        }
+
+        // 4) Gather samples concurrently (collect origin shard id alongside samples)
+        std::vector<std::future<std::vector<Vector>>> futs;
+        futs.reserve(S);
+        for (std::size_t i = 0; i < S; ++i)
+        {
+            std::size_t bud = per_shard_budget[i];
+            // capture raw shard pointer
+            Shard *sh = shards_[i].get();
+            futs.push_back(std::async(std::launch::async, [sh, bud]()
+                                      { return sh->SampleVectors(bud); }));
         }
 
         std::vector<Vector> aggregate;
-        for (auto &f : futs)
+        std::vector<std::size_t> sample_origin; // parallel vector storing shard index for each sample
+        aggregate.reserve(sample_size);
+        sample_origin.reserve(sample_size);
+
+        for (std::size_t i = 0; i < futs.size(); ++i)
         {
             try
             {
-                auto part = f.get();
-                if (!part.empty())
+                auto part = futs[i].get();
+                for (auto &v : part)
                 {
-                    aggregate.insert(aggregate.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end()));
+                    aggregate.push_back(std::move(v));
+                    sample_origin.push_back(i);
                 }
             }
             catch (const std::exception &e)
             {
-                std::cerr << "[Router] sample gather failed: " << e.what() << "\n";
+                std::cerr << "[Router] sample gather failed for shard " << i << ": " << e.what() << "\n";
             }
             catch (...)
             {
-                std::cerr << "[Router] sample gather failed: unknown error\n";
+                std::cerr << "[Router] sample gather failed for shard " << i << ": unknown error\n";
             }
         }
 
@@ -525,16 +639,29 @@ namespace pomai
             return false;
         }
 
-        // Downsample to reasonable kmeans input size if necessary
-        const std::size_t MAX_KMEANS_INPUT = std::max<std::size_t>(4096, k * 64);
-        if (aggregate.size() > MAX_KMEANS_INPUT)
+        // If we have more samples than allowed, downsample randomly
+        if (aggregate.size() > sample_size)
         {
             std::mt19937_64 rng(std::random_device{}());
-            std::shuffle(aggregate.begin(), aggregate.end(), rng);
-            aggregate.resize(MAX_KMEANS_INPUT);
+            std::vector<std::size_t> idx(aggregate.size());
+            for (std::size_t i = 0; i < idx.size(); ++i)
+                idx[i] = i;
+            std::shuffle(idx.begin(), idx.end(), rng);
+
+            std::vector<Vector> agg2;
+            std::vector<std::size_t> origin2;
+            agg2.reserve(sample_size);
+            origin2.reserve(sample_size);
+            for (std::size_t t = 0; t < sample_size; ++t)
+            {
+                agg2.push_back(std::move(aggregate[idx[t]]));
+                origin2.push_back(sample_origin[idx[t]]);
+            }
+            aggregate.swap(agg2);
+            sample_origin.swap(origin2);
         }
 
-        // Build centroids (this may be moderately CPU-heavy)
+        // 5) Build centroids (k-means)
         std::vector<Vector> centroids;
         try
         {
@@ -551,7 +678,55 @@ namespace pomai
             return false;
         }
 
-        // Install new centroids atomically and build simple centroid->shard mapping
+        if (centroids.empty())
+        {
+            std::cerr << "[Router] BuildKMeans returned zero centroids\n";
+            return false;
+        }
+
+        // 6) Map centroid -> shard by majority voting from the sampled vectors
+        // votes[c][s] = number of samples from shard s assigned to centroid c
+        const std::size_t K = centroids.size();
+        std::vector<std::vector<uint32_t>> votes(K, std::vector<uint32_t>(S, 0u));
+
+        // For each sample, find nearest centroid (linear search on centroids; centroids count K should be manageable)
+        for (std::size_t i = 0; i < aggregate.size(); ++i)
+        {
+            const Vector &v = aggregate[i];
+            std::size_t best_c = 0;
+            float best_d = std::numeric_limits<float>::infinity();
+            for (std::size_t c = 0; c < K; ++c)
+            {
+                float d = pomai::kernels::L2Sqr(v.data.data(), centroids[c].data.data(), v.data.size());
+                if (d < best_d)
+                {
+                    best_d = d;
+                    best_c = c;
+                }
+            }
+            std::size_t shard_origin = sample_origin[i];
+            votes[best_c][shard_origin]++;
+        }
+
+        // Build mapping
+        centroid_to_shard_.clear();
+        centroid_to_shard_.resize(K);
+        for (std::size_t c = 0; c < K; ++c)
+        {
+            uint32_t best_count = 0;
+            std::size_t best_shard = 0;
+            for (std::size_t s = 0; s < S; ++s)
+            {
+                if (votes[c][s] > best_count)
+                {
+                    best_count = votes[c][s];
+                    best_shard = s;
+                }
+            }
+            centroid_to_shard_[c] = best_shard;
+        }
+
+        // 7) Install centroids atomically and persist mapping
         ConfigureCentroids(centroids);
         std::cout << "[Router] ConfigureCentroids: built " << centroids.size() << " centroids\n";
 
@@ -562,6 +737,9 @@ namespace pomai
             else
                 std::cerr << "[Router] Failed to save centroids to " << centroids_path_ << "\n";
         }
+
+        // Optionally: if K is large, build a small routing index (HNSW/OrbitIndex) over centroids for faster routing.
+        // TODO: implement centroid index build when needed.
 
         return true;
     }
@@ -654,22 +832,71 @@ namespace pomai
         }
 
         std::size_t total_floats = static_cast<std::size_t>(count * dim);
-        std::size_t expected_size = kCentroidsHeaderSize + total_floats * sizeof(float);
-        if (static_cast<std::size_t>(st.st_size) != expected_size)
+        std::size_t floats_bytes = total_floats * sizeof(float);
+
+        // After header + centroid floats, file must contain mapping_count (u64) and mapping entries (u32 each)
+        if (static_cast<std::size_t>(st.st_size) < kCentroidsHeaderSize + floats_bytes + sizeof(std::uint64_t))
         {
-            std::cerr << "[Router] centroids file size mismatch: expected " << expected_size
-                      << " got " << st.st_size << "\n";
+            std::cerr << "[Router] centroids file too small for mapping: " << path << "\n";
             ::close(fd);
             return false;
         }
 
         std::vector<float> flat(total_floats);
-        if (!ReadFull(fd, flat.data(), total_floats * sizeof(float)))
+        if (!ReadFull(fd, flat.data(), floats_bytes))
         {
             std::cerr << "[Router] failed to read centroids payload: " << path << "\n";
             ::close(fd);
             return false;
         }
+
+        // Read mapping_count
+        std::uint64_t mapping_count_le = 0;
+        if (!ReadFull(fd, &mapping_count_le, sizeof(mapping_count_le)))
+        {
+            std::cerr << "[Router] failed to read mapping_count: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+        std::uint64_t mapping_count = Le64ToHost(mapping_count_le);
+        if (mapping_count != count)
+        {
+            std::cerr << "[Router] mapping_count != centroid count: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        // Ensure enough bytes for mapping entries
+        std::size_t mapping_bytes = static_cast<std::size_t>(mapping_count) * sizeof(std::uint32_t);
+        off_t cur_off = lseek(fd, 0, SEEK_CUR);
+        if (cur_off == -1)
+        {
+            std::cerr << "[Router] lseek failed reading mapping: " << std::strerror(errno) << "\n";
+            ::close(fd);
+            return false;
+        }
+        if (static_cast<std::size_t>(st.st_size) != (kCentroidsHeaderSize + floats_bytes + sizeof(std::uint64_t) + mapping_bytes))
+        {
+            std::cerr << "[Router] centroids file size mismatch (mapping): expected "
+                      << (kCentroidsHeaderSize + floats_bytes + sizeof(std::uint64_t) + mapping_bytes)
+                      << " got " << st.st_size << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::vector<std::uint32_t> mapping(mapping_count);
+        for (std::size_t i = 0; i < mapping_count; ++i)
+        {
+            std::uint32_t v_le = 0;
+            if (!ReadFull(fd, &v_le, sizeof(v_le)))
+            {
+                std::cerr << "[Router] failed to read mapping entry: " << path << "\n";
+                ::close(fd);
+                return false;
+            }
+            mapping[i] = Le32ToHost(v_le);
+        }
+
         ::close(fd);
 
 #if __BYTE_ORDER == __BIG_ENDIAN
@@ -688,7 +915,27 @@ namespace pomai
             it += dim;
         }
 
+        // Install centroids
         ConfigureCentroids(centroids);
+
+        // Fix: define shard count here for mapping validation
+        const std::size_t S = shards_.size();
+
+        // Install mapping (ensure mapping values are in shard range)
+        centroid_to_shard_.clear();
+        centroid_to_shard_.reserve(mapping.size());
+        for (auto m : mapping)
+        {
+            if (m >= S)
+            {
+                std::cerr << "[Router] mapping value out of range in file: " << path << "\n";
+                // fallback: assign by round-robin for out-of-range entries
+                centroid_to_shard_.push_back(0);
+            }
+            else
+                centroid_to_shard_.push_back(static_cast<std::size_t>(m));
+        }
+
         return true;
     }
 
@@ -718,6 +965,13 @@ namespace pomai
         if (dim_ != 0 && dim != dim_)
         {
             std::cerr << "[Router] centroids dim mismatch: " << dim << " expected " << dim_ << "\n";
+            return false;
+        }
+
+        // mapping must match centroids size
+        if (centroid_to_shard_.size() != centroids.size())
+        {
+            std::cerr << "[Router] centroid_to_shard mapping size mismatch\n";
             return false;
         }
 
@@ -760,6 +1014,27 @@ namespace pomai
                     ::close(fd);
                     return false;
                 }
+            }
+        }
+
+        // Write mapping: mapping_count (u64) + mapping values (u32 each)
+        std::uint64_t mapping_count_le = HostToLe64(static_cast<std::uint64_t>(centroid_to_shard_.size()));
+        if (!WriteFull(fd, &mapping_count_le, sizeof(mapping_count_le)))
+        {
+            std::cerr << "[Router] write mapping_count failed\n";
+            ::close(fd);
+            return false;
+        }
+        for (auto sidx : centroid_to_shard_)
+        {
+            // store as u32
+            std::uint32_t m = static_cast<std::uint32_t>(sidx);
+            std::uint32_t m_le = HostToLe32(m);
+            if (!WriteFull(fd, &m_le, sizeof(m_le)))
+            {
+                std::cerr << "[Router] write mapping payload failed\n";
+                ::close(fd);
+                return false;
             }
         }
 
