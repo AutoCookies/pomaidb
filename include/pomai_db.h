@@ -32,6 +32,7 @@ namespace pomai
 
         // NEW: search pool worker count (0 = auto)
         std::size_t search_pool_workers{0};
+        std::size_t search_timeout_ms{500};
     };
 
     class PomaiDB
