@@ -247,15 +247,8 @@ namespace pomai
 
         const float *q = req.query.data.data();
 
-        constexpr std::size_t kOversample = 10;
-        std::size_t candidate_k = k;
-        if (k < n)
-        {
-            if (k > n / kOversample)
-                candidate_k = n;
-            else
-                candidate_k = k * kOversample;
-        }
+        constexpr std::size_t kOversample = 128;
+        const std::size_t candidate_k = std::min<std::size_t>(kOversample, n);
 
         constexpr std::size_t kUnroll = 8;
         constexpr std::size_t kPrefetchDistance = 4;
@@ -309,10 +302,12 @@ namespace pomai
         std::size_t row = 0;
         for (; row + kUnroll <= n; row += kUnroll)
         {
-            std::size_t prefetch_row = row + kPrefetchDistance;
-            if (prefetch_row < n)
+            std::size_t prefetch_row = row + kUnroll;
+            for (std::size_t p = 0; p < kPrefetchDistance; ++p)
             {
-                _mm_prefetch(reinterpret_cast<const char *>(qbase + prefetch_row * dim), _MM_HINT_T0);
+                std::size_t next_row = prefetch_row + p;
+                if (next_row < n)
+                    _mm_prefetch(reinterpret_cast<const char *>(qbase + next_row * dim), _MM_HINT_T0);
             }
 
             float d0 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 0) * dim, qquant, dim);

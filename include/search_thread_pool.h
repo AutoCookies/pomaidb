@@ -13,9 +13,10 @@
 // - This implementation is intentionally small and dependency-free (header-only).
 // - It throws std::runtime_error if Submit() is called after Stop() / destruction.
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
+#include <array>
 #include <functional>
 #include <future>
 #include <memory>
@@ -32,10 +33,12 @@ namespace pomai
     class SearchThreadPool
     {
     public:
+        static constexpr std::size_t kQueueCapacity = 1024;
+
         explicit SearchThreadPool(std::size_t workers = std::thread::hardware_concurrency(),
                                   std::size_t max_queue_size = 1024)
             : stop_(false),
-              max_queue_size_(max_queue_size)
+              max_queue_size_(std::min(max_queue_size, kQueueCapacity))
         {
             if (workers == 0)
                 workers = 1;
@@ -74,11 +77,13 @@ namespace pomai
                 std::lock_guard<std::mutex> lk(mu_);
                 if (stop_.load(std::memory_order_acquire))
                     throw std::runtime_error("SearchThreadPool: submit on stopped pool");
-                if (tasks_.size() >= max_queue_size_)
-                    throw std::runtime_error("SearchThreadPool: queue capacity reached");
-                tasks_.push_back(QueuedTask{[task]()
-                                            { (*task)(); },
-                                            queued_at});
+                if (tasks_.Size() >= max_queue_size_)
+                    throw std::runtime_error("CAPACITY_EXCEEDED");
+                bool pushed = tasks_.Push(QueuedTask{[task]()
+                                                    { (*task)(); },
+                                                    queued_at});
+                if (!pushed)
+                    throw std::runtime_error("CAPACITY_EXCEEDED");
             }
             cv_.notify_one();
             return fut;
@@ -122,11 +127,10 @@ namespace pomai
                 {
                     std::unique_lock<std::mutex> lk(mu_);
                     cv_.wait(lk, [this]
-                             { return stop_.load(std::memory_order_acquire) || !tasks_.empty(); });
-                    if (stop_.load(std::memory_order_acquire) && tasks_.empty())
+                             { return stop_.load(std::memory_order_acquire) || !tasks_.Empty(); });
+                    if (stop_.load(std::memory_order_acquire) && tasks_.Empty())
                         return;
-                    job = std::move(tasks_.front());
-                    tasks_.pop_front();
+                    tasks_.Pop(job);
                 }
                 const auto start = std::chrono::steady_clock::now();
                 const std::chrono::duration<double, std::milli> wait_ms = start - job.queued_at;
@@ -155,9 +159,43 @@ namespace pomai
             queue_wait_ema_ms_.store(next, std::memory_order_relaxed);
         }
 
+        template <typename T, std::size_t Capacity>
+        class FixedQueue
+        {
+        public:
+            bool Empty() const noexcept { return size_ == 0; }
+            std::size_t Size() const noexcept { return size_; }
+
+            bool Push(T value)
+            {
+                if (size_ >= Capacity)
+                    return false;
+                buffer_[tail_] = std::move(value);
+                tail_ = (tail_ + 1) % Capacity;
+                ++size_;
+                return true;
+            }
+
+            bool Pop(T &out)
+            {
+                if (size_ == 0)
+                    return false;
+                out = std::move(buffer_[head_]);
+                head_ = (head_ + 1) % Capacity;
+                --size_;
+                return true;
+            }
+
+        private:
+            std::array<T, Capacity> buffer_{};
+            std::size_t head_{0};
+            std::size_t tail_{0};
+            std::size_t size_{0};
+        };
+
         std::size_t workers_{0};
         std::vector<std::thread> threads_;
-        std::deque<QueuedTask> tasks_;
+        FixedQueue<QueuedTask, kQueueCapacity> tasks_;
         mutable std::mutex mu_;
         std::condition_variable cv_;
         std::atomic<bool> stop_{false};

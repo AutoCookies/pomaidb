@@ -1,10 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -24,6 +24,8 @@ namespace pomai
     class IndexBuildPool
     {
     public:
+        static constexpr std::size_t kQueueCapacity = 1024;
+
         using AttachFn = std::function<void(std::size_t segment_pos,
                                             Seed::Snapshot snap,
                                             std::shared_ptr<pomai::core::OrbitIndex> idx)>;
@@ -94,7 +96,10 @@ namespace pomai
                 std::lock_guard<std::mutex> lk(mu_);
                 if (stop_requested_)
                     return false;
-                q_.push_back(std::move(job));
+                if (q_.Size() >= kQueueCapacity)
+                    return false;
+                if (!q_.Push(std::move(job)))
+                    return false;
             }
             cv_.notify_one();
             return true;
@@ -103,7 +108,7 @@ namespace pomai
         std::size_t Pending() const
         {
             std::lock_guard<std::mutex> lk(mu_);
-            return q_.size();
+            return q_.Size();
         }
 
         std::size_t ActiveBuilds() const
@@ -124,18 +129,19 @@ namespace pomai
                              {
                                  if (stop_requested_)
                                      return true;
-                                 if (q_.empty())
+                                 if (q_.Empty())
                                      return false;
-                                 if (MemoryManager::Instance().AtOrAboveSoftWatermark() &&
-                                     active_builds_.load(std::memory_order_acquire) >= 1)
+                                 std::size_t limit = worker_count_;
+                                 if (MemoryManager::Instance().AtOrAboveSoftWatermark())
+                                     limit = 1;
+                                 if (active_builds_.load(std::memory_order_acquire) >= limit)
                                      return false;
                                  return true;
                              });
-                    if (stop_requested_ && q_.empty())
+                    if (stop_requested_ && q_.Empty())
                         return;
 
-                    job = std::move(q_.front());
-                    q_.pop_front();
+                    q_.Pop(job);
                     active_builds_.fetch_add(1, std::memory_order_release);
                 }
 
@@ -164,9 +170,43 @@ namespace pomai
     private:
         std::size_t worker_count_{1};
 
+        template <typename T, std::size_t Capacity>
+        class FixedQueue
+        {
+        public:
+            bool Empty() const noexcept { return size_ == 0; }
+            std::size_t Size() const noexcept { return size_; }
+
+            bool Push(T value)
+            {
+                if (size_ >= Capacity)
+                    return false;
+                buffer_[tail_] = std::move(value);
+                tail_ = (tail_ + 1) % Capacity;
+                ++size_;
+                return true;
+            }
+
+            bool Pop(T &out)
+            {
+                if (size_ == 0)
+                    return false;
+                out = std::move(buffer_[head_]);
+                head_ = (head_ + 1) % Capacity;
+                --size_;
+                return true;
+            }
+
+        private:
+            std::array<T, Capacity> buffer_{};
+            std::size_t head_{0};
+            std::size_t tail_{0};
+            std::size_t size_{0};
+        };
+
         mutable std::mutex mu_;
         std::condition_variable cv_;
-        std::deque<Job> q_;
+        FixedQueue<Job, kQueueCapacity> q_;
         std::vector<std::thread> threads_;
 
         std::atomic<bool> running_{false};
