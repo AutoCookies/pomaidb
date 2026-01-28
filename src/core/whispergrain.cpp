@@ -92,4 +92,15 @@ namespace pomai::ai
 
         return b;
     }
-}
+
+    WhisperGrain::BudgetHealth WhisperGrain::health() const
+    {
+        float ema = latency_ema_.load(std::memory_order_acquire);
+        float cpu = cpu_load_.load(std::memory_order_relaxed);
+        if (!(ema > 0.0f))
+            ema = cfg_.latency_target_ms;
+
+        bool tight = (ema > cfg_.latency_target_ms) || (cpu >= cfg_.cpu_soft_threshold);
+        return tight ? BudgetHealth::Tight : BudgetHealth::Healthy;
+    }
+} 

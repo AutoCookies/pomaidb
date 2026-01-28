@@ -23,7 +23,10 @@
 #include <mutex>
 #include <shared_mutex>
 #include <cstddef>
+#include <cstdint>
 #include <algorithm>
+#include <atomic>
+#include <optional>
 #include <random>
 #include <limits>
 #include <stdexcept>
@@ -37,6 +40,14 @@ namespace pomai
     class SpatialRouter
     {
     public:
+        struct HotspotInfo
+        {
+            std::size_t centroid_idx{0};
+            double ratio{0.0};
+            std::size_t total_hits{0};
+            double average_hits{0.0};
+        };
+
         // Construct empty router. centroids_ size is zero until ReplaceCentroids is called.
         SpatialRouter() = default;
 
@@ -55,6 +66,8 @@ namespace pomai
         // Read-only access (snapshot copy) to centroids for external tooling or debugging.
         std::vector<Vector> SnapshotCentroids() const;
 
+        std::optional<HotspotInfo> DetectHotspot(double threshold_ratio = 2.0) const;
+
         // ----- Helper: build centroids using simple k-means (Lloyd)
         // This is a convenience offline method. It does not touch internal centroids_;
         // it returns computed centroids so caller can decide when to atomically replace.
@@ -67,6 +80,7 @@ namespace pomai
     private:
         mutable std::shared_mutex mu_;
         std::vector<Vector> centroids_;
+        mutable std::vector<std::atomic<std::uint64_t>> centroid_hits_;
     };
 
 } // namespace pomai

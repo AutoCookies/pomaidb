@@ -61,6 +61,8 @@ namespace pomai
             out.reserve(C);
             for (auto &p : v)
                 out.push_back(p.idx);
+            for (auto idx : out)
+                centroid_hits_[idx].fetch_add(1, std::memory_order_relaxed);
             return out;
         }
 
@@ -74,6 +76,9 @@ namespace pomai
         for (size_t i = 0; i < P; ++i)
             out.push_back(v[i].idx);
 
+        for (auto idx : out)
+            centroid_hits_[idx].fetch_add(1, std::memory_order_relaxed);
+
         return out;
     }
 
@@ -81,12 +86,57 @@ namespace pomai
     {
         std::unique_lock<std::shared_mutex> lk(mu_);
         centroids_.swap(new_centroids);
+        centroid_hits_.clear();
+        centroid_hits_.resize(centroids_.size());
+        for (auto &hit : centroid_hits_)
+            hit.store(0, std::memory_order_relaxed);
     }
 
     std::vector<Vector> SpatialRouter::SnapshotCentroids() const
     {
         std::shared_lock<std::shared_mutex> lk(mu_);
         return centroids_;
+    }
+
+    std::optional<SpatialRouter::HotspotInfo> SpatialRouter::DetectHotspot(double threshold_ratio) const
+    {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        const std::size_t C = centroids_.size();
+        if (C == 0 || centroid_hits_.size() != C)
+            return std::nullopt;
+
+        std::uint64_t total_hits = 0;
+        std::size_t best_idx = 0;
+        std::uint64_t best_hits = 0;
+
+        for (std::size_t i = 0; i < C; ++i)
+        {
+            std::uint64_t hits = centroid_hits_[i].load(std::memory_order_relaxed);
+            total_hits += hits;
+            if (hits > best_hits)
+            {
+                best_hits = hits;
+                best_idx = i;
+            }
+        }
+
+        if (total_hits == 0)
+            return std::nullopt;
+
+        const double avg = static_cast<double>(total_hits) / static_cast<double>(C);
+        if (avg <= 0.0)
+            return std::nullopt;
+
+        const double ratio = static_cast<double>(best_hits) / avg;
+        if (ratio < threshold_ratio)
+            return std::nullopt;
+
+        HotspotInfo info;
+        info.centroid_idx = best_idx;
+        info.ratio = ratio;
+        info.total_hits = static_cast<std::size_t>(total_hits);
+        info.average_hits = avg;
+        return info;
     }
 
     // -------------------- Simple Lloyd's k-means --------------------
