@@ -45,10 +45,15 @@ namespace pomai
     private:
         mutable std::shared_mutex mu_;
         std::vector<Vector> centroids_;
+        std::vector<Vector> master_centroids_;
+        std::vector<std::vector<std::size_t>> master_to_leaf_;
+        std::size_t num_master_{0};
         
         // Chuẩn Big Tech: Sử dụng mảng unique_ptr để quản lý atomic counters
         // Tránh lỗi biên dịch "use of deleted function" của std::vector
         mutable std::unique_ptr<std::atomic<std::uint64_t>[]> centroid_hits_;
         std::size_t num_centroids_{0};
+
+        static constexpr std::size_t kHierarchicalThreshold = 256;
     };
 }

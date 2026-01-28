@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <immintrin.h>
 #include <cmath>
+#include <cstdint>
 
 namespace pomai::kernels
 {
@@ -98,6 +99,55 @@ namespace pomai::kernels
             const float *v = base + i * dim;
             out_distances[i] = L2SqrKernel(v, query, dim);
         }
+    }
+
+    /**
+     * @brief Computes squared L2 distance between a float query and SQ8 quantized vector.
+     * @param qdata Pointer to quantized vector (uint8_t per dimension).
+     * @param query Pointer to float query vector.
+     * @param mins Per-dimension min values.
+     * @param scales Per-dimension scale values (range/255).
+     * @param dim Dimension of vectors.
+     * @return float Squared Euclidean distance.
+     */
+    static inline float L2Sqr_SQ8_AVX2(const std::uint8_t *qdata,
+                                      const float *query,
+                                      const float *mins,
+                                      const float *scales,
+                                      std::size_t dim)
+    {
+        __m256 sum = _mm256_setzero_ps();
+        std::size_t i = 0;
+
+        for (; i + 8 <= dim; i += 8)
+        {
+            __m128i packed = _mm_loadl_epi64(reinterpret_cast<const __m128i *>(qdata + i));
+            __m256i expanded = _mm256_cvtepu8_epi32(packed);
+            __m256 qvals = _mm256_cvtepi32_ps(expanded);
+
+            __m256 scale = _mm256_loadu_ps(scales + i);
+            __m256 minv = _mm256_loadu_ps(mins + i);
+            __m256 dequant = _mm256_fmadd_ps(qvals, scale, minv);
+
+            __m256 q = _mm256_loadu_ps(query + i);
+            __m256 diff = _mm256_sub_ps(dequant, q);
+            sum = _mm256_fmadd_ps(diff, diff, sum);
+        }
+
+        alignas(32) float temp[8];
+        _mm256_storeu_ps(temp, sum);
+        float total = 0.0f;
+        for (int k = 0; k < 8; ++k)
+            total += temp[k];
+
+        for (; i < dim; ++i)
+        {
+            float dequant = mins[i] + scales[i] * static_cast<float>(qdata[i]);
+            float diff = dequant - query[i];
+            total += diff * diff;
+        }
+
+        return total;
     }
 
 } // namespace pomai::kernels

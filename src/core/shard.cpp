@@ -151,6 +151,21 @@ namespace pomai
         return fut;
     }
 
+    void Shard::RequestEmergencyFreeze()
+    {
+        bool expected = false;
+        if (!emergency_freeze_pending_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+            return;
+
+        UpsertTask t;
+        t.is_emergency_freeze = true;
+        t.wait_durable = false;
+        if (!ingest_q_.Push(std::move(t)))
+        {
+            emergency_freeze_pending_.store(false, std::memory_order_release);
+        }
+    }
+
     std::size_t Shard::ApproxCountUnsafe() const
     {
         return seed_.Count();
@@ -331,6 +346,13 @@ namespace pomai
                 {
                 }
                 continue; // proceed to next loop iteration
+            }
+
+            if (task.is_emergency_freeze)
+            {
+                MaybeFreezeSegment();
+                emergency_freeze_pending_.store(false, std::memory_order_release);
+                continue;
             }
 
             // --- Normal upsert path ---
