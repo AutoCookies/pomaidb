@@ -22,10 +22,6 @@ namespace pomai
     // Footer magic (8 bytes). Chosen mnemonic ASCII 'pomaiwal'
     static constexpr uint64_t FOOTER_MAGIC = UINT64_C(0x706f6d616977616c); // "pomaiwal" little-endian
 
-    // Defensive caps to avoid server-side OOM caused by overly large client batches
-    static constexpr std::size_t MAX_WAL_PAYLOAD_BYTES = 64ULL * 1024ULL * 1024ULL; // 64 MiB
-    static constexpr std::size_t MAX_BATCH_ROWS = 50'000;                           // reasonable row cap
-
     static void ThrowSys(const std::string &what)
     {
         throw std::runtime_error(what + ": " + std::string(std::strerror(errno)));
