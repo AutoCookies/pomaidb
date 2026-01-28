@@ -1,5 +1,6 @@
 #include "seed.h"
 #include "cpu_kernels.h"
+#include "memory_manager.h"
 
 #include <algorithm>
 #include <queue>
@@ -16,6 +17,61 @@ namespace pomai
         ids_.reserve(1024);
         data_.reserve(1024 * dim_);
         pos_.reserve(1024);
+    }
+
+    Seed::Seed(const Seed &other)
+        : dim_(other.dim_),
+          ids_(other.ids_),
+          data_(other.data_),
+          pos_(other.pos_),
+          accounted_bytes_(other.accounted_bytes_)
+    {
+        if (accounted_bytes_ > 0)
+            MemoryManager::Instance().AddUsage(MemoryManager::Pool::Memtable, accounted_bytes_);
+    }
+
+    Seed &Seed::operator=(const Seed &other)
+    {
+        if (this == &other)
+            return *this;
+        ReleaseMemtableAccounting();
+        dim_ = other.dim_;
+        ids_ = other.ids_;
+        data_ = other.data_;
+        pos_ = other.pos_;
+        accounted_bytes_ = other.accounted_bytes_;
+        if (accounted_bytes_ > 0)
+            MemoryManager::Instance().AddUsage(MemoryManager::Pool::Memtable, accounted_bytes_);
+        return *this;
+    }
+
+    Seed::Seed(Seed &&other) noexcept
+        : dim_(other.dim_),
+          ids_(std::move(other.ids_)),
+          data_(std::move(other.data_)),
+          pos_(std::move(other.pos_)),
+          accounted_bytes_(other.accounted_bytes_)
+    {
+        other.accounted_bytes_ = 0;
+    }
+
+    Seed &Seed::operator=(Seed &&other) noexcept
+    {
+        if (this == &other)
+            return *this;
+        ReleaseMemtableAccounting();
+        dim_ = other.dim_;
+        ids_ = std::move(other.ids_);
+        data_ = std::move(other.data_);
+        pos_ = std::move(other.pos_);
+        accounted_bytes_ = other.accounted_bytes_;
+        other.accounted_bytes_ = 0;
+        return *this;
+    }
+
+    Seed::~Seed()
+    {
+        ReleaseMemtableAccounting();
     }
 
     void Seed::ReserveForAppend(std::size_t add_rows)
@@ -73,16 +129,47 @@ namespace pomai
                 std::copy(r.vec.data.begin(), r.vec.data.end(), data_.begin() + base);
             }
         }
+
+        UpdateMemtableAccounting();
     }
 
     Seed::Snapshot Seed::MakeSnapshot() const
     {
         // Immutable snapshot: copy contiguous buffers (much cheaper than copying a hashmap of vectors).
-        auto out = std::make_shared<Store>();
+        auto out = std::shared_ptr<Store>(
+            new Store(),
+            [](Store *s)
+            {
+                if (s->accounted_bytes > 0)
+                    MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Search, s->accounted_bytes);
+                delete s;
+            });
         out->dim = dim_;
         out->ids = ids_;
         out->data = data_;
+        out->accounted_bytes = out->ids.size() * sizeof(Id) + out->data.size() * sizeof(float);
+        if (out->accounted_bytes > 0)
+            MemoryManager::Instance().AddUsage(MemoryManager::Pool::Search, out->accounted_bytes);
         return out;
+    }
+
+    bool Seed::TryDetachSnapshot(Snapshot &snap, std::vector<float> &data, std::vector<Id> &ids)
+    {
+        if (!snap)
+            return false;
+        if (!snap.unique())
+            return false;
+
+        auto *store = const_cast<Store *>(snap.get());
+        if (store->accounted_bytes > 0)
+        {
+            MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Search, store->accounted_bytes);
+            store->accounted_bytes = 0;
+        }
+
+        ids = std::move(store->ids);
+        data = std::move(store->data);
+        return true;
     }
 
     SearchResponse Seed::SearchSnapshot(const Snapshot &snap, const SearchRequest &req)
@@ -145,6 +232,31 @@ namespace pomai
         }
         std::reverse(resp.items.begin(), resp.items.end());
         return resp;
+    }
+
+    void Seed::UpdateMemtableAccounting()
+    {
+        const std::size_t bytes =
+            ids_.size() * sizeof(Id) + data_.size() * sizeof(float);
+        if (bytes == accounted_bytes_)
+            return;
+        if (bytes > accounted_bytes_)
+        {
+            MemoryManager::Instance().AddUsage(MemoryManager::Pool::Memtable, bytes - accounted_bytes_);
+        }
+        else
+        {
+            MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Memtable, accounted_bytes_ - bytes);
+        }
+        accounted_bytes_ = bytes;
+    }
+
+    void Seed::ReleaseMemtableAccounting()
+    {
+        if (accounted_bytes_ == 0)
+            return;
+        MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Memtable, accounted_bytes_);
+        accounted_bytes_ = 0;
     }
 
 } // namespace pomai

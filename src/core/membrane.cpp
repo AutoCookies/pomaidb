@@ -1,6 +1,7 @@
 #include "membrane.h"
 #include "spatial_router.h"
 #include "search_fanout.h"
+#include "memory_manager.h"
 
 #include <stdexcept>
 #include <algorithm>
@@ -202,13 +203,15 @@ namespace pomai
     MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                    pomai::server::WhisperConfig w_cfg,
                                    std::size_t dim,
-                                   std::size_t search_pool_workers)
+                                   std::size_t search_pool_workers,
+                                   std::size_t search_timeout_ms)
         : shards_(std::move(shards)),
           brain_(w_cfg),
           probe_P_(2),
           centroids_path_(),
           centroids_load_mode_(CentroidsLoadMode::Auto),
           dim_(dim),
+          search_timeout_ms_(search_timeout_ms),
           // initialize search_pool_ using helper and constructor parameter 'shards' size (use param shards size for decision)
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size()))
     {
@@ -315,6 +318,23 @@ namespace pomai
             std::promise<Lsn> p;
             auto f = p.get_future();
             p.set_value(0);
+            return f;
+        }
+
+        std::size_t estimated_bytes = 0;
+        for (const auto &r : batch)
+        {
+            if (r.vec.data.size() != dim_)
+                continue;
+            estimated_bytes += sizeof(Id) + r.vec.data.size() * sizeof(float);
+        }
+
+        if (!MemoryManager::Instance().CanAllocate(estimated_bytes))
+        {
+            std::promise<Lsn> p;
+            auto f = p.get_future();
+            p.set_exception(std::make_exception_ptr(
+                std::runtime_error("UpsertBatch rejected: memory pressure")));
             return f;
         }
 
@@ -428,8 +448,15 @@ namespace pomai
         auto futs = ParallelSubmit(search_pool_, std::move(jobs));
 
         std::vector<SearchResultItem> all;
+        const auto timeout = std::chrono::milliseconds(search_timeout_ms_);
         for (auto &f : futs)
         {
+            if (f.wait_for(timeout) != std::future_status::ready)
+            {
+                std::cerr << "[Router] Search shard timeout after "
+                          << search_timeout_ms_ << "ms; returning partial results\n";
+                continue;
+            }
             auto r = f.get();
             all.insert(all.end(), r.items.begin(), r.items.end());
         }

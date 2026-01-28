@@ -14,6 +14,7 @@
 
 #include "seed.h"
 #include "orbit_index.h"
+#include "memory_manager.h"
 
 namespace pomai
 {
@@ -115,21 +116,43 @@ namespace pomai
                 {
                     std::unique_lock<std::mutex> lk(mu_);
                     cv_.wait(lk, [&]
-                             { return stop_requested_ || !q_.empty(); });
+                             {
+                                 if (stop_requested_)
+                                     return true;
+                                 if (q_.empty())
+                                     return false;
+                                 if (MemoryManager::Instance().AtOrAboveSoftWatermark() &&
+                                     active_builds_.load(std::memory_order_acquire) >= 1)
+                                     return false;
+                                 return true;
+                             });
                     if (stop_requested_ && q_.empty())
                         return;
 
                     job = std::move(q_.front());
                     q_.pop_front();
+                    active_builds_.fetch_add(1, std::memory_order_release);
                 }
 
                 // Build index outside lock
                 auto idx = std::make_shared<pomai::core::OrbitIndex>(
                     job.snap->dim, job.M, job.ef_construction);
-                idx->Build(job.snap->data, job.snap->ids);
+                std::vector<float> moved_data;
+                std::vector<Id> moved_ids;
+                if (Seed::TryDetachSnapshot(job.snap, moved_data, moved_ids))
+                {
+                    idx->BuildFromMove(std::move(moved_data), std::move(moved_ids));
+                }
+                else
+                {
+                    idx->Build(job.snap->data, job.snap->ids);
+                }
 
                 // Attach callback
                 job.attach(job.segment_pos, job.snap, std::move(idx));
+
+                active_builds_.fetch_sub(1, std::memory_order_release);
+                cv_.notify_all();
             }
         }
 
@@ -143,6 +166,7 @@ namespace pomai
 
         std::atomic<bool> running_{false};
         bool stop_requested_{false};
+        std::atomic<std::size_t> active_builds_{0};
     };
 
 } // namespace pomai

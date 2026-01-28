@@ -29,7 +29,8 @@ namespace pomai
         explicit MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                 pomai::server::WhisperConfig w_cfg,
                                 std::size_t dim,
-                                std::size_t search_pool_workers = 0);
+                                std::size_t search_pool_workers = 0,
+                                std::size_t search_timeout_ms = 500);
 
         void Start();
         void Stop();
@@ -83,6 +84,7 @@ namespace pomai
         std::string centroids_path_;
         CentroidsLoadMode centroids_load_mode_{CentroidsLoadMode::Auto};
         std::size_t dim_{0};
+        std::size_t search_timeout_ms_{500};
 
         // Thread-pool for bounded parallel search fanout. Mutable so Search() can be const.
         mutable SearchThreadPool search_pool_;
