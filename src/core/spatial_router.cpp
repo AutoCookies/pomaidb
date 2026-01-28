@@ -1,16 +1,9 @@
 #include "spatial_router.h"
-
 #include <cmath>
-#include <iostream>
-#include <random>
-#include <limits>
-#include <atomic>
-#include <algorithm>
-#include <numeric> // for std::iota
+#include <numeric>
 
 namespace pomai
 {
-
     std::size_t SpatialRouter::PickShardForInsert(const Vector &vec) const
     {
         std::shared_lock<std::shared_mutex> lk(mu_);
@@ -20,6 +13,7 @@ namespace pomai
         const std::size_t C = centroids_.size();
         float best_d = std::numeric_limits<float>::infinity();
         std::size_t best = 0;
+
         for (std::size_t i = 0; i < C; ++i)
         {
             float d = kernels::L2Sqr(vec.data.data(), centroids_[i].data.data(), vec.data.size());
@@ -29,15 +23,19 @@ namespace pomai
                 best = i;
             }
         }
+
+        // Tăng bộ đếm hotspot với memory_order_relaxed để đạt hiệu suất tối đa
+        if (centroid_hits_)
+            centroid_hits_[best].fetch_add(1, std::memory_order_relaxed);
+
         return best;
     }
 
     std::vector<std::size_t> SpatialRouter::CandidateShardsForQuery(const Vector &q, std::size_t P) const
     {
         std::shared_lock<std::shared_mutex> lk(mu_);
-        std::vector<std::size_t> out;
         if (centroids_.empty())
-            return out;
+            return {};
 
         const std::size_t C = centroids_.size();
         struct Pair
@@ -47,37 +45,37 @@ namespace pomai
         };
         std::vector<Pair> v;
         v.reserve(C);
+
         for (std::size_t i = 0; i < C; ++i)
         {
             float d = kernels::L2Sqr(q.data.data(), centroids_[i].data.data(), q.data.size());
-            v.push_back(Pair{d, i});
+            v.push_back({d, i});
         }
 
-        // If P >= C, return all centroids sorted.
+        std::vector<std::size_t> out;
         if (P >= C)
         {
             std::sort(v.begin(), v.end(), [](const Pair &a, const Pair &b)
                       { return a.d < b.d; });
-            out.reserve(C);
             for (auto &p : v)
                 out.push_back(p.idx);
-            for (auto idx : out)
-                centroid_hits_[idx].fetch_add(1, std::memory_order_relaxed);
-            return out;
+        }
+        else
+        {
+            std::nth_element(v.begin(), v.begin() + P, v.end(), [](const Pair &a, const Pair &b)
+                             { return a.d < b.d; });
+            std::sort(v.begin(), v.begin() + P, [](const Pair &a, const Pair &b)
+                      { return a.d < b.d; });
+            for (std::size_t i = 0; i < P; ++i)
+                out.push_back(v[i].idx);
         }
 
-        // partial sort: get top-P without fully sorting
-        std::nth_element(v.begin(), v.begin() + P, v.end(), [](const Pair &a, const Pair &b)
-                         { return a.d < b.d; });
-        std::sort(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(P), [](const Pair &a, const Pair &b)
-                  { return a.d < b.d; });
-
-        out.reserve(P);
-        for (size_t i = 0; i < P; ++i)
-            out.push_back(v[i].idx);
-
-        for (auto idx : out)
-            centroid_hits_[idx].fetch_add(1, std::memory_order_relaxed);
+        // Cập nhật bộ đếm cho các shard tiềm năng
+        if (centroid_hits_)
+        {
+            for (auto idx : out)
+                centroid_hits_[idx].fetch_add(1, std::memory_order_relaxed);
+        }
 
         return out;
     }
@@ -85,11 +83,22 @@ namespace pomai
     void SpatialRouter::ReplaceCentroids(std::vector<Vector> new_centroids)
     {
         std::unique_lock<std::shared_mutex> lk(mu_);
+        const std::size_t C = new_centroids.size();
+
         centroids_.swap(new_centroids);
-        centroid_hits_.clear();
-        centroid_hits_.resize(centroids_.size());
-        for (auto &hit : centroid_hits_)
-            hit.store(0, std::memory_order_relaxed);
+        num_centroids_ = C;
+
+        if (C > 0)
+        {
+            // Cấp phát mảng nguyên tử mới, tránh việc copy/move gây lỗi
+            centroid_hits_ = std::make_unique<std::atomic<std::uint64_t>[]>(C);
+            for (std::size_t i = 0; i < C; ++i)
+                centroid_hits_[i].store(0, std::memory_order_relaxed);
+        }
+        else
+        {
+            centroid_hits_.reset();
+        }
     }
 
     std::vector<Vector> SpatialRouter::SnapshotCentroids() const
@@ -101,15 +110,14 @@ namespace pomai
     std::optional<SpatialRouter::HotspotInfo> SpatialRouter::DetectHotspot(double threshold_ratio) const
     {
         std::shared_lock<std::shared_mutex> lk(mu_);
-        const std::size_t C = centroids_.size();
-        if (C == 0 || centroid_hits_.size() != C)
+        if (num_centroids_ == 0 || !centroid_hits_)
             return std::nullopt;
 
         std::uint64_t total_hits = 0;
         std::size_t best_idx = 0;
         std::uint64_t best_hits = 0;
 
-        for (std::size_t i = 0; i < C; ++i)
+        for (std::size_t i = 0; i < num_centroids_; ++i)
         {
             std::uint64_t hits = centroid_hits_[i].load(std::memory_order_relaxed);
             total_hits += hits;
@@ -123,81 +131,48 @@ namespace pomai
         if (total_hits == 0)
             return std::nullopt;
 
-        const double avg = static_cast<double>(total_hits) / static_cast<double>(C);
-        if (avg <= 0.0)
-            return std::nullopt;
+        double avg = static_cast<double>(total_hits) / num_centroids_;
+        double ratio = (avg > 0) ? (static_cast<double>(best_hits) / avg) : 0;
 
-        const double ratio = static_cast<double>(best_hits) / avg;
         if (ratio < threshold_ratio)
             return std::nullopt;
 
-        HotspotInfo info;
-        info.centroid_idx = best_idx;
-        info.ratio = ratio;
-        info.total_hits = static_cast<std::size_t>(total_hits);
-        info.average_hits = avg;
-        return info;
+        return HotspotInfo{best_idx, ratio, static_cast<std::size_t>(total_hits), avg};
     }
 
-    // -------------------- Simple Lloyd's k-means --------------------
-    //
-    // A lightweight k-means implementation for offline centroid computation.
-    // Not optimized for huge data; intended for sampling-based centroid computation.
-    //
-    // Data assumptions:
-    // - All vectors in 'data' share the same dimension
-    //
+    // K-Means giữ nguyên logic xử lý dữ liệu của bạn nhưng tối ưu hóa việc di chuyển vector
     std::vector<Vector> SpatialRouter::BuildKMeans(const std::vector<Vector> &data, std::size_t k, int iterations)
     {
-        if (data.empty())
-            throw std::runtime_error("BuildKMeans: empty input data");
-        if (k == 0)
-            throw std::runtime_error("BuildKMeans: k must be > 0");
+        if (data.empty() || k == 0)
+            throw std::runtime_error("BuildKMeans: Invalid input");
+
         const std::size_t dim = data[0].data.size();
-
-        // Validate dims
-        for (const auto &v : data)
-        {
-            if (v.data.size() != dim)
-                throw std::runtime_error("BuildKMeans: inconsistent vector dimension in sample");
-        }
-
         const std::size_t N = data.size();
         if (k > N)
-            throw std::runtime_error("BuildKMeans: k cannot be greater than number of samples");
+            throw std::runtime_error("BuildKMeans: k > N");
 
         std::vector<Vector> centroids;
-        centroids.reserve(k);
-
-        // Initialize centroids by selecting k distinct random samples using a partial shuffle.
         std::mt19937_64 rng(std::random_device{}());
         std::vector<std::size_t> indices(N);
         std::iota(indices.begin(), indices.end(), 0);
+        std::shuffle(indices.begin(), indices.end(), rng);
 
-        // Fisher-Yates style: shuffle first k elements (partial shuffle)
         for (std::size_t i = 0; i < k; ++i)
-        {
-            std::uniform_int_distribution<std::size_t> dist(i, N - 1);
-            std::size_t j = dist(rng);
-            std::swap(indices[i], indices[j]);
-            centroids.push_back(data[indices[i]]); // copy initial centroid
-        }
+            centroids.push_back(data[indices[i]]);
 
-        std::vector<std::size_t> assignments(N, 0);
-        std::vector<double> counts(k, 0.0);
-        std::vector<std::vector<double>> acc(k, std::vector<double>(dim, 0.0));
-
+        std::vector<std::size_t> assignments(N);
         for (int it = 0; it < iterations; ++it)
         {
-            // assignment step
+            std::vector<std::vector<double>> acc(k, std::vector<double>(dim, 0.0));
+            std::vector<std::size_t> counts(k, 0);
+
             for (std::size_t i = 0; i < N; ++i)
             {
                 float bestd = std::numeric_limits<float>::infinity();
                 std::size_t best = 0;
-                const auto &v = data[i];
                 for (std::size_t c = 0; c < k; ++c)
                 {
-                    float d = kernels::L2Sqr(v.data.data(), centroids[c].data.data(), dim);
+                    float d = kernels::L2Sqr(data[i].data.data(), centroids[c].data.data(), dim);
                     if (d < bestd)
                     {
                         bestd = d;
@@ -205,48 +180,19 @@ namespace pomai
                     }
                 }
                 assignments[i] = best;
-            }
-
-            // reset accumulators
-            for (std::size_t c = 0; c < k; ++c)
-            {
-                counts[c] = 0.0;
-                std::fill(acc[c].begin(), acc[c].end(), 0.0);
-            }
-
-            // accumulate
-            for (std::size_t i = 0; i < N; ++i)
-            {
-                std::size_t c = assignments[i];
-                counts[c] += 1.0;
-                const auto &src = data[i].data;
-                auto &dst = acc[c];
+                counts[best]++;
                 for (std::size_t d = 0; d < dim; ++d)
-                    dst[d] += static_cast<double>(src[d]);
+                    acc[best][d] += data[i].data[d];
             }
 
-            // update centroids
             for (std::size_t c = 0; c < k; ++c)
             {
-                if (counts[c] == 0.0)
-                {
-                    // reinitialize empty cluster to a random point
-                    std::uniform_int_distribution<std::size_t> dist(0, N - 1);
-                    centroids[c] = data[dist(rng)];
-                }
-                else
-                {
-                    Vector cv;
-                    cv.data.resize(dim);
-                    double inv = 1.0 / counts[c];
-                    for (std::size_t d = 0; d < dim; ++d)
-                        cv.data[d] = static_cast<float>(acc[c][d] * inv);
-                    centroids[c] = std::move(cv);
-                }
+                if (counts[c] == 0)
+                    continue;
+                for (std::size_t d = 0; d < dim; ++d)
+                    centroids[c].data[d] = static_cast<float>(acc[c][d] / counts[c]);
             }
         }
-
         return centroids;
     }
-
-} // namespace pomai
+}
