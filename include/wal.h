@@ -1,4 +1,5 @@
-#pragma once
+#ifndef WAL_H
+#define WAL_H
 
 #include "types.h"
 #include <atomic>
@@ -93,3 +94,5 @@ namespace pomai
   };
 
 } // namespace pomai
+
+#endif // WAL_H

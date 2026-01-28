@@ -71,7 +71,8 @@ namespace pomai
             shards.push_back(std::move(sh));
         }
 
-        membrane_ = std::make_unique<MembraneRouter>(std::move(shards), opt_.whisper, opt_.dim);
+        // Pass search_pool_workers through to MembraneRouter so operator can tune pool size.
+        membrane_ = std::make_unique<MembraneRouter>(std::move(shards), opt_.whisper, opt_.dim, opt_.search_pool_workers);
         membrane_->SetCentroidsFilePath(opt_.centroids_path);
         membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
     }
@@ -200,40 +201,11 @@ namespace pomai
             return p.get_future();
         }
 
-        // Delegate to MembraneRouter if it exposes compute helper; otherwise perform orchestration here by
-        // asking MembraneRouter to expose a method for sampling/building. To keep this API stable we call
-        // a MembraneRouter helper `ComputeAndConfigureCentroids` if available.
-        //
-        // The MembraneRouter implementation may either:
-        //  - provide ComputeAndConfigureCentroids(k, total_samples) (recommended), or
-        //  - you can implement this PomaiDB method to gather samples from shards (Shard::SampleVectors)
-        //    and then call SpatialRouter::BuildKMeans(...) and membrane_->ConfigureCentroids(...).
-        //
-        // Implementation below will perform sampling via MembraneRouter if it has ComputeAndConfigureCentroids;
-        // otherwise it will fallback to a simple orchestration by calling an expected helper on MembraneRouter.
-        //
         return std::async(std::launch::async, [this, k, total_samples]() -> bool
                           {
             try
             {
-                // Prefer if MembraneRouter provides a direct compute method.
-#if 1
-                // If your MembraneRouter implements ComputeAndConfigureCentroids(k, total_samples),
-                // this will compile and run. If not, replace this block with the fallback below.
                 return membrane_->ComputeAndConfigureCentroids(k, total_samples);
-#else
-                // Fallback orchestration (if MembraneRouter does NOT implement ComputeAndConfigureCentroids).
-                // Collect samples from shards via an imagined MembraneRouter->SampleAllShards(per_shard)
-                // or by exposing shards; if unavailable, you'll need to add a small helper to MembraneRouter.
-                //
-                // Pseudocode:
-                //   per_shard = max(1, total_samples / membrane_->ShardCount());
-                //   aggregate_samples = membrane_->CollectShardSamples(per_shard);
-                //   centroids = SpatialRouter::BuildKMeans(aggregate_samples, k, 10);
-                //   membrane_->ConfigureCentroids(centroids);
-                //   return true;
-                return false;
-#endif
             }
             catch (const std::exception &e)
             {

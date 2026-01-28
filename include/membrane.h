@@ -7,6 +7,8 @@
 #include "server/config.h"
 #include "whispergrain.h"
 #include "spatial_router.h"
+#include "search_thread_pool.h" // new
+#include "search_fanout.h"      // new
 
 namespace pomai
 {
@@ -22,9 +24,12 @@ namespace pomai
             None
         };
 
+        // Added 'search_pool_workers' parameter so callers can tune the bounded search pool.
+        //  - search_pool_workers == 0 -> auto (hw concurrency, capped)
         explicit MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                 pomai::server::WhisperConfig w_cfg,
-                                std::size_t dim);
+                                std::size_t dim,
+                                std::size_t search_pool_workers = 0);
 
         void Start();
         void Stop();
@@ -78,6 +83,9 @@ namespace pomai
         std::string centroids_path_;
         CentroidsLoadMode centroids_load_mode_{CentroidsLoadMode::Auto};
         std::size_t dim_{0};
+
+        // Thread-pool for bounded parallel search fanout. Mutable so Search() can be const.
+        mutable SearchThreadPool search_pool_;
     };
 
 }
