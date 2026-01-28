@@ -144,8 +144,8 @@ namespace pomai
         // Nếu bộ nhớ vượt ngưỡng Soft Watermark (70%), thực hiện làm chậm (Throttle)
         if (MemoryManager::Instance().AtOrAboveSoftWatermark())
         {
-            // Tạm dừng 10ms để IndexBuildPool có thời gian giải phóng Snapshot
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // Tạm dừng 20ms để IndexBuildPool có thời gian giải phóng Snapshot
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
 
         // Nếu chạm ngưỡng Hard Watermark (90%), từ chối ngay lập tức để tránh bị OS Kill

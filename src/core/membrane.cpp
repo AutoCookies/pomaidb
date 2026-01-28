@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <cstring>
 #include <cerrno>
+#include <string_view>
 #include <limits>
 #include <fcntl.h>
 #include <unistd.h>
@@ -467,6 +468,18 @@ namespace pomai
             try
             {
                 futs.emplace_back(search_pool_.Submit(std::move(job)));
+            }
+            catch (const std::runtime_error &e)
+            {
+                if (std::string_view(e.what()) == "CAPACITY_EXCEEDED")
+                {
+                    std::cerr << "[Router] WARNING: Search submit rejected (CAPACITY_EXCEEDED); returning partial results\n";
+                }
+                else
+                {
+                    std::cerr << "[Router] Search submit rejected: " << e.what()
+                              << " (returning partial results)\n";
+                }
             }
             catch (const std::exception &e)
             {
