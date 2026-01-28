@@ -361,35 +361,48 @@ namespace pomai
             }
 
             // --- Normal upsert path ---
-            // 1) WAL: pass through wait_durable flag so AppendUpserts can optionally fsync immediately.
-            Lsn lsn = wal_.AppendUpserts(task.batch, task.wait_durable);
-
-            // 2) Seed apply
-            seed_.ApplyUpserts(task.batch);
-
-            // 3) publish live snapshot sometimes
-            since_live_publish_ += task.batch.size();
-            if (since_live_publish_ >= kPublishLiveEveryVectors)
+            try
             {
-                since_live_publish_ = 0;
-                auto snap = seed_.MakeSnapshot();
-                std::lock_guard<std::mutex> lk(state_mu_);
-                live_snap_ = std::move(snap);
-            }
+                // 1) WAL: pass through wait_durable flag so AppendUpserts can optionally fsync immediately.
+                Lsn lsn = wal_.AppendUpserts(task.batch, task.wait_durable);
 
-            // 4) freeze to segment sometimes
-            since_freeze_ += task.batch.size();
-            if (since_freeze_ >= kFreezeEveryVectors)
+                // 2) Seed apply
+                seed_.ApplyUpserts(task.batch);
+
+                // 3) publish live snapshot sometimes
+                since_live_publish_ += task.batch.size();
+                if (since_live_publish_ >= kPublishLiveEveryVectors)
+                {
+                    since_live_publish_ = 0;
+                    auto snap = seed_.MakeSnapshot();
+                    std::lock_guard<std::mutex> lk(state_mu_);
+                    live_snap_ = std::move(snap);
+                }
+
+                // 4) freeze to segment sometimes
+                since_freeze_ += task.batch.size();
+                if (since_freeze_ >= kFreezeEveryVectors)
+                {
+                    since_freeze_ = 0;
+                    MaybeFreezeSegment();
+                }
+
+                // 5) durable wait if requested (usually fast because AppendUpserts already fdatasync'd)
+                if (task.wait_durable)
+                    wal_.WaitDurable(lsn);
+
+                task.done.set_value(lsn);
+            }
+            catch (...)
             {
-                since_freeze_ = 0;
-                MaybeFreezeSegment();
+                try
+                {
+                    task.done.set_exception(std::current_exception());
+                }
+                catch (...)
+                {
+                }
             }
-
-            // 5) durable wait if requested (usually fast because AppendUpserts already fdatasync'd)
-            if (task.wait_durable)
-                wal_.WaitDurable(lsn);
-
-            task.done.set_value(lsn);
         }
 
         // final freeze
@@ -449,14 +462,13 @@ namespace pomai
         // fast path by position
         if (segment_pos < segments_.size() && segments_[segment_pos].snap == snap)
         {
+            const std::size_t indexed = snap->ids.size();
             segments_[segment_pos].index = std::move(idx);
             // Release the snapshot to free memory — index now holds the searchable data.
             segments_[segment_pos].snap.reset();
 
             if (log_info_)
-                log_info_("[" + name_ + "] Indexed segment: " + std::to_string(snap->ids.size()) + " vectors");
-            else
-                std::cout << "[" << name_ << "] Indexed segment: " << snap->ids.size() << " vectors\n";
+                log_info_("[" + name_ + "] Snapshot released. Vectors indexed: " + std::to_string(indexed));
             return;
         }
 
@@ -465,13 +477,12 @@ namespace pomai
         {
             if (s.snap == snap)
             {
+                const std::size_t indexed = snap->ids.size();
                 s.index = std::move(idx);
                 s.snap.reset();
 
                 if (log_info_)
-                    log_info_("[" + name_ + "] Indexed segment: " + std::to_string(snap->ids.size()) + " vectors");
-                else
-                    std::cout << "[" << name_ << "] Indexed segment: " << snap->ids.size() << " vectors\n";
+                    log_info_("[" + name_ + "] Snapshot released. Vectors indexed: " + std::to_string(indexed));
                 return;
             }
         }

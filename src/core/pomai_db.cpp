@@ -72,7 +72,11 @@ namespace pomai
         }
 
         // Pass search_pool_workers through to MembraneRouter so operator can tune pool size.
-        membrane_ = std::make_unique<MembraneRouter>(std::move(shards), opt_.whisper, opt_.dim, opt_.search_pool_workers);
+        membrane_ = std::make_unique<MembraneRouter>(std::move(shards),
+                                                     opt_.whisper,
+                                                     opt_.dim,
+                                                     opt_.search_pool_workers,
+                                                     opt_.search_timeout_ms);
         membrane_->SetCentroidsFilePath(opt_.centroids_path);
         membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
     }

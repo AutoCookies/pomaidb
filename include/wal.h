@@ -25,6 +25,9 @@ namespace pomai
 
   using Lsn = std::uint64_t;
 
+  constexpr std::size_t MAX_WAL_PAYLOAD_BYTES = 64 * 1024 * 1024;
+  constexpr std::size_t MAX_BATCH_ROWS = 50000;
+
   struct WalReplayStats
   {
     Lsn last_lsn{0};                // last applied LSN

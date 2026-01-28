@@ -73,4 +73,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/tests")
 
     add_executable(centroids_persistence_tests tests/centroids_persistence_tests.cpp)
     target_link_libraries(centroids_persistence_tests pomai_core)
+
+    add_executable(memory_safety_tests tests/memory_safety_tests.cpp)
+    target_link_libraries(memory_safety_tests pomai_core)
 endif()

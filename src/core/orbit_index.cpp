@@ -1,5 +1,6 @@
 #include "orbit_index.h"
 #include "cpu_kernels.h"
+#include "memory_manager.h"
 
 #include <algorithm>
 #include <queue>
@@ -68,6 +69,14 @@ namespace pomai::core
             throw std::runtime_error("OrbitIndex M must be > 0");
         if (ef_construction_ == 0)
             ef_construction_ = 64;
+    }
+
+    OrbitIndex::~OrbitIndex()
+    {
+        if (accounted_bytes_ > 0)
+        {
+            MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Indexing, accounted_bytes_);
+        }
     }
 
     void OrbitIndex::Build(const std::vector<float> &flat_data, const std::vector<Id> &flat_ids)
@@ -159,6 +168,110 @@ namespace pomai::core
         }
 
         built_.store(true, std::memory_order_release);
+
+        const std::size_t graph_bytes = [&]()
+        {
+            std::size_t bytes = 0;
+            for (const auto &g : graph_)
+                bytes += g.size() * sizeof(std::uint32_t);
+            return bytes;
+        }();
+        accounted_bytes_ =
+            data_.size() * sizeof(float) + ids_.size() * sizeof(Id) + graph_bytes;
+        MemoryManager::Instance().AddUsage(MemoryManager::Pool::Indexing, accounted_bytes_);
+    }
+
+    void OrbitIndex::BuildFromMove(std::vector<float> &&flat_data, std::vector<Id> &&flat_ids)
+    {
+        if (built_.load(std::memory_order_acquire))
+        {
+            throw std::runtime_error("OrbitIndex::Build called twice");
+        }
+        if (flat_ids.empty())
+        {
+            data_.clear();
+            ids_.clear();
+            graph_.clear();
+            total_vectors_.store(0, std::memory_order_release);
+            built_.store(true, std::memory_order_release);
+            return;
+        }
+        if (flat_data.size() != flat_ids.size() * dim_)
+        {
+            throw std::runtime_error("OrbitIndex::Build flat_data size mismatch");
+        }
+
+        const std::size_t N = flat_ids.size();
+
+        data_ = std::move(flat_data);
+        ids_ = std::move(flat_ids);
+
+        graph_.clear();
+        graph_.resize(N);
+        for (auto &g : graph_)
+            g.reserve(M_ + 1);
+
+        total_vectors_.store(N, std::memory_order_release);
+
+        std::mt19937 rng(123);
+
+        for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(N); ++i)
+        {
+            if (i == 0)
+                continue;
+
+            const float *vec = data_.data() + static_cast<std::size_t>(i) * dim_;
+
+            std::vector<std::uint32_t> neigh = FindNeighborsBuild(vec, i, ef_construction_);
+
+            if (i > 32)
+            {
+                std::uniform_int_distribution<std::uint32_t> dist(0, i - 1);
+                for (int r = 0; r < 2; ++r)
+                {
+                    std::uint32_t rnd = dist(rng);
+                    if (rnd != i)
+                        neigh.push_back(rnd);
+                }
+            }
+
+            if (!neigh.empty())
+            {
+                std::sort(neigh.begin(), neigh.end());
+                neigh.erase(std::unique(neigh.begin(), neigh.end()), neigh.end());
+
+                std::vector<std::pair<float, std::uint32_t>> scored;
+                scored.reserve(neigh.size());
+                for (auto nb : neigh)
+                {
+                    const float *v2 = data_.data() + static_cast<std::size_t>(nb) * dim_;
+                    float d = pomai::kernels::L2Sqr(vec, v2, dim_);
+                    scored.push_back({d, nb});
+                }
+                std::sort(scored.begin(), scored.end(),
+                          [](const auto &a, const auto &b)
+                          { return a.first < b.first; });
+
+                const std::size_t take = std::min<std::size_t>(M_, scored.size());
+                for (std::size_t k = 0; k < take; ++k)
+                {
+                    Connect(i, scored[k].second);
+                }
+            }
+        }
+
+        built_.store(true, std::memory_order_release);
+
+        const std::size_t graph_bytes = [&]()
+        {
+            std::size_t bytes = 0;
+            for (const auto &g : graph_)
+                bytes += g.size() * sizeof(std::uint32_t);
+            return bytes;
+        }();
+        accounted_bytes_ =
+            data_.size() * sizeof(float) + ids_.size() * sizeof(Id) + graph_bytes;
+        MemoryManager::Instance().AddUsage(MemoryManager::Pool::Indexing, accounted_bytes_);
     }
 
     std::vector<std::uint32_t> OrbitIndex::FindNeighborsBuild(const float *vec, std::uint32_t curr_idx, std::size_t ef) const

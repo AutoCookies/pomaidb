@@ -19,17 +19,24 @@ namespace pomai
             std::size_t dim{0};
             std::vector<Id> ids;     // row ids [N]
             std::vector<float> data; // row-major vectors [N * dim]
+            std::size_t accounted_bytes{0};
         };
 
         using Snapshot = std::shared_ptr<const Store>;
 
         explicit Seed(std::size_t dim);
+        Seed(const Seed &other);
+        Seed &operator=(const Seed &other);
+        Seed(Seed &&other) noexcept;
+        Seed &operator=(Seed &&other) noexcept;
+        ~Seed();
 
         // Apply a batch of upserts (owner thread only).
         void ApplyUpserts(const std::vector<UpsertRequest> &batch);
 
         // Create an immutable snapshot for concurrent readers.
         Snapshot MakeSnapshot() const;
+        static bool TryDetachSnapshot(Snapshot &snap, std::vector<float> &data, std::vector<Id> &ids);
 
         // Exact scan using snapshot (L2 squared), returns best K with score = -dist.
         static SearchResponse SearchSnapshot(const Snapshot &snap, const SearchRequest &req);
@@ -46,6 +53,10 @@ namespace pomai
         std::unordered_map<Id, std::uint32_t> pos_; // id -> row index
 
         void ReserveForAppend(std::size_t add_rows);
+        void UpdateMemtableAccounting();
+        void ReleaseMemtableAccounting();
+
+        std::size_t accounted_bytes_{0};
     };
 
 } // namespace pomai

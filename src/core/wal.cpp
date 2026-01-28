@@ -22,10 +22,6 @@ namespace pomai
     // Footer magic (8 bytes). Chosen mnemonic ASCII 'pomaiwal'
     static constexpr uint64_t FOOTER_MAGIC = UINT64_C(0x706f6d616977616c); // "pomaiwal" little-endian
 
-    // Defensive caps to avoid server-side OOM caused by overly large client batches
-    static constexpr std::size_t MAX_WAL_PAYLOAD_BYTES = 64ULL * 1024ULL * 1024ULL; // 64 MiB
-    static constexpr std::size_t MAX_BATCH_ROWS = 50'000;                           // reasonable row cap
-
     static void ThrowSys(const std::string &what)
     {
         throw std::runtime_error(what + ": " + std::string(std::strerror(errno)));
@@ -146,10 +142,6 @@ namespace pomai
         if (batch.empty())
             return 0;
 
-        // Defensive: cap number of rows a client may submit in one batch.
-        if (batch.size() > MAX_BATCH_ROWS)
-            throw std::runtime_error("WAL append rejected: batch too large; split into smaller batches (max rows = " + std::to_string(MAX_BATCH_ROWS) + ")");
-
         // Compute per-entry bytes and check for overflow before building buffers.
         const uint64_t per_entry_bytes = static_cast<uint64_t>(sizeof(uint64_t) + dim_ * sizeof(float));
         if (per_entry_bytes == 0)
@@ -164,8 +156,8 @@ namespace pomai
             sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t) +
             static_cast<std::size_t>(count * per_entry_bytes);
 
-        if (payload_size > MAX_WAL_PAYLOAD_BYTES)
-            throw std::runtime_error("WAL append rejected: payload too large; split batch into smaller chunks (max payload bytes = " + std::to_string(MAX_WAL_PAYLOAD_BYTES) + ")");
+        if (batch.size() > MAX_BATCH_ROWS || payload_size > MAX_WAL_PAYLOAD_BYTES)
+            throw std::runtime_error("WAL append rejected: payload too large (" + std::to_string(payload_size) + " bytes); split batch or reduce vector dimensions.");
 
         if (payload_size > static_cast<std::size_t>(std::numeric_limits<uint32_t>::max()))
             throw std::runtime_error("WAL append rejected: payload larger than 4GB (unsupported)");

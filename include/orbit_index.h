@@ -16,9 +16,11 @@ namespace pomai::core
     {
     public:
         explicit OrbitIndex(std::size_t dim, std::size_t M = 48, std::size_t ef_construction = 200);
+        ~OrbitIndex();
 
         // One-time build. After Build(), the index is immutable and can be searched concurrently.
         void Build(const std::vector<float> &flat_data, const std::vector<Id> &flat_ids);
+        void BuildFromMove(std::vector<float> &&flat_data, std::vector<Id> &&flat_ids);
 
         // Thread-safe after Build() (read-only).
         SearchResponse Search(const Vector &query, const pomai::ai::Budget &budget) const;
@@ -51,6 +53,7 @@ namespace pomai::core
         std::vector<float> data_;                       // [N * dim]
         std::vector<Id> ids_;                           // [N]
         std::vector<std::vector<std::uint32_t>> graph_; // adjacency
+        std::size_t accounted_bytes_{0};
 
         std::atomic<std::size_t> total_vectors_{0};
         std::atomic<bool> built_{false};
