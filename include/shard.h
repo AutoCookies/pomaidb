@@ -7,6 +7,7 @@
 #include <mutex>
 #include <functional>
 #include <optional>
+#include <atomic>
 
 #include "types.h"
 #include "wal.h"
@@ -28,6 +29,9 @@ namespace pomai
         // Checkpoint control
         bool is_checkpoint{false};
         std::optional<std::promise<bool>> checkpoint_done;
+
+        // Emergency freeze control
+        bool is_emergency_freeze{false};
     };
 
     struct IndexedSegment
@@ -62,6 +66,7 @@ namespace pomai
 
         // Request checkpoint (snapshot + wal truncation)
         std::future<bool> RequestCheckpoint();
+        void RequestEmergencyFreeze();
 
         // Sample up to max_samples vectors from this shard (from frozen segments and live memtable).
         // Non-blocking for writers (uses snapshot copies under short lock).
@@ -105,6 +110,8 @@ namespace pomai
 
         static constexpr std::size_t kPublishLiveEveryVectors = 10'000;
         std::size_t since_live_publish_{0};
+
+        std::atomic<bool> emergency_freeze_pending_{false};
     };
 
 } // namespace pomai
