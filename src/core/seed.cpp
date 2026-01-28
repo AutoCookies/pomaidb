@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace pomai
@@ -148,7 +149,52 @@ namespace pomai
         out->dim = dim_;
         out->ids = ids_;
         out->data = data_;
-        out->accounted_bytes = out->ids.size() * sizeof(Id) + out->data.size() * sizeof(float);
+
+        const std::size_t n = out->ids.size();
+        out->qmins.assign(dim_, std::numeric_limits<float>::infinity());
+        out->qscales.assign(dim_, 0.0f);
+        std::vector<float> qmaxs(dim_, -std::numeric_limits<float>::infinity());
+
+        if (n > 0)
+        {
+            for (std::size_t row = 0; row < n; ++row)
+            {
+                const float *src = out->data.data() + row * dim_;
+                for (std::size_t d = 0; d < dim_; ++d)
+                {
+                    float v = src[d];
+                    out->qmins[d] = std::min(out->qmins[d], v);
+                    qmaxs[d] = std::max(qmaxs[d], v);
+                }
+            }
+
+            for (std::size_t d = 0; d < dim_; ++d)
+            {
+                float range = qmaxs[d] - out->qmins[d];
+                out->qscales[d] = (range > 0.0f) ? (range / 255.0f) : 1.0f;
+            }
+
+            out->qdata.resize(n * dim_);
+            for (std::size_t row = 0; row < n; ++row)
+            {
+                const float *src = out->data.data() + row * dim_;
+                std::uint8_t *dst = out->qdata.data() + row * dim_;
+                for (std::size_t d = 0; d < dim_; ++d)
+                {
+                    float scale = out->qscales[d];
+                    float q = (scale > 0.0f) ? ((src[d] - out->qmins[d]) / scale) : 0.0f;
+                    int qi = static_cast<int>(std::nearbyint(q));
+                    qi = std::min(255, std::max(0, qi));
+                    dst[d] = static_cast<std::uint8_t>(qi);
+                }
+            }
+        }
+
+        out->accounted_bytes = out->ids.size() * sizeof(Id) +
+                               out->data.size() * sizeof(float) +
+                               out->qdata.size() * sizeof(std::uint8_t) +
+                               out->qmins.size() * sizeof(float) +
+                               out->qscales.size() * sizeof(float);
         if (out->accounted_bytes > 0)
             MemoryManager::Instance().AddUsage(MemoryManager::Pool::Search, out->accounted_bytes);
         return out;
@@ -170,6 +216,12 @@ namespace pomai
 
         ids = std::move(store->ids);
         data = std::move(store->data);
+        store->qdata.clear();
+        store->qdata.shrink_to_fit();
+        store->qmins.clear();
+        store->qmins.shrink_to_fit();
+        store->qscales.clear();
+        store->qscales.shrink_to_fit();
         return true;
     }
 
@@ -194,22 +246,67 @@ namespace pomai
 
         const float *q = req.query.data.data();
 
-        const float *base = snap->data.data();
         FixedTopK topk(k);
 
-        constexpr std::size_t kBlock = 16;
-        std::array<float, kBlock> distances{};
+        constexpr std::size_t kUnroll = 8;
+        constexpr std::size_t kPrefetchDistance = 4;
 
-        for (std::size_t row = 0; row < n; row += kBlock)
+        if (snap->qdata.size() != n * dim || snap->qmins.size() != dim || snap->qscales.size() != dim)
         {
-            const std::size_t count = std::min(kBlock, n - row);
-            kernels::ScanBucketAVX2(base + row * dim, q, dim, count, distances.data());
-
-            for (std::size_t i = 0; i < count; ++i)
+            const float *base = snap->data.data();
+            constexpr std::size_t kBlock = 16;
+            std::array<float, kBlock> distances{};
+            for (std::size_t row = 0; row < n; row += kBlock)
             {
-                float score = -distances[i];
-                topk.Push(score, snap->ids[row + i]);
+                const std::size_t count = std::min(kBlock, n - row);
+                kernels::ScanBucketAVX2(base + row * dim, q, dim, count, distances.data());
+                for (std::size_t i = 0; i < count; ++i)
+                {
+                    float score = -distances[i];
+                    topk.Push(score, snap->ids[row + i]);
+                }
             }
+
+            topk.FillSorted(resp.items);
+            return resp;
+        }
+
+        const std::uint8_t *qbase = snap->qdata.data();
+        const float *mins = snap->qmins.data();
+        const float *scales = snap->qscales.data();
+
+        std::size_t row = 0;
+        for (; row + kUnroll <= n; row += kUnroll)
+        {
+            std::size_t prefetch_row = row + kPrefetchDistance;
+            if (prefetch_row < n)
+            {
+                _mm_prefetch(reinterpret_cast<const char *>(qbase + prefetch_row * dim), _MM_HINT_T0);
+            }
+
+            float d0 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 0) * dim, q, mins, scales, dim);
+            float d1 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 1) * dim, q, mins, scales, dim);
+            float d2 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 2) * dim, q, mins, scales, dim);
+            float d3 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 3) * dim, q, mins, scales, dim);
+            float d4 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 4) * dim, q, mins, scales, dim);
+            float d5 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 5) * dim, q, mins, scales, dim);
+            float d6 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 6) * dim, q, mins, scales, dim);
+            float d7 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 7) * dim, q, mins, scales, dim);
+
+            topk.Push(-d0, snap->ids[row + 0]);
+            topk.Push(-d1, snap->ids[row + 1]);
+            topk.Push(-d2, snap->ids[row + 2]);
+            topk.Push(-d3, snap->ids[row + 3]);
+            topk.Push(-d4, snap->ids[row + 4]);
+            topk.Push(-d5, snap->ids[row + 5]);
+            topk.Push(-d6, snap->ids[row + 6]);
+            topk.Push(-d7, snap->ids[row + 7]);
+        }
+
+        for (; row < n; ++row)
+        {
+            float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, q, mins, scales, dim);
+            topk.Push(-d, snap->ids[row]);
         }
 
         topk.FillSorted(resp.items);

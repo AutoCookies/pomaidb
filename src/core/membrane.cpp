@@ -482,6 +482,11 @@ namespace pomai
         auto end = std::chrono::steady_clock::now();
         float latency_ms = std::chrono::duration<float, std::milli>(end - start).count();
         brain_.observe_latency(latency_ms);
+        if (latency_ms > 50.0f || brain_.latency_ema() > 50.0f)
+        {
+            for (auto &s : shards_)
+                s->RequestEmergencyFreeze();
+        }
 
         const std::uint64_t searches = search_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((searches % 128) == 0)
