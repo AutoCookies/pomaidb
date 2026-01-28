@@ -120,6 +120,8 @@ namespace pomai
         std::shared_lock<std::shared_mutex> lk(mu_);
         if (centroids_.empty())
             return {};
+        if (P == 0)
+            return {};
 
         const std::size_t C = centroids_.size();
         struct Pair
@@ -133,16 +135,45 @@ namespace pomai
         {
             std::vector<std::size_t> master_indices(num_master_);
             std::iota(master_indices.begin(), master_indices.end(), 0);
-            std::size_t best_master = SelectBestIndex(master_centroids_.data(),
-                                                      master_indices.data(),
-                                                      num_master_,
-                                                      q.data.data(),
-                                                      q.data.size());
+            std::vector<float> master_distances(num_master_, 0.0f);
+            L2Sqr8CentroidsAVX2(master_centroids_.data(),
+                               master_indices.data(),
+                               num_master_,
+                               q.data.data(),
+                               q.data.size(),
+                               master_distances.data());
 
-            const auto &leafs = master_to_leaf_[best_master];
-            v.reserve(leafs.size());
-            if (!leafs.empty())
+            float best_master_d = std::numeric_limits<float>::infinity();
+            for (std::size_t i = 0; i < num_master_; ++i)
+                best_master_d = std::min(best_master_d, master_distances[i]);
+
+            const float master_radius = best_master_d * kProbeRadiusMultiplier + kProbeRadiusBias;
+            std::vector<std::size_t> master_candidates;
+            master_candidates.reserve(num_master_);
+            for (std::size_t i = 0; i < num_master_; ++i)
             {
+                if (master_distances[i] <= master_radius)
+                    master_candidates.push_back(i);
+            }
+            if (master_candidates.empty())
+            {
+                std::size_t best_master = SelectBestIndex(master_centroids_.data(),
+                                                          master_indices.data(),
+                                                          num_master_,
+                                                          q.data.data(),
+                                                          q.data.size());
+                master_candidates.push_back(best_master);
+            }
+
+            std::size_t total_leafs = 0;
+            for (auto midx : master_candidates)
+                total_leafs += master_to_leaf_[midx].size();
+            v.reserve(total_leafs);
+            for (auto midx : master_candidates)
+            {
+                const auto &leafs = master_to_leaf_[midx];
+                if (leafs.empty())
+                    continue;
                 std::vector<float> distances(leafs.size(), 0.0f);
                 L2Sqr8CentroidsAVX2(centroids_.data(),
                                    leafs.data(),
@@ -151,9 +182,7 @@ namespace pomai
                                    q.data.size(),
                                    distances.data());
                 for (std::size_t i = 0; i < leafs.size(); ++i)
-                {
                     v.push_back({distances[i], leafs[i]});
-                }
             }
         }
         else
@@ -167,21 +196,47 @@ namespace pomai
         }
 
         std::vector<std::size_t> out;
-        if (P >= C)
+        if (v.empty())
+            return out;
+
+        float best_d = std::numeric_limits<float>::infinity();
+        for (const auto &p : v)
+            best_d = std::min(best_d, p.d);
+
+        const float radius = best_d * kProbeRadiusMultiplier + kProbeRadiusBias;
+        std::vector<Pair> within_radius;
+        within_radius.reserve(v.size());
+        for (const auto &p : v)
         {
-            std::sort(v.begin(), v.end(), [](const Pair &a, const Pair &b)
+            if (p.d <= radius)
+                within_radius.push_back(p);
+        }
+
+        const std::size_t cap = std::min<std::size_t>(C, std::max<std::size_t>(P, P * kProbeCapMultiplier));
+        if (!within_radius.empty())
+        {
+            std::sort(within_radius.begin(), within_radius.end(), [](const Pair &a, const Pair &b)
                       { return a.d < b.d; });
-            for (auto &p : v)
+            if (within_radius.size() > cap)
+                within_radius.resize(cap);
+            out.reserve(within_radius.size());
+            for (const auto &p : within_radius)
                 out.push_back(p.idx);
         }
-        else
+
+        if (out.size() < P)
         {
-            std::nth_element(v.begin(), v.begin() + P, v.end(), [](const Pair &a, const Pair &b)
+            std::nth_element(v.begin(), v.begin() + std::min<std::size_t>(P, v.size() - 1), v.end(),
+                             [](const Pair &a, const Pair &b)
                              { return a.d < b.d; });
-            std::sort(v.begin(), v.begin() + P, [](const Pair &a, const Pair &b)
+            std::size_t take = std::min<std::size_t>(P, v.size());
+            std::sort(v.begin(), v.begin() + take, [](const Pair &a, const Pair &b)
                       { return a.d < b.d; });
-            for (std::size_t i = 0; i < P; ++i)
-                out.push_back(v[i].idx);
+            for (std::size_t i = 0; i < take; ++i)
+            {
+                if (std::find(out.begin(), out.end(), v[i].idx) == out.end())
+                    out.push_back(v[i].idx);
+            }
         }
 
         // Cập nhật bộ đếm cho các shard tiềm năng

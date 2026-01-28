@@ -2,6 +2,7 @@
 #include "spatial_router.h"
 #include "search_fanout.h"
 #include "memory_manager.h"
+#include "fixed_topk.h"
 
 #include <stdexcept>
 #include <algorithm>
@@ -29,6 +30,7 @@ namespace pomai
         constexpr std::size_t kCentroidsHeaderSize = 8 + 4 + 2 + 8;
         constexpr std::uint32_t kCentroidsVersion = 1;
         constexpr char kCentroidsMagic[8] = {'P', 'O', 'M', 'C', 'E', 'N', '0', '7'};
+        constexpr std::size_t kShardCandidateMultiplier = 3;
 
         // Choose worker count for SearchThreadPool based on requested knob and shard count.
         // - requested == 0 means auto choose based on hardware_concurrency and shard_count.
@@ -441,12 +443,16 @@ namespace pomai
             std::iota(target_shard_ids.begin(), target_shard_ids.end(), 0);
         }
 
+        const std::size_t shard_topk = std::max<std::size_t>(req.topk, req.topk * kShardCandidateMultiplier);
+
         // Use thread-pool based bounded fanout instead of std::async to avoid thread explosion.
         std::vector<std::function<SearchResponse()>> jobs;
         jobs.reserve(target_shard_ids.size());
 
         // Capture request via shared_ptr to avoid copying heavy vectors per job.
-        auto req_ptr = std::make_shared<SearchRequest>(req);
+        SearchRequest shard_req = req;
+        shard_req.topk = shard_topk;
+        auto req_ptr = std::make_shared<SearchRequest>(std::move(shard_req));
 
         for (auto sid : target_shard_ids)
         {
@@ -457,7 +463,11 @@ namespace pomai
 
         auto futs = ParallelSubmit(search_pool_, std::move(jobs));
 
-        std::vector<SearchResultItem> all;
+        thread_local std::unique_ptr<FixedTopK> merge_topk;
+        if (!merge_topk)
+            merge_topk = std::make_unique<FixedTopK>(req.topk);
+        merge_topk->Reset(req.topk);
+
         const auto timeout = std::chrono::milliseconds(search_timeout_ms_);
         for (auto &f : futs)
         {
@@ -468,16 +478,12 @@ namespace pomai
                 continue;
             }
             auto r = f.get();
-            all.insert(all.end(), r.items.begin(), r.items.end());
+            for (const auto &item : r.items)
+                merge_topk->Push(item.score, item.id);
         }
 
-        std::sort(all.begin(), all.end(), [](const auto &a, const auto &b)
-                  { return a.score > b.score; });
-        if (all.size() > req.topk)
-            all.resize(req.topk);
-
         SearchResponse out;
-        out.items = std::move(all);
+        merge_topk->FillSorted(out.items);
 
         auto end = std::chrono::steady_clock::now();
         float latency_ms = std::chrono::duration<float, std::milli>(end - start).count();
