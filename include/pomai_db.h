@@ -44,6 +44,13 @@ namespace pomai
 
         SearchResponse Search(const SearchRequest &req) const;
         std::size_t TotalApproxCountUnsafe() const;
+        std::future<bool> RequestCheckpoint();
+
+        // Trigger recompute of routing centroids across shards.
+        // - k: desired number of centroids (e.g., shards * 8)
+        // - total_samples: total vectors to sample across all shards (e.g., shards * 1024)
+        // Returns a future that resolves to true on success.
+        std::future<bool> RecomputeCentroids(std::size_t k, std::size_t total_samples = 4096);
 
     private:
         static std::size_t AutoIndexBuildThreads();

@@ -3,6 +3,8 @@
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <future>
+#include <chrono>
 
 namespace pomai
 {
@@ -77,6 +79,40 @@ namespace pomai
         if (build_pool_)
             build_pool_->Start();
         membrane_->Start();
+
+        // Spawn a background non-blocking centroid recompute after startup to avoid blocking Start().
+        // This provides a reasonable default: k = shards * 8, samples = shards * 1024.
+        // If you prefer control, call RecomputeCentroids(...) from the embedding app or admin API.
+        std::thread([this]()
+                    {
+            // small delay to let shards finish replay/freeze work
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            const std::size_t shards = membrane_->ShardCount();
+            if (shards == 0)
+                return;
+
+            const std::size_t k = shards * 8;
+            const std::size_t total_samples = shards * 1024;
+
+            try
+            {
+                auto fut = RecomputeCentroids(k, total_samples);
+                bool ok = fut.get();
+                if (log_info_)
+                {
+                    if (ok)
+                        log_info_("Centroid recompute succeeded at startup");
+                    else
+                        log_info_("Centroid recompute failed at startup");
+                }
+            }
+            catch (...)
+            {
+                if (log_error_)
+                    log_error_("Centroid recompute threw exception at startup");
+            } })
+            .detach();
     }
 
     void PomaiDB::Stop()
@@ -129,6 +165,70 @@ namespace pomai
     std::size_t PomaiDB::TotalApproxCountUnsafe() const
     {
         return membrane_->TotalApproxCountUnsafe();
+    }
+
+    std::future<bool> PomaiDB::RequestCheckpoint()
+    {
+        return membrane_->RequestCheckpoint();
+    }
+
+    // Trigger recompute of centroids (samples shards, runs k-means, installs centroids).
+    std::future<bool> PomaiDB::RecomputeCentroids(std::size_t k, std::size_t total_samples)
+    {
+        if (k == 0)
+        {
+            std::promise<bool> p;
+            p.set_value(false);
+            return p.get_future();
+        }
+
+        // Delegate to MembraneRouter if it exposes compute helper; otherwise perform orchestration here by
+        // asking MembraneRouter to expose a method for sampling/building. To keep this API stable we call
+        // a MembraneRouter helper `ComputeAndConfigureCentroids` if available.
+        //
+        // The MembraneRouter implementation may either:
+        //  - provide ComputeAndConfigureCentroids(k, total_samples) (recommended), or
+        //  - you can implement this PomaiDB method to gather samples from shards (Shard::SampleVectors)
+        //    and then call SpatialRouter::BuildKMeans(...) and membrane_->ConfigureCentroids(...).
+        //
+        // Implementation below will perform sampling via MembraneRouter if it has ComputeAndConfigureCentroids;
+        // otherwise it will fallback to a simple orchestration by calling an expected helper on MembraneRouter.
+        //
+        return std::async(std::launch::async, [this, k, total_samples]() -> bool
+                          {
+            try
+            {
+                // Prefer if MembraneRouter provides a direct compute method.
+#if 1
+                // If your MembraneRouter implements ComputeAndConfigureCentroids(k, total_samples),
+                // this will compile and run. If not, replace this block with the fallback below.
+                return membrane_->ComputeAndConfigureCentroids(k, total_samples);
+#else
+                // Fallback orchestration (if MembraneRouter does NOT implement ComputeAndConfigureCentroids).
+                // Collect samples from shards via an imagined MembraneRouter->SampleAllShards(per_shard)
+                // or by exposing shards; if unavailable, you'll need to add a small helper to MembraneRouter.
+                //
+                // Pseudocode:
+                //   per_shard = max(1, total_samples / membrane_->ShardCount());
+                //   aggregate_samples = membrane_->CollectShardSamples(per_shard);
+                //   centroids = SpatialRouter::BuildKMeans(aggregate_samples, k, 10);
+                //   membrane_->ConfigureCentroids(centroids);
+                //   return true;
+                return false;
+#endif
+            }
+            catch (const std::exception &e)
+            {
+                if (log_error_)
+                    log_error_(std::string("RecomputeCentroids failed: ") + e.what());
+                return false;
+            }
+            catch (...)
+            {
+                if (log_error_)
+                    log_error_("RecomputeCentroids failed: unknown exception");
+                return false;
+            } });
     }
 
 } // namespace pomai

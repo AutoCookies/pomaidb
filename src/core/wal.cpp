@@ -1,4 +1,3 @@
-// Full wal.cpp with synchronous fdatasync fast-path in AppendUpserts
 #include "wal.h"
 #include "seed.h"
 #include "crc64.h"
@@ -13,7 +12,8 @@
 #include <vector>
 #include <iostream>
 #include <algorithm>
-#include <endian.h> // for byte-order helpers on glibc
+#include <endian.h>
+#include <mutex>
 
 namespace pomai
 {
@@ -294,6 +294,52 @@ namespace pomai
         }
     }
 
+    // --- Checkpoint helpers ---
+
+    Lsn Wal::WrittenLsn() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return written_lsn_;
+    }
+
+    void Wal::TruncateToZero()
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+
+        if (fd_ < 0)
+            ThrowSys("truncate wal: wal fd invalid");
+
+        // ftruncate to zero
+        if (ftruncate(fd_, 0) != 0)
+            ThrowSys("ftruncate failed during checkpoint");
+
+        // fdatasync the file to ensure truncation durable
+        if (::fdatasync(fd_) != 0)
+            ThrowSys("fdatasync failed after truncate");
+
+        // fsync the directory
+        int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0)
+        {
+            if (::fsync(dfd) != 0)
+            {
+                ::close(dfd);
+                ThrowSys("fsync(dir) failed after truncate");
+            }
+            ::close(dfd);
+        }
+        else
+        {
+            ThrowSys("open(wal_dir) for fsync after truncate failed");
+        }
+
+        // Reset in-memory LSN counters to a clean initial state for an empty WAL.
+        next_lsn_.store(1, std::memory_order_relaxed);
+        written_lsn_ = 0;
+        durable_lsn_ = 0;
+        cv_.notify_all();
+    }
+
     WalReplayStats Wal::ReplayToSeed(Seed &seed)
     {
         crc64_init();
@@ -311,21 +357,84 @@ namespace pomai
         if (!S_ISREG(st.st_mode))
             return WalReplayStats{};
 
-        int rfd = ::open(wal_path_.c_str(), O_RDONLY | O_CLOEXEC);
+        // Open read/write so we can truncate the file if corruption is detected.
+        int rfd = ::open(wal_path_.c_str(), O_RDWR | O_CLOEXEC);
         if (rfd < 0)
             ThrowSys("open WAL for replay failed: " + wal_path_);
 
+        const off_t original_size = st.st_size;
+        off_t truncated_bytes = 0;
+
         Lsn last_lsn = 0;
-        off_t good_offset = 0;
         std::size_t total_replayed = 0;
         std::size_t total_vectors = 0;
-        const off_t original_size = st.st_size;
+
+        const std::size_t header_size = sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t);
+        const std::size_t footer_size = 24;
+        const std::size_t max_payload_allowed = 64U * 1024U * 1024U; // 64 MB cap for whole_payload
 
         while (true)
         {
+            // Record start position for possible truncation.
+            off_t rec_start = lseek(rfd, 0, SEEK_CUR);
+            if (rec_start == -1)
+            {
+                // lseek failure; abort replay.
+                std::cerr << "[WAL] Error: lseek failed during replay: " << std::strerror(errno) << "\n";
+                break;
+            }
+
+            // If remaining bytes less than header, this is a truncated tail. Truncate and stop.
+            off_t rem = original_size - rec_start;
+            if (rem == 0)
+                break; // clean EOF, nothing left
+            if ((off_t)header_size > rem)
+            {
+                // Partial header at tail -> truncate to rec_start
+                if (original_size > rec_start)
+                {
+                    if (ftruncate(rfd, rec_start) != 0)
+                        std::cerr << "[WAL] Warning: ftruncate failed while truncating partial header: " << std::strerror(errno) << "\n";
+                    else
+                    {
+                        if (::fdatasync(rfd) != 0)
+                            std::cerr << "[WAL] Warning: fdatasync failed after truncate: " << std::strerror(errno) << "\n";
+                        int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                        if (dfd >= 0)
+                        {
+                            if (::fsync(dfd) != 0)
+                                std::cerr << "[WAL] Warning: fsync(dir) failed after truncate: " << std::strerror(errno) << "\n";
+                            ::close(dfd);
+                        }
+                    }
+                    truncated_bytes = original_size - rec_start;
+                }
+                break;
+            }
+
+            // Read header
             uint8_t head_buf[sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t)];
             if (!ReadExact(rfd, head_buf, sizeof(head_buf)))
             {
+                // Could not read header (EOF/interrupted): truncate tail if any bytes present.
+                if (original_size > rec_start)
+                {
+                    if (ftruncate(rfd, rec_start) != 0)
+                        std::cerr << "[WAL] Warning: ftruncate failed while truncating missing-header tail: " << std::strerror(errno) << "\n";
+                    else
+                    {
+                        if (::fdatasync(rfd) != 0)
+                            std::cerr << "[WAL] Warning: fdatasync failed after truncate: " << std::strerror(errno) << "\n";
+                        int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                        if (dfd >= 0)
+                        {
+                            if (::fsync(dfd) != 0)
+                                std::cerr << "[WAL] Warning: fsync(dir) failed after truncate: " << std::strerror(errno) << "\n";
+                            ::close(dfd);
+                        }
+                    }
+                    truncated_bytes = original_size - rec_start;
+                }
                 break;
             }
 
@@ -351,32 +460,94 @@ namespace pomai
             uint32_t count = count_le;
             uint16_t dim16 = dim_le;
 
+            // Basic sanity checks
             if (dim16 != dim_)
             {
-                std::cerr << "[WAL] Error: dimension mismatch in record. Stopping replay.\n";
+                std::cerr << "[WAL] Error: dimension mismatch in record. Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                else
+                {
+                    if (::fdatasync(rfd) != 0)
+                        std::cerr << "[WAL] Warning: fdatasync failed after truncate: " << std::strerror(errno) << "\n";
+                    int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                    if (dfd >= 0)
+                    {
+                        if (::fsync(dfd) != 0)
+                            std::cerr << "[WAL] Warning: fsync(dir) failed after truncate: " << std::strerror(errno) << "\n";
+                        ::close(dfd);
+                    }
+                }
+                truncated_bytes = original_size - rec_start;
                 break;
             }
 
-            const std::size_t rest_payload_bytes = static_cast<std::size_t>(count) * (sizeof(uint64_t) + dim_ * sizeof(float));
-
-            std::vector<uint8_t> payload_rest;
-            payload_rest.resize(rest_payload_bytes);
-            if (rest_payload_bytes > 0)
+            // Compute expected bytes for payload and validate against remaining file size
+            const uint64_t per_entry_bytes = static_cast<uint64_t>(sizeof(uint64_t) + dim_ * sizeof(float));
+            // guard multiplication overflow
+            if (count != 0 && per_entry_bytes > 0 && count > (UINT64_MAX / per_entry_bytes))
             {
-                if (!ReadExact(rfd, payload_rest.data(), rest_payload_bytes))
+                std::cerr << "[WAL] Error: count overflow in WAL header. Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                truncated_bytes = original_size - rec_start;
+                break;
+            }
+
+            uint64_t rest_payload_bytes_u64 = static_cast<uint64_t>(count) * per_entry_bytes;
+            // Ensure that rest + footer does not exceed remaining bytes in file
+            off_t after_header = rec_start + static_cast<off_t>(header_size);
+            off_t remaining_after_header = original_size - after_header;
+            // If remaining bytes are smaller than required payload + footer -> truncated record
+            if (remaining_after_header < 0 ||
+                static_cast<uint64_t>(remaining_after_header) < (rest_payload_bytes_u64 + footer_size))
+            {
+                std::cerr << "[WAL] Error: truncated payload detected during replay. Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                else
                 {
-                    std::cerr << "[WAL] Error: truncated payload detected during replay. Stopping.\n";
+                    if (::fdatasync(rfd) != 0)
+                        std::cerr << "[WAL] Warning: fdatasync failed after truncate: " << std::strerror(errno) << "\n";
+                    int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                    if (dfd >= 0)
+                    {
+                        if (::fsync(dfd) != 0)
+                            std::cerr << "[WAL] Warning: fsync(dir) failed after truncate: " << std::strerror(errno) << "\n";
+                        ::close(dfd);
+                    }
+                }
+                truncated_bytes = original_size - rec_start;
+                break;
+            }
+
+            // Read payload (ids + vectors)
+            std::vector<uint8_t> payload_rest;
+            payload_rest.resize(static_cast<std::size_t>(rest_payload_bytes_u64));
+            if (rest_payload_bytes_u64 > 0)
+            {
+                if (!ReadExact(rfd, payload_rest.data(), payload_rest.size()))
+                {
+                    std::cerr << "[WAL] Error: truncated payload during read. Truncating at offset " << rec_start << "\n";
+                    if (ftruncate(rfd, rec_start) != 0)
+                        std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                    truncated_bytes = original_size - rec_start;
                     break;
                 }
             }
 
+            // Read footer
             uint8_t footer_buf[24];
             if (!ReadExact(rfd, footer_buf, sizeof(footer_buf)))
             {
-                std::cerr << "[WAL] Error: missing footer at end of record. Truncation suspected. Stopping.\n";
+                std::cerr << "[WAL] Error: missing footer at end of record. Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                truncated_bytes = original_size - rec_start;
                 break;
             }
 
+            // Parse footer
             const uint8_t *f = footer_buf;
             uint32_t payload_size_le;
             uint32_t reserved_le;
@@ -402,36 +573,57 @@ namespace pomai
             uint64_t crc = crc_le;
             uint64_t magic = magic_le;
 
+            // Rebuild whole_payload for CRC check: header + payload_rest
             std::vector<uint8_t> whole_payload;
-            whole_payload.reserve(sizeof(head_buf) + payload_rest.size());
-            whole_payload.insert(whole_payload.end(), head_buf, head_buf + sizeof(head_buf));
+            whole_payload.reserve(header_size + payload_rest.size());
+            whole_payload.insert(whole_payload.end(), head_buf, head_buf + header_size);
             if (!payload_rest.empty())
                 whole_payload.insert(whole_payload.end(), payload_rest.begin(), payload_rest.end());
 
+            // Validate payload size matches expectation
             if (whole_payload.size() != payload_size)
             {
-                std::cerr << "[WAL] Error: payload size mismatch. Stopping replay.\n";
+                std::cerr << "[WAL] Error: payload size mismatch. Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                truncated_bytes = original_size - rec_start;
+                break;
+            }
+
+            if (payload_size > max_payload_allowed)
+            {
+                std::cerr << "[WAL] Error: payload size too large (" << payload_size << "). Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                truncated_bytes = original_size - rec_start;
                 break;
             }
 
             if (magic != FOOTER_MAGIC)
             {
-                std::cerr << "[WAL] Error: footer magic mismatch. Stopping replay.\n";
+                std::cerr << "[WAL] Error: footer magic mismatch. Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                truncated_bytes = original_size - rec_start;
                 break;
             }
 
             uint64_t calc = crc64(0, whole_payload.data(), whole_payload.size());
             if (calc != crc)
             {
-                std::cerr << "[WAL] Error: CRC mismatch. Stopping replay.\n";
+                std::cerr << "[WAL] Error: CRC mismatch. Truncating at offset " << rec_start << "\n";
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
+                truncated_bytes = original_size - rec_start;
                 break;
             }
 
-            std::vector<UpsertRequest> batch;
-            batch.reserve(count);
-
+            // All checks passed: decode entries and apply to seed
             const uint8_t *qptr = whole_payload.data();
             qptr += sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t);
+
+            std::vector<UpsertRequest> batch;
+            batch.reserve(count);
 
             for (uint32_t i = 0; i < count; ++i)
             {
@@ -458,6 +650,10 @@ namespace pomai
             catch (const std::exception &e)
             {
                 std::cerr << "[WAL] Error applying batch during replay: " << e.what() << "\n";
+                // Truncate to rec_start to avoid reprocessing failing record next time.
+                if (ftruncate(rfd, rec_start) != 0)
+                    std::cerr << "[WAL] Warning: ftruncate failed after apply error: " << std::strerror(errno) << "\n";
+                truncated_bytes = original_size - rec_start;
                 break;
             }
 
@@ -465,67 +661,33 @@ namespace pomai
             total_replayed++;
             total_vectors += count;
 
+            // Move good_offset forward
             off_t cur = lseek(rfd, 0, SEEK_CUR);
             if (cur == -1)
-                good_offset = -1;
-            else
-                good_offset = cur;
+            {
+                // If we can't get current offset, set good offset to -1 and break.
+                truncated_bytes = 0;
+                break;
+            }
+            // continue to next record
         }
 
         ::close(rfd);
 
-        off_t truncated = 0;
-        if (good_offset > 0)
-        {
-            int wfd = ::open(wal_path_.c_str(), O_WRONLY | O_CLOEXEC);
-            if (wfd >= 0)
-            {
-                if (ftruncate(wfd, good_offset) != 0)
-                {
-                    std::cerr << "[WAL] Warning: ftruncate failed: " << std::strerror(errno) << "\n";
-                }
-                else
-                {
-                    if (::fdatasync(wfd) != 0)
-                    {
-                        std::cerr << "[WAL] Warning: fdatasync(wal) after truncate failed: " << std::strerror(errno) << "\n";
-                    }
+        // If we truncated the file during replay, ensure directory is fsynced and record truncated bytes.
+        // Note: individual truncations already attempted to fdatasync and fsync dir; truncated_bytes holds bytes removed.
+        WalReplayStats stats;
+        stats.last_lsn = last_lsn;
+        stats.records_applied = total_replayed;
+        stats.vectors_applied = total_vectors;
+        stats.truncated_bytes = static_cast<std::size_t>(truncated_bytes);
 
-                    int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-                    if (dfd >= 0)
-                    {
-                        if (::fsync(dfd) != 0)
-                        {
-                            std::cerr << "[WAL] Warning: fsync(dir) after truncate failed: " << std::strerror(errno) << "\n";
-                        }
-                        ::close(dfd);
-                    }
-                    else
-                    {
-                        std::cerr << "[WAL] Warning: open(dir) failed for fsync: " << std::strerror(errno) << "\n";
-                    }
-                    truncated = original_size > good_offset ? (original_size - good_offset) : 0;
-                }
-                ::close(wfd);
-            }
-            else
-            {
-                std::cerr << "[WAL] Warning: open(wal) for truncate fsync failed: " << std::strerror(errno) << "\n";
-            }
-        }
-
+        // Ensure next_lsn_ starts after last_lsn
         Lsn want = last_lsn + 1;
         Lsn cur = next_lsn_.load(std::memory_order_relaxed);
         if (want > cur)
             next_lsn_.store(want, std::memory_order_relaxed);
 
-        WalReplayStats stats;
-        stats.last_lsn = last_lsn;
-        stats.records_applied = total_replayed;
-        stats.vectors_applied = total_vectors;
-        stats.truncated_bytes = truncated;
-
         return stats;
     }
-
 } // namespace pomai

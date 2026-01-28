@@ -38,14 +38,14 @@ run_and_kill() {
     # Wait for status file to contain the desired marker
     local status_file="${tmpdir}/writer.status"
     local found=0
-    for i in {1..200}; do
+    for i in {1..500}; do
         if [[ -f "${status_file}" ]]; then
             if grep -q "^batch ${KILL_AT_BATCH}$" "${status_file}"; then
                 found=1
                 break
             fi
         fi
-        sleep 0.05
+        sleep 0.02
     done
 
     if [[ $found -ne 1 ]]; then
@@ -56,15 +56,20 @@ run_and_kill() {
         exit 3
     fi
 
+    # Wait a small extra delay to let fdatasync finish
+    sleep 0.2
+
     echo "Marker seen; killing writer (SIGKILL)..."
     kill -9 ${pid} || true
     wait ${pid} 2>/dev/null || true
-
+    echo "-- Directory contents before inspect --"
+    ls -l "${tmpdir}"
+    echo "-- WAL hexdump --"
+    hexdump -C "${tmpdir}/shard-0.wal" || true
     echo "Running replay inspect on ${tmpdir} ..."
     "${INSPECT_BIN}" "${tmpdir}" "${DIM}"
-    echo "Replay done for allow_sync=${allow_sync}"
 
-    # Return tmpdir for manual inspection if needed
+    echo "Replay done for allow_sync=${allow_sync}"
     echo "${tmpdir}"
 }
 

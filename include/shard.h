@@ -6,6 +6,7 @@
 #include <thread>
 #include <mutex>
 #include <functional>
+#include <optional>
 
 #include "types.h"
 #include "wal.h"
@@ -14,6 +15,7 @@
 #include "bounded_queue.h"
 #include "whispergrain.h"
 #include "index_build_pool.h"
+
 namespace pomai
 {
 
@@ -22,6 +24,10 @@ namespace pomai
         std::vector<UpsertRequest> batch;
         bool wait_durable{true};
         std::promise<Lsn> done;
+
+        // Checkpoint control
+        bool is_checkpoint{false};
+        std::optional<std::promise<bool>> checkpoint_done;
     };
 
     struct IndexedSegment
@@ -52,6 +58,13 @@ namespace pomai
         void Stop();
 
         std::future<Lsn> EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable);
+
+        // Request checkpoint (snapshot + wal truncation)
+        std::future<bool> RequestCheckpoint();
+
+        // Sample up to max_samples vectors from this shard (from frozen segments and live memtable).
+        // Non-blocking for writers (uses snapshot copies under short lock).
+        std::vector<Vector> SampleVectors(std::size_t max_samples) const;
 
         SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
         std::size_t ApproxCountUnsafe() const;

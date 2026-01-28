@@ -1,4 +1,6 @@
 #pragma once
+
+#include "types.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -8,17 +10,19 @@
 #include <thread>
 #include <vector>
 
-#include "types.h"
-
 /*
   Production-ready WAL (append-only, checksummed, replay-safe).
 
-  AppendUpserts now supports an optional per-append synchronous durability flag.
+  AppendUpserts supports an optional per-append synchronous durability flag.
   ReplayToSeed returns WalReplayStats describing the replay operation.
+
+  New: WrittenLsn() and TruncateToZero() to support checkpointing.
 */
 
 namespace pomai
 {
+
+  using Lsn = std::uint64_t;
 
   struct WalReplayStats
   {
@@ -52,6 +56,15 @@ namespace pomai
     // Replay WAL into the provided seed and return replay statistics.
     WalReplayStats ReplayToSeed(class Seed &seed);
 
+    // ----- Checkpoint helpers -----
+    // Return latest written LSN (may be 0)
+    Lsn WrittenLsn() const;
+
+    // Truncate WAL file to zero-length and reset LSN counters.
+    // Should be called only while the shard's RunLoop is the only writer.
+    // Throws on error.
+    void TruncateToZero();
+
   private:
     void OpenOrCreateForAppend();
     void CloseFd();
@@ -69,7 +82,7 @@ namespace pomai
 
     std::atomic<Lsn> next_lsn_{1};
 
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;
     std::thread fsync_th_;
     std::atomic<bool> running_{false};

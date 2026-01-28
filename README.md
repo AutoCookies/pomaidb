@@ -351,3 +351,35 @@ If you use PomaiDB in academic or research projects:
 * That a database can be proud of what it doesn’t demand.
 
 Welcome to the new edge of AI.
+
+
+## How to run sync policy test
+Run this block at a time
+```
+# 1) confirm binary exists
+ls -l build/pomai_db_writer || ls -l build/pomai_db_writer*
+
+# 2) prepare tmp dir and run writer (5 batches x 10 vectors)
+rm -rf /tmp/pomai_dbg
+mkdir -p /tmp/pomai_dbg
+./build/pomai_db_writer /tmp/pomai_dbg 1 5 10 8 | tee /tmp/pomai_dbg/writer.stdout
+
+# 3) show captured outputs and files
+echo "---- writer.stdout ----"
+sed -n '1,200p' /tmp/pomai_dbg/writer.stdout || true
+
+echo "---- writer.status ----"
+ls -l /tmp/pomai_dbg/writer.status || true
+cat /tmp/pomai_dbg/writer.status || true
+
+echo "---- ls -la /tmp/pomai_dbg ----"
+ls -la /tmp/pomai_dbg || true
+
+echo "---- hexdump shard-0.wal (first 128 bytes) ----"
+hexdump -C -n 128 /tmp/pomai_dbg/shard-0.wal || true
+
+echo "---- replay inspect ----"
+/bin/true && ./build/wal_replay_inspect /tmp/pomai_dbg 8 || true
+```
+
+Then run ```./test/test_sync_policy.sh```

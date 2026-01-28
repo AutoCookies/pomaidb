@@ -5,6 +5,14 @@
 #include <queue>
 #include <stdexcept>
 #include <utility>
+#include <chrono>
+#include <filesystem>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+#include <random>
 
 namespace pomai
 {
@@ -125,6 +133,23 @@ namespace pomai
         return fut;
     }
 
+    std::future<bool> Shard::RequestCheckpoint()
+    {
+        UpsertTask t;
+        t.is_checkpoint = true;
+        t.checkpoint_done.emplace(); // construct optional promise
+
+        auto fut = t.checkpoint_done->get_future();
+        // Push into ingest queue like normal tasks
+        if (!ingest_q_.Push(std::move(t)))
+        {
+            std::promise<bool> p;
+            p.set_exception(std::make_exception_ptr(std::runtime_error("shard queue closed")));
+            return p.get_future();
+        }
+        return fut;
+    }
+
     std::size_t Shard::ApproxCountUnsafe() const
     {
         return seed_.Count();
@@ -231,6 +256,111 @@ namespace pomai
 
             UpsertTask task = std::move(*opt);
 
+            // Handle checkpoint control task
+            if (task.is_checkpoint)
+            {
+                bool ok = false;
+                try
+                {
+                    // Local helper to throw with errno message
+                    auto ThrowLocal = [](const std::string &what)
+                    {
+                        throw std::runtime_error(what + ": " + std::string(std::strerror(errno)));
+                    };
+
+                    // 1) Ensure WAL up to currently written LSN is durable
+                    Lsn last_written = wal_.WrittenLsn();
+                    if (last_written != 0)
+                        wal_.WaitDurable(last_written);
+
+                    // 2) Create snapshot of seed (atomic)
+                    auto snap = seed_.MakeSnapshot();
+
+                    // 3) Serialize snapshot to checkpoint file
+                    std::string cp_dir = wal_dir_;
+                    std::filesystem::create_directories(cp_dir);
+                    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+                    std::string path = cp_dir + "/checkpoint-" + std::to_string(ts) + ".bin";
+
+                    int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+                    if (fd < 0)
+                        ThrowLocal("open checkpoint file failed");
+
+                    // Header: dim (u16), count (u64)
+                    uint16_t dim16 = static_cast<uint16_t>(snap->dim);
+                    uint64_t count64 = static_cast<uint64_t>(snap->ids.size());
+
+#if __BYTE_ORDER == __BIG_ENDIAN
+                    uint16_t dim_be = __builtin_bswap16(dim16);
+                    uint64_t count_be = __builtin_bswap64(count64);
+                    if (::write(fd, &dim_be, sizeof(dim_be)) != sizeof(dim_be))
+                        ThrowLocal("write cp header");
+                    if (::write(fd, &count_be, sizeof(count_be)) != sizeof(count_be))
+                        ThrowLocal("write cp header");
+#else
+                    if (::write(fd, &dim16, sizeof(dim16)) != sizeof(dim16))
+                        ThrowLocal("write cp header");
+                    if (::write(fd, &count64, sizeof(count64)) != sizeof(count64))
+                        ThrowLocal("write cp header");
+#endif
+
+                    // write ids
+                    if (!snap->ids.empty())
+                    {
+                        ssize_t w = ::write(fd, snap->ids.data(), snap->ids.size() * sizeof(uint64_t));
+                        if (w < 0 || static_cast<size_t>(w) != snap->ids.size() * sizeof(uint64_t))
+                            ThrowLocal("write checkpoint ids failed");
+                    }
+
+                    // write data (floats)
+                    if (!snap->data.empty())
+                    {
+                        ssize_t w2 = ::write(fd, snap->data.data(), snap->data.size() * sizeof(float));
+                        if (w2 < 0 || static_cast<size_t>(w2) != snap->data.size() * sizeof(float))
+                            ThrowLocal("write checkpoint data failed");
+                    }
+
+                    if (::fdatasync(fd) != 0)
+                        ThrowLocal("fdatasync checkpoint file failed");
+                    ::close(fd);
+
+                    // fsync directory
+                    int dfd = ::open(cp_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                    if (dfd >= 0)
+                    {
+                        if (::fsync(dfd) != 0)
+                        {
+                            ::close(dfd);
+                            ThrowLocal("fsync checkpoint dir failed");
+                        }
+                        ::close(dfd);
+                    }
+
+                    // 4) Truncate WAL to zero safely
+                    wal_.TruncateToZero();
+
+                    ok = true;
+                }
+                catch (...)
+                {
+                    ok = false;
+                }
+
+                // Fulfill checkpoint promise so caller knows outcome
+                try
+                {
+                    if (task.checkpoint_done)
+                        task.checkpoint_done->set_value(ok);
+                }
+                catch (...)
+                {
+                }
+                continue; // proceed to next loop iteration
+            }
+
+            // --- Normal upsert path ---
             // 1) WAL: pass through wait_durable flag so AppendUpserts can optionally fsync immediately.
             Lsn lsn = wal_.AppendUpserts(task.batch, task.wait_durable);
 
@@ -340,6 +470,69 @@ namespace pomai
                 return;
             }
         }
+    }
+
+    // -------------------- Sampling implementation --------------------
+    // Return up to max_samples vectors sampled uniformly from this shard's snapshots.
+    std::vector<Vector> Shard::SampleVectors(std::size_t max_samples) const
+    {
+        if (max_samples == 0)
+            return {};
+
+        // Acquire short lock and copy references to segment snapshots and live snapshot.
+        std::vector<Seed::Snapshot> snaps;
+        Seed::Snapshot live;
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            snaps.reserve(segments_.size());
+            for (const auto &s : segments_)
+            {
+                if (s.snap)
+                    snaps.push_back(s.snap);
+            }
+            live = live_snap_;
+        }
+
+        std::vector<Vector> reservoir;
+        reservoir.reserve(std::min<std::size_t>(max_samples, 1024));
+
+        std::mt19937_64 rng(std::random_device{}());
+        std::size_t seen = 0;
+
+        auto process_snapshot = [&](const Seed::Snapshot &snap)
+        {
+            if (!snap || snap->ids.empty())
+                return;
+            const std::size_t n = snap->ids.size();
+            const std::size_t dim = snap->dim;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                Vector v;
+                v.data.resize(dim);
+                const float *src = snap->data.data() + i * dim;
+                std::copy(src, src + dim, v.data.begin());
+
+                ++seen;
+                if (reservoir.size() < max_samples)
+                {
+                    reservoir.push_back(std::move(v));
+                }
+                else
+                {
+                    std::uniform_int_distribution<std::size_t> dist(0, seen - 1);
+                    std::size_t j = dist(rng);
+                    if (j < max_samples)
+                        reservoir[j] = std::move(v);
+                }
+            }
+        };
+
+        for (const auto &s : snaps)
+            process_snapshot(s);
+        if (live)
+            process_snapshot(live);
+
+        return reservoir;
     }
 
 } // namespace pomai
