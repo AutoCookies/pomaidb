@@ -38,6 +38,7 @@ namespace pomai
         }
 
         std::size_t Size() const noexcept { return size_; }
+        const Node *Data() const noexcept { return data_; }
 
         void Reset(std::size_t k)
         {

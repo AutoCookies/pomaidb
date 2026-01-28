@@ -247,8 +247,15 @@ namespace pomai
 
         const float *q = req.query.data.data();
 
-        constexpr std::size_t kRerankPool = 100;
-        const std::size_t candidate_k = std::min<std::size_t>(n, std::max(k, kRerankPool));
+        constexpr std::size_t kOversample = 10;
+        std::size_t candidate_k = k;
+        if (k < n)
+        {
+            if (k > n / kOversample)
+                candidate_k = n;
+            else
+                candidate_k = k * kOversample;
+        }
 
         constexpr std::size_t kUnroll = 8;
         constexpr std::size_t kPrefetchDistance = 4;
@@ -277,7 +284,14 @@ namespace pomai
         const std::uint8_t *qbase = snap->qdata.data();
         const float *mins = snap->qmins.data();
         const float *scales = snap->qscales.data();
-        std::vector<std::uint8_t> qquant(dim);
+        thread_local std::unique_ptr<std::uint8_t[]> qquant_buf;
+        thread_local std::size_t qquant_cap = 0;
+        if (qquant_cap < dim)
+        {
+            qquant_buf.reset(new std::uint8_t[dim]);
+            qquant_cap = dim;
+        }
+        std::uint8_t *qquant = qquant_buf.get();
         for (std::size_t d = 0; d < dim; ++d)
         {
             float scale = scales[d];
@@ -287,7 +301,10 @@ namespace pomai
             qquant[d] = static_cast<std::uint8_t>(qi);
         }
 
-        FixedTopK topk(candidate_k);
+        thread_local std::unique_ptr<FixedTopK> candidate_topk;
+        if (!candidate_topk)
+            candidate_topk = std::make_unique<FixedTopK>(candidate_k);
+        candidate_topk->Reset(candidate_k);
 
         std::size_t row = 0;
         for (; row + kUnroll <= n; row += kUnroll)
@@ -298,42 +315,45 @@ namespace pomai
                 _mm_prefetch(reinterpret_cast<const char *>(qbase + prefetch_row * dim), _MM_HINT_T0);
             }
 
-            float d0 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 0) * dim, qquant.data(), dim);
-            float d1 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 1) * dim, qquant.data(), dim);
-            float d2 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 2) * dim, qquant.data(), dim);
-            float d3 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 3) * dim, qquant.data(), dim);
-            float d4 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 4) * dim, qquant.data(), dim);
-            float d5 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 5) * dim, qquant.data(), dim);
-            float d6 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 6) * dim, qquant.data(), dim);
-            float d7 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 7) * dim, qquant.data(), dim);
+            float d0 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 0) * dim, qquant, dim);
+            float d1 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 1) * dim, qquant, dim);
+            float d2 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 2) * dim, qquant, dim);
+            float d3 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 3) * dim, qquant, dim);
+            float d4 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 4) * dim, qquant, dim);
+            float d5 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 5) * dim, qquant, dim);
+            float d6 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 6) * dim, qquant, dim);
+            float d7 = kernels::L2Sqr_SQ8_AVX2(qbase + (row + 7) * dim, qquant, dim);
 
-            topk.Push(-d0, static_cast<Id>(row + 0));
-            topk.Push(-d1, static_cast<Id>(row + 1));
-            topk.Push(-d2, static_cast<Id>(row + 2));
-            topk.Push(-d3, static_cast<Id>(row + 3));
-            topk.Push(-d4, static_cast<Id>(row + 4));
-            topk.Push(-d5, static_cast<Id>(row + 5));
-            topk.Push(-d6, static_cast<Id>(row + 6));
-            topk.Push(-d7, static_cast<Id>(row + 7));
+            candidate_topk->Push(-d0, static_cast<Id>(row + 0));
+            candidate_topk->Push(-d1, static_cast<Id>(row + 1));
+            candidate_topk->Push(-d2, static_cast<Id>(row + 2));
+            candidate_topk->Push(-d3, static_cast<Id>(row + 3));
+            candidate_topk->Push(-d4, static_cast<Id>(row + 4));
+            candidate_topk->Push(-d5, static_cast<Id>(row + 5));
+            candidate_topk->Push(-d6, static_cast<Id>(row + 6));
+            candidate_topk->Push(-d7, static_cast<Id>(row + 7));
         }
 
         for (; row < n; ++row)
         {
-            float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, qquant.data(), dim);
-            topk.Push(-d, static_cast<Id>(row));
+            float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, qquant, dim);
+            candidate_topk->Push(-d, static_cast<Id>(row));
         }
 
-        FixedTopK final_topk(k);
-        std::vector<FixedTopK::Node> candidates;
-        topk.FillSortedNodes(candidates);
+        thread_local std::unique_ptr<FixedTopK> final_topk;
+        if (!final_topk)
+            final_topk = std::make_unique<FixedTopK>(k);
+        final_topk->Reset(k);
         const float *base = snap->data.data();
-        for (const auto &node : candidates)
+        const auto *candidates = candidate_topk->Data();
+        const std::size_t candidate_count = candidate_topk->Size();
+        for (std::size_t i = 0; i < candidate_count; ++i)
         {
-            std::size_t cand_row = static_cast<std::size_t>(node.id);
+            std::size_t cand_row = static_cast<std::size_t>(candidates[i].id);
             float d = kernels::L2Sqr(base + cand_row * dim, q, dim);
-            final_topk.Push(-d, snap->ids[cand_row]);
+            final_topk->Push(-d, snap->ids[cand_row]);
         }
-        final_topk.FillSorted(resp.items);
+        final_topk->FillSorted(resp.items);
         return resp;
     }
 

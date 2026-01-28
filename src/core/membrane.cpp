@@ -1,6 +1,5 @@
 #include "membrane.h"
 #include "spatial_router.h"
-#include "search_fanout.h"
 #include "memory_manager.h"
 #include "fixed_topk.h"
 
@@ -461,7 +460,20 @@ namespace pomai
                               { return shard_ptr->Search(*req_ptr, budget); });
         }
 
-        auto futs = ParallelSubmit(search_pool_, std::move(jobs));
+        std::vector<std::future<SearchResponse>> futs;
+        futs.reserve(jobs.size());
+        for (auto &job : jobs)
+        {
+            try
+            {
+                futs.emplace_back(search_pool_.Submit(std::move(job)));
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "[Router] Search submit rejected: " << e.what()
+                          << " (returning partial results)\n";
+            }
+        }
 
         thread_local std::unique_ptr<FixedTopK> merge_topk;
         if (!merge_topk)

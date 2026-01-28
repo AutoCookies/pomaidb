@@ -6,43 +6,6 @@ namespace pomai
 {
     namespace
     {
-        void L2Sqr8CentroidsAVX2(const Vector *centroids,
-                                 const std::size_t *indices,
-                                 std::size_t count,
-                                 const float *query,
-                                 std::size_t dim,
-                                 float *out)
-        {
-            std::size_t i = 0;
-            for (; i + 8 <= count; i += 8)
-            {
-                __m256 sum = _mm256_setzero_ps();
-                for (std::size_t d = 0; d < dim; ++d)
-                {
-                    float qv = query[d];
-                    __m256 c = _mm256_set_ps(
-                        centroids[indices[i + 7]].data[d],
-                        centroids[indices[i + 6]].data[d],
-                        centroids[indices[i + 5]].data[d],
-                        centroids[indices[i + 4]].data[d],
-                        centroids[indices[i + 3]].data[d],
-                        centroids[indices[i + 2]].data[d],
-                        centroids[indices[i + 1]].data[d],
-                        centroids[indices[i + 0]].data[d]);
-                    __m256 q = _mm256_set1_ps(qv);
-                    __m256 diff = _mm256_sub_ps(c, q);
-                    sum = _mm256_fmadd_ps(diff, diff, sum);
-                }
-                _mm256_storeu_ps(out + i, sum);
-            }
-
-            for (; i < count; ++i)
-            {
-                const auto &v = centroids[indices[i]];
-                out[i] = kernels::L2Sqr(query, v.data.data(), dim);
-            }
-        }
-
         std::size_t SelectBestIndex(const Vector *centroids,
                                     const std::size_t *indices,
                                     std::size_t count,
@@ -50,7 +13,7 @@ namespace pomai
                                     std::size_t dim)
         {
             std::vector<float> distances(count, 0.0f);
-            L2Sqr8CentroidsAVX2(centroids, indices, count, query, dim, distances.data());
+            kernels::L2Sqr8CentroidsAVX2(centroids, indices, count, query, dim, distances.data());
             float best_d = std::numeric_limits<float>::infinity();
             std::size_t best = 0;
             for (std::size_t i = 0; i < count; ++i)
@@ -136,12 +99,12 @@ namespace pomai
             std::vector<std::size_t> master_indices(num_master_);
             std::iota(master_indices.begin(), master_indices.end(), 0);
             std::vector<float> master_distances(num_master_, 0.0f);
-            L2Sqr8CentroidsAVX2(master_centroids_.data(),
-                               master_indices.data(),
-                               num_master_,
-                               q.data.data(),
-                               q.data.size(),
-                               master_distances.data());
+            kernels::L2Sqr8CentroidsAVX2(master_centroids_.data(),
+                                         master_indices.data(),
+                                         num_master_,
+                                         q.data.data(),
+                                         q.data.size(),
+                                         master_distances.data());
 
             float best_master_d = std::numeric_limits<float>::infinity();
             for (std::size_t i = 0; i < num_master_; ++i)
@@ -175,12 +138,12 @@ namespace pomai
                 if (leafs.empty())
                     continue;
                 std::vector<float> distances(leafs.size(), 0.0f);
-                L2Sqr8CentroidsAVX2(centroids_.data(),
-                                   leafs.data(),
-                                   leafs.size(),
-                                   q.data.data(),
-                                   q.data.size(),
-                                   distances.data());
+                kernels::L2Sqr8CentroidsAVX2(centroids_.data(),
+                                             leafs.data(),
+                                             leafs.size(),
+                                             q.data.data(),
+                                             q.data.size(),
+                                             distances.data());
                 for (std::size_t i = 0; i < leafs.size(); ++i)
                     v.push_back({distances[i], leafs[i]});
             }
@@ -262,21 +225,36 @@ namespace pomai
 
         if (C > kHierarchicalThreshold)
         {
-            num_master_ = static_cast<std::size_t>(std::max<std::size_t>(1, std::sqrt(static_cast<double>(C))));
-            master_centroids_ = BuildKMeans(centroids_, num_master_, 8);
+            constexpr std::size_t kMaxMasters = 64;
+            num_master_ = std::min<std::size_t>(kMaxMasters, C);
+            master_centroids_.clear();
+            master_centroids_.reserve(num_master_);
+            const std::size_t stride = std::max<std::size_t>(1, C / num_master_);
+            for (std::size_t m = 0; m < num_master_; ++m)
+            {
+                std::size_t idx = std::min<std::size_t>(C - 1, m * stride);
+                master_centroids_.push_back(centroids_[idx]);
+            }
+
             master_to_leaf_.assign(num_master_, {});
+            std::vector<std::size_t> master_indices(num_master_);
+            std::iota(master_indices.begin(), master_indices.end(), 0);
+            std::vector<float> master_distances(num_master_, 0.0f);
             for (std::size_t i = 0; i < C; ++i)
             {
+                kernels::L2Sqr8CentroidsAVX2(master_centroids_.data(),
+                                             master_indices.data(),
+                                             num_master_,
+                                             centroids_[i].data.data(),
+                                             centroids_[i].data.size(),
+                                             master_distances.data());
                 float best_d = std::numeric_limits<float>::infinity();
                 std::size_t best = 0;
                 for (std::size_t m = 0; m < num_master_; ++m)
                 {
-                    float d = kernels::L2Sqr(centroids_[i].data.data(),
-                                            master_centroids_[m].data.data(),
-                                            centroids_[i].data.size());
-                    if (d < best_d)
+                    if (master_distances[m] < best_d)
                     {
-                        best_d = d;
+                        best_d = master_distances[m];
                         best = m;
                     }
                 }

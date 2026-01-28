@@ -13,7 +13,6 @@
 #include "whispergrain.h"
 #include "spatial_router.h"
 #include "search_thread_pool.h" // new
-#include "search_fanout.h"      // new
 
 namespace pomai
 {
