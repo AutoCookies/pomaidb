@@ -6,17 +6,176 @@
 #include <future>
 #include <thread>
 #include <chrono>
+#include <array>
 #include <vector>
 #include <unordered_set>
 #include <numeric>
 #include <random>
 #include <iostream>
+#include <filesystem>
+#include <cstring>
+#include <cerrno>
+#include <limits>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 namespace pomai
 {
+    namespace
+    {
+        constexpr std::size_t kCentroidsHeaderSize = 8 + 4 + 2 + 8;
+        constexpr std::uint32_t kCentroidsVersion = 1;
+        constexpr char kCentroidsMagic[8] = {'P', 'O', 'M', 'C', 'E', 'N', '0', '7'};
 
-    MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards, pomai::server::WhisperConfig w_cfg)
-        : shards_(std::move(shards)), brain_(w_cfg), probe_P_(2)
+        bool WriteFull(int fd, const void *buf, std::size_t len)
+        {
+            const char *p = static_cast<const char *>(buf);
+            std::size_t remaining = len;
+            while (remaining > 0)
+            {
+                ssize_t w = ::write(fd, p, remaining);
+                if (w < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    return false;
+                }
+                if (w == 0)
+                    return false;
+                p += static_cast<std::size_t>(w);
+                remaining -= static_cast<std::size_t>(w);
+            }
+            return true;
+        }
+
+        bool ReadFull(int fd, void *buf, std::size_t len)
+        {
+            char *p = static_cast<char *>(buf);
+            std::size_t remaining = len;
+            while (remaining > 0)
+            {
+                ssize_t r = ::read(fd, p, remaining);
+                if (r < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    return false;
+                }
+                if (r == 0)
+                    return false;
+                p += static_cast<std::size_t>(r);
+                remaining -= static_cast<std::size_t>(r);
+            }
+            return true;
+        }
+
+        std::string ParentDir(const std::string &path)
+        {
+            std::filesystem::path p(path);
+            if (p.has_parent_path())
+                return p.parent_path().string();
+            return ".";
+        }
+
+        bool FsyncDir(const std::string &path)
+        {
+            std::string dir = ParentDir(path);
+            int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (dfd < 0)
+                return false;
+            int rc = ::fsync(dfd);
+            ::close(dfd);
+            return rc == 0;
+        }
+
+        std::uint16_t Le16ToHost(std::uint16_t v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            return __builtin_bswap16(v);
+#else
+            return v;
+#endif
+        }
+
+        std::uint32_t Le32ToHost(std::uint32_t v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            return __builtin_bswap32(v);
+#else
+            return v;
+#endif
+        }
+
+        std::uint64_t Le64ToHost(std::uint64_t v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            return __builtin_bswap64(v);
+#else
+            return v;
+#endif
+        }
+
+        std::uint16_t HostToLe16(std::uint16_t v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            return __builtin_bswap16(v);
+#else
+            return v;
+#endif
+        }
+
+        std::uint32_t HostToLe32(std::uint32_t v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            return __builtin_bswap32(v);
+#else
+            return v;
+#endif
+        }
+
+        std::uint64_t HostToLe64(std::uint64_t v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            return __builtin_bswap64(v);
+#else
+            return v;
+#endif
+        }
+
+        float LeFloatToHost(float v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            std::uint32_t u;
+            std::memcpy(&u, &v, sizeof(u));
+            u = __builtin_bswap32(u);
+            std::memcpy(&v, &u, sizeof(u));
+#endif
+            return v;
+        }
+
+        float HostToLeFloat(float v)
+        {
+#if __BYTE_ORDER == __BIG_ENDIAN
+            std::uint32_t u;
+            std::memcpy(&u, &v, sizeof(u));
+            u = __builtin_bswap32(u);
+            std::memcpy(&v, &u, sizeof(u));
+#endif
+            return v;
+        }
+
+        bool FileExists(const std::string &path)
+        {
+            struct stat st;
+            return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+        }
+    } // namespace
+
+    MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
+                                   pomai::server::WhisperConfig w_cfg,
+                                   std::size_t dim)
+        : shards_(std::move(shards)), brain_(w_cfg), probe_P_(2), dim_(dim)
     {
         if (shards_.empty())
             throw std::runtime_error("must have at least 1 shard");
@@ -24,6 +183,27 @@ namespace pomai
 
     void MembraneRouter::Start()
     {
+        if (centroids_load_mode_ != CentroidsLoadMode::None && centroids_load_mode_ != CentroidsLoadMode::Async)
+        {
+            if (!centroids_path_.empty() && FileExists(centroids_path_))
+            {
+                if (LoadCentroidsFromFile(centroids_path_))
+                {
+                    std::cout << "[Router] Loaded centroids from " << centroids_path_ << "\n";
+                }
+                else
+                {
+                    std::cerr << "[Router] Failed to load centroids from " << centroids_path_
+                              << " (will recompute in background)\n";
+                }
+            }
+            else if (!centroids_path_.empty())
+            {
+                std::cout << "[Router] No centroids file at " << centroids_path_
+                          << " (will recompute in background)\n";
+            }
+        }
+
         // PARALLEL BOOT: Khởi động tất cả Shard cùng lúc
         std::vector<std::future<void>> futures;
         futures.reserve(shards_.size());
@@ -290,6 +470,16 @@ namespace pomai
         probe_P_ = (p == 0 ? 1 : p);
     }
 
+    std::vector<Vector> MembraneRouter::SnapshotCentroids() const
+    {
+        return router_.SnapshotCentroids();
+    }
+
+    bool MembraneRouter::HasCentroids() const
+    {
+        return !router_.SnapshotCentroids().empty();
+    }
+
     // Compute centroids from samples across shards and install them atomically.
     bool MembraneRouter::ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples)
     {
@@ -365,7 +555,250 @@ namespace pomai
         ConfigureCentroids(centroids);
         std::cout << "[Router] ConfigureCentroids: built " << centroids.size() << " centroids\n";
 
+        if (!centroids_path_.empty() && centroids_load_mode_ != CentroidsLoadMode::None)
+        {
+            if (SaveCentroidsToFile(centroids_path_))
+                std::cout << "[Router] Saved centroids to " << centroids_path_ << "\n";
+            else
+                std::cerr << "[Router] Failed to save centroids to " << centroids_path_ << "\n";
+        }
+
         return true;
+    }
+
+    bool MembraneRouter::LoadCentroidsFromFile(const std::string &path)
+    {
+        int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
+        {
+            std::cerr << "[Router] open failed for centroids file " << path
+                      << ": " << std::strerror(errno) << "\n";
+            return false;
+        }
+
+        struct stat st;
+        if (::fstat(fd, &st) != 0)
+        {
+            std::cerr << "[Router] fstat failed for centroids file " << path
+                      << ": " << std::strerror(errno) << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        if (static_cast<std::size_t>(st.st_size) < kCentroidsHeaderSize)
+        {
+            std::cerr << "[Router] centroids file too small: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::array<char, 8> magic{};
+        std::uint32_t version_le = 0;
+        std::uint16_t dim_le = 0;
+        std::uint64_t count_le = 0;
+
+        if (!ReadFull(fd, magic.data(), magic.size()) ||
+            !ReadFull(fd, &version_le, sizeof(version_le)) ||
+            !ReadFull(fd, &dim_le, sizeof(dim_le)) ||
+            !ReadFull(fd, &count_le, sizeof(count_le)))
+        {
+            std::cerr << "[Router] failed to read centroids header: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        if (std::memcmp(magic.data(), kCentroidsMagic, sizeof(kCentroidsMagic)) != 0)
+        {
+            std::cerr << "[Router] invalid centroids magic: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::uint32_t version = Le32ToHost(version_le);
+        if (version != kCentroidsVersion)
+        {
+            std::cerr << "[Router] unsupported centroids version " << version << ": " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::uint16_t dim = Le16ToHost(dim_le);
+        if (dim_ != 0 && dim != dim_)
+        {
+            std::cerr << "[Router] centroids dim mismatch: file=" << dim
+                      << " expected=" << dim_ << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::uint64_t count = Le64ToHost(count_le);
+        if (count == 0)
+        {
+            std::cerr << "[Router] centroids file has zero count: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        if (dim == 0)
+        {
+            std::cerr << "[Router] centroids file has zero dim: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        if (count > (std::numeric_limits<std::size_t>::max() / dim))
+        {
+            std::cerr << "[Router] centroids file size overflow: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::size_t total_floats = static_cast<std::size_t>(count * dim);
+        std::size_t expected_size = kCentroidsHeaderSize + total_floats * sizeof(float);
+        if (static_cast<std::size_t>(st.st_size) != expected_size)
+        {
+            std::cerr << "[Router] centroids file size mismatch: expected " << expected_size
+                      << " got " << st.st_size << "\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::vector<float> flat(total_floats);
+        if (!ReadFull(fd, flat.data(), total_floats * sizeof(float)))
+        {
+            std::cerr << "[Router] failed to read centroids payload: " << path << "\n";
+            ::close(fd);
+            return false;
+        }
+        ::close(fd);
+
+#if __BYTE_ORDER == __BIG_ENDIAN
+        for (auto &v : flat)
+            v = LeFloatToHost(v);
+#endif
+
+        std::vector<Vector> centroids;
+        centroids.reserve(static_cast<std::size_t>(count));
+        auto it = flat.begin();
+        for (std::size_t i = 0; i < static_cast<std::size_t>(count); ++i)
+        {
+            Vector v;
+            v.data.assign(it, it + dim);
+            centroids.push_back(std::move(v));
+            it += dim;
+        }
+
+        ConfigureCentroids(centroids);
+        return true;
+    }
+
+    bool MembraneRouter::SaveCentroidsToFile(const std::string &path) const
+    {
+        auto centroids = router_.SnapshotCentroids();
+        if (centroids.empty())
+        {
+            std::cerr << "[Router] no centroids to save\n";
+            return false;
+        }
+
+        std::size_t dim = centroids.front().data.size();
+        if (dim == 0)
+        {
+            std::cerr << "[Router] centroids have zero dim\n";
+            return false;
+        }
+        for (const auto &c : centroids)
+        {
+            if (c.data.size() != dim)
+            {
+                std::cerr << "[Router] inconsistent centroid dims\n";
+                return false;
+            }
+        }
+        if (dim_ != 0 && dim != dim_)
+        {
+            std::cerr << "[Router] centroids dim mismatch: " << dim << " expected " << dim_ << "\n";
+            return false;
+        }
+
+        std::string tmp_path = path + ".tmp";
+        int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0)
+        {
+            std::cerr << "[Router] open failed for " << tmp_path << ": " << std::strerror(errno) << "\n";
+            return false;
+        }
+
+        if (!WriteFull(fd, kCentroidsMagic, sizeof(kCentroidsMagic)))
+        {
+            std::cerr << "[Router] write magic failed\n";
+            ::close(fd);
+            return false;
+        }
+
+        std::uint32_t version_le = HostToLe32(kCentroidsVersion);
+        std::uint16_t dim_le = HostToLe16(static_cast<std::uint16_t>(dim));
+        std::uint64_t count_le = HostToLe64(static_cast<std::uint64_t>(centroids.size()));
+
+        if (!WriteFull(fd, &version_le, sizeof(version_le)) ||
+            !WriteFull(fd, &dim_le, sizeof(dim_le)) ||
+            !WriteFull(fd, &count_le, sizeof(count_le)))
+        {
+            std::cerr << "[Router] write header failed\n";
+            ::close(fd);
+            return false;
+        }
+
+        for (const auto &c : centroids)
+        {
+            for (float f : c.data)
+            {
+                float out = HostToLeFloat(f);
+                if (!WriteFull(fd, &out, sizeof(out)))
+                {
+                    std::cerr << "[Router] write centroid payload failed\n";
+                    ::close(fd);
+                    return false;
+                }
+            }
+        }
+
+        if (::fdatasync(fd) != 0)
+        {
+            std::cerr << "[Router] fdatasync failed for " << tmp_path << ": " << std::strerror(errno) << "\n";
+            ::close(fd);
+            return false;
+        }
+        if (::close(fd) != 0)
+        {
+            std::cerr << "[Router] close failed for " << tmp_path << ": " << std::strerror(errno) << "\n";
+            return false;
+        }
+
+        if (::rename(tmp_path.c_str(), path.c_str()) != 0)
+        {
+            std::cerr << "[Router] rename failed from " << tmp_path << " to " << path
+                      << ": " << std::strerror(errno) << "\n";
+            return false;
+        }
+
+        if (!FsyncDir(path))
+        {
+            std::cerr << "[Router] fsync dir failed for " << path << ": " << std::strerror(errno) << "\n";
+            return false;
+        }
+
+        return true;
+    }
+
+    void MembraneRouter::SetCentroidsFilePath(const std::string &path)
+    {
+        centroids_path_ = path;
+    }
+
+    void MembraneRouter::SetCentroidsLoadMode(CentroidsLoadMode mode)
+    {
+        centroids_load_mode_ = mode;
     }
 
 } // namespace pomai
