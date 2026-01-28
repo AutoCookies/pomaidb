@@ -34,35 +34,23 @@ namespace pomai
         // - clamp result to [1, max_cap].
         static std::size_t ChooseSearchPoolWorkers(std::size_t requested, std::size_t shard_count)
         {
-            const std::size_t MIN_WORKERS = 1;
-            const std::size_t DEFAULT_MAX = 8; // safe cap for small devices
+            const std::size_t min_workers = 1;
+            const std::size_t max_workers = 8;
 
             unsigned hc = std::thread::hardware_concurrency();
             if (hc == 0)
-                hc = 2;
-
-            std::size_t suggested = static_cast<std::size_t>(hc);
-            if (suggested < MIN_WORKERS)
-                suggested = MIN_WORKERS;
+                hc = 1;
 
             std::size_t w = 0;
             if (requested == 0)
-            {
-                // auto: choose min(hardware, shard_count) but at least 1
-                if (shard_count == 0)
-                    w = suggested;
-                else
-                    w = std::min<std::size_t>(suggested, std::max<std::size_t>(MIN_WORKERS, shard_count));
-            }
+                w = std::min<std::size_t>(static_cast<std::size_t>(hc), shard_count);
             else
-            {
                 w = requested;
-            }
 
-            if (w < MIN_WORKERS)
-                w = MIN_WORKERS;
-            if (w > DEFAULT_MAX)
-                w = DEFAULT_MAX;
+            if (w < min_workers)
+                w = min_workers;
+            if (w > max_workers)
+                w = max_workers;
             return w;
         }
 
@@ -225,9 +213,7 @@ namespace pomai
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size()))
     {
         // Log chosen worker count for observability
-        std::cout << "[Router] search pool workers = " << search_pool_.WorkerCount()
-                  << " (requested=" << search_pool_workers << ", hw_concurrency=" << std::thread::hardware_concurrency()
-                  << ", shards=" << shards_.size() << ")\n";
+        std::cout << "[Router] search_pool_workers=" << search_pool_.WorkerCount() << "\n";
 
         if (shards_.empty())
             throw std::runtime_error("must have at least 1 shard");
