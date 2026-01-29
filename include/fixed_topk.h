@@ -92,7 +92,11 @@ namespace pomai
                 out.push_back(SearchResultItem{data_[i].id, data_[i].score});
 
             std::sort(out.begin(), out.end(), [](const SearchResultItem &a, const SearchResultItem &b)
-                      { return a.score > b.score; });
+                      {
+                          if (a.score == b.score)
+                              return a.id < b.id;
+                          return a.score > b.score;
+                      });
         }
 
         void FillSortedNodes(std::vector<Node> &out) const
@@ -106,7 +110,11 @@ namespace pomai
                 out.push_back(data_[i]);
 
             std::sort(out.begin(), out.end(), [](const Node &a, const Node &b)
-                      { return a.score > b.score; });
+                      {
+                          if (a.score == b.score)
+                              return a.id < b.id;
+                          return a.score > b.score;
+                      });
         }
 
     private:

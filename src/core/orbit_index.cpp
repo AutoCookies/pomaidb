@@ -1,6 +1,7 @@
 #include "orbit_index.h"
 #include "cpu_kernels.h"
 #include "memory_manager.h"
+#include "search_utils.h"
 
 #include <algorithm>
 #include <array>
@@ -398,7 +399,7 @@ namespace pomai::core
         links.resize(M_);
     }
 
-    std::vector<std::uint32_t> OrbitIndex::FindNeighborsSearch(const float *q, std::size_t ops_budget) const
+    std::vector<std::uint32_t> OrbitIndex::FindNeighborsSearch(const float *q, std::size_t ef, std::size_t candidate_k) const
     {
         const std::size_t N = total_vectors_.load(std::memory_order_acquire);
         if (N == 0)
@@ -440,7 +441,8 @@ namespace pomai::core
 
         // ops_budget limits expansions (not exact dist calls, but close enough)
         std::size_t expansions = 0;
-        const std::size_t ef = std::max<std::size_t>(64, std::min<std::size_t>(256, ops_budget ? ops_budget : 128));
+        ef = std::max<std::size_t>(64, std::min<std::size_t>(2048, ef));
+        std::size_t best_cap = std::max<std::size_t>(1, candidate_k);
 
         while (!candidates.empty() && expansions < ef)
         {
@@ -448,7 +450,7 @@ namespace pomai::core
             candidates.pop();
             ++expansions;
 
-            if (best.size() >= ef && cur.first > best.top().first)
+            if (best.size() >= best_cap && cur.first > best.top().first)
                 break;
 
             for (std::uint32_t nb : graph_[cur.second])
@@ -464,7 +466,7 @@ namespace pomai::core
 
                 candidates.push({d, nb});
                 best.push({d, nb});
-                if (best.size() > ef)
+                if (best.size() > best_cap)
                     best.pop();
             }
         }
@@ -479,42 +481,49 @@ namespace pomai::core
         return out;
     }
 
-    SearchResponse OrbitIndex::Search(const Vector &query, const pomai::ai::Budget &budget) const
+    SearchResponse OrbitIndex::Search(const SearchRequest &req, const pomai::ai::Budget &budget) const
     {
         SearchResponse resp;
 
         if (!built_.load(std::memory_order_acquire))
             return resp;
-        if (query.data.size() != dim_)
+        if (req.query.data.size() != dim_)
+            return resp;
+        if (req.metric != Metric::L2)
             return resp;
 
         const std::size_t N = total_vectors_.load(std::memory_order_acquire);
         if (N == 0)
             return resp;
 
-        const std::size_t ops_budget = (budget.ops_budget == 0) ? 128u : (std::size_t)budget.ops_budget;
+        const std::size_t candidate_k = NormalizeCandidateK(req);
+        const std::uint32_t ef = NormalizeGraphEf(req, candidate_k);
+        const std::size_t ops_budget = (budget.ops_budget == 0) ? ef : std::max<std::size_t>(budget.ops_budget, ef);
+        const std::size_t search_ef = std::max<std::size_t>(ops_budget, candidate_k);
 
         // Get candidate nodes
-        const float *q = query.data.data();
-        std::vector<std::uint32_t> cand = FindNeighborsSearch(q, ops_budget);
+        const float *q = req.query.data.data();
+        std::vector<std::uint32_t> cand = FindNeighborsSearch(q, search_ef, candidate_k);
 
         // Score candidates exactly and return top results
         std::vector<std::pair<float, std::uint32_t>> scored;
         scored.reserve(cand.size());
-        std::array<float, 1> distance{};
         for (auto idx : cand)
         {
             const float *v = data_.data() + (std::size_t)idx * dim_;
-            pomai::kernels::ScanBucketAVX2(v, q, dim_, 1, distance.data());
-            scored.push_back({distance[0], idx});
+            float d = pomai::kernels::L2Sqr(v, q, dim_);
+            scored.push_back({d, idx});
         }
 
         std::sort(scored.begin(), scored.end(),
                   [](const auto &a, const auto &b)
-                  { return a.first < b.first; });
+                  {
+                      if (a.first == b.first)
+                          return a.second < b.second;
+                      return a.first < b.first;
+                  });
 
-        // OrbitIndex returns top-20 by default (caller merges & trims to req.topk at shard/router level)
-        const std::size_t limit = std::min<std::size_t>(20, scored.size());
+        const std::size_t limit = std::min<std::size_t>(req.topk, scored.size());
         resp.items.resize(limit);
 
         for (std::size_t i = 0; i < limit; ++i)
@@ -522,6 +531,8 @@ namespace pomai::core
             const auto idx = scored[i].second;
             resp.items[i] = {ids_[idx], -scored[i].first};
         }
+
+        SortAndDedupeResults(resp.items, req.topk);
 
         return resp;
     }

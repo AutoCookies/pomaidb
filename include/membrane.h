@@ -59,6 +59,7 @@ namespace pomai
         double SearchQueueAvgLatencyMs() const;
         std::uint64_t SearchOverloadCount() const { return search_overload_.load(std::memory_order_relaxed); }
         std::uint64_t SearchInlineCount() const { return search_inline_.load(std::memory_order_relaxed); }
+        std::uint64_t SearchPartialCount() const { return search_partial_.load(std::memory_order_relaxed); }
 
         struct HotspotInfo
         {
@@ -118,6 +119,7 @@ namespace pomai
         mutable std::atomic<std::uint64_t> search_count_{0};
         mutable std::atomic<std::uint64_t> search_overload_{0};
         mutable std::atomic<std::uint64_t> search_inline_{0};
+        mutable std::atomic<std::uint64_t> search_partial_{0};
     };
 
 }

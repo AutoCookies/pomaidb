@@ -14,6 +14,7 @@
 #include <limits>
 #include <cmath>
 #include "fixed_topk.h"
+#include "search_utils.h"
 #include "cpu_kernels.h"
 #include "spatial_router.h"
 #include "pomai_assert.h"
@@ -293,7 +294,10 @@ namespace pomai
         POMAI_ASSERT(req.query.data.size() == dim, "SearchGrains query dim mismatch");
         POMAI_ASSERT(grains.dim == dim, "SearchGrains grains dim mismatch");
         POMAI_ASSERT(snap->qdata.size() == snap->ids.size() * dim, "SearchGrains qdata size mismatch");
-        const std::size_t topk = std::min<std::size_t>(req.topk, 128);
+        if (req.metric != Metric::L2)
+            return resp;
+        const std::size_t candidate_k = NormalizeCandidateK(req);
+        const std::size_t topk = std::min<std::size_t>(req.topk, candidate_k);
         std::size_t probe = budget.bucket_budget > 0 ? budget.bucket_budget : std::min<std::size_t>(16, grains.centroids.size());
         probe = std::min({probe, grains.centroids.size(), (std::size_t)128});
         FixedTopK centroid_topk(probe);
@@ -308,7 +312,7 @@ namespace pomai
             float qv = (snap->qscales[d] > 0.0f) ? ((req.query.data[d] - snap->qmins[d]) / snap->qscales[d]) : 0.0f;
             qquant[d] = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::nearbyint(qv)), 0, 255));
         }
-        FixedTopK candidates(128);
+        FixedTopK candidates(candidate_k);
         const auto *c_data = centroid_topk.Data();
         for (std::size_t i = 0; i < centroid_topk.Size(); ++i)
         {
@@ -331,6 +335,7 @@ namespace pomai
             final_topk.Push(-kernels::L2Sqr(dequant.data(), req.query.data.data(), dim), snap->ids[row]);
         }
         final_topk.FillSorted(resp.items);
+        SortAndDedupeResults(resp.items, topk);
         return resp;
     }
 
@@ -341,23 +346,32 @@ namespace pomai
         SearchResponse out;
         if (!snapshot)
             return out;
+        SearchRequest normalized = req;
+        normalized.candidate_k = NormalizeCandidateK(req);
+        normalized.max_rerank_k = NormalizeMaxRerankK(req);
+        normalized.graph_ef = NormalizeGraphEf(req, normalized.candidate_k);
+        normalized.metric = req.metric;
+        pomai::ai::Budget effective_budget = budget;
+        if (normalized.graph_ef > 0)
+            effective_budget.ops_budget = normalized.graph_ef;
         for (const auto &s : snapshot->segments)
         {
             SearchResponse r;
             if (s.grains && s.snap)
-                r = SearchGrains(s.snap, *s.grains, req, budget);
+                r = SearchGrains(s.snap, *s.grains, normalized, effective_budget);
             else if (s.index)
-                r = s.index->Search(req.query, budget);
+                r = s.index->Search(normalized, effective_budget);
             else if (s.snap)
-                r = Seed::SearchSnapshot(s.snap, req);
+                r = Seed::SearchSnapshot(s.snap, normalized);
             MergeTopK(out, r, req.topk);
         }
         SearchResponse lr;
         if (snapshot->live_snap && snapshot->live_grains)
-            lr = SearchGrains(snapshot->live_snap, *snapshot->live_grains, req, budget);
+            lr = SearchGrains(snapshot->live_snap, *snapshot->live_grains, normalized, effective_budget);
         else if (snapshot->live_snap)
-            lr = Seed::SearchSnapshot(snapshot->live_snap, req);
+            lr = Seed::SearchSnapshot(snapshot->live_snap, normalized);
         MergeTopK(out, lr, req.topk);
+        SortAndDedupeResults(out.items, req.topk);
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > 40)
             const_cast<Shard *>(this)->RequestEmergencyFreeze();
         return out;
@@ -468,11 +482,16 @@ namespace pomai
         }
         if (build_pool_)
         {
-            IndexBuildPool::Job job{pos, snap, 48, 200, [this](std::size_t p, Seed::Snapshot s, std::shared_ptr<pomai::core::OrbitIndex> i)
-                                    {
-                                        auto g = this->BuildGrainIndex(s);
-                                        this->AttachIndex(p, std::move(s), std::move(i), std::move(g));
-                                    }};
+            IndexBuildPool::Job job;
+            job.segment_pos = pos;
+            job.snap = snap;
+            job.M = 48;
+            job.ef_construction = 200;
+            job.attach = [this](std::size_t p, Seed::Snapshot s, std::shared_ptr<pomai::core::OrbitIndex> i)
+            {
+                auto g = this->BuildGrainIndex(s);
+                this->AttachIndex(p, std::move(s), std::move(i), std::move(g));
+            };
             build_pool_->Enqueue(std::move(job));
         }
         Seed next_seed(seed_.Dim());

@@ -1,4 +1,5 @@
 #include "membrane.h"
+#include "search_utils.h"
 #include "spatial_router.h"
 #include "search_fanout.h"
 #include "memory_manager.h"
@@ -283,24 +284,25 @@ namespace pomai
                 futs.push_back(shards_[i]->EnqueueUpserts(std::move(parts[i]), wait_durable));
         }
 
-        std::promise<Lsn> done;
-        auto out = done.get_future();
-        auto task = [futs = std::move(futs), done = std::move(done)]() mutable
+        auto done = std::make_shared<std::promise<Lsn>>();
+        auto out = done->get_future();
+        auto shared_futs = std::make_shared<std::vector<std::future<Lsn>>>(std::move(futs));
+        auto task = [shared_futs, done]() mutable
         {
             Lsn max_lsn = 0;
             try
             {
-                for (auto &f : futs)
+                for (auto &f : *shared_futs)
                 {
                     Lsn l = f.get();
                     if (l > max_lsn)
                         max_lsn = l;
                 }
-                done.set_value(max_lsn);
+                done->set_value(max_lsn);
             }
             catch (...)
             {
-                done.set_exception(std::current_exception());
+                done->set_exception(std::current_exception());
             }
         };
         if (!completion_.Enqueue(std::move(task)))
@@ -361,7 +363,12 @@ namespace pomai
 
         const std::size_t shard_topk = std::max<std::size_t>(req.topk, req.topk * kShardCandidateMultiplier);
         SearchRequest shard_req = req;
+        shard_req.candidate_k = NormalizeCandidateK(req);
+        shard_req.max_rerank_k = NormalizeMaxRerankK(req);
+        shard_req.graph_ef = NormalizeGraphEf(req, shard_req.candidate_k);
         shard_req.topk = shard_topk;
+        if (shard_req.graph_ef > 0)
+            budget.ops_budget = shard_req.graph_ef;
         auto req_ptr = std::make_shared<SearchRequest>(std::move(shard_req));
 
         std::vector<std::future<SearchResponse>> futs;
@@ -390,6 +397,7 @@ namespace pomai
             merge_topk = std::make_unique<FixedTopK>(req.topk);
         merge_topk->Reset(req.topk);
 
+        std::size_t completed = 0;
         for (auto &f : futs)
         {
             if (f.wait_until(deadline) == std::future_status::ready)
@@ -399,6 +407,7 @@ namespace pomai
                     auto r = f.get();
                     for (const auto &item : r.items)
                         merge_topk->Push(item.score, item.id);
+                    ++completed;
                 }
                 catch (...)
                 {
@@ -409,10 +418,18 @@ namespace pomai
         {
             for (const auto &item : r.items)
                 merge_topk->Push(item.score, item.id);
+            ++completed;
         }
 
         SearchResponse out;
         merge_topk->FillSorted(out.items);
+        SortAndDedupeResults(out.items, req.topk);
+        const std::size_t total_targets = futs.size() + inline_responses.size();
+        if (completed < total_targets)
+        {
+            out.partial = true;
+            search_partial_.fetch_add(1, std::memory_order_relaxed);
+        }
         float lat = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
         brain_.observe_latency(lat);
 
@@ -440,25 +457,26 @@ namespace pomai
         std::vector<std::future<bool>> futs;
         for (auto &s : shards_)
             futs.push_back(s->RequestCheckpoint());
-        std::promise<bool> done;
-        auto out = done.get_future();
-        auto task = [futs = std::move(futs), done = std::move(done)]() mutable
+        auto done = std::make_shared<std::promise<bool>>();
+        auto out = done->get_future();
+        auto shared_futs = std::make_shared<std::vector<std::future<bool>>>(std::move(futs));
+        auto task = [shared_futs, done]() mutable
         {
             try
             {
-                for (auto &f : futs)
+                for (auto &f : *shared_futs)
                 {
                     if (!f.get())
                     {
-                        done.set_value(false);
+                        done->set_value(false);
                         return;
                     }
                 }
-                done.set_value(true);
+                done->set_value(true);
             }
             catch (...)
             {
-                done.set_exception(std::current_exception());
+                done->set_exception(std::current_exception());
             }
         };
         if (!completion_.Enqueue(std::move(task)))
