@@ -81,6 +81,8 @@ namespace pomai
 
         void SetFixedBounds(const std::vector<float> &mins, const std::vector<float> &maxs);
         void InheritBounds(const Seed &other);
+        void SetFixedBoundsAfterCount(std::size_t count);
+        std::uint64_t ConsumeOutOfRangeCount();
 
         std::size_t Count() const { return ids_.size(); }
         std::size_t Dim() const { return dim_; }
@@ -105,6 +107,9 @@ namespace pomai
         std::size_t sample_threshold_{4096};
         bool calibrated_{false};
         bool is_fixed_{false};
+        std::size_t total_ingested_{0};
+        std::size_t fixed_bounds_after_{50000};
+        std::atomic<std::uint64_t> out_of_range_rows_{0};
 
         void ReserveForAppend(std::size_t add_rows);
         void UpdateMemtableAccounting();

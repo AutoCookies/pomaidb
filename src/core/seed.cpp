@@ -135,7 +135,7 @@ namespace pomai
     }
 
     Seed::Seed(const Seed &other)
-        : dim_(other.dim_), ids_(other.ids_), qdata_(other.qdata_), qmins_(other.qmins_), qmaxs_(other.qmaxs_), qscales_(other.qscales_), qinv_scales_(other.qinv_scales_), pos_(other.pos_), accounted_bytes_(other.accounted_bytes_), qrows_(other.qrows_), qcap_(other.qcap_), sample_buf_(other.sample_buf_), sample_ids_(other.sample_ids_), sample_rows_(other.sample_rows_), calibrated_(other.calibrated_), is_fixed_(other.is_fixed_)
+        : dim_(other.dim_), ids_(other.ids_), qdata_(other.qdata_), qmins_(other.qmins_), qmaxs_(other.qmaxs_), qscales_(other.qscales_), qinv_scales_(other.qinv_scales_), pos_(other.pos_), accounted_bytes_(other.accounted_bytes_), qrows_(other.qrows_), qcap_(other.qcap_), sample_buf_(other.sample_buf_), sample_ids_(other.sample_ids_), sample_rows_(other.sample_rows_), calibrated_(other.calibrated_), is_fixed_(other.is_fixed_), total_ingested_(other.total_ingested_), fixed_bounds_after_(other.fixed_bounds_after_), out_of_range_rows_(other.out_of_range_rows_.load(std::memory_order_relaxed))
     {
         if (accounted_bytes_ > 0)
             MemoryManager::Instance().AddUsage(MemoryManager::Pool::Memtable, accounted_bytes_);
@@ -162,15 +162,19 @@ namespace pomai
         sample_rows_ = other.sample_rows_;
         calibrated_ = other.calibrated_;
         is_fixed_ = other.is_fixed_;
+        total_ingested_ = other.total_ingested_;
+        fixed_bounds_after_ = other.fixed_bounds_after_;
+        out_of_range_rows_.store(other.out_of_range_rows_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         if (accounted_bytes_ > 0)
             MemoryManager::Instance().AddUsage(MemoryManager::Pool::Memtable, accounted_bytes_);
         return *this;
     }
 
     Seed::Seed(Seed &&other) noexcept
-        : dim_(other.dim_), ids_(std::move(other.ids_)), qdata_(std::move(other.qdata_)), qmins_(std::move(other.qmins_)), qmaxs_(std::move(other.qmaxs_)), qscales_(std::move(other.qscales_)), qinv_scales_(std::move(other.qinv_scales_)), pos_(std::move(other.pos_)), accounted_bytes_(other.accounted_bytes_), qrows_(other.qrows_), qcap_(other.qcap_), sample_buf_(std::move(other.sample_buf_)), sample_ids_(std::move(other.sample_ids_)), sample_rows_(other.sample_rows_), calibrated_(other.calibrated_), is_fixed_(other.is_fixed_)
+        : dim_(other.dim_), ids_(std::move(other.ids_)), qdata_(std::move(other.qdata_)), qmins_(std::move(other.qmins_)), qmaxs_(std::move(other.qmaxs_)), qscales_(std::move(other.qscales_)), qinv_scales_(std::move(other.qinv_scales_)), pos_(std::move(other.pos_)), accounted_bytes_(other.accounted_bytes_), qrows_(other.qrows_), qcap_(other.qcap_), sample_buf_(std::move(other.sample_buf_)), sample_ids_(std::move(other.sample_ids_)), sample_rows_(other.sample_rows_), calibrated_(other.calibrated_), is_fixed_(other.is_fixed_), total_ingested_(other.total_ingested_), fixed_bounds_after_(other.fixed_bounds_after_), out_of_range_rows_(other.out_of_range_rows_.load(std::memory_order_relaxed))
     {
         other.accounted_bytes_ = 0;
+        other.out_of_range_rows_.store(0, std::memory_order_relaxed);
     }
 
     Seed &Seed::operator=(Seed &&other) noexcept
@@ -194,7 +198,11 @@ namespace pomai
         sample_rows_ = other.sample_rows_;
         calibrated_ = other.calibrated_;
         is_fixed_ = other.is_fixed_;
+        total_ingested_ = other.total_ingested_;
+        fixed_bounds_after_ = other.fixed_bounds_after_;
+        out_of_range_rows_.store(other.out_of_range_rows_.load(std::memory_order_relaxed), std::memory_order_relaxed);
         other.accounted_bytes_ = 0;
+        other.out_of_range_rows_.store(0, std::memory_order_relaxed);
         return *this;
     }
 
@@ -314,6 +322,56 @@ namespace pomai
         if (batch.empty())
             return;
         InitQuantizeDispatch();
+        if (!is_fixed_)
+        {
+            std::vector<float> new_mins = qmins_;
+            std::vector<float> new_maxs = qmaxs_;
+            bool changed = false;
+            for (const auto &req : batch)
+            {
+                if (req.vec.data.size() != dim_)
+                    continue;
+                for (std::size_t d = 0; d < dim_; ++d)
+                {
+                    float v = req.vec.data[d];
+                    if (v < new_mins[d])
+                    {
+                        new_mins[d] = v;
+                        changed = true;
+                    }
+                    if (v > new_maxs[d])
+                    {
+                        new_maxs[d] = v;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed)
+            {
+                std::vector<float> new_scales(dim_);
+                for (std::size_t d = 0; d < dim_; ++d)
+                {
+                    float range = new_maxs[d] - new_mins[d];
+                    new_scales[d] = (range > 0.0f) ? (range / 255.0f) : 1.0f;
+                }
+                if (qrows_ > 0)
+                {
+                    RescaleAll(new_mins, new_scales);
+                    qmaxs_ = new_maxs;
+                }
+                else
+                {
+                    qmins_ = new_mins;
+                    qmaxs_ = new_maxs;
+                    qscales_ = new_scales;
+                    qinv_scales_.resize(dim_);
+                    for (std::size_t d = 0; d < dim_; ++d)
+                        qinv_scales_[d] = 1.0f / qscales_[d];
+                }
+            }
+        }
+
+        std::size_t valid_rows = 0;
         for (const auto &req : batch)
         {
             if (req.vec.data.size() != dim_)
@@ -334,27 +392,32 @@ namespace pomai
             else
                 row = it->second;
 
-            if (!is_fixed_)
+            bool out_of_range = false;
+            if (is_fixed_)
             {
                 for (std::size_t d = 0; d < dim_; ++d)
                 {
                     float v = req.vec.data[d];
-                    if (v < qmins_[d])
-                        qmins_[d] = v;
-                    if (v > qmaxs_[d])
-                        qmaxs_[d] = v;
-                }
-                for (std::size_t d = 0; d < dim_; ++d)
-                {
-                    float range = qmaxs_[d] - qmins_[d];
-                    qscales_[d] = (range > 0.0f) ? (range / 255.0f) : 1.0f;
-                    qinv_scales_[d] = 1.0f / qscales_[d];
+                    if (v < qmins_[d] || v > qmaxs_[d])
+                    {
+                        out_of_range = true;
+                        break;
+                    }
                 }
             }
+            if (out_of_range)
+                out_of_range_rows_.fetch_add(1, std::memory_order_relaxed);
 
             const float *src = req.vec.data.data();
             std::uint8_t *dst = qdata_.data() + static_cast<std::size_t>(row) * dim_;
             quantize_row_impl_(src, qmins_.data(), qinv_scales_.data(), dst, dim_);
+            ++valid_rows;
+        }
+        if (!is_fixed_ && valid_rows > 0)
+        {
+            total_ingested_ += valid_rows;
+            if (total_ingested_ >= fixed_bounds_after_)
+                SetFixedBounds(qmins_, qmaxs_);
         }
         UpdateMemtableAccounting();
     }
@@ -437,6 +500,18 @@ namespace pomai
         qscales_ = other.qscales_;
         qinv_scales_ = other.qinv_scales_;
         is_fixed_ = other.is_fixed_;
+        total_ingested_ = other.total_ingested_;
+        fixed_bounds_after_ = other.fixed_bounds_after_;
+    }
+
+    void Seed::SetFixedBoundsAfterCount(std::size_t count)
+    {
+        fixed_bounds_after_ = std::max<std::size_t>(1, count);
+    }
+
+    std::uint64_t Seed::ConsumeOutOfRangeCount()
+    {
+        return out_of_range_rows_.exchange(0, std::memory_order_relaxed);
     }
 
     SearchResponse Seed::SearchSnapshot(const Snapshot &snap, const SearchRequest &req)

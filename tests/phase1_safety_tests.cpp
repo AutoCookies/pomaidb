@@ -19,7 +19,7 @@ struct ShardTestAccessor
     static void AddSegment(Shard &shard, const Seed::Snapshot &snap)
     {
         std::lock_guard<std::mutex> lk(shard.state_mu_);
-        shard.segments_.push_back(IndexedSegment{snap, nullptr});
+        shard.segments_.push_back(IndexedSegment{snap, nullptr, nullptr});
     }
 
     static void AttachIndex(Shard &shard,

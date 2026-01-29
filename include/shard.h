@@ -44,6 +44,13 @@ namespace pomai
         std::shared_ptr<pomai::core::OrbitIndex> index;
     };
 
+    struct SnapshotState
+    {
+        std::vector<IndexedSegment> segments;
+        Seed::Snapshot live_snap;
+        std::shared_ptr<GrainIndex> live_grains;
+    };
+
     class Shard
     {
     public:
@@ -71,6 +78,7 @@ namespace pomai
     private:
         void RunLoop();
         void MaybeFreezeSegment();
+        void PublishSnapshotLocked();
 
         void AttachIndex(std::size_t segment_pos,
                          Seed::Snapshot snap,
@@ -94,6 +102,7 @@ namespace pomai
         std::vector<IndexedSegment> segments_;
         Seed::Snapshot live_snap_;
         std::shared_ptr<GrainIndex> live_grains_;
+        std::atomic<std::shared_ptr<const SnapshotState>> current_snapshot_{nullptr};
         std::thread owner_;
         static constexpr std::size_t kFreezeEveryVectors = 50000;
         std::size_t since_freeze_{0};
