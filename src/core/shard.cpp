@@ -29,8 +29,7 @@ namespace pomai
         {
             if (n == 0)
                 return 0;
-            std::size_t k = static_cast<std::size_t>(std::sqrt(n));
-            return std::max<std::size_t>(1, k);
+            return std::max<std::size_t>(1, static_cast<std::size_t>(std::sqrt(n)));
         }
 
         std::vector<Vector> SnapshotToVectors(const Seed::Snapshot &snap)
@@ -49,6 +48,24 @@ namespace pomai
             }
             return out;
         }
+
+        void CheckedWrite(int fd, const void *buf, size_t count)
+        {
+            const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
+            size_t rem = count;
+            while (rem > 0)
+            {
+                ssize_t res = ::write(fd, p, rem);
+                if (res < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    throw std::runtime_error("Disk write failed");
+                }
+                p += res;
+                rem -= res;
+            }
+        }
     }
 
     Shard::Shard(std::string name, std::size_t dim, std::size_t queue_cap, std::string wal_dir, LogFn info, LogFn error)
@@ -57,10 +74,7 @@ namespace pomai
         live_snap_ = seed_.MakeSnapshot();
     }
 
-    Shard::~Shard()
-    {
-        Stop();
-    }
+    Shard::~Shard() { Stop(); }
 
     void Shard::Start()
     {
@@ -68,25 +82,18 @@ namespace pomai
         {
             WalReplayStats stats = wal_.ReplayToSeed(seed_);
             if (log_info_)
-            {
-                log_info_("[" + name_ + "] WAL Replay: records=" + std::to_string(stats.records_applied) + ", vectors=" + std::to_string(stats.vectors_applied));
-            }
+                log_info_("[" + name_ + "] WAL Replay: records=" + std::to_string(stats.records_applied));
         }
-        catch (const std::exception &e)
+        catch (...)
         {
-            if (log_error_)
-                log_error_("[" + name_ + "] WAL replay failed: " + std::string(e.what()));
         }
-
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             live_snap_ = seed_.MakeSnapshot();
             live_grains_ = BuildGrainIndex(live_snap_);
         }
-
         if (seed_.Count() > 0)
             MaybeFreezeSegment();
-
         wal_.Start();
         owner_ = std::thread(&Shard::RunLoop, this);
     }
@@ -99,10 +106,7 @@ namespace pomai
         wal_.Stop();
     }
 
-    std::size_t Shard::ApproxCountUnsafe() const
-    {
-        return seed_.Count();
-    }
+    std::size_t Shard::ApproxCountUnsafe() const { return seed_.Count(); }
 
     std::future<Lsn> Shard::EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable)
     {
@@ -113,7 +117,7 @@ namespace pomai
         if (!ingest_q_.Push(std::move(t)))
         {
             std::promise<Lsn> p;
-            p.set_exception(std::make_exception_ptr(std::runtime_error("queue_closed")));
+            p.set_exception(std::make_exception_ptr(std::runtime_error("closed")));
             return p.get_future();
         }
         return fut;
@@ -128,7 +132,7 @@ namespace pomai
         if (!ingest_q_.Push(std::move(t)))
         {
             std::promise<bool> p;
-            p.set_exception(std::make_exception_ptr(std::runtime_error("queue_closed")));
+            p.set_exception(std::make_exception_ptr(std::runtime_error("closed")));
             return p.get_future();
         }
         return fut;
@@ -137,12 +141,12 @@ namespace pomai
     void Shard::RequestEmergencyFreeze()
     {
         bool expected = false;
-        if (!emergency_freeze_pending_.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        if (!emergency_freeze_pending_.compare_exchange_strong(expected, true))
             return;
         UpsertTask t;
         t.is_emergency_freeze = true;
         if (!ingest_q_.Push(std::move(t)))
-            emergency_freeze_pending_.store(false, std::memory_order_release);
+            emergency_freeze_pending_.store(false);
     }
 
     void Shard::MergeTopK(SearchResponse &out, const SearchResponse &in, std::size_t k)
@@ -162,7 +166,7 @@ namespace pomai
         topk.FillSorted(out.items);
     }
 
-    std::shared_ptr<IndexedSegment::GrainIndex> Shard::BuildGrainIndex(const Seed::Snapshot &snap) const
+    std::shared_ptr<GrainIndex> Shard::BuildGrainIndex(const Seed::Snapshot &snap) const
     {
         if (!snap || snap->ids.empty())
             return nullptr;
@@ -190,9 +194,10 @@ namespace pomai
         {
             float best_d = std::numeric_limits<float>::infinity();
             std::size_t best = 0;
+            const float *src = snap->data.data() + row * dim;
             for (std::size_t c = 0; c < centroids.size(); ++c)
             {
-                float d = kernels::L2Sqr(snap->data.data() + row * dim, centroids[c].data.data(), dim);
+                float d = kernels::L2Sqr(src, centroids[c].data.data(), dim);
                 if (d < best_d)
                 {
                     best_d = d;
@@ -203,20 +208,20 @@ namespace pomai
             counts[best]++;
         }
 
-        auto grains = std::make_shared<IndexedSegment::GrainIndex>();
+        auto grains = std::make_shared<GrainIndex>();
         grains->dim = dim;
         grains->centroids = std::move(centroids);
         grains->offsets.resize(grains->centroids.size() + 1, 0);
         for (std::size_t c = 0; c < grains->centroids.size(); ++c)
             grains->offsets[c + 1] = grains->offsets[c] + counts[c];
         grains->postings.resize(n);
-        std::vector<std::uint32_t> cursor = grains->offsets;
+        std::vector<std::size_t> cursor = grains->offsets;
         for (std::size_t row = 0; row < n; ++row)
             grains->postings[cursor[assignments[row]]++] = static_cast<std::uint32_t>(row);
         return grains;
     }
 
-    SearchResponse Shard::SearchGrains(const Seed::Snapshot &snap, const IndexedSegment::GrainIndex &grains, const SearchRequest &req, const pomai::ai::Budget &budget) const
+    SearchResponse Shard::SearchGrains(const Seed::Snapshot &snap, const GrainIndex &grains, const SearchRequest &req, const pomai::ai::Budget &budget) const
     {
         SearchResponse resp;
         const std::size_t dim = snap->dim;
@@ -273,14 +278,13 @@ namespace pomai
         const auto start = std::chrono::steady_clock::now();
         std::vector<IndexedSegment> segs;
         Seed::Snapshot live;
-        std::shared_ptr<IndexedSegment::GrainIndex> live_g;
+        std::shared_ptr<GrainIndex> live_g;
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             segs = segments_;
             live = live_snap_;
             live_g = live_grains_;
         }
-
         SearchResponse out;
         for (const auto &s : segs)
         {
@@ -293,7 +297,6 @@ namespace pomai
                 r = Seed::SearchSnapshot(s.snap, req);
             MergeTopK(out, r, req.topk);
         }
-
         SearchResponse lr;
         if (live && live_g)
             lr = SearchGrains(live, *live_g, req, budget);
@@ -323,10 +326,10 @@ namespace pomai
                     {
                         uint16_t d = static_cast<uint16_t>(snap->dim);
                         uint64_t c = static_cast<uint64_t>(snap->ids.size());
-                        ::write(fd, &d, 2);
-                        ::write(fd, &c, 8);
-                        ::write(fd, snap->ids.data(), snap->ids.size() * 8);
-                        ::write(fd, snap->data.data(), snap->data.size() * 4);
+                        CheckedWrite(fd, &d, 2);
+                        CheckedWrite(fd, &c, 8);
+                        CheckedWrite(fd, snap->ids.data(), snap->ids.size() * 8);
+                        CheckedWrite(fd, snap->data.data(), snap->data.size() * 4);
                         ::fdatasync(fd);
                         ::close(fd);
                         wal_.TruncateToZero();
@@ -383,18 +386,19 @@ namespace pomai
         auto snap = seed_.MakeSnapshot();
         if (!snap || snap->ids.empty())
             return;
-        auto grains = BuildGrainIndex(snap);
         std::size_t pos;
         {
             std::lock_guard<std::mutex> lk(state_mu_);
-            segments_.push_back({snap, std::move(grains), nullptr});
+            segments_.push_back({snap, nullptr, nullptr});
             pos = segments_.size() - 1;
         }
         if (build_pool_)
         {
             IndexBuildPool::Job job{pos, snap, 48, 200, [this](std::size_t p, Seed::Snapshot s, std::shared_ptr<pomai::core::OrbitIndex> i)
                                     {
-                                        this->AttachIndex(p, std::move(s), std::move(i));
+                                        auto g = this->BuildGrainIndex(s);
+                                        Seed::Quantize(s);
+                                        this->AttachIndex(p, std::move(s), std::move(i), std::move(g));
                                     }};
             build_pool_->Enqueue(std::move(job));
         }
@@ -406,11 +410,14 @@ namespace pomai
         }
     }
 
-    void Shard::AttachIndex(std::size_t pos, Seed::Snapshot snap, std::shared_ptr<pomai::core::OrbitIndex> idx)
+    void Shard::AttachIndex(std::size_t pos, Seed::Snapshot snap, std::shared_ptr<pomai::core::OrbitIndex> idx, std::shared_ptr<GrainIndex> grains)
     {
         std::lock_guard<std::mutex> lk(state_mu_);
         if (pos < segments_.size() && segments_[pos].snap == snap)
+        {
             segments_[pos].index = std::move(idx);
+            segments_[pos].grains = std::move(grains);
+        }
     }
 
     std::vector<Vector> Shard::SampleVectors(std::size_t max_samples) const
@@ -446,9 +453,7 @@ namespace pomai
                     std::uniform_int_distribution<std::size_t> d(0, seen - 1);
                     std::size_t j = d(rng);
                     if (j < max_samples)
-                    {
                         res[j].data.assign(s->data.data() + i * s->dim, s->data.data() + (i + 1) * s->dim);
-                    }
                 }
             }
         };

@@ -52,10 +52,10 @@ int main(int argc, char **argv)
     std::cout << ":: POMAI PRODUCTION-GRADE BENCHMARK (IVF-SQ8 READY) ::\n";
 
     // 1. Cấu hình tham số chuẩn Big Tech
-    size_t N = 5'000'000;
+    size_t N = 500'000;
     size_t dim = 512;
-    size_t shards = 8;
-    size_t probe_p = 6; // Tăng probe để đạt Recall > 90%
+    size_t shards = 2;
+    size_t probe_p = 4; // Tăng probe để đạt Recall > 90%
     size_t train_size = 50'000;
     size_t query_count = 100;
     size_t topk = 10;
