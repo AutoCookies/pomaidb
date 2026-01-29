@@ -316,8 +316,9 @@ namespace pomai
                 throw std::runtime_error("WAL error: " + wal_error_msg_);
             if (!running_.load() || stop_requested_)
                 ThrowSys("WAL not running");
-            pending_bytes_ += buf->size();
-            pending_writes_.push_back(Pending{lsn, std::move(buf), buf->size()});
+            const std::size_t buf_bytes = buf->size();
+            pending_bytes_ += buf_bytes;
+            pending_writes_.push_back(Pending{lsn, std::move(buf), buf_bytes});
             cv_.notify_all();
         }
 
