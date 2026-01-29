@@ -1,4 +1,5 @@
 #include "membrane.h"
+#include "search_utils.h"
 #include "spatial_router.h"
 #include "search_fanout.h"
 #include "memory_manager.h"
@@ -361,7 +362,12 @@ namespace pomai
 
         const std::size_t shard_topk = std::max<std::size_t>(req.topk, req.topk * kShardCandidateMultiplier);
         SearchRequest shard_req = req;
+        shard_req.candidate_k = NormalizeCandidateK(req);
+        shard_req.max_rerank_k = NormalizeMaxRerankK(req);
+        shard_req.graph_ef = NormalizeGraphEf(req, shard_req.candidate_k);
         shard_req.topk = shard_topk;
+        if (shard_req.graph_ef > 0)
+            budget.ops_budget = shard_req.graph_ef;
         auto req_ptr = std::make_shared<SearchRequest>(std::move(shard_req));
 
         std::vector<std::future<SearchResponse>> futs;
@@ -390,6 +396,7 @@ namespace pomai
             merge_topk = std::make_unique<FixedTopK>(req.topk);
         merge_topk->Reset(req.topk);
 
+        std::size_t completed = 0;
         for (auto &f : futs)
         {
             if (f.wait_until(deadline) == std::future_status::ready)
@@ -399,6 +406,7 @@ namespace pomai
                     auto r = f.get();
                     for (const auto &item : r.items)
                         merge_topk->Push(item.score, item.id);
+                    ++completed;
                 }
                 catch (...)
                 {
@@ -409,10 +417,18 @@ namespace pomai
         {
             for (const auto &item : r.items)
                 merge_topk->Push(item.score, item.id);
+            ++completed;
         }
 
         SearchResponse out;
         merge_topk->FillSorted(out.items);
+        SortAndDedupeResults(out.items, req.topk);
+        const std::size_t total_targets = futs.size() + inline_responses.size();
+        if (completed < total_targets)
+        {
+            out.partial = true;
+            search_partial_.fetch_add(1, std::memory_order_relaxed);
+        }
         float lat = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
         brain_.observe_latency(lat);
 

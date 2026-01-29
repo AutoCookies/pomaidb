@@ -23,7 +23,7 @@ namespace pomai::core
         void BuildFromMove(std::vector<float> &&flat_data, std::vector<Id> &&flat_ids);
 
         // Thread-safe after Build() (read-only).
-        SearchResponse Search(const Vector &query, const pomai::ai::Budget &budget) const;
+        SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
 
         std::size_t TotalVectors() const noexcept { return total_vectors_.load(std::memory_order_acquire); }
         std::size_t Dim() const noexcept { return dim_; }
@@ -40,7 +40,7 @@ namespace pomai::core
         std::vector<std::uint32_t> FindNeighborsBuild(const float *vec, std::uint32_t curr_idx, std::size_t ef) const;
 
         // Search-time neighbor discovery (limits expansions by ops_budget)
-        std::vector<std::uint32_t> FindNeighborsSearch(const float *q, std::size_t ops_budget) const;
+        std::vector<std::uint32_t> FindNeighborsSearch(const float *q, std::size_t ef, std::size_t candidate_k) const;
 
         void Connect(std::uint32_t a, std::uint32_t b);
         void Prune(std::uint32_t node);

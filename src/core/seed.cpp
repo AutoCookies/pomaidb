@@ -1,4 +1,5 @@
 #include "seed.h"
+#include "search_utils.h"
 #include "cpu_kernels.h"
 #include "fixed_topk.h"
 #include "memory_manager.h"
@@ -557,6 +558,8 @@ namespace pomai
         SearchResponse resp;
         if (!snap || snap->dim == 0 || req.query.data.size() != snap->dim)
             return resp;
+        if (req.metric != Metric::L2)
+            return resp;
         const std::size_t dim = snap->dim;
         const std::size_t n = snap->ids.size();
         if (n == 0)
@@ -567,7 +570,8 @@ namespace pomai
             float qv = (snap->qscales[d] > 0.0f) ? ((req.query.data[d] - snap->qmins[d]) / snap->qscales[d]) : 0.0f;
             qquant[d] = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::nearbyint(qv)), 0, 255));
         }
-        FixedTopK candidate_topk(128);
+        const std::size_t candidate_k = NormalizeCandidateK(req);
+        FixedTopK candidate_topk(candidate_k);
         const std::uint8_t *qbase = snap->qdata.data();
         for (std::size_t row = 0; row < n; ++row)
         {
@@ -575,7 +579,9 @@ namespace pomai
             candidate_topk.Push(-d, static_cast<Id>(row));
         }
         FixedTopK final_topk(req.topk);
-        std::vector<float> dequant(dim);
+        thread_local std::vector<float, AlignedAllocator<float, 64>> dequant;
+        if (dequant.size() < dim)
+            dequant.resize(dim);
         const auto *candidates = candidate_topk.Data();
         for (std::size_t i = 0; i < candidate_topk.Size(); ++i)
         {
@@ -584,6 +590,7 @@ namespace pomai
             final_topk.Push(-kernels::L2Sqr(dequant.data(), req.query.data.data(), dim), snap->ids[cand_row]);
         }
         final_topk.FillSorted(resp.items);
+        SortAndDedupeResults(resp.items, req.topk);
         return resp;
     }
 }
