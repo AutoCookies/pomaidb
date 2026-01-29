@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <cstring>
+#include <unordered_set>
 
 namespace pomai
 {
@@ -102,13 +103,14 @@ namespace pomai
         using LocalQuantizeFn = void (*)(const float *, const float *, const float *, std::uint8_t *, std::size_t);
         static LocalQuantizeFn SelectKernelLocal()
         {
+            LocalQuantizeFn kernel = quantize_row_scalar;
 #if defined(__GNUC__) || defined(__clang__)
             if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw"))
-                return quantize_row_avx512;
-            if (__builtin_cpu_supports("avx2"))
-                return quantize_row_avx2;
+                kernel = quantize_row_avx512;
+            else if (__builtin_cpu_supports("avx2"))
+                kernel = quantize_row_avx2;
 #endif
-            return quantize_row_scalar;
+            return kernel;
         }
     }
 
@@ -371,6 +373,27 @@ namespace pomai
             }
         }
 
+        std::size_t new_rows = 0;
+        std::unordered_set<Id> pending_ids;
+        pending_ids.reserve(batch.size());
+        for (const auto &req : batch)
+        {
+            if (req.vec.data.size() != dim_)
+                continue;
+            if (pos_.find(req.id) == pos_.end() && pending_ids.insert(req.id).second)
+                ++new_rows;
+        }
+        if (new_rows > 0)
+        {
+            ReserveForAppend(new_rows);
+            const std::size_t target_rows = ids_.size() + new_rows;
+            if (qrows_ < target_rows)
+            {
+                qrows_ = target_rows;
+                qdata_.resize(qrows_ * dim_);
+            }
+        }
+
         std::size_t valid_rows = 0;
         for (const auto &req : batch)
         {
@@ -383,11 +406,6 @@ namespace pomai
                 row = static_cast<std::uint32_t>(ids_.size());
                 ids_.push_back(req.id);
                 pos_[req.id] = row;
-                if (qrows_ <= row)
-                {
-                    qrows_ = row + 1;
-                    qdata_.resize(qrows_ * dim_);
-                }
             }
             else
                 row = it->second;
@@ -443,20 +461,18 @@ namespace pomai
             return;
         if (snap->is_quantized.load(std::memory_order_acquire))
             return;
-        const std::size_t n = snap->ids.size();
-        const std::size_t dim = snap->dim;
-        if (n == 0)
+        if (!snap->qdata.empty())
+        {
+            snap->is_quantized.store(true, std::memory_order_release);
             return;
-        std::vector<float> inv(dim);
-        for (std::size_t d = 0; d < dim; ++d)
-            inv[d] = 1.0f / snap->qscales[d];
-        for (std::size_t r = 0; r < n; ++r)
-            quantize_row_impl_(nullptr, snap->qmins.data(), inv.data(), snap->qdata.data() + r * dim, dim);
+        }
         snap->is_quantized.store(true, std::memory_order_release);
     }
 
     void Seed::DequantizeRow(const Snapshot &snap, std::size_t row, float *out)
     {
+        if (!snap || !out || snap->qdata.empty() || snap->dim == 0 || row >= snap->ids.size())
+            return;
         const std::uint8_t *src = snap->qdata.data() + row * snap->dim;
         for (std::size_t d = 0; d < snap->dim; ++d)
             out[d] = snap->qmins[d] + snap->qscales[d] * static_cast<float>(src[d]);

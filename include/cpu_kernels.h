@@ -115,13 +115,6 @@ namespace pomai::kernels
         }
     }
 
-    /**
-     * @brief Computes squared L2 distance between two SQ8 quantized vectors.
-     * @param qdata Pointer to quantized vector (uint8_t per dimension).
-     * @param qquery Pointer to quantized query vector (uint8_t per dimension).
-     * @param dim Dimension of vectors.
-     * @return float Squared Euclidean distance.
-     */
     static inline float L2Sqr_SQ8_AVX2(const std::uint8_t *qdata,
                                       const std::uint8_t *qquery,
                                       std::size_t dim)
@@ -187,10 +180,6 @@ namespace pomai::kernels
         return static_cast<float>(total);
     }
 
-    /**
-     * @brief Computes squared L2 distances for a bucket of SQ8 vectors against a quantized query.
-     * Uses prefetching of the (i+4)-th vector to hide memory latency.
-     */
     static inline void ScanBucketSQ8_AVX2(const std::uint8_t *base,
                                           const std::uint8_t *qquery,
                                           std::size_t dim,

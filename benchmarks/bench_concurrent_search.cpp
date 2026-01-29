@@ -108,7 +108,7 @@ int main()
     searchers.reserve(search_threads);
     for (std::size_t t = 0; t < search_threads; ++t)
     {
-        searchers.emplace_back([&]()
+        searchers.emplace_back([&, t]()
                                {
                                    std::mt19937_64 rng(1000 + t);
                                    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);

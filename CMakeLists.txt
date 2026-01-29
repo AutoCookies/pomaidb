@@ -17,7 +17,7 @@ target_compile_features(pomai_compiler_flags INTERFACE cxx_std_20)
 if(MSVC)
     target_compile_options(pomai_compiler_flags INTERFACE /W4 /WX)
 else()
-    target_compile_options(pomai_compiler_flags INTERFACE -Wall -Wextra -Wpedantic)
+    target_compile_options(pomai_compiler_flags INTERFACE -Wall -Wextra -Wpedantic -mavx2 -mfma)
     if(CMAKE_BUILD_TYPE MATCHES Release)
         target_compile_options(pomai_compiler_flags INTERFACE -O3 -march=native -ffast-math -funroll-loops)
         # Kích hoạt Interprocedural Optimization (LTO) nếu trình biên dịch hỗ trợ
@@ -26,9 +26,22 @@ else()
         if(ipo_supported)
             set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
         endif()
+    elseif(CMAKE_BUILD_TYPE MATCHES RelWithDebInfo)
+        target_compile_options(pomai_compiler_flags INTERFACE -O2 -g3 -fno-omit-frame-pointer)
     else()
-        target_compile_options(pomai_compiler_flags INTERFACE -O0 -g -fno-omit-frame-pointer)
+        target_compile_options(pomai_compiler_flags INTERFACE -O1 -g3 -fno-omit-frame-pointer)
     endif()
+    target_link_options(pomai_compiler_flags INTERFACE -rdynamic)
+endif()
+
+set(POMAI_SANITIZE "" CACHE STRING "Enable sanitizers: ASAN_UBSAN or TSAN")
+set_property(CACHE POMAI_SANITIZE PROPERTY STRINGS "" ASAN_UBSAN TSAN)
+if(POMAI_SANITIZE STREQUAL "ASAN_UBSAN")
+    target_compile_options(pomai_compiler_flags INTERFACE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    target_link_options(pomai_compiler_flags INTERFACE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+elseif(POMAI_SANITIZE STREQUAL "TSAN")
+    target_compile_options(pomai_compiler_flags INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(pomai_compiler_flags INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
 endif()
 
 # --- 4. CORE LIBRARY (pomai_core) ---
@@ -38,6 +51,7 @@ set(CORE_SOURCES
     src/core/pomai_db.cpp
     src/core/shard.cpp
     src/core/wal.cpp
+    src/core/wal_uring.cpp
     src/core/seed.cpp
     src/core/spatial_router.cpp
     src/core/orbit_index.cpp
@@ -88,6 +102,7 @@ add_pomai_benchmark(bench_embedded benchmarks/bench_embedded.cpp)
 add_pomai_benchmark(bench_phase3 benchmarks/bench_phase3.cpp)
 add_pomai_benchmark(bench_concurrent benchmarks/bench_concurrent.cpp)
 add_pomai_benchmark(bench_concurrent_search benchmarks/bench_concurrent_search.cpp)
+add_pomai_benchmark(bench_wal bench/bench_wal.cpp)
 
 # --- 7. AUTOMATED TESTS ---
 option(BUILD_TESTING "Build the test suite" ON)
@@ -101,6 +116,8 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     endmacro()
 
     add_pomai_test(wal_unit_tests tests/wal_unit_tests.cpp)
+    add_pomai_test(wal_durable_tests tests/wal_durable_tests.cpp)
+    add_pomai_test(wal_concurrency_tests tests/wal_concurrency_tests.cpp)
     add_pomai_test(wal_integration_writer tests/wal_integration_writer.cpp)
     add_pomai_test(wal_replay_inspect tests/wal_replay_inspect.cpp)
     add_pomai_test(pomai_db_writer tests/pomai_db_writer.cpp)
@@ -108,4 +125,17 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_pomai_test(memory_safety_tests tests/memory_safety_tests.cpp)
     add_pomai_test(quantization_fixed_bounds_tests tests/quantization_fixed_bounds_tests.cpp)
     add_pomai_test(shard_concurrency_tests tests/shard_concurrency_tests.cpp)
+    add_pomai_test(wal_append_regression_tests tests/wal_append_regression_tests.cpp)
+    add_pomai_test(tsan_smoke_tests tests/tsan_smoke_tests.cpp)
+endif()
+
+# --- 8. TOOLS ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/wal_crash_test.cpp")
+    add_executable(wal_crash_test tools/wal_crash_test.cpp)
+    target_link_libraries(wal_crash_test PRIVATE pomai_core)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/repro_segfault.cpp")
+    add_executable(repro_segfault tools/repro_segfault.cpp)
+    target_link_libraries(repro_segfault PRIVATE pomai_core)
 endif()

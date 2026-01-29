@@ -16,6 +16,7 @@
 #include "fixed_topk.h"
 #include "cpu_kernels.h"
 #include "spatial_router.h"
+#include "pomai_assert.h"
 
 namespace pomai
 {
@@ -37,12 +38,15 @@ namespace pomai
             std::vector<Vector> out;
             if (!snap || snap->ids.empty())
                 return out;
+            if (!snap->is_quantized.load(std::memory_order_acquire) || snap->qdata.empty())
+                return out;
             const std::size_t n = snap->ids.size();
             const std::size_t dim = snap->dim;
             const std::size_t target = std::min(max_samples, n);
             out.reserve(target);
             std::vector<float> buf(dim);
             std::mt19937_64 rng(0x9e3779b97f4a7c15ULL);
+            std::uniform_int_distribution<std::size_t> dist;
             for (std::size_t row = 0; row < n; ++row)
             {
                 Seed::DequantizeRow(snap, row, buf.data());
@@ -54,10 +58,14 @@ namespace pomai
                 }
                 else
                 {
-                    std::uniform_int_distribution<std::size_t> dist(0, row);
-                    std::size_t pick = dist(rng);
+                    std::uniform_int_distribution<std::size_t> d(0, row);
+                    std::size_t pick = d(rng);
                     if (pick < target)
-                        out[pick].data = buf;
+                    {
+                        std::uniform_int_distribution<std::size_t> idx(0, target - 1);
+                        std::size_t j = pick % target;
+                        out[j].data = buf;
+                    }
                 }
             }
             return out;
@@ -204,14 +212,27 @@ namespace pomai
     {
         if (!snap || snap->ids.empty())
             return nullptr;
+        if (!snap->is_quantized.load(std::memory_order_acquire) || snap->qdata.empty())
+        {
+            if (log_info_)
+                log_info_("[" + name_ + "] BuildGrainIndex: snapshot not quantized, skipping index build");
+            return nullptr;
+        }
         const std::size_t n = snap->ids.size();
+        const std::size_t dim = snap->dim;
+        POMAI_ASSERT(snap->qmins.size() == dim && snap->qscales.size() == dim, "BuildGrainIndex quantization dim mismatch");
+        POMAI_ASSERT(snap->qdata.size() == n * dim, "BuildGrainIndex qdata size mismatch");
         const std::size_t k = TargetCentroidCount(n);
         if (k == 0)
             return nullptr;
         const std::size_t sample_cap = std::min<std::size_t>(n, 20000);
         std::vector<Vector> sample = SampleSnapshotVectors(snap, sample_cap);
         if (sample.empty())
+        {
+            if (log_info_)
+                log_info_("[" + name_ + "] BuildGrainIndex: no valid samples, skipping index build");
             return nullptr;
+        }
         std::vector<Vector> centroids;
         try
         {
@@ -223,7 +244,6 @@ namespace pomai
         }
         if (centroids.empty())
             return nullptr;
-        const std::size_t dim = snap->dim;
         std::vector<std::uint32_t> assignments(n);
         std::vector<std::uint32_t> counts(centroids.size(), 0);
         std::vector<float> buf(dim);
@@ -244,11 +264,8 @@ namespace pomai
             assignments[row] = static_cast<std::uint32_t>(best);
             counts[best]++;
         }
-        const std::size_t peak_rss = PeakRssBytes();
-        if (log_info_ && peak_rss > 0)
-            log_info_("[" + name_ + "] index build peak_rss_bytes=" + std::to_string(peak_rss));
         auto grains = std::make_shared<GrainIndex>();
-        grains->dim = dim;
+        grains->dim = snap->dim;
         grains->centroids = std::move(centroids);
         grains->offsets.resize(grains->centroids.size() + 1, 0);
         for (std::size_t c = 0; c < grains->centroids.size(); ++c)
@@ -264,6 +281,9 @@ namespace pomai
     {
         SearchResponse resp;
         const std::size_t dim = snap->dim;
+        POMAI_ASSERT(req.query.data.size() == dim, "SearchGrains query dim mismatch");
+        POMAI_ASSERT(grains.dim == dim, "SearchGrains grains dim mismatch");
+        POMAI_ASSERT(snap->qdata.size() == snap->ids.size() * dim, "SearchGrains qdata size mismatch");
         const std::size_t topk = std::min<std::size_t>(req.topk, 128);
         std::size_t probe = budget.bucket_budget > 0 ? budget.bucket_budget : std::min<std::size_t>(16, grains.centroids.size());
         probe = std::min({probe, grains.centroids.size(), (std::size_t)128});

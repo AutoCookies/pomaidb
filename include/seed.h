@@ -12,6 +12,7 @@
 
 namespace pomai
 {
+    // Aligned Allocator để đảm bảo tương thích AVX2/AVX-512
     template <typename T, std::size_t Alignment>
     struct AlignedAllocator
     {
@@ -48,6 +49,7 @@ namespace pomai
     class Seed
     {
     public:
+        // Dùng AlignedAllocator cho dữ liệu SQ8 để tránh Segfault khi Load SIMD
         using QData = std::vector<std::uint8_t, AlignedAllocator<std::uint8_t, 64>>;
 
         struct Store
@@ -79,6 +81,7 @@ namespace pomai
 
         static SearchResponse SearchSnapshot(const Snapshot &snap, const SearchRequest &req);
 
+        // Global Calibration Methods
         void SetFixedBounds(const std::vector<float> &mins, const std::vector<float> &maxs);
         void InheritBounds(const Seed &other);
         void SetFixedBoundsAfterCount(std::size_t count);
