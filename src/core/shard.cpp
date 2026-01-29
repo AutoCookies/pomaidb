@@ -62,19 +62,22 @@ namespace pomai
                         continue;
                     throw std::runtime_error("Disk write failed");
                 }
-                p += res;
-                rem -= res;
+                p += static_cast<size_t>(res);
+                rem -= static_cast<size_t>(res);
             }
         }
     }
 
     Shard::Shard(std::string name, std::size_t dim, std::size_t queue_cap, std::string wal_dir, LogFn info, LogFn error)
-        : name_(std::move(name)), wal_dir_(std::move(wal_dir)), wal_(name_, wal_dir_, dim), seed_(dim), ingest_q_(queue_cap), log_info_(std::move(info)), log_error_(std::move(error))
+        : name_(std::move(name)), wal_dir_(std::move(wal_dir)), wal_(name_, wal_dir_, dim), seed_(dim), ingest_q_(queue_cap), build_pool_(nullptr), log_info_(std::move(info)), log_error_(std::move(error))
     {
         live_snap_ = seed_.MakeSnapshot();
     }
 
-    Shard::~Shard() { Stop(); }
+    Shard::~Shard()
+    {
+        Stop();
+    }
 
     void Shard::Start()
     {
@@ -106,7 +109,10 @@ namespace pomai
         wal_.Stop();
     }
 
-    std::size_t Shard::ApproxCountUnsafe() const { return seed_.Count(); }
+    std::size_t Shard::ApproxCountUnsafe() const
+    {
+        return seed_.Count();
+    }
 
     std::future<Lsn> Shard::EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable)
     {
@@ -186,7 +192,6 @@ namespace pomai
         }
         if (centroids.empty())
             return nullptr;
-
         const std::size_t dim = snap->dim;
         std::vector<std::uint32_t> assignments(n);
         std::vector<std::uint32_t> counts(centroids.size(), 0);
@@ -194,11 +199,9 @@ namespace pomai
         {
             float best_d = std::numeric_limits<float>::infinity();
             std::size_t best = 0;
-            std::vector<float> dequant(dim);
-            Seed::DequantizeRow(snap, row, dequant.data());
             for (std::size_t c = 0; c < centroids.size(); ++c)
             {
-                float d = kernels::L2Sqr(dequant.data(), centroids[c].data.data(), dim);
+                float d = kernels::L2Sqr(data[row].data.data(), centroids[c].data.data(), dim);
                 if (d < best_d)
                 {
                     best_d = d;
@@ -208,7 +211,17 @@ namespace pomai
             assignments[row] = static_cast<std::uint32_t>(best);
             counts[best]++;
         }
-
+        std::vector<float> global_mins(dim, std::numeric_limits<float>::infinity());
+        std::vector<float> global_maxs(dim, -std::numeric_limits<float>::infinity());
+        for (const auto &v : data)
+        {
+            for (std::size_t d = 0; d < dim; ++d)
+            {
+                global_mins[d] = std::min(global_mins[d], v.data[d]);
+                global_maxs[d] = std::max(global_maxs[d], v.data[d]);
+            }
+        }
+        const_cast<Seed &>(seed_).SetFixedBounds(global_mins, global_maxs);
         auto grains = std::make_shared<GrainIndex>();
         grains->dim = dim;
         grains->centroids = std::move(centroids);
@@ -226,29 +239,22 @@ namespace pomai
     {
         SearchResponse resp;
         const std::size_t dim = snap->dim;
-        const std::size_t n = snap->ids.size();
-        const std::size_t topk = std::min<std::size_t>(req.topk, kOversample);
+        const std::size_t topk = std::min<std::size_t>(req.topk, 128);
         std::size_t probe = budget.bucket_budget > 0 ? budget.bucket_budget : std::min<std::size_t>(16, grains.centroids.size());
-        probe = std::min({probe, grains.centroids.size(), kMaxProbe});
-
+        probe = std::min({probe, grains.centroids.size(), (std::size_t)128});
         FixedTopK centroid_topk(probe);
         for (std::size_t c = 0; c < grains.centroids.size(); ++c)
         {
             float d = kernels::L2Sqr(req.query.data.data(), grains.centroids[c].data.data(), dim);
             centroid_topk.Push(-d, static_cast<Id>(c));
         }
-
-        if (snap->qdata.empty())
-            return Seed::SearchSnapshot(snap, req);
-
         std::vector<std::uint8_t> qquant(dim);
         for (std::size_t d = 0; d < dim; ++d)
         {
             float qv = (snap->qscales[d] > 0.0f) ? ((req.query.data[d] - snap->qmins[d]) / snap->qscales[d]) : 0.0f;
-            qquant[d] = static_cast<std::uint8_t>(std::clamp<int>(std::nearbyint(qv), 0, 255));
+            qquant[d] = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::nearbyint(qv)), 0, 255));
         }
-
-        FixedTopK candidates(kOversample);
+        FixedTopK candidates(128);
         const auto *c_data = centroid_topk.Data();
         for (std::size_t i = 0; i < centroid_topk.Size(); ++i)
         {
@@ -256,21 +262,17 @@ namespace pomai
             for (std::size_t j = grains.offsets[c]; j < grains.offsets[c + 1]; ++j)
             {
                 std::size_t row = grains.postings[j];
-                if (j + 4 < grains.offsets[c + 1])
-                    _mm_prefetch(reinterpret_cast<const char *>(snap->qdata.data() + grains.postings[j + 4] * dim), _MM_HINT_T0);
-                float d = kernels::L2Sqr_SQ8_AVX2(snap->qdata.data() + row * dim, qquant, dim);
+                float d = kernels::L2Sqr_SQ8_AVX2(snap->qdata.data() + row * dim, qquant.data(), dim);
                 candidates.Push(-d, static_cast<Id>(row));
             }
         }
-
         FixedTopK final_topk(topk);
         std::vector<float> dequant(dim);
         for (std::size_t i = 0; i < candidates.Size(); ++i)
         {
             std::size_t row = static_cast<std::size_t>(candidates.Data()[i].id);
             Seed::DequantizeRow(snap, row, dequant.data());
-            float d = kernels::L2Sqr(dequant.data(), req.query.data.data(), dim);
-            final_topk.Push(-d, snap->ids[row]);
+            final_topk.Push(-kernels::L2Sqr(dequant.data(), req.query.data.data(), dim), snap->ids[row]);
         }
         final_topk.FillSorted(resp.items);
         return resp;
@@ -306,7 +308,6 @@ namespace pomai
         else if (live)
             lr = Seed::SearchSnapshot(live, req);
         MergeTopK(out, lr, req.topk);
-
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > 40)
             const_cast<Shard *>(this)->RequestEmergencyFreeze();
         return out;
@@ -406,7 +407,9 @@ namespace pomai
                                     }};
             build_pool_->Enqueue(std::move(job));
         }
-        seed_ = Seed(seed_.Dim());
+        Seed next_seed(seed_.Dim());
+        next_seed.InheritBounds(seed_);
+        seed_ = std::move(next_seed);
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             live_snap_ = seed_.MakeSnapshot();
@@ -421,28 +424,28 @@ namespace pomai
         {
             segments_[pos].index = std::move(idx);
             segments_[pos].grains = std::move(grains);
+            segments_[pos].snap.reset();
         }
     }
 
     std::vector<Vector> Shard::SampleVectors(std::size_t max_samples) const
     {
         std::vector<Seed::Snapshot> snaps;
-        Seed::Snapshot live;
         {
             std::lock_guard<std::mutex> lk(state_mu_);
             for (const auto &s : segments_)
                 if (s.snap)
                     snaps.push_back(s.snap);
-            live = seed_.MakeSnapshot();
+            snaps.push_back(seed_.MakeSnapshot());
         }
         std::vector<Vector> res;
         res.reserve(std::min(max_samples, (std::size_t)2000));
         std::mt19937_64 rng(std::random_device{}());
         std::size_t seen = 0;
-        auto process = [&](const Seed::Snapshot &s)
+        for (const auto &s : snaps)
         {
             if (!s)
-                return;
+                continue;
             for (std::size_t i = 0; i < s->ids.size(); ++i)
             {
                 seen++;
@@ -458,17 +461,10 @@ namespace pomai
                     std::uniform_int_distribution<std::size_t> d(0, seen - 1);
                     std::size_t j = d(rng);
                     if (j < max_samples)
-                    {
-                        if (res[j].data.size() != s->dim)
-                            res[j].data.resize(s->dim);
                         Seed::DequantizeRow(s, i, res[j].data.data());
-                    }
                 }
             }
-        };
-        for (const auto &s : snaps)
-            process(s);
-        process(live);
+        }
         return res;
     }
 }

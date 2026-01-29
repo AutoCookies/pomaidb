@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <new>
+#include <algorithm>
 #include "types.h"
 
 namespace pomai
@@ -16,8 +17,13 @@ namespace pomai
     {
         using value_type = T;
 
-        AlignedAllocator() noexcept = default;
+        template <typename U>
+        struct rebind
+        {
+            using other = AlignedAllocator<U, Alignment>;
+        };
 
+        AlignedAllocator() noexcept = default;
         template <typename U>
         AlignedAllocator(const AlignedAllocator<U, Alignment> &) noexcept {}
 
@@ -31,23 +37,13 @@ namespace pomai
             return static_cast<T *>(ptr);
         }
 
-        void deallocate(T *p, std::size_t) noexcept
-        {
-            std::free(p);
-        }
+        void deallocate(T *p, std::size_t) noexcept { std::free(p); }
     };
 
-    template <typename T, std::size_t Alignment, typename U, std::size_t AlignmentU>
-    bool operator==(const AlignedAllocator<T, Alignment> &, const AlignedAllocator<U, AlignmentU> &) noexcept
-    {
-        return Alignment == AlignmentU;
-    }
-
-    template <typename T, std::size_t Alignment, typename U, std::size_t AlignmentU>
-    bool operator!=(const AlignedAllocator<T, Alignment> &, const AlignedAllocator<U, AlignmentU> &) noexcept
-    {
-        return Alignment != AlignmentU;
-    }
+    template <typename T, std::size_t A, typename U, std::size_t B>
+    bool operator==(const AlignedAllocator<T, A> &, const AlignedAllocator<U, B> &) noexcept { return A == B; }
+    template <typename T, std::size_t A, typename U, std::size_t B>
+    bool operator!=(const AlignedAllocator<T, A> &, const AlignedAllocator<U, B> &) noexcept { return A != B; }
 
     class Seed
     {
@@ -75,13 +71,16 @@ namespace pomai
         ~Seed();
 
         void ApplyUpserts(const std::vector<UpsertRequest> &batch);
-
         Snapshot MakeSnapshot() const;
+
         static void Quantize(Snapshot snap);
         static void DequantizeRow(const Snapshot &snap, std::size_t row, float *out);
         static std::vector<float> DequantizeSnapshot(const Snapshot &snap);
 
         static SearchResponse SearchSnapshot(const Snapshot &snap, const SearchRequest &req);
+
+        void SetFixedBounds(const std::vector<float> &mins, const std::vector<float> &maxs);
+        void InheritBounds(const Seed &other);
 
         std::size_t Count() const { return ids_.size(); }
         std::size_t Dim() const { return dim_; }
@@ -97,8 +96,28 @@ namespace pomai
         std::unordered_map<Id, std::uint32_t> pos_;
         std::size_t accounted_bytes_{0};
 
+        std::size_t qrows_{0};
+        std::size_t qcap_{0};
+
+        std::vector<float> sample_buf_;
+        std::vector<Id> sample_ids_;
+        std::size_t sample_rows_{0};
+        std::size_t sample_threshold_{4096};
+        bool calibrated_{false};
+        bool is_fixed_{false};
+
         void ReserveForAppend(std::size_t add_rows);
         void UpdateMemtableAccounting();
         void ReleaseMemtableAccounting();
+        void EnsureCalibration();
+        void FinalizeCalibrationAndQuantizeSamples();
+        void RescaleAll(const std::vector<float> &new_mins, const std::vector<float> &new_scales);
+
+        using QuantizeRowFn = void (*)(const float *src, const float *mins, const float *inv_scales, std::uint8_t *dst, std::size_t dim);
+        static QuantizeRowFn quantize_row_impl_;
+        static void InitQuantizeDispatch();
+
+        static std::uint8_t *AlignedAllocBytes(std::size_t bytes);
+        static void AlignedFreeBytes(std::uint8_t *p);
     };
 }
