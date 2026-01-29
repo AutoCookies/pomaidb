@@ -93,7 +93,12 @@ namespace pomai
     Shard::Shard(std::string name, std::size_t dim, std::size_t queue_cap, std::string wal_dir, LogFn info, LogFn error)
         : name_(std::move(name)), wal_dir_(std::move(wal_dir)), wal_(name_, wal_dir_, dim), seed_(dim), ingest_q_(queue_cap), build_pool_(nullptr), log_info_(std::move(info)), log_error_(std::move(error))
     {
-        live_snap_ = seed_.MakeSnapshot();
+        auto live_snap = seed_.MakeSnapshot();
+        auto live_grains = BuildGrainIndex(live_snap);
+        auto next = std::make_shared<ShardState>();
+        next->live_snap = std::move(live_snap);
+        next->live_grains = std::move(live_grains);
+        PublishState(std::move(next));
     }
 
     Shard::~Shard()
@@ -112,12 +117,12 @@ namespace pomai
         catch (...)
         {
         }
-        {
-            std::lock_guard<std::mutex> lk(state_mu_);
-            live_snap_ = seed_.MakeSnapshot();
-            live_grains_ = BuildGrainIndex(live_snap_);
-            PublishSnapshotLocked();
-        }
+        auto live_snap = seed_.MakeSnapshot();
+        auto live_grains = BuildGrainIndex(live_snap);
+        auto next = std::make_shared<ShardState>();
+        next->live_snap = std::move(live_snap);
+        next->live_grains = std::move(live_grains);
+        PublishState(std::move(next));
         if (seed_.Count() > 0)
             MaybeFreezeSegment();
         wal_.Start();
@@ -303,7 +308,7 @@ namespace pomai
     SearchResponse Shard::Search(const SearchRequest &req, const pomai::ai::Budget &budget) const
     {
         const auto start = std::chrono::steady_clock::now();
-        auto snapshot = current_snapshot_.load(std::memory_order_acquire);
+        auto snapshot = state_.load(std::memory_order_acquire);
         SearchResponse out;
         if (!snapshot)
             return out;
@@ -390,10 +395,12 @@ namespace pomai
                     since_live_publish_ = 0;
                     auto s = seed_.MakeSnapshot();
                     auto g = BuildGrainIndex(s);
-                    std::lock_guard<std::mutex> lk(state_mu_);
-                    live_snap_ = std::move(s);
-                    live_grains_ = std::move(g);
-                    PublishSnapshotLocked();
+                    std::lock_guard<std::mutex> lk(writer_mu_);
+                    auto prev = state_.load(std::memory_order_acquire);
+                    auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
+                    next->live_snap = std::move(s);
+                    next->live_grains = std::move(g);
+                    PublishState(std::move(next));
                 }
                 if (task.wait_durable)
                     wal_.WaitDurable(lsn);
@@ -414,10 +421,12 @@ namespace pomai
             return;
         std::size_t pos;
         {
-            std::lock_guard<std::mutex> lk(state_mu_);
-            segments_.push_back({snap, nullptr, nullptr});
-            pos = segments_.size() - 1;
-            PublishSnapshotLocked();
+            std::lock_guard<std::mutex> lk(writer_mu_);
+            auto prev = state_.load(std::memory_order_acquire);
+            auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
+            next->segments.push_back({snap, nullptr, nullptr});
+            pos = next->segments.size() - 1;
+            PublishState(std::move(next));
         }
         if (build_pool_)
         {
@@ -431,45 +440,48 @@ namespace pomai
         Seed next_seed(seed_.Dim());
         next_seed.InheritBounds(seed_);
         seed_ = std::move(next_seed);
+        auto live_snap = seed_.MakeSnapshot();
         {
-            std::lock_guard<std::mutex> lk(state_mu_);
-            live_snap_ = seed_.MakeSnapshot();
-            live_grains_ = nullptr;
-            PublishSnapshotLocked();
+            std::lock_guard<std::mutex> lk(writer_mu_);
+            auto prev = state_.load(std::memory_order_acquire);
+            auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
+            next->live_snap = std::move(live_snap);
+            next->live_grains.reset();
+            PublishState(std::move(next));
         }
     }
 
     void Shard::AttachIndex(std::size_t pos, Seed::Snapshot snap, std::shared_ptr<pomai::core::OrbitIndex> idx, std::shared_ptr<GrainIndex> grains)
     {
-        std::lock_guard<std::mutex> lk(state_mu_);
-        if (pos < segments_.size() && segments_[pos].snap == snap)
-        {
-            segments_[pos].index = std::move(idx);
-            segments_[pos].grains = std::move(grains);
-            segments_[pos].snap.reset();
-            PublishSnapshotLocked();
-        }
+        std::lock_guard<std::mutex> lk(writer_mu_);
+        auto prev = state_.load(std::memory_order_acquire);
+        if (!prev)
+            return;
+        if (pos >= prev->segments.size() || prev->segments[pos].snap != snap)
+            return;
+        auto next = std::make_shared<ShardState>(*prev);
+        next->segments[pos].index = std::move(idx);
+        next->segments[pos].grains = std::move(grains);
+        next->segments[pos].snap.reset();
+        PublishState(std::move(next));
     }
 
-    void Shard::PublishSnapshotLocked()
+    void Shard::PublishState(std::shared_ptr<const ShardState> next)
     {
-        auto next = std::make_shared<SnapshotState>();
-        next->segments = segments_;
-        next->live_snap = live_snap_;
-        next->live_grains = live_grains_;
-        current_snapshot_.store(std::move(next), std::memory_order_release);
+        state_.store(std::move(next), std::memory_order_release);
     }
 
     std::vector<Vector> Shard::SampleVectors(std::size_t max_samples) const
     {
         std::vector<Seed::Snapshot> snaps;
-        {
-            std::lock_guard<std::mutex> lk(state_mu_);
-            for (const auto &s : segments_)
-                if (s.snap)
-                    snaps.push_back(s.snap);
-            snaps.push_back(seed_.MakeSnapshot());
-        }
+        auto snapshot = state_.load(std::memory_order_acquire);
+        if (!snapshot)
+            return {};
+        for (const auto &s : snapshot->segments)
+            if (s.snap)
+                snaps.push_back(s.snap);
+        if (snapshot->live_snap)
+            snaps.push_back(snapshot->live_snap);
         std::vector<Vector> res;
         res.reserve(std::min(max_samples, (std::size_t)2000));
         std::mt19937_64 rng(std::random_device{}());
