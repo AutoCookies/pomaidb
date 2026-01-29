@@ -145,21 +145,12 @@ namespace pomai
                     active_builds_.fetch_add(1, std::memory_order_release);
                 }
 
-                // Build index outside lock
                 auto idx = std::make_shared<pomai::core::OrbitIndex>(
                     job.snap->dim, job.M, job.ef_construction);
-                std::vector<float> moved_data;
-                std::vector<Id> moved_ids;
-                if (Seed::TryDetachSnapshot(job.snap, moved_data, moved_ids))
-                {
-                    idx->BuildFromMove(std::move(moved_data), std::move(moved_ids));
-                }
-                else
-                {
-                    idx->Build(job.snap->data, job.snap->ids);
-                }
+                std::vector<float> data = Seed::DequantizeSnapshot(job.snap);
+                std::vector<Id> ids = job.snap->ids;
+                idx->BuildFromMove(std::move(data), std::move(ids));
 
-                // Attach callback
                 job.attach(job.segment_pos, job.snap, std::move(idx));
 
                 active_builds_.fetch_sub(1, std::memory_order_release);
