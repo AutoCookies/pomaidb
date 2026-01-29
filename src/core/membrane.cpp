@@ -184,6 +184,7 @@ namespace pomai
 
     void MembraneRouter::Start()
     {
+        completion_.Start();
         if (centroids_load_mode_ != CentroidsLoadMode::None && centroids_load_mode_ != CentroidsLoadMode::Async)
         {
             if (!centroids_path_.empty() && FileExists(centroids_path_))
@@ -208,6 +209,7 @@ namespace pomai
         for (auto &s : shards_)
             s->Stop();
         search_pool_.Stop();
+        completion_.Stop();
     }
 
     std::size_t MembraneRouter::PickShardById(Id id) const
@@ -283,19 +285,26 @@ namespace pomai
 
         std::promise<Lsn> done;
         auto out = done.get_future();
-        std::thread([futs = std::move(futs), done = std::move(done)]() mutable
-                    {
+        auto task = [futs = std::move(futs), done = std::move(done)]() mutable
+        {
             Lsn max_lsn = 0;
-            try {
-                for (auto& f : futs) {
+            try
+            {
+                for (auto &f : futs)
+                {
                     Lsn l = f.get();
-                    if (l > max_lsn) max_lsn = l;
+                    if (l > max_lsn)
+                        max_lsn = l;
                 }
                 done.set_value(max_lsn);
-            } catch (...) {
+            }
+            catch (...)
+            {
                 done.set_exception(std::current_exception());
-            } })
-            .detach();
+            }
+        };
+        if (!completion_.Enqueue(std::move(task)))
+            task();
 
         return out;
     }
@@ -311,6 +320,7 @@ namespace pomai
     SearchResponse MembraneRouter::Search(const SearchRequest &req) const
     {
         auto start = std::chrono::steady_clock::now();
+        auto deadline = start + std::chrono::milliseconds(search_timeout_ms_);
         auto budget = brain_.compute_budget(false);
         auto health = brain_.health();
         std::size_t adaptive_probe = probe_P_;
@@ -355,6 +365,7 @@ namespace pomai
         auto req_ptr = std::make_shared<SearchRequest>(std::move(shard_req));
 
         std::vector<std::future<SearchResponse>> futs;
+        std::vector<SearchResponse> inline_responses;
         for (auto sid : target_ids)
         {
             Shard *sh_ptr = shards_[sid].get();
@@ -365,6 +376,12 @@ namespace pomai
             }
             catch (...)
             {
+                search_overload_.fetch_add(1, std::memory_order_relaxed);
+                if (std::chrono::steady_clock::now() < deadline)
+                {
+                    inline_responses.push_back(sh_ptr->Search(*req_ptr, budget));
+                    search_inline_.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
 
@@ -373,15 +390,25 @@ namespace pomai
             merge_topk = std::make_unique<FixedTopK>(req.topk);
         merge_topk->Reset(req.topk);
 
-        const auto timeout = std::chrono::milliseconds(search_timeout_ms_);
         for (auto &f : futs)
         {
-            if (f.wait_for(timeout) == std::future_status::ready)
+            if (f.wait_until(deadline) == std::future_status::ready)
             {
-                auto r = f.get();
-                for (const auto &item : r.items)
-                    merge_topk->Push(item.score, item.id);
+                try
+                {
+                    auto r = f.get();
+                    for (const auto &item : r.items)
+                        merge_topk->Push(item.score, item.id);
+                }
+                catch (...)
+                {
+                }
             }
+        }
+        for (const auto &r : inline_responses)
+        {
+            for (const auto &item : r.items)
+                merge_topk->Push(item.score, item.id);
         }
 
         SearchResponse out;
@@ -415,13 +442,27 @@ namespace pomai
             futs.push_back(s->RequestCheckpoint());
         std::promise<bool> done;
         auto out = done.get_future();
-        std::thread([futs = std::move(futs), done = std::move(done)]() mutable
+        auto task = [futs = std::move(futs), done = std::move(done)]() mutable
+        {
+            try
+            {
+                for (auto &f : futs)
+                {
+                    if (!f.get())
                     {
-            try {
-                for (auto &f : futs) if (!f.get()) { done.set_value(false); return; }
+                        done.set_value(false);
+                        return;
+                    }
+                }
                 done.set_value(true);
-            } catch (...) { done.set_exception(std::current_exception()); } })
-            .detach();
+            }
+            catch (...)
+            {
+                done.set_exception(std::current_exception());
+            }
+        };
+        if (!completion_.Enqueue(std::move(task)))
+            task();
         return out;
     }
 
@@ -442,6 +483,10 @@ namespace pomai
     }
     std::vector<Vector> MembraneRouter::SnapshotCentroids() const { return router_.SnapshotCentroids(); }
     bool MembraneRouter::HasCentroids() const { return !router_.SnapshotCentroids().empty(); }
+    bool MembraneRouter::ScheduleCompletion(std::function<void()> fn, std::chrono::steady_clock::duration delay)
+    {
+        return completion_.Enqueue(std::move(fn), delay);
+    }
 
     bool MembraneRouter::ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples)
     {
@@ -449,6 +494,14 @@ namespace pomai
             return false;
         const std::size_t S = shards_.size();
         std::size_t sample_size = std::clamp<std::size_t>(total_samples, 50000, 200000);
+        auto &mm = MemoryManager::Instance();
+        const std::size_t total = mm.TotalUsage();
+        const std::size_t hard = mm.HardWatermarkBytes();
+        const std::size_t avail = (hard > total) ? (hard - total) : 0;
+        const std::size_t max_samples_by_mem = (dim_ > 0) ? (avail / (dim_ * sizeof(float))) : 0;
+        if (max_samples_by_mem == 0)
+            return false;
+        sample_size = std::min(sample_size, max_samples_by_mem);
         std::vector<std::future<std::vector<Vector>>> futs;
         for (std::size_t i = 0; i < S; ++i)
         {

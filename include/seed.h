@@ -63,7 +63,8 @@ namespace pomai
             std::atomic<bool> is_quantized{false};
         };
 
-        using Snapshot = std::shared_ptr<Store>;
+        using Snapshot = std::shared_ptr<const Store>;
+        using MutableSnapshot = std::shared_ptr<Store>;
 
         explicit Seed(std::size_t dim);
         Seed(const Seed &other);
@@ -75,9 +76,10 @@ namespace pomai
         void ApplyUpserts(const std::vector<UpsertRequest> &batch);
         Snapshot MakeSnapshot() const;
 
-        static void Quantize(Snapshot snap);
+        static void Quantize(MutableSnapshot snap);
         static void DequantizeRow(const Snapshot &snap, std::size_t row, float *out);
         static std::vector<float> DequantizeSnapshot(const Snapshot &snap);
+        static std::vector<float> DequantizeSnapshotBounded(const Snapshot &snap, std::size_t max_bytes);
 
         static SearchResponse SearchSnapshot(const Snapshot &snap, const SearchRequest &req);
 

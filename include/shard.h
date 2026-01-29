@@ -79,11 +79,13 @@ namespace pomai
         void RunLoop();
         void MaybeFreezeSegment();
         void PublishState(std::shared_ptr<const ShardState> next);
+        void ScheduleLiveGrainBuild(const Seed::Snapshot &snap);
 
         void AttachIndex(std::size_t segment_pos,
                          Seed::Snapshot snap,
                          std::shared_ptr<pomai::core::OrbitIndex> idx,
                          std::shared_ptr<GrainIndex> grains = nullptr);
+        void AttachLiveGrains(Seed::Snapshot snap, std::shared_ptr<GrainIndex> grains);
 
         static void MergeTopK(SearchResponse &out, const SearchResponse &in, std::size_t k);
         std::shared_ptr<GrainIndex> BuildGrainIndex(const Seed::Snapshot &snap) const;
@@ -103,6 +105,7 @@ namespace pomai
         std::thread owner_;
         static constexpr std::size_t kFreezeEveryVectors = 50000;
         std::size_t since_freeze_{0};
+        static constexpr std::size_t kMaxSegments = 64;
         static constexpr std::size_t kPublishLiveEveryVectors = 10000;
         std::size_t since_live_publish_{0};
         std::atomic<bool> emergency_freeze_pending_{false};

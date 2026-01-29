@@ -442,7 +442,15 @@ namespace pomai
 
     Seed::Snapshot Seed::MakeSnapshot() const
     {
-        auto out = std::make_shared<Store>();
+        auto deleter = [](Store *store)
+        {
+            if (!store)
+                return;
+            if (store->accounted_bytes > 0)
+                MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Search, store->accounted_bytes);
+            delete store;
+        };
+        std::shared_ptr<Store> out(new Store(), deleter);
         out->dim = dim_;
         out->ids = ids_;
         out->qdata = qdata_;
@@ -452,10 +460,10 @@ namespace pomai
         out->accounted_bytes = out->ids.size() * sizeof(Id) + out->qdata.size() * sizeof(std::uint8_t) + (out->qmins.size() + out->qscales.size()) * sizeof(float);
         if (out->accounted_bytes > 0)
             MemoryManager::Instance().AddUsage(MemoryManager::Pool::Search, out->accounted_bytes);
-        return out;
+        return std::const_pointer_cast<const Store>(out);
     }
 
-    void Seed::Quantize(Snapshot snap)
+    void Seed::Quantize(MutableSnapshot snap)
     {
         if (!snap)
             return;
@@ -482,8 +490,22 @@ namespace pomai
     {
         if (!snap || snap->ids.empty())
             return {};
+        auto &mm = MemoryManager::Instance();
+        const std::size_t total = mm.TotalUsage();
+        const std::size_t hard = mm.HardWatermarkBytes();
+        const std::size_t budget = (hard > total) ? (hard - total) : 0;
+        return DequantizeSnapshotBounded(snap, budget);
+    }
+
+    std::vector<float> Seed::DequantizeSnapshotBounded(const Snapshot &snap, std::size_t max_bytes)
+    {
+        if (!snap || snap->ids.empty())
+            return {};
         const std::size_t n = snap->ids.size();
         const std::size_t dim = snap->dim;
+        const std::size_t bytes = n * dim * sizeof(float);
+        if (bytes > max_bytes || !MemoryManager::Instance().CanAllocate(bytes))
+            return {};
         std::vector<float> out(n * dim);
         for (std::size_t r = 0; r < n; ++r)
             DequantizeRow(snap, r, out.data() + r * dim);

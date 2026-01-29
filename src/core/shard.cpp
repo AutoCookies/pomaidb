@@ -17,6 +17,7 @@
 #include "cpu_kernels.h"
 #include "spatial_router.h"
 #include "pomai_assert.h"
+#include "memory_manager.h"
 
 namespace pomai
 {
@@ -102,11 +103,11 @@ namespace pomai
         : name_(std::move(name)), wal_dir_(std::move(wal_dir)), wal_(name_, wal_dir_, dim), seed_(dim), ingest_q_(queue_cap), build_pool_(nullptr), log_info_(std::move(info)), log_error_(std::move(error))
     {
         auto live_snap = seed_.MakeSnapshot();
-        auto live_grains = BuildGrainIndex(live_snap);
         auto next = std::make_shared<ShardState>();
-        next->live_snap = std::move(live_snap);
-        next->live_grains = std::move(live_grains);
+        next->live_snap = live_snap;
+        next->live_grains.reset();
         PublishState(std::move(next));
+        ScheduleLiveGrainBuild(live_snap);
     }
 
     Shard::~Shard()
@@ -126,11 +127,11 @@ namespace pomai
         {
         }
         auto live_snap = seed_.MakeSnapshot();
-        auto live_grains = BuildGrainIndex(live_snap);
         auto next = std::make_shared<ShardState>();
-        next->live_snap = std::move(live_snap);
-        next->live_grains = std::move(live_grains);
+        next->live_snap = live_snap;
+        next->live_grains.reset();
         PublishState(std::move(next));
+        ScheduleLiveGrainBuild(live_snap);
         if (seed_.Count() > 0)
             MaybeFreezeSegment();
         wal_.Start();
@@ -225,7 +226,15 @@ namespace pomai
         const std::size_t k = TargetCentroidCount(n);
         if (k == 0)
             return nullptr;
-        const std::size_t sample_cap = std::min<std::size_t>(n, 20000);
+        std::size_t sample_cap = std::min<std::size_t>(n, 20000);
+        auto &mm = MemoryManager::Instance();
+        const std::size_t total = mm.TotalUsage();
+        const std::size_t hard = mm.HardWatermarkBytes();
+        const std::size_t avail = (hard > total) ? (hard - total) : 0;
+        const std::size_t max_samples_by_mem = (dim > 0) ? (avail / (dim * sizeof(float))) : 0;
+        if (max_samples_by_mem == 0)
+            return nullptr;
+        sample_cap = std::min(sample_cap, max_samples_by_mem);
         std::vector<Vector> sample = SampleSnapshotVectors(snap, sample_cap);
         if (sample.empty())
         {
@@ -414,13 +423,15 @@ namespace pomai
                 {
                     since_live_publish_ = 0;
                     auto s = seed_.MakeSnapshot();
-                    auto g = BuildGrainIndex(s);
-                    std::lock_guard<std::mutex> lk(writer_mu_);
-                    auto prev = state_.load(std::memory_order_acquire);
-                    auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
-                    next->live_snap = std::move(s);
-                    next->live_grains = std::move(g);
-                    PublishState(std::move(next));
+                    {
+                        std::lock_guard<std::mutex> lk(writer_mu_);
+                        auto prev = state_.load(std::memory_order_acquire);
+                        auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
+                        next->live_snap = s;
+                        next->live_grains.reset();
+                        PublishState(std::move(next));
+                    }
+                    ScheduleLiveGrainBuild(s);
                 }
                 if (task.wait_durable)
                     wal_.WaitDurable(lsn);
@@ -439,6 +450,13 @@ namespace pomai
         auto snap = seed_.MakeSnapshot();
         if (!snap || snap->ids.empty())
             return;
+        auto current = state_.load(std::memory_order_acquire);
+        if (current && current->segments.size() >= kMaxSegments)
+        {
+            if (log_error_)
+                log_error_("[" + name_ + "] segment cap reached, skipping freeze to bound segment count");
+            return;
+        }
         std::size_t pos;
         {
             std::lock_guard<std::mutex> lk(writer_mu_);
@@ -465,10 +483,30 @@ namespace pomai
             std::lock_guard<std::mutex> lk(writer_mu_);
             auto prev = state_.load(std::memory_order_acquire);
             auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
-            next->live_snap = std::move(live_snap);
+            next->live_snap = live_snap;
             next->live_grains.reset();
             PublishState(std::move(next));
         }
+        ScheduleLiveGrainBuild(live_snap);
+    }
+
+    void Shard::ScheduleLiveGrainBuild(const Seed::Snapshot &snap)
+    {
+        if (!snap)
+            return;
+        if (!build_pool_)
+        {
+            if (log_info_)
+                log_info_("[" + name_ + "] ScheduleLiveGrainBuild: no build pool, skipping live grains build");
+            return;
+        }
+        bool queued = build_pool_->EnqueueTask([this, snap]()
+                                               {
+                                                   auto grains = BuildGrainIndex(snap);
+                                                   AttachLiveGrains(snap, std::move(grains));
+                                               });
+        if (!queued && log_info_)
+            log_info_("[" + name_ + "] ScheduleLiveGrainBuild: queue full, skipping live grains build");
     }
 
     void Shard::AttachIndex(std::size_t pos, Seed::Snapshot snap, std::shared_ptr<pomai::core::OrbitIndex> idx, std::shared_ptr<GrainIndex> grains)
@@ -483,6 +521,19 @@ namespace pomai
         next->segments[pos].index = std::move(idx);
         next->segments[pos].grains = std::move(grains);
         next->segments[pos].snap.reset();
+        PublishState(std::move(next));
+    }
+
+    void Shard::AttachLiveGrains(Seed::Snapshot snap, std::shared_ptr<GrainIndex> grains)
+    {
+        std::lock_guard<std::mutex> lk(writer_mu_);
+        auto prev = state_.load(std::memory_order_acquire);
+        if (!prev)
+            return;
+        if (prev->live_snap != snap)
+            return;
+        auto next = std::make_shared<ShardState>(*prev);
+        next->live_grains = std::move(grains);
         PublishState(std::move(next));
     }
 
