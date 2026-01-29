@@ -163,6 +163,7 @@ namespace pomai
         ss << ",\"search_queue_avg_latency_ms\":" << membrane_->SearchQueueAvgLatencyMs();
         ss << ",\"search_overload_total\":" << membrane_->SearchOverloadCount();
         ss << ",\"search_inline_total\":" << membrane_->SearchInlineCount();
+        ss << ",\"search_partial_total\":" << membrane_->SearchPartialCount();
         ss << ",\"active_index_builds\":" << (build_pool_ ? build_pool_->ActiveBuilds() : 0);
         ss << ",\"memory_usage_bytes\":{";
         ss << "\"snapshot\":" << mm.Usage(MemoryManager::Pool::Search);

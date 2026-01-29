@@ -59,6 +59,28 @@ int main(int argc, char **argv)
     size_t train_size = 50'000;
     size_t query_count = 100;
     size_t topk = 10;
+    size_t rerank_k = 0;
+    std::uint32_t graph_ef = 0;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::strncmp(argv[i], "--rerank_k=", 11) == 0)
+        {
+            rerank_k = static_cast<size_t>(std::stoull(argv[i] + 11));
+        }
+        else if (std::strncmp(argv[i], "--graph_ef=", 11) == 0)
+        {
+            graph_ef = static_cast<std::uint32_t>(std::stoul(argv[i] + 11));
+        }
+        else if (std::strncmp(argv[i], "--queries=", 10) == 0)
+        {
+            query_count = static_cast<size_t>(std::stoull(argv[i] + 10));
+        }
+        else if (std::strncmp(argv[i], "--topk=", 7) == 0)
+        {
+            topk = static_cast<size_t>(std::stoull(argv[i] + 7));
+        }
+    }
 
     DbOptions opt;
     opt.dim = dim;
@@ -140,6 +162,9 @@ int main(int argc, char **argv)
 
         SearchRequest req;
         req.topk = topk;
+        req.candidate_k = rerank_k;
+        req.graph_ef = graph_ef;
+        req.metric = Metric::L2;
         req.query.data = query_vec;
 
         auto q0 = std::chrono::high_resolution_clock::now();
@@ -171,6 +196,14 @@ int main(int argc, char **argv)
     std::cout << "Latency p50: " << latencies[query_count / 2] << " us\n";
     std::cout << "Latency p95: " << latencies[query_count * 95 / 100] << " us\n";
     std::cout << "Latency p99: " << latencies[query_count * 99 / 100] << " us\n";
+    SearchRequest summary_req;
+    summary_req.topk = topk;
+    summary_req.candidate_k = rerank_k;
+    summary_req.graph_ef = graph_ef;
+    std::size_t effective_rerank_k = NormalizeCandidateK(summary_req);
+    std::uint32_t effective_graph_ef = NormalizeGraphEf(summary_req, effective_rerank_k);
+    std::cout << "Candidate_k: " << effective_rerank_k << "\n";
+    std::cout << "Graph_ef   : " << effective_graph_ef << "\n";
     std::cout << "=======================================================================\n";
 
     db.Stop();
