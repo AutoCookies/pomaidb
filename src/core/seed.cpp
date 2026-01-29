@@ -461,15 +461,11 @@ namespace pomai
             return;
         if (snap->is_quantized.load(std::memory_order_acquire))
             return;
-        const std::size_t n = snap->ids.size();
-        const std::size_t dim = snap->dim;
-        if (n == 0)
+        if (!snap->qdata.empty())
+        {
+            snap->is_quantized.store(true, std::memory_order_release);
             return;
-        std::vector<float> inv(dim);
-        for (std::size_t d = 0; d < dim; ++d)
-            inv[d] = 1.0f / snap->qscales[d];
-        for (std::size_t r = 0; r < n; ++r)
-            quantize_row_impl_(nullptr, snap->qmins.data(), inv.data(), snap->qdata.data() + r * dim, dim);
+        }
         snap->is_quantized.store(true, std::memory_order_release);
     }
 
