@@ -195,9 +195,8 @@ namespace pomai::server
                         if (log_)
                             log_->Info("IPC Listening on " + cfg_.unix_socket);
                         // Chạy AcceptLoopIPC trên thread riêng
-                        std::thread([this]()
-                                    { this->AcceptLoopIPC(); })
-                            .detach();
+                        ipc_thread_ = std::thread([this]()
+                                                  { this->AcceptLoopIPC(); });
                     }
                 }
             }
@@ -277,6 +276,10 @@ namespace pomai::server
                 ::unlink(cfg_.unix_socket.c_str());
             }
         }
+
+        if (ipc_thread_.joinable())
+            ipc_thread_.join();
+        JoinClientThreads();
 
         // Chờ Client thoát
         int retries = 50;
@@ -478,9 +481,12 @@ namespace pomai::server
             ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 
             active_connections_++;
-            std::thread([this, client_fd]()
-                        { this->ClientSession(client_fd); })
-                .detach();
+            std::thread t([this, client_fd]()
+                          { this->ClientSession(client_fd); });
+            {
+                std::lock_guard<std::mutex> lk(client_mu_);
+                client_threads_.push_back(std::move(t));
+            }
         }
     }
 
@@ -510,9 +516,26 @@ namespace pomai::server
 
             active_connections_++;
             // Spawn thread xử lý y hệt như TCP, chỉ khác là không cần set TCP_NODELAY
-            std::thread([this, client_fd]()
-                        { this->ClientSession(client_fd); })
-                .detach();
+            std::thread t([this, client_fd]()
+                          { this->ClientSession(client_fd); });
+            {
+                std::lock_guard<std::mutex> lk(client_mu_);
+                client_threads_.push_back(std::move(t));
+            }
+        }
+    }
+
+    void PomaiServer::JoinClientThreads()
+    {
+        std::vector<std::thread> threads;
+        {
+            std::lock_guard<std::mutex> lk(client_mu_);
+            threads.swap(client_threads_);
+        }
+        for (auto &t : threads)
+        {
+            if (t.joinable())
+                t.join();
         }
     }
 

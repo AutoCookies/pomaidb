@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <thread>
 #include <mutex>
+#include <vector>
 
 #include "pomai_db.h"
 #include "server/config.h"
@@ -33,6 +34,7 @@ namespace pomai::server
 
         // Xử lý phiên làm việc của Client (dùng chung cho cả TCP và UDS)
         void ClientSession(int fd);
+        void JoinClientThreads();
 
         static bool ReadFrame(int fd, std::vector<std::uint8_t> &payload);
         static bool WriteFrame(int fd, const std::vector<std::uint8_t> &payload);
@@ -62,10 +64,13 @@ namespace pomai::server
 
         // Unix Domain Socket (IPC)
         int ipc_fd_{-1};
+        std::thread ipc_thread_;
 
         // Connection Management
         std::atomic<int32_t> active_connections_{0};
         const int32_t MAX_CONNECTIONS = 100;
+        std::mutex client_mu_;
+        std::vector<std::thread> client_threads_;
 
         // Collection Management
         std::mutex cols_mu_;

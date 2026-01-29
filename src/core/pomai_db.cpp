@@ -86,16 +86,25 @@ namespace pomai
         if (opt_.centroids_load_mode == MembraneRouter::CentroidsLoadMode::None)
             return;
 
-        std::thread([this]()
-                    {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        auto task = [this]()
+        {
             const std::size_t shards = membrane_->ShardCount();
-            if (shards == 0) return;
-            try {
+            if (shards == 0)
+                return;
+            try
+            {
                 auto fut = RecomputeCentroids(shards * 8, shards * 1024);
                 fut.get();
-            } catch (...) {} })
-            .detach();
+            }
+            catch (...)
+            {
+            }
+        };
+        if (!membrane_->ScheduleCompletion(task, std::chrono::seconds(1)))
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            task();
+        }
     }
 
     void PomaiDB::Stop()
@@ -152,6 +161,8 @@ namespace pomai
         ss << "{";
         ss << "\"rejected_upsert_batches_total\":" << metrics_.rejected_upsert_batches_total.load(std::memory_order_relaxed);
         ss << ",\"search_queue_avg_latency_ms\":" << membrane_->SearchQueueAvgLatencyMs();
+        ss << ",\"search_overload_total\":" << membrane_->SearchOverloadCount();
+        ss << ",\"search_inline_total\":" << membrane_->SearchInlineCount();
         ss << ",\"active_index_builds\":" << (build_pool_ ? build_pool_->ActiveBuilds() : 0);
         ss << ",\"memory_usage_bytes\":{";
         ss << "\"snapshot\":" << mm.Usage(MemoryManager::Pool::Search);
