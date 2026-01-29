@@ -9,7 +9,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <cstring>
 #include <random>
 #include <limits>
 #include <cmath>
@@ -43,7 +42,8 @@ namespace pomai
             for (std::size_t row = 0; row < n; ++row)
             {
                 Vector v;
-                v.data.assign(snap->data.data() + row * dim, snap->data.data() + (row + 1) * dim);
+                v.data.resize(dim);
+                Seed::DequantizeRow(snap, row, v.data.data());
                 out.push_back(std::move(v));
             }
             return out;
@@ -194,10 +194,11 @@ namespace pomai
         {
             float best_d = std::numeric_limits<float>::infinity();
             std::size_t best = 0;
-            const float *src = snap->data.data() + row * dim;
+            std::vector<float> dequant(dim);
+            Seed::DequantizeRow(snap, row, dequant.data());
             for (std::size_t c = 0; c < centroids.size(); ++c)
             {
-                float d = kernels::L2Sqr(src, centroids[c].data.data(), dim);
+                float d = kernels::L2Sqr(dequant.data(), centroids[c].data.data(), dim);
                 if (d < best_d)
                 {
                     best_d = d;
@@ -240,7 +241,7 @@ namespace pomai
         if (snap->qdata.empty())
             return Seed::SearchSnapshot(snap, req);
 
-        alignas(32) std::uint8_t qquant[1024];
+        std::vector<std::uint8_t> qquant(dim);
         for (std::size_t d = 0; d < dim; ++d)
         {
             float qv = (snap->qscales[d] > 0.0f) ? ((req.query.data[d] - snap->qmins[d]) / snap->qscales[d]) : 0.0f;
@@ -263,10 +264,12 @@ namespace pomai
         }
 
         FixedTopK final_topk(topk);
+        std::vector<float> dequant(dim);
         for (std::size_t i = 0; i < candidates.Size(); ++i)
         {
             std::size_t row = static_cast<std::size_t>(candidates.Data()[i].id);
-            float d = kernels::L2Sqr(snap->data.data() + row * dim, req.query.data.data(), dim);
+            Seed::DequantizeRow(snap, row, dequant.data());
+            float d = kernels::L2Sqr(dequant.data(), req.query.data.data(), dim);
             final_topk.Push(-d, snap->ids[row]);
         }
         final_topk.FillSorted(resp.items);
@@ -328,8 +331,10 @@ namespace pomai
                         uint64_t c = static_cast<uint64_t>(snap->ids.size());
                         CheckedWrite(fd, &d, 2);
                         CheckedWrite(fd, &c, 8);
+                        CheckedWrite(fd, snap->qmins.data(), snap->qmins.size() * 4);
+                        CheckedWrite(fd, snap->qscales.data(), snap->qscales.size() * 4);
                         CheckedWrite(fd, snap->ids.data(), snap->ids.size() * 8);
-                        CheckedWrite(fd, snap->data.data(), snap->data.size() * 4);
+                        CheckedWrite(fd, snap->qdata.data(), snap->qdata.size());
                         ::fdatasync(fd);
                         ::close(fd);
                         wal_.TruncateToZero();
@@ -397,7 +402,6 @@ namespace pomai
             IndexBuildPool::Job job{pos, snap, 48, 200, [this](std::size_t p, Seed::Snapshot s, std::shared_ptr<pomai::core::OrbitIndex> i)
                                     {
                                         auto g = this->BuildGrainIndex(s);
-                                        Seed::Quantize(s);
                                         this->AttachIndex(p, std::move(s), std::move(i), std::move(g));
                                     }};
             build_pool_->Enqueue(std::move(job));
@@ -445,7 +449,8 @@ namespace pomai
                 if (res.size() < max_samples)
                 {
                     Vector v;
-                    v.data.assign(s->data.data() + i * s->dim, s->data.data() + (i + 1) * s->dim);
+                    v.data.resize(s->dim);
+                    Seed::DequantizeRow(s, i, v.data.data());
                     res.push_back(std::move(v));
                 }
                 else
@@ -453,7 +458,11 @@ namespace pomai
                     std::uniform_int_distribution<std::size_t> d(0, seen - 1);
                     std::size_t j = d(rng);
                     if (j < max_samples)
-                        res[j].data.assign(s->data.data() + i * s->dim, s->data.data() + (i + 1) * s->dim);
+                    {
+                        if (res[j].data.size() != s->dim)
+                            res[j].data.resize(s->dim);
+                        Seed::DequantizeRow(s, i, res[j].data.data());
+                    }
                 }
             }
         };

@@ -4,23 +4,121 @@
 #include "memory_manager.h"
 #include <immintrin.h>
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
 namespace pomai
 {
+    namespace
+    {
+        using QuantizeFn = void (*)(const float *, const float *, const float *, std::uint8_t *, std::size_t);
+
+        inline bool IsAligned(const void *ptr, std::size_t alignment)
+        {
+            return (reinterpret_cast<std::uintptr_t>(ptr) & (alignment - 1)) == 0;
+        }
+
+        void Quantize_Scalar(const float *src, const float *mins, const float *inv_scales, std::uint8_t *dst, std::size_t dim)
+        {
+            for (std::size_t d = 0; d < dim; ++d)
+            {
+                float qv = (src[d] - mins[d]) * inv_scales[d];
+                int v = static_cast<int>(std::nearbyint(qv));
+                dst[d] = static_cast<std::uint8_t>(std::clamp(v, 0, 255));
+            }
+        }
+
+        __attribute__((target("avx2"))) void Quantize_AVX2(const float *src, const float *mins, const float *inv_scales, std::uint8_t *dst, std::size_t dim)
+        {
+            std::size_t d = 0;
+            for (; d + 32 <= dim; d += 32)
+            {
+                alignas(32) std::uint8_t out[32];
+                for (int chunk = 0; chunk < 4; ++chunk)
+                {
+                    const std::size_t off = d + static_cast<std::size_t>(chunk) * 8;
+                    __m256 v = _mm256_loadu_ps(src + off);
+                    __m256 vmin = _mm256_loadu_ps(mins + off);
+                    __m256 vinv = _mm256_loadu_ps(inv_scales + off);
+                    __m256 res = _mm256_mul_ps(_mm256_sub_ps(v, vmin), vinv);
+                    __m256i qi = _mm256_cvtps_epi32(_mm256_round_ps(res, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                    alignas(32) int32_t ints[8];
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(ints), qi);
+                    for (int k = 0; k < 8; ++k)
+                        out[chunk * 8 + k] = static_cast<std::uint8_t>(std::clamp(ints[k], 0, 255));
+                }
+                if (IsAligned(dst + d, 32))
+                    _mm256_stream_si256(reinterpret_cast<__m256i *>(dst + d), _mm256_load_si256(reinterpret_cast<const __m256i *>(out)));
+                else
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(dst + d), _mm256_load_si256(reinterpret_cast<const __m256i *>(out)));
+            }
+            for (; d < dim; ++d)
+            {
+                float qv = (src[d] - mins[d]) * inv_scales[d];
+                int v = static_cast<int>(std::nearbyint(qv));
+                dst[d] = static_cast<std::uint8_t>(std::clamp(v, 0, 255));
+            }
+        }
+
+        __attribute__((target("avx512f"))) void Quantize_AVX512(const float *src, const float *mins, const float *inv_scales, std::uint8_t *dst, std::size_t dim)
+        {
+            std::size_t d = 0;
+            for (; d + 64 <= dim; d += 64)
+            {
+                alignas(64) std::uint8_t out[64];
+                for (int chunk = 0; chunk < 4; ++chunk)
+                {
+                    const std::size_t off = d + static_cast<std::size_t>(chunk) * 16;
+                    __m512 v = _mm512_loadu_ps(src + off);
+                    __m512 vmin = _mm512_loadu_ps(mins + off);
+                    __m512 vinv = _mm512_loadu_ps(inv_scales + off);
+                    __m512 res = _mm512_mul_ps(_mm512_sub_ps(v, vmin), vinv);
+                    __m512i qi = _mm512_cvtps_epi32(_mm512_round_ps(res, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                    alignas(64) int32_t ints[16];
+                    _mm512_storeu_si512(reinterpret_cast<void *>(ints), qi);
+                    for (int k = 0; k < 16; ++k)
+                        out[chunk * 16 + k] = static_cast<std::uint8_t>(std::clamp(ints[k], 0, 255));
+                }
+                if (IsAligned(dst + d, 64))
+                    _mm512_stream_si512(reinterpret_cast<void *>(dst + d), _mm512_load_si512(reinterpret_cast<const void *>(out)));
+                else
+                    _mm512_storeu_si512(reinterpret_cast<void *>(dst + d), _mm512_load_si512(reinterpret_cast<const void *>(out)));
+            }
+            for (; d < dim; ++d)
+            {
+                float qv = (src[d] - mins[d]) * inv_scales[d];
+                int v = static_cast<int>(std::nearbyint(qv));
+                dst[d] = static_cast<std::uint8_t>(std::clamp(v, 0, 255));
+            }
+        }
+
+        QuantizeFn SelectQuantizeFn()
+        {
+            if (__builtin_cpu_supports("avx512f"))
+                return &Quantize_AVX512;
+            if (__builtin_cpu_supports("avx2"))
+                return &Quantize_AVX2;
+            return &Quantize_Scalar;
+        }
+
+        const QuantizeFn kQuantizeFn = SelectQuantizeFn();
+    }
+
     Seed::Seed(std::size_t dim) : dim_(dim)
     {
         if (dim_ == 0)
             throw std::runtime_error("Seed dim must be > 0");
         ids_.reserve(1024);
-        data_.reserve(1024 * dim_);
+        qdata_.reserve(1024 * dim_);
+        qmins_.assign(dim_, std::numeric_limits<float>::infinity());
+        qmaxs_.assign(dim_, -std::numeric_limits<float>::infinity());
+        qscales_.assign(dim_, 1.0f);
+        qinv_scales_.assign(dim_, 1.0f);
     }
 
     Seed::Seed(const Seed &other)
-        : dim_(other.dim_), ids_(other.ids_), data_(other.data_), pos_(other.pos_), accounted_bytes_(other.accounted_bytes_)
+        : dim_(other.dim_), ids_(other.ids_), qdata_(other.qdata_), qmins_(other.qmins_), qmaxs_(other.qmaxs_), qscales_(other.qscales_), qinv_scales_(other.qinv_scales_), pos_(other.pos_), accounted_bytes_(other.accounted_bytes_)
     {
         if (accounted_bytes_ > 0)
             MemoryManager::Instance().AddUsage(MemoryManager::Pool::Memtable, accounted_bytes_);
@@ -33,7 +131,11 @@ namespace pomai
         ReleaseMemtableAccounting();
         dim_ = other.dim_;
         ids_ = other.ids_;
-        data_ = other.data_;
+        qdata_ = other.qdata_;
+        qmins_ = other.qmins_;
+        qmaxs_ = other.qmaxs_;
+        qscales_ = other.qscales_;
+        qinv_scales_ = other.qinv_scales_;
         pos_ = other.pos_;
         accounted_bytes_ = other.accounted_bytes_;
         if (accounted_bytes_ > 0)
@@ -42,7 +144,7 @@ namespace pomai
     }
 
     Seed::Seed(Seed &&other) noexcept
-        : dim_(other.dim_), ids_(std::move(other.ids_)), data_(std::move(other.data_)), pos_(std::move(other.pos_)), accounted_bytes_(other.accounted_bytes_)
+        : dim_(other.dim_), ids_(std::move(other.ids_)), qdata_(std::move(other.qdata_)), qmins_(std::move(other.qmins_)), qmaxs_(std::move(other.qmaxs_)), qscales_(std::move(other.qscales_)), qinv_scales_(std::move(other.qinv_scales_)), pos_(std::move(other.pos_)), accounted_bytes_(other.accounted_bytes_)
     {
         other.accounted_bytes_ = 0;
     }
@@ -54,7 +156,11 @@ namespace pomai
         ReleaseMemtableAccounting();
         dim_ = other.dim_;
         ids_ = std::move(other.ids_);
-        data_ = std::move(other.data_);
+        qdata_ = std::move(other.qdata_);
+        qmins_ = std::move(other.qmins_);
+        qmaxs_ = std::move(other.qmaxs_);
+        qscales_ = std::move(other.qscales_);
+        qinv_scales_ = std::move(other.qinv_scales_);
         pos_ = std::move(other.pos_);
         accounted_bytes_ = other.accounted_bytes_;
         other.accounted_bytes_ = 0;
@@ -70,7 +176,7 @@ namespace pomai
         {
             std::size_t new_cap = std::max<std::size_t>(need_rows, ids_.capacity() + ids_.capacity() / 2 + 1024);
             ids_.reserve(new_cap);
-            data_.reserve(new_cap * dim_);
+            qdata_.reserve(new_cap * dim_);
         }
     }
 
@@ -78,6 +184,13 @@ namespace pomai
     {
         if (batch.empty())
             return;
+        if (qmins_.size() != dim_)
+        {
+            qmins_.assign(dim_, std::numeric_limits<float>::infinity());
+            qmaxs_.assign(dim_, -std::numeric_limits<float>::infinity());
+            qscales_.assign(dim_, 1.0f);
+            qinv_scales_.assign(dim_, 1.0f);
+        }
         std::size_t new_cnt = 0;
         for (const auto &r : batch)
         {
@@ -92,6 +205,18 @@ namespace pomai
         {
             if (r.vec.data.size() != dim_)
                 continue;
+            for (std::size_t d = 0; d < dim_; ++d)
+            {
+                float v = r.vec.data[d];
+                if (v < qmins_[d])
+                    qmins_[d] = v;
+                if (v > qmaxs_[d])
+                    qmaxs_[d] = v;
+                float range = qmaxs_[d] - qmins_[d];
+                float scale = (range > 0.0f) ? (range / 255.0f) : 1.0f;
+                qscales_[d] = scale;
+                qinv_scales_[d] = 1.0f / scale;
+            }
             auto it = pos_.find(r.id);
             if (it == pos_.end())
             {
@@ -99,14 +224,14 @@ namespace pomai
                 ids_.push_back(r.id);
                 pos_.emplace(r.id, row);
                 const std::size_t base = static_cast<std::size_t>(row) * dim_;
-                data_.resize(base + dim_);
-                std::copy(r.vec.data.begin(), r.vec.data.end(), data_.begin() + base);
+                qdata_.resize(base + dim_);
+                kQuantizeFn(r.vec.data.data(), qmins_.data(), qinv_scales_.data(), qdata_.data() + base, dim_);
             }
             else
             {
                 const std::uint32_t row = it->second;
                 const std::size_t base = static_cast<std::size_t>(row) * dim_;
-                std::copy(r.vec.data.begin(), r.vec.data.end(), data_.begin() + base);
+                kQuantizeFn(r.vec.data.data(), qmins_.data(), qinv_scales_.data(), qdata_.data() + base, dim_);
             }
         }
         UpdateMemtableAccounting();
@@ -120,8 +245,11 @@ namespace pomai
             delete s; });
         out->dim = dim_;
         out->ids = ids_;
-        out->data = data_;
-        out->accounted_bytes = out->ids.size() * sizeof(Id) + out->data.size() * sizeof(float);
+        out->qdata = qdata_;
+        out->qmins = qmins_;
+        out->qscales = qscales_;
+        out->is_quantized.store(true, std::memory_order_release);
+        out->accounted_bytes = out->ids.size() * sizeof(Id) + out->qdata.size() * sizeof(std::uint8_t) + out->qmins.size() * sizeof(float) + out->qscales.size() * sizeof(float);
         if (out->accounted_bytes > 0)
             MemoryManager::Instance().AddUsage(MemoryManager::Pool::Search, out->accounted_bytes);
         return out;
@@ -129,123 +257,48 @@ namespace pomai
 
     void Seed::Quantize(Snapshot snap)
     {
-        if (snap->is_quantized.exchange(true))
+        if (!snap)
             return;
-        const std::size_t n = snap->ids.size();
-        const std::size_t dim = snap->dim;
-        if (n == 0)
-            return;
-
-        snap->qmins.assign(dim, std::numeric_limits<float>::infinity());
-        snap->qscales.assign(dim, 0.0f);
-        std::vector<float> qmaxs(dim, -std::numeric_limits<float>::infinity());
-
-        for (std::size_t d = 0; d < dim; d += 8)
-        {
-            __m256 vmin = _mm256_set1_ps(std::numeric_limits<float>::infinity());
-            __m256 vmax = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
-            std::size_t limit = std::min(d + 8, dim);
-
-            for (std::size_t row = 0; row < n; ++row)
-            {
-                const float *ptr = snap->data.data() + row * dim + d;
-                __m256 v;
-                if (d + 8 <= dim)
-                    v = _mm256_loadu_ps(ptr);
-                else
-                {
-                    alignas(32) float tmp[8] = {0};
-                    for (std::size_t k = 0; k < limit - d; ++k)
-                        tmp[k] = ptr[k];
-                    v = _mm256_loadu_ps(tmp);
-                }
-                vmin = _mm256_min_ps(vmin, v);
-                vmax = _mm256_max_ps(vmax, v);
-            }
-
-            alignas(32) float mins_out[8], maxs_out[8];
-            _mm256_storeu_ps(mins_out, vmin);
-            _mm256_storeu_ps(maxs_out, vmax);
-            for (std::size_t k = 0; k < limit - d; ++k)
-            {
-                snap->qmins[d + k] = mins_out[k];
-                qmaxs[d + k] = maxs_out[k];
-            }
-        }
-
-        std::vector<float> inv_scales(dim);
-        for (std::size_t d = 0; d < dim; ++d)
-        {
-            float range = qmaxs[d] - snap->qmins[d];
-            snap->qscales[d] = (range > 0.0f) ? (range / 255.0f) : 1.0f;
-            inv_scales[d] = 1.0f / snap->qscales[d];
-        }
-
-        snap->qdata.resize(n * dim);
-        for (std::size_t row = 0; row < n; ++row)
-        {
-            const float *src = snap->data.data() + row * dim;
-            std::uint8_t *dst = snap->qdata.data() + row * dim;
-            for (std::size_t d = 0; d < dim; d += 8)
-            {
-                std::size_t limit = std::min(d + 8, dim);
-                __m256 v = _mm256_loadu_ps(src + d);
-                __m256 v_min = _mm256_loadu_ps(snap->qmins.data() + d);
-                __m256 v_inv_scale = _mm256_loadu_ps(inv_scales.data() + d);
-                __m256 res = _mm256_mul_ps(_mm256_sub_ps(v, v_min), v_inv_scale);
-                __m256i qi = _mm256_cvtps_epi32(_mm256_round_ps(res, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-
-                alignas(32) int32_t ints[8];
-                _mm256_storeu_si256((__m256i *)ints, qi);
-                for (std::size_t k = 0; k < limit - d; ++k)
-                {
-                    dst[d + k] = static_cast<std::uint8_t>(std::clamp(ints[k], 0, 255));
-                }
-            }
-        }
-
-        std::size_t extra_bytes = snap->qdata.size() * sizeof(std::uint8_t) + snap->qmins.size() * sizeof(float) + snap->qscales.size() * sizeof(float);
-        snap->accounted_bytes += extra_bytes;
-        MemoryManager::Instance().AddUsage(MemoryManager::Pool::Search, extra_bytes);
+        snap->is_quantized.store(true, std::memory_order_release);
     }
 
-    bool Seed::TryDetachSnapshot(Snapshot &snap, std::vector<float> &data, std::vector<Id> &ids)
+    void Seed::DequantizeRow(const Snapshot &snap, std::size_t row, float *out)
     {
-        if (!snap || snap.use_count() > 2)
-            return false;
-        if (snap->accounted_bytes > 0)
-            MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Search, snap->accounted_bytes);
-        snap->accounted_bytes = 0;
-        ids = std::move(snap->ids);
-        data = std::move(snap->data);
-        return true;
+        const std::size_t dim = snap->dim;
+        const std::uint8_t *src = snap->qdata.data() + row * dim;
+        for (std::size_t d = 0; d < dim; ++d)
+            out[d] = snap->qmins[d] + snap->qscales[d] * static_cast<float>(src[d]);
+    }
+
+    std::vector<float> Seed::DequantizeSnapshot(const Snapshot &snap)
+    {
+        if (!snap || snap->ids.empty())
+            return {};
+        const std::size_t n = snap->ids.size();
+        const std::size_t dim = snap->dim;
+        std::vector<float> out(n * dim);
+        for (std::size_t row = 0; row < n; ++row)
+        {
+            float *dst = out.data() + row * dim;
+            DequantizeRow(snap, row, dst);
+        }
+        return out;
     }
 
     SearchResponse Seed::SearchSnapshot(const Snapshot &snap, const SearchRequest &req)
     {
         SearchResponse resp;
-        if (!snap || snap->dim == 0 || req.query.data.size() != snap->dim)
+        if (!snap || snap->dim == 0 || req.query.data.size() != snap->dim || snap->qdata.empty())
             return resp;
         const std::size_t dim = snap->dim;
         const std::size_t n = snap->ids.size();
         if (n == 0)
             return resp;
 
-        if (!snap->is_quantized.load(std::memory_order_acquire))
-        {
-            FixedTopK float_topk(req.topk);
-            const float *base = snap->data.data();
-            for (std::size_t row = 0; row < n; ++row)
-                float_topk.Push(-kernels::L2Sqr(base + row * dim, req.query.data.data(), dim), snap->ids[row]);
-            float_topk.FillSorted(resp.items);
-            return resp;
-        }
-
         constexpr std::size_t kOversample = 128;
-        const std::size_t k = std::min({req.topk, kOversample, n});
         const float *q = req.query.data.data();
 
-        alignas(32) std::uint8_t qquant[1024];
+        std::vector<std::uint8_t> qquant(dim);
         for (std::size_t d = 0; d < dim; ++d)
         {
             float qv = (snap->qscales[d] > 0.0f) ? ((q[d] - snap->qmins[d]) / snap->qscales[d]) : 0.0f;
@@ -261,12 +314,13 @@ namespace pomai
         }
 
         FixedTopK final_topk(req.topk);
-        const float *base = snap->data.data();
+        std::vector<float> dequant(dim);
         const auto *candidates = candidate_topk.Data();
         for (std::size_t i = 0; i < candidate_topk.Size(); ++i)
         {
             std::size_t cand_row = static_cast<std::size_t>(candidates[i].id);
-            final_topk.Push(-kernels::L2Sqr(base + cand_row * dim, q, dim), snap->ids[cand_row]);
+            DequantizeRow(snap, cand_row, dequant.data());
+            final_topk.Push(-kernels::L2Sqr(dequant.data(), q, dim), snap->ids[cand_row]);
         }
         final_topk.FillSorted(resp.items);
         return resp;
@@ -274,7 +328,7 @@ namespace pomai
 
     void Seed::UpdateMemtableAccounting()
     {
-        const std::size_t bytes = ids_.size() * sizeof(Id) + data_.size() * sizeof(float);
+        const std::size_t bytes = ids_.size() * sizeof(Id) + qdata_.size() * sizeof(std::uint8_t) + qmins_.size() * sizeof(float) + qmaxs_.size() * sizeof(float) + qscales_.size() * sizeof(float) + qinv_scales_.size() * sizeof(float);
         if (bytes == accounted_bytes_)
             return;
         if (bytes > accounted_bytes_)
