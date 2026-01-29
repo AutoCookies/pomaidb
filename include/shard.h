@@ -40,8 +40,15 @@ namespace pomai
     struct IndexedSegment
     {
         Seed::Snapshot snap;
-        std::shared_ptr<GrainIndex> grains;
-        std::shared_ptr<pomai::core::OrbitIndex> index;
+        std::shared_ptr<const GrainIndex> grains;
+        std::shared_ptr<const pomai::core::OrbitIndex> index;
+    };
+
+    struct ShardState
+    {
+        std::vector<IndexedSegment> segments;
+        Seed::Snapshot live_snap;
+        std::shared_ptr<const GrainIndex> live_grains;
     };
 
     class Shard
@@ -71,6 +78,7 @@ namespace pomai
     private:
         void RunLoop();
         void MaybeFreezeSegment();
+        void PublishState(std::shared_ptr<const ShardState> next);
 
         void AttachIndex(std::size_t segment_pos,
                          Seed::Snapshot snap,
@@ -90,10 +98,8 @@ namespace pomai
         IndexBuildPool *build_pool_{nullptr};
         LogFn log_info_;
         LogFn log_error_;
-        mutable std::mutex state_mu_;
-        std::vector<IndexedSegment> segments_;
-        Seed::Snapshot live_snap_;
-        std::shared_ptr<GrainIndex> live_grains_;
+        mutable std::mutex writer_mu_;
+        std::atomic<std::shared_ptr<const ShardState>> state_{nullptr};
         std::thread owner_;
         static constexpr std::size_t kFreezeEveryVectors = 50000;
         std::size_t since_freeze_{0};

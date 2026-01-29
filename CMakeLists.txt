@@ -86,6 +86,8 @@ endfunction()
 
 add_pomai_benchmark(bench_embedded benchmarks/bench_embedded.cpp)
 add_pomai_benchmark(bench_phase3 benchmarks/bench_phase3.cpp)
+add_pomai_benchmark(bench_concurrent benchmarks/bench_concurrent.cpp)
+add_pomai_benchmark(bench_concurrent_search benchmarks/bench_concurrent_search.cpp)
 
 # --- 7. AUTOMATED TESTS ---
 option(BUILD_TESTING "Build the test suite" ON)
@@ -104,4 +106,6 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_pomai_test(pomai_db_writer tests/pomai_db_writer.cpp)
     add_pomai_test(centroids_persistence_tests tests/centroids_persistence_tests.cpp)
     add_pomai_test(memory_safety_tests tests/memory_safety_tests.cpp)
+    add_pomai_test(quantization_fixed_bounds_tests tests/quantization_fixed_bounds_tests.cpp)
+    add_pomai_test(shard_concurrency_tests tests/shard_concurrency_tests.cpp)
 endif()
