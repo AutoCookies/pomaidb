@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <random>
 #include <limits>
 #include <cmath>
@@ -31,20 +32,33 @@ namespace pomai
             return std::max<std::size_t>(1, static_cast<std::size_t>(std::sqrt(n)));
         }
 
-        std::vector<Vector> SnapshotToVectors(const Seed::Snapshot &snap)
+        std::vector<Vector> SampleSnapshotVectors(const Seed::Snapshot &snap, std::size_t max_samples)
         {
             std::vector<Vector> out;
             if (!snap || snap->ids.empty())
                 return out;
             const std::size_t n = snap->ids.size();
             const std::size_t dim = snap->dim;
-            out.reserve(n);
+            const std::size_t target = std::min(max_samples, n);
+            out.reserve(target);
+            std::vector<float> buf(dim);
+            std::mt19937_64 rng(0x9e3779b97f4a7c15ULL);
             for (std::size_t row = 0; row < n; ++row)
             {
-                Vector v;
-                v.data.resize(dim);
-                Seed::DequantizeRow(snap, row, v.data.data());
-                out.push_back(std::move(v));
+                Seed::DequantizeRow(snap, row, buf.data());
+                if (out.size() < target)
+                {
+                    Vector v;
+                    v.data = buf;
+                    out.push_back(std::move(v));
+                }
+                else
+                {
+                    std::uniform_int_distribution<std::size_t> dist(0, row);
+                    std::size_t pick = dist(rng);
+                    if (pick < target)
+                        out[pick].data = buf;
+                }
             }
             return out;
         }
@@ -65,6 +79,14 @@ namespace pomai
                 p += static_cast<size_t>(res);
                 rem -= static_cast<size_t>(res);
             }
+        }
+
+        std::size_t PeakRssBytes()
+        {
+            struct rusage usage;
+            if (getrusage(RUSAGE_SELF, &usage) != 0)
+                return 0;
+            return static_cast<std::size_t>(usage.ru_maxrss) * 1024;
         }
     }
 
@@ -94,6 +116,7 @@ namespace pomai
             std::lock_guard<std::mutex> lk(state_mu_);
             live_snap_ = seed_.MakeSnapshot();
             live_grains_ = BuildGrainIndex(live_snap_);
+            PublishSnapshotLocked();
         }
         if (seed_.Count() > 0)
             MaybeFreezeSegment();
@@ -178,13 +201,16 @@ namespace pomai
             return nullptr;
         const std::size_t n = snap->ids.size();
         const std::size_t k = TargetCentroidCount(n);
-        std::vector<Vector> data = SnapshotToVectors(snap);
-        if (data.empty())
+        if (k == 0)
+            return nullptr;
+        const std::size_t sample_cap = std::min<std::size_t>(n, 20000);
+        std::vector<Vector> sample = SampleSnapshotVectors(snap, sample_cap);
+        if (sample.empty())
             return nullptr;
         std::vector<Vector> centroids;
         try
         {
-            centroids = SpatialRouter::BuildKMeans(data, k, 8);
+            centroids = SpatialRouter::BuildKMeans(sample, std::min(k, sample.size()), 8);
         }
         catch (...)
         {
@@ -195,13 +221,15 @@ namespace pomai
         const std::size_t dim = snap->dim;
         std::vector<std::uint32_t> assignments(n);
         std::vector<std::uint32_t> counts(centroids.size(), 0);
+        std::vector<float> buf(dim);
         for (std::size_t row = 0; row < n; ++row)
         {
+            Seed::DequantizeRow(snap, row, buf.data());
             float best_d = std::numeric_limits<float>::infinity();
             std::size_t best = 0;
             for (std::size_t c = 0; c < centroids.size(); ++c)
             {
-                float d = kernels::L2Sqr(data[row].data.data(), centroids[c].data.data(), dim);
+                float d = kernels::L2Sqr(buf.data(), centroids[c].data.data(), dim);
                 if (d < best_d)
                 {
                     best_d = d;
@@ -211,17 +239,9 @@ namespace pomai
             assignments[row] = static_cast<std::uint32_t>(best);
             counts[best]++;
         }
-        std::vector<float> global_mins(dim, std::numeric_limits<float>::infinity());
-        std::vector<float> global_maxs(dim, -std::numeric_limits<float>::infinity());
-        for (const auto &v : data)
-        {
-            for (std::size_t d = 0; d < dim; ++d)
-            {
-                global_mins[d] = std::min(global_mins[d], v.data[d]);
-                global_maxs[d] = std::max(global_maxs[d], v.data[d]);
-            }
-        }
-        const_cast<Seed &>(seed_).SetFixedBounds(global_mins, global_maxs);
+        const std::size_t peak_rss = PeakRssBytes();
+        if (log_info_ && peak_rss > 0)
+            log_info_("[" + name_ + "] index build peak_rss_bytes=" + std::to_string(peak_rss));
         auto grains = std::make_shared<GrainIndex>();
         grains->dim = dim;
         grains->centroids = std::move(centroids);
@@ -267,7 +287,9 @@ namespace pomai
             }
         }
         FixedTopK final_topk(topk);
-        std::vector<float> dequant(dim);
+        thread_local std::vector<float, AlignedAllocator<float, 64>> dequant;
+        if (dequant.size() < dim)
+            dequant.resize(dim);
         for (std::size_t i = 0; i < candidates.Size(); ++i)
         {
             std::size_t row = static_cast<std::size_t>(candidates.Data()[i].id);
@@ -281,17 +303,11 @@ namespace pomai
     SearchResponse Shard::Search(const SearchRequest &req, const pomai::ai::Budget &budget) const
     {
         const auto start = std::chrono::steady_clock::now();
-        std::vector<IndexedSegment> segs;
-        Seed::Snapshot live;
-        std::shared_ptr<GrainIndex> live_g;
-        {
-            std::lock_guard<std::mutex> lk(state_mu_);
-            segs = segments_;
-            live = live_snap_;
-            live_g = live_grains_;
-        }
+        auto snapshot = current_snapshot_.load(std::memory_order_acquire);
         SearchResponse out;
-        for (const auto &s : segs)
+        if (!snapshot)
+            return out;
+        for (const auto &s : snapshot->segments)
         {
             SearchResponse r;
             if (s.grains && s.snap)
@@ -303,10 +319,10 @@ namespace pomai
             MergeTopK(out, r, req.topk);
         }
         SearchResponse lr;
-        if (live && live_g)
-            lr = SearchGrains(live, *live_g, req, budget);
-        else if (live)
-            lr = Seed::SearchSnapshot(live, req);
+        if (snapshot->live_snap && snapshot->live_grains)
+            lr = SearchGrains(snapshot->live_snap, *snapshot->live_grains, req, budget);
+        else if (snapshot->live_snap)
+            lr = Seed::SearchSnapshot(snapshot->live_snap, req);
         MergeTopK(out, lr, req.topk);
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > 40)
             const_cast<Shard *>(this)->RequestEmergencyFreeze();
@@ -360,6 +376,9 @@ namespace pomai
             {
                 Lsn lsn = wal_.AppendUpserts(task.batch, task.wait_durable);
                 seed_.ApplyUpserts(task.batch);
+                std::uint64_t clamped = seed_.ConsumeOutOfRangeCount();
+                if (clamped > 0 && log_error_)
+                    log_error_("[" + name_ + "] quantization clamp rows=" + std::to_string(clamped));
                 since_freeze_ += task.batch.size();
                 if (since_freeze_ >= kFreezeEveryVectors)
                 {
@@ -374,6 +393,7 @@ namespace pomai
                     std::lock_guard<std::mutex> lk(state_mu_);
                     live_snap_ = std::move(s);
                     live_grains_ = std::move(g);
+                    PublishSnapshotLocked();
                 }
                 if (task.wait_durable)
                     wal_.WaitDurable(lsn);
@@ -397,6 +417,7 @@ namespace pomai
             std::lock_guard<std::mutex> lk(state_mu_);
             segments_.push_back({snap, nullptr, nullptr});
             pos = segments_.size() - 1;
+            PublishSnapshotLocked();
         }
         if (build_pool_)
         {
@@ -414,6 +435,7 @@ namespace pomai
             std::lock_guard<std::mutex> lk(state_mu_);
             live_snap_ = seed_.MakeSnapshot();
             live_grains_ = nullptr;
+            PublishSnapshotLocked();
         }
     }
 
@@ -425,7 +447,17 @@ namespace pomai
             segments_[pos].index = std::move(idx);
             segments_[pos].grains = std::move(grains);
             segments_[pos].snap.reset();
+            PublishSnapshotLocked();
         }
+    }
+
+    void Shard::PublishSnapshotLocked()
+    {
+        auto next = std::make_shared<SnapshotState>();
+        next->segments = segments_;
+        next->live_snap = live_snap_;
+        next->live_grains = live_grains_;
+        current_snapshot_.store(std::move(next), std::memory_order_release);
     }
 
     std::vector<Vector> Shard::SampleVectors(std::size_t max_samples) const
