@@ -91,7 +91,7 @@ namespace pomai
         LogFn log_info_;
         LogFn log_error_;
         mutable std::mutex state_mu_;
-        std::vector<IndexedSegment> segments_;
+        std::shared_ptr<std::vector<IndexedSegment>> segments_ptr_;
         Seed::Snapshot live_snap_;
         std::shared_ptr<GrainIndex> live_grains_;
         std::thread owner_;
