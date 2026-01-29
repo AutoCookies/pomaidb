@@ -29,7 +29,7 @@ namespace pomai
     struct SearchRequest
     {
         Vector query;
-        std::size_t topk{10};
+        std::size_t topk{100};
     };
 
     struct SearchResultItem

@@ -4,28 +4,27 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
-
+#include <atomic>
 #include "types.h"
 
 namespace pomai
 {
-
     class Seed
     {
     public:
-        // Immutable snapshot payload for readers.
         struct Store
         {
             std::size_t dim{0};
-            std::vector<Id> ids;     // row ids [N]
-            std::vector<float> data; // row-major vectors [N * dim]
-            std::vector<std::uint8_t> qdata; // SQ8 row-major vectors [N * dim]
-            std::vector<float> qmins;  // per-dimension min
-            std::vector<float> qscales; // per-dimension scale
+            std::vector<Id> ids;
+            std::vector<float> data;
+            std::vector<std::uint8_t> qdata;
+            std::vector<float> qmins;
+            std::vector<float> qscales;
             std::size_t accounted_bytes{0};
+            std::atomic<bool> is_quantized{false};
         };
 
-        using Snapshot = std::shared_ptr<const Store>;
+        using Snapshot = std::shared_ptr<Store>;
 
         explicit Seed(std::size_t dim);
         Seed(const Seed &other);
@@ -34,14 +33,12 @@ namespace pomai
         Seed &operator=(Seed &&other) noexcept;
         ~Seed();
 
-        // Apply a batch of upserts (owner thread only).
         void ApplyUpserts(const std::vector<UpsertRequest> &batch);
 
-        // Create an immutable snapshot for concurrent readers.
         Snapshot MakeSnapshot() const;
+        static void Quantize(Snapshot snap);
         static bool TryDetachSnapshot(Snapshot &snap, std::vector<float> &data, std::vector<Id> &ids);
 
-        // Exact scan using snapshot (L2 squared), returns best K with score = -dist.
         static SearchResponse SearchSnapshot(const Snapshot &snap, const SearchRequest &req);
 
         std::size_t Count() const { return ids_.size(); }
@@ -49,17 +46,13 @@ namespace pomai
 
     private:
         std::size_t dim_{0};
-
-        // Mutable hot store (owner thread only):
-        std::vector<Id> ids_;                       // [N]
-        std::vector<float> data_;                   // [N * dim]
-        std::unordered_map<Id, std::uint32_t> pos_; // id -> row index
+        std::vector<Id> ids_;
+        std::vector<float> data_;
+        std::unordered_map<Id, std::uint32_t> pos_;
+        std::size_t accounted_bytes_{0};
 
         void ReserveForAppend(std::size_t add_rows);
         void UpdateMemtableAccounting();
         void ReleaseMemtableAccounting();
-
-        std::size_t accounted_bytes_{0};
     };
-
-} // namespace pomai
+}

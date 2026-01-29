@@ -10,15 +10,8 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-/*
-  Production-ready WAL (append-only, checksummed, replay-safe).
-
-  AppendUpserts supports an optional per-append synchronous durability flag.
-  ReplayToSeed returns WalReplayStats describing the replay operation.
-
-  New: WrittenLsn() and TruncateToZero() to support checkpointing.
-*/
+#include <deque>
+#include <memory>
 
 namespace pomai
 {
@@ -26,14 +19,14 @@ namespace pomai
   using Lsn = std::uint64_t;
 
   constexpr std::size_t MAX_WAL_PAYLOAD_BYTES = 64 * 1024 * 1024;
-  constexpr std::size_t MAX_BATCH_ROWS = 50000;
+  constexpr std::size_t MAX_BATCH_ROWS = 50'000;
 
   struct WalReplayStats
   {
-    Lsn last_lsn{0};                // last applied LSN
-    std::size_t records_applied{0}; // number of WAL records (append batches) applied
-    std::size_t vectors_applied{0}; // number of vectors applied into seed
-    off_t truncated_bytes{0};       // bytes truncated off the WAL (0 if no truncation)
+    Lsn last_lsn{0};
+    std::size_t records_applied{0};
+    std::size_t vectors_applied{0};
+    off_t truncated_bytes{0};
   };
 
   class Wal
@@ -48,34 +41,30 @@ namespace pomai
     void Start();
     void Stop();
 
-    // AppendUpserts writes the batch to the WAL and returns the assigned LSN.
-    // If wait_durable==true, AppendUpserts will synchronously fdatasync the WAL
-    // before returning and update durable_lsn_ so the append is durable on return.
     Lsn AppendUpserts(const std::vector<UpsertRequest> &batch, bool wait_durable = false);
 
-    // Wait until the given LSN is durable (fsynced). This may perform an fdatasync
-    // if the background thread hasn't yet advanced durable_lsn_.
     void WaitDurable(Lsn lsn);
 
-    // Replay WAL into the provided seed and return replay statistics.
     WalReplayStats ReplayToSeed(class Seed &seed);
 
-    // ----- Checkpoint helpers -----
-    // Return latest written LSN (may be 0)
     Lsn WrittenLsn() const;
 
-    // Truncate WAL file to zero-length and reset LSN counters.
-    // Should be called only while the shard's RunLoop is the only writer.
-    // Throws on error.
     void TruncateToZero();
 
   private:
     void OpenOrCreateForAppend();
     void CloseFd();
-    void FsyncLoop();
+    void WriterLoop(); // writer thread: flush pending buffers and fsync
+    void FsyncLoop();  // kept for backward-compatible periodic fsync behavior (now writer also writes)
 
     static void WriteAll(int fd, const void *buf, std::size_t n);
     static bool ReadExact(int fd, void *buf, std::size_t n);
+
+    struct Pending
+    {
+      Lsn lsn;
+      std::vector<uint8_t> buf;
+    };
 
     std::string shard_name_;
     std::string wal_dir_;
@@ -88,12 +77,15 @@ namespace pomai
 
     mutable std::mutex mu_;
     std::condition_variable cv_;
+    std::thread writer_th_;
     std::thread fsync_th_;
     std::atomic<bool> running_{false};
 
     // protected by mu_
     Lsn written_lsn_{0};
     Lsn durable_lsn_{0};
+
+    std::deque<Pending> pending_writes_;
   };
 
 } // namespace pomai

@@ -1,34 +1,27 @@
 #include "pomai_db.h"
-
 #include <sstream>
 #include <thread>
 #include <utility>
 #include <future>
 #include <chrono>
-
 #include "memory_manager.h"
 
 namespace pomai
 {
-
     static std::size_t clamp_workers(std::size_t x)
     {
         if (x == 0)
             return 1;
         if (x > 8)
-            return 8; // hard cap to avoid runaway CPU on small devices
+            return 8;
         return x;
     }
 
     std::size_t PomaiDB::AutoIndexBuildThreads()
     {
-        // Production default for your "single user local DB":
-        // Keep index build from stealing CPU from ingest/search.
         std::size_t hc = std::thread::hardware_concurrency();
         if (hc == 0)
             hc = 4;
-
-        // Weak device: 1 worker. Stronger: 2 workers.
         if (hc < 8)
             return 1;
         return 2;
@@ -42,15 +35,12 @@ namespace pomai
             opt_.centroids_path = opt_.wal_dir + "/centroids.bin";
         }
 
-        // Create global index build pool (not started yet)
         std::size_t workers = opt_.index_build_threads;
         if (workers == 0)
             workers = AutoIndexBuildThreads();
         workers = clamp_workers(workers);
-
         build_pool_ = std::make_unique<IndexBuildPool>(workers);
 
-        // Construct shards
         std::vector<std::unique_ptr<Shard>> shards;
         shards.reserve(opt_.shards);
 
@@ -58,7 +48,6 @@ namespace pomai
         {
             std::ostringstream ss;
             ss << "shard-" << i;
-
             auto sh = std::make_unique<Shard>(
                 ss.str(),
                 opt_.dim,
@@ -66,14 +55,10 @@ namespace pomai
                 opt_.wal_dir,
                 log_info_,
                 log_error_);
-
-            // Inject pool pointer
             sh->SetIndexBuildPool(build_pool_.get());
-
             shards.push_back(std::move(sh));
         }
 
-        // Pass search_pool_workers through to MembraneRouter so operator can tune pool size.
         membrane_ = std::make_unique<MembraneRouter>(std::move(shards),
                                                      opt_.whisper,
                                                      opt_.dim,
@@ -83,6 +68,7 @@ namespace pomai
                                                      {
                                                          metrics_.rejected_upsert_batches_total.fetch_add(1, std::memory_order_relaxed);
                                                      });
+
         membrane_->SetCentroidsFilePath(opt_.centroids_path);
         membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
     }
@@ -93,7 +79,6 @@ namespace pomai
             return;
         started_ = true;
 
-        // Start pool first so early freezes can enqueue
         if (build_pool_)
             build_pool_->Start();
         membrane_->Start();
@@ -101,46 +86,15 @@ namespace pomai
         if (opt_.centroids_load_mode == MembraneRouter::CentroidsLoadMode::None)
             return;
 
-        if (opt_.centroids_load_mode != MembraneRouter::CentroidsLoadMode::Async &&
-            membrane_->HasCentroids())
-        {
-            if (log_info_)
-                log_info_("Centroids already loaded; skipping background recompute");
-            return;
-        }
-
-        // Spawn a background non-blocking centroid recompute after startup to avoid blocking Start().
-        // This provides a reasonable default: k = shards * 8, samples = shards * 1024.
-        // If you prefer control, call RecomputeCentroids(...) from the embedding app or admin API.
         std::thread([this]()
                     {
-            // small delay to let shards finish replay/freeze work
             std::this_thread::sleep_for(std::chrono::seconds(1));
-
             const std::size_t shards = membrane_->ShardCount();
-            if (shards == 0)
-                return;
-
-            const std::size_t k = shards * 8;
-            const std::size_t total_samples = shards * 1024;
-
-            try
-            {
-                auto fut = RecomputeCentroids(k, total_samples);
-                bool ok = fut.get();
-                if (log_info_)
-                {
-                    if (ok)
-                        log_info_("Centroid recompute succeeded at startup");
-                    else
-                        log_info_("Centroid recompute failed at startup");
-                }
-            }
-            catch (...)
-            {
-                if (log_error_)
-                    log_error_("Centroid recompute threw exception at startup");
-            } })
+            if (shards == 0) return;
+            try {
+                auto fut = RecomputeCentroids(shards * 8, shards * 1024);
+                fut.get();
+            } catch (...) {} })
             .detach();
     }
 
@@ -149,56 +103,41 @@ namespace pomai
         if (!started_)
             return;
         started_ = false;
-
-        // Stop shards first (they stop enqueuing new index jobs)
         membrane_->Stop();
-
-        // Then stop background pool
         if (build_pool_)
             build_pool_->Stop();
     }
 
     std::future<Lsn> PomaiDB::Upsert(Id id, Vector vec, bool wait_durable)
     {
-        // Enforce collection-level policy: if the collection disallows sync-on-append,
-        // ignore client's request for synchronous durability.
-        bool effective_wait = wait_durable && opt_.allow_sync_on_append;
-        if (log_info_)
-        {
-            // Optional debug log; keep concise in production
-            // log_info_("Upsert: client_wait=" + std::to_string(wait_durable) +
-            //           " effective_wait=" + std::to_string(effective_wait));
-        }
-        return membrane_->Upsert(id, std::move(vec), effective_wait);
+        std::vector<UpsertRequest> batch;
+        batch.push_back({id, std::move(vec)});
+        return UpsertBatch(std::move(batch), wait_durable);
     }
 
     std::future<Lsn> PomaiDB::UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable)
     {
-        // Enforce collection-level policy as above.
-        bool effective_wait = wait_durable && opt_.allow_sync_on_append;
-        if (log_info_)
+        if (MemoryManager::Instance().AtOrAboveSoftWatermark())
         {
-            // Optional debug log
-            // log_info_("UpsertBatch: client_wait=" + std::to_string(wait_durable) +
-            //           " effective_wait=" + std::to_string(effective_wait) +
-            //           " batch_size=" + std::to_string(batch.size()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+
+        std::size_t estimated_bytes = batch.size() * (opt_.dim * sizeof(float) + sizeof(Id));
+        if (!MemoryManager::Instance().CanAllocate(estimated_bytes))
+        {
+            metrics_.rejected_upsert_batches_total.fetch_add(1, std::memory_order_relaxed);
+            std::promise<Lsn> p;
+            p.set_exception(std::make_exception_ptr(std::runtime_error("PomaiDB: Hard memory limit reached. Batch rejected.")));
+            return p.get_future();
+        }
+
+        bool effective_wait = wait_durable && opt_.allow_sync_on_append;
         return membrane_->UpsertBatch(std::move(batch), effective_wait);
     }
 
     SearchResponse PomaiDB::Search(const SearchRequest &req) const
     {
         return membrane_->Search(req);
-    }
-
-    std::size_t PomaiDB::TotalApproxCountUnsafe() const
-    {
-        return membrane_->TotalApproxCountUnsafe();
-    }
-
-    std::future<bool> PomaiDB::RequestCheckpoint()
-    {
-        return membrane_->RequestCheckpoint();
     }
 
     void PomaiDB::SetProbeCount(std::size_t p)
@@ -209,40 +148,33 @@ namespace pomai
     std::string PomaiDB::GetStats() const
     {
         std::ostringstream ss;
+        auto &mm = MemoryManager::Instance();
         ss << "{";
         ss << "\"rejected_upsert_batches_total\":" << metrics_.rejected_upsert_batches_total.load(std::memory_order_relaxed);
         ss << ",\"search_queue_avg_latency_ms\":" << membrane_->SearchQueueAvgLatencyMs();
         ss << ",\"active_index_builds\":" << (build_pool_ ? build_pool_->ActiveBuilds() : 0);
-
-        const std::size_t snapshot_bytes = MemoryManager::Instance().Usage(MemoryManager::Pool::Search);
-        const std::size_t index_bytes = MemoryManager::Instance().Usage(MemoryManager::Pool::Indexing);
-        const std::size_t memtable_bytes = MemoryManager::Instance().Usage(MemoryManager::Pool::Memtable);
         ss << ",\"memory_usage_bytes\":{";
-        ss << "\"snapshot\":" << snapshot_bytes;
-        ss << ",\"index\":" << index_bytes;
-        ss << ",\"memtable\":" << memtable_bytes;
-        ss << ",\"total\":" << (snapshot_bytes + index_bytes + memtable_bytes);
+        ss << "\"snapshot\":" << mm.Usage(MemoryManager::Pool::Search);
+        ss << ",\"index\":" << mm.Usage(MemoryManager::Pool::Indexing);
+        ss << ",\"memtable\":" << mm.Usage(MemoryManager::Pool::Memtable);
+        ss << ",\"total\":" << mm.TotalUsage();
+        ss << ",\"limit\":" << mm.HardWatermarkBytes();
         ss << "}";
-
         auto hotspot = membrane_->CurrentHotspot();
         ss << ",\"hotspot\":{";
         if (hotspot)
         {
-            ss << "\"detected\":true";
-            ss << ",\"shard_id\":" << hotspot->shard_id;
-            ss << ",\"centroid_idx\":" << hotspot->centroid_idx;
-            ss << ",\"ratio\":" << hotspot->ratio;
+            ss << "\"detected\":true,\"shard_id\":" << hotspot->shard_id
+               << ",\"ratio\":" << hotspot->ratio;
         }
         else
         {
             ss << "\"detected\":false";
         }
-        ss << "}";
-        ss << "}";
+        ss << "}}";
         return ss.str();
     }
 
-    // Trigger recompute of centroids (samples shards, runs k-means, installs centroids).
     std::future<bool> PomaiDB::RecomputeCentroids(std::size_t k, std::size_t total_samples)
     {
         if (k == 0)
@@ -254,22 +186,19 @@ namespace pomai
 
         return std::async(std::launch::async, [this, k, total_samples]() -> bool
                           {
-            try
-            {
+            try {
+                auto flush_fut = membrane_->RequestCheckpoint();
+                flush_fut.get();
                 return membrane_->ComputeAndConfigureCentroids(k, total_samples);
-            }
-            catch (const std::exception &e)
-            {
-                if (log_error_)
-                    log_error_(std::string("RecomputeCentroids failed: ") + e.what());
+            } catch (const std::exception &e) {
+                if (log_error_) log_error_(std::string("RecomputeCentroids failed: ") + e.what());
                 return false;
-            }
-            catch (...)
-            {
-                if (log_error_)
-                    log_error_("RecomputeCentroids failed: unknown exception");
+            } catch (...) {
                 return false;
             } });
     }
 
-} // namespace pomai
+    std::size_t PomaiDB::TotalApproxCountUnsafe() const { return membrane_->TotalApproxCountUnsafe(); }
+    std::future<bool> PomaiDB::RequestCheckpoint() { return membrane_->RequestCheckpoint(); }
+
+}

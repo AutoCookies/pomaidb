@@ -13,7 +13,6 @@
 #include "whispergrain.h"
 #include "spatial_router.h"
 #include "search_thread_pool.h" // new
-#include "search_fanout.h"      // new
 
 namespace pomai
 {
@@ -95,7 +94,7 @@ namespace pomai
         std::vector<std::size_t> centroid_to_shard_;
 
         // How many centroid neighbors to probe per query. Default 2 (multi-probe).
-        std::size_t probe_P_{2};
+        std::size_t probe_P_{6};
 
         std::string centroids_path_;
         CentroidsLoadMode centroids_load_mode_{CentroidsLoadMode::Auto};
