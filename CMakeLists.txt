@@ -38,6 +38,7 @@ set(CORE_SOURCES
     src/core/pomai_db.cpp
     src/core/shard.cpp
     src/core/wal.cpp
+    src/core/wal_uring.cpp
     src/core/seed.cpp
     src/core/spatial_router.cpp
     src/core/orbit_index.cpp
@@ -88,6 +89,7 @@ add_pomai_benchmark(bench_embedded benchmarks/bench_embedded.cpp)
 add_pomai_benchmark(bench_phase3 benchmarks/bench_phase3.cpp)
 add_pomai_benchmark(bench_concurrent benchmarks/bench_concurrent.cpp)
 add_pomai_benchmark(bench_concurrent_search benchmarks/bench_concurrent_search.cpp)
+add_pomai_benchmark(bench_wal bench/bench_wal.cpp)
 
 # --- 7. AUTOMATED TESTS ---
 option(BUILD_TESTING "Build the test suite" ON)
@@ -101,6 +103,8 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     endmacro()
 
     add_pomai_test(wal_unit_tests tests/wal_unit_tests.cpp)
+    add_pomai_test(wal_durable_tests tests/wal_durable_tests.cpp)
+    add_pomai_test(wal_concurrency_tests tests/wal_concurrency_tests.cpp)
     add_pomai_test(wal_integration_writer tests/wal_integration_writer.cpp)
     add_pomai_test(wal_replay_inspect tests/wal_replay_inspect.cpp)
     add_pomai_test(pomai_db_writer tests/pomai_db_writer.cpp)
@@ -108,4 +112,10 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_pomai_test(memory_safety_tests tests/memory_safety_tests.cpp)
     add_pomai_test(quantization_fixed_bounds_tests tests/quantization_fixed_bounds_tests.cpp)
     add_pomai_test(shard_concurrency_tests tests/shard_concurrency_tests.cpp)
+endif()
+
+# --- 8. TOOLS ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/wal_crash_test.cpp")
+    add_executable(wal_crash_test tools/wal_crash_test.cpp)
+    target_link_libraries(wal_crash_test PRIVATE pomai_core)
 endif()
