@@ -284,24 +284,25 @@ namespace pomai
                 futs.push_back(shards_[i]->EnqueueUpserts(std::move(parts[i]), wait_durable));
         }
 
-        std::promise<Lsn> done;
-        auto out = done.get_future();
-        auto task = [futs = std::move(futs), done = std::move(done)]() mutable
+        auto done = std::make_shared<std::promise<Lsn>>();
+        auto out = done->get_future();
+        auto shared_futs = std::make_shared<std::vector<std::future<Lsn>>>(std::move(futs));
+        auto task = [shared_futs, done]() mutable
         {
             Lsn max_lsn = 0;
             try
             {
-                for (auto &f : futs)
+                for (auto &f : *shared_futs)
                 {
                     Lsn l = f.get();
                     if (l > max_lsn)
                         max_lsn = l;
                 }
-                done.set_value(max_lsn);
+                done->set_value(max_lsn);
             }
             catch (...)
             {
-                done.set_exception(std::current_exception());
+                done->set_exception(std::current_exception());
             }
         };
         if (!completion_.Enqueue(std::move(task)))
@@ -456,25 +457,26 @@ namespace pomai
         std::vector<std::future<bool>> futs;
         for (auto &s : shards_)
             futs.push_back(s->RequestCheckpoint());
-        std::promise<bool> done;
-        auto out = done.get_future();
-        auto task = [futs = std::move(futs), done = std::move(done)]() mutable
+        auto done = std::make_shared<std::promise<bool>>();
+        auto out = done->get_future();
+        auto shared_futs = std::make_shared<std::vector<std::future<bool>>>(std::move(futs));
+        auto task = [shared_futs, done]() mutable
         {
             try
             {
-                for (auto &f : futs)
+                for (auto &f : *shared_futs)
                 {
                     if (!f.get())
                     {
-                        done.set_value(false);
+                        done->set_value(false);
                         return;
                     }
                 }
-                done.set_value(true);
+                done->set_value(true);
             }
             catch (...)
             {
-                done.set_exception(std::current_exception());
+                done->set_exception(std::current_exception());
             }
         };
         if (!completion_.Enqueue(std::move(task)))

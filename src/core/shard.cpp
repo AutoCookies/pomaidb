@@ -482,11 +482,16 @@ namespace pomai
         }
         if (build_pool_)
         {
-            IndexBuildPool::Job job{pos, snap, 48, 200, [this](std::size_t p, Seed::Snapshot s, std::shared_ptr<pomai::core::OrbitIndex> i)
-                                    {
-                                        auto g = this->BuildGrainIndex(s);
-                                        this->AttachIndex(p, std::move(s), std::move(i), std::move(g));
-                                    }};
+            IndexBuildPool::Job job;
+            job.segment_pos = pos;
+            job.snap = snap;
+            job.M = 48;
+            job.ef_construction = 200;
+            job.attach = [this](std::size_t p, Seed::Snapshot s, std::shared_ptr<pomai::core::OrbitIndex> i)
+            {
+                auto g = this->BuildGrainIndex(s);
+                this->AttachIndex(p, std::move(s), std::move(i), std::move(g));
+            };
             build_pool_->Enqueue(std::move(job));
         }
         Seed next_seed(seed_.Dim());
