@@ -16,6 +16,7 @@
 #include "fixed_topk.h"
 #include "cpu_kernels.h"
 #include "spatial_router.h"
+#include "pomai_assert.h"
 
 namespace pomai
 {
@@ -218,6 +219,9 @@ namespace pomai
             return nullptr;
         }
         const std::size_t n = snap->ids.size();
+        const std::size_t dim = snap->dim;
+        POMAI_ASSERT(snap->qmins.size() == dim && snap->qscales.size() == dim, "BuildGrainIndex quantization dim mismatch");
+        POMAI_ASSERT(snap->qdata.size() == n * dim, "BuildGrainIndex qdata size mismatch");
         const std::size_t k = TargetCentroidCount(n);
         if (k == 0)
             return nullptr;
@@ -240,7 +244,6 @@ namespace pomai
         }
         if (centroids.empty())
             return nullptr;
-        const std::size_t dim = snap->dim;
         std::vector<std::uint32_t> assignments(n);
         std::vector<std::uint32_t> counts(centroids.size(), 0);
         std::vector<float> buf(dim);
@@ -278,6 +281,9 @@ namespace pomai
     {
         SearchResponse resp;
         const std::size_t dim = snap->dim;
+        POMAI_ASSERT(req.query.data.size() == dim, "SearchGrains query dim mismatch");
+        POMAI_ASSERT(grains.dim == dim, "SearchGrains grains dim mismatch");
+        POMAI_ASSERT(snap->qdata.size() == snap->ids.size() * dim, "SearchGrains qdata size mismatch");
         const std::size_t topk = std::min<std::size_t>(req.topk, 128);
         std::size_t probe = budget.bucket_budget > 0 ? budget.bucket_budget : std::min<std::size_t>(16, grains.centroids.size());
         probe = std::min({probe, grains.centroids.size(), (std::size_t)128});

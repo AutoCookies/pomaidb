@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -40,7 +41,18 @@ int main()
     {
         const std::size_t dim = 16;
         const std::size_t batch_size = 128;
-        const std::chrono::seconds runtime(5);
+        int runtime_sec = 5;
+        if (const char *env = std::getenv("POMAI_TEST_RUNTIME_SEC"))
+        {
+            try
+            {
+                runtime_sec = std::max(1, std::stoi(env));
+            }
+            catch (...)
+            {
+            }
+        }
+        const std::chrono::seconds runtime(runtime_sec);
 
         std::string dir = MakeTempDir();
 
@@ -93,7 +105,7 @@ int main()
         searchers.reserve(search_threads);
         for (std::size_t t = 0; t < search_threads; ++t)
         {
-            searchers.emplace_back([&]()
+            searchers.emplace_back([&, t]()
                                    {
                                        std::mt19937_64 rng(1000 + t);
                                        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
