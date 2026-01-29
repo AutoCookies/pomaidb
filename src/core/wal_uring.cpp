@@ -227,8 +227,9 @@ namespace pomai
     void WalUring::PrepFdatasync(io_uring_sqe *sqe, int fd)
     {
         std::memset(sqe, 0, sizeof(*sqe));
-        sqe->opcode = IORING_OP_FDATASYNC;
+        sqe->opcode = IORING_OP_FSYNC;
         sqe->fd = fd;
+        sqe->fsync_flags = IORING_FSYNC_DATASYNC;
     }
 } // namespace pomai
 

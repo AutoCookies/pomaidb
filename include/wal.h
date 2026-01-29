@@ -67,6 +67,13 @@ namespace pomai
 
     void TruncateToZero();
 
+    struct Pending
+    {
+      Lsn lsn;
+      std::shared_ptr<std::vector<uint8_t>> buf;
+      std::size_t bytes;
+    };
+
   private:
     // Durability: an LSN is durable once fdatasync completes after its write submission.
     // On WAL creation, fsync the directory once; on truncate/rotate, fsync the directory
@@ -80,13 +87,6 @@ namespace pomai
 
     static void WriteAll(int fd, const void *buf, std::size_t n);
     static bool ReadExact(int fd, void *buf, std::size_t n);
-
-    struct Pending
-    {
-      Lsn lsn;
-      std::shared_ptr<std::vector<uint8_t>> buf;
-      std::size_t bytes;
-    };
 
     std::string shard_name_;
     std::string wal_dir_;
