@@ -8,11 +8,13 @@
 #include <atomic>
 #include <mutex>
 #include <cstdint>
+#include <chrono>
 #include "shard.h"
 #include "server/config.h"
 #include "whispergrain.h"
 #include "spatial_router.h"
 #include "search_thread_pool.h" // new
+#include "completion_executor.h"
 
 namespace pomai
 {
@@ -55,6 +57,8 @@ namespace pomai
         void SetProbeCount(std::size_t p);
         std::vector<Vector> SnapshotCentroids() const;
         double SearchQueueAvgLatencyMs() const;
+        std::uint64_t SearchOverloadCount() const { return search_overload_.load(std::memory_order_relaxed); }
+        std::uint64_t SearchInlineCount() const { return search_inline_.load(std::memory_order_relaxed); }
 
         struct HotspotInfo
         {
@@ -76,6 +80,7 @@ namespace pomai
         void SetCentroidsFilePath(const std::string &path);
         void SetCentroidsLoadMode(CentroidsLoadMode mode);
         bool HasCentroids() const;
+        bool ScheduleCompletion(std::function<void()> fn, std::chrono::steady_clock::duration delay = {});
 
     private:
         // Legacy id-based pick (used as fallback)
@@ -103,6 +108,7 @@ namespace pomai
 
         // Thread-pool for bounded parallel search fanout. Mutable so Search() can be const.
         mutable SearchThreadPool search_pool_;
+        mutable CompletionExecutor completion_{1024};
 
         std::function<void()> on_rejected_upsert_;
 
@@ -110,6 +116,8 @@ namespace pomai
         mutable std::optional<HotspotInfo> hotspot_;
         mutable std::size_t last_hotspot_shard_{static_cast<std::size_t>(-1)};
         mutable std::atomic<std::uint64_t> search_count_{0};
+        mutable std::atomic<std::uint64_t> search_overload_{0};
+        mutable std::atomic<std::uint64_t> search_inline_{0};
     };
 
 }
