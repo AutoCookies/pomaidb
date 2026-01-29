@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <filesystem>
 
@@ -29,7 +30,9 @@ namespace pomai
             return;
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&]
-                 { return !running_.load() || durable_lsn_ >= lsn; });
+                 { return wal_error_.load() || !running_.load() || durable_lsn_ >= lsn; });
+        if (wal_error_.load())
+            throw std::runtime_error("WAL error: " + wal_error_msg_);
     }
 
     static void ThrowSys(const std::string &what)
@@ -43,6 +46,24 @@ namespace pomai
         if (!std::filesystem::create_directories(dir, ec) && ec)
         {
             throw std::runtime_error("failed to create directory " + dir + ": " + ec.message());
+        }
+    }
+
+    static void FsyncDir(const std::string &dir)
+    {
+        int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dfd >= 0)
+        {
+            if (::fsync(dfd) != 0)
+            {
+                ::close(dfd);
+                ThrowSys("fsync(dir) failed");
+            }
+            ::close(dfd);
+        }
+        else
+        {
+            ThrowSys("open(wal_dir) for fsync failed");
         }
     }
 
@@ -83,10 +104,11 @@ namespace pomai
         return true;
     }
 
-    Wal::Wal(std::string shard_name, std::string wal_dir, std::size_t dim)
+    Wal::Wal(std::string shard_name, std::string wal_dir, std::size_t dim, WalOptions options)
         : shard_name_(std::move(shard_name)),
           wal_dir_(std::move(wal_dir)),
-          dim_(dim)
+          dim_(dim),
+          options_(options)
     {
         if (dim_ == 0)
             throw std::runtime_error("Wal dim must be > 0");
@@ -101,12 +123,21 @@ namespace pomai
     void Wal::OpenOrCreateForAppend()
     {
         EnsureDirExists(wal_dir_);
-
+        struct stat st{};
+        bool created = false;
+        if (::stat(wal_path_.c_str(), &st) != 0)
+        {
+            if (errno != ENOENT)
+                ThrowSys("stat WAL failed: " + wal_path_);
+            created = true;
+        }
         fd_ = ::open(wal_path_.c_str(),
                      O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC,
                      0644);
         if (fd_ < 0)
             ThrowSys("open WAL failed: " + wal_path_);
+        if (created)
+            FsyncDir(wal_dir_);
     }
 
     void Wal::CloseFd()
@@ -125,23 +156,61 @@ namespace pomai
 
         crc64_init();
         OpenOrCreateForAppend();
+        uring_enabled_ = false;
+#ifdef __linux__
+        if (options_.prefer_uring)
+        {
+            std::string error;
+            if (uring_.Init(options_.uring_entries, options_.enable_sqpoll, &error))
+                uring_enabled_ = true;
+            else
+                std::cerr << "[WAL] io_uring disabled: " << error << "\n";
+        }
+        if (uring_enabled_ && uring_.Entries() < 2)
+        {
+            std::cerr << "[WAL] io_uring disabled: insufficient SQ entries\n";
+            uring_.Shutdown();
+            uring_enabled_ = false;
+        }
+#endif
         writer_th_ = std::thread(&Wal::WriterLoop, this);
-        fsync_th_ = std::thread(&Wal::FsyncLoop, this);
+        completion_th_ = std::thread(&Wal::CompletionLoop, this);
     }
 
     void Wal::Stop()
     {
-        if (!running_.exchange(false))
+        if (!running_.load())
             return;
 
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_requested_ = true;
+        }
+        cv_.notify_all();
+        try
+        {
+            WaitDurable(WrittenLsn());
+        }
+        catch (...)
+        {
+        }
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&]
+                     { return wal_error_.load() || (pending_writes_.empty() && inflight_.empty()); });
+        }
+        running_.store(false);
         cv_.notify_all();
         if (writer_th_.joinable())
             writer_th_.join();
-        if (fsync_th_.joinable())
-            fsync_th_.join();
+        if (completion_th_.joinable())
+            completion_th_.join();
 
         if (fd_ >= 0)
             ::fdatasync(fd_);
+#ifdef __linux__
+        uring_.Shutdown();
+#endif
         CloseFd();
     }
 
@@ -176,13 +245,13 @@ namespace pomai
         const uint32_t count_u32 = static_cast<uint32_t>(batch.size());
         const uint16_t dim16 = static_cast<uint16_t>(dim_);
 
-        std::vector<uint8_t> buf;
-        buf.reserve(payload_size + 24);
+        auto buf = std::make_shared<std::vector<uint8_t>>();
+        buf->reserve(payload_size + 24);
 
         auto push_le = [&](const void *ptr, std::size_t n)
         {
             const uint8_t *p = reinterpret_cast<const uint8_t *>(ptr);
-            buf.insert(buf.end(), p, p + n);
+            buf->insert(buf->end(), p, p + n);
         };
 
         uint64_t lsn_le = (uint64_t)lsn;
@@ -213,9 +282,9 @@ namespace pomai
             push_le(vf, dim_ * sizeof(float));
         }
 
-        uint64_t crc = crc64(0, buf.data(), buf.size());
+        uint64_t crc = crc64(0, buf->data(), buf->size());
 
-        uint32_t payload_size_u32 = static_cast<uint32_t>(buf.size());
+        uint32_t payload_size_u32 = static_cast<uint32_t>(buf->size());
         uint32_t reserved = 0;
         uint64_t crc_le = crc;
         uint64_t magic_le = FOOTER_MAGIC;
@@ -233,29 +302,27 @@ namespace pomai
         push_le(&magic_le, sizeof(magic_le));
 
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::unique_lock<std::mutex> lk(mu_);
             if (!running_.load())
                 ThrowSys("WAL not started");
-            pending_writes_.push_back(Pending{lsn, std::move(buf)});
+            cv_.wait(lk, [&]
+                     {
+                         return !running_.load() ||
+                                (!stop_requested_ &&
+                                 pending_writes_.size() < options_.max_pending_records &&
+                                 pending_bytes_ + buf->size() <= options_.max_queued_bytes);
+                     });
+            if (wal_error_.load())
+                throw std::runtime_error("WAL error: " + wal_error_msg_);
+            if (!running_.load() || stop_requested_)
+                ThrowSys("WAL not running");
+            pending_bytes_ += buf->size();
+            pending_writes_.push_back(Pending{lsn, std::move(buf), buf->size()});
             cv_.notify_all();
         }
 
         if (wait_durable)
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            if (durable_lsn_ >= lsn)
-                return lsn;
-            lk.unlock();
-            // As fallback, attempt immediate fdatasync to speed up durability
-            if (fd_ >= 0)
-            {
-                if (::fdatasync(fd_) != 0)
-                    ThrowSys("fdatasync failed in AppendUpserts (wait_durable)");
-            }
-            std::unique_lock<std::mutex> lk2(mu_);
-            cv_.wait(lk2, [&]
-                     { return durable_lsn_ >= lsn; });
-        }
+            WaitDurable(lsn);
 
         return lsn;
     }
@@ -268,57 +335,201 @@ namespace pomai
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 cv_.wait(lk, [&]
-                         { return !running_.load() || !pending_writes_.empty(); });
+                         {
+                             return wal_error_.load() || !running_.load() ||
+                                    !pending_writes_.empty();
+                         });
+                if (wal_error_.load())
+                    break;
                 if (!running_.load() && pending_writes_.empty())
                     break;
-                to_write.swap(pending_writes_);
-            }
-
-            for (auto &p : to_write)
-            {
-                if (fd_ < 0)
-                    ThrowSys("WAL writer fd invalid");
-                WriteAll(fd_, p.buf.data(), p.buf.size());
+                if (options_.max_inflight_batches > 0)
                 {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    written_lsn_ = p.lsn;
-                    cv_.notify_all();
+                    cv_.wait(lk, [&]
+                             {
+                                 return wal_error_.load() || inflight_batches_ < options_.max_inflight_batches ||
+                                        !running_.load();
+                             });
+                    if (wal_error_.load())
+                        break;
+                    if (!running_.load() && pending_writes_.empty())
+                        break;
                 }
-            }
-
-            // ensure background durability progress: fsync file and advance durable_lsn_
-            if (fd_ >= 0)
-            {
-                if (::fdatasync(fd_) != 0)
-                    std::cerr << "[WAL] fdatasync failed in writer: " << std::strerror(errno) << "\n";
-            }
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                durable_lsn_ = written_lsn_;
+                std::size_t batch_bytes = 0;
+                while (!pending_writes_.empty())
+                {
+                    Pending p = std::move(pending_writes_.front());
+                    pending_writes_.pop_front();
+                    pending_bytes_ -= p.bytes;
+                    to_write.push_back(std::move(p));
+                    batch_bytes += to_write.back().bytes;
+                    if (options_.max_batch_bytes > 0 && batch_bytes >= options_.max_batch_bytes)
+                        break;
+                    if (options_.max_iovecs > 0 && to_write.size() >= options_.max_iovecs)
+                        break;
+                }
                 cv_.notify_all();
             }
+            if (to_write.empty())
+                continue;
+            if (uring_enabled_)
+                SubmitBatchUring(std::move(to_write));
+            else
+                SubmitBatchSync(std::move(to_write));
         }
     }
 
-    void Wal::FsyncLoop()
+    void Wal::SubmitBatchSync(std::deque<Pending> &&batch)
     {
-        using namespace std::chrono_literals;
-        const auto interval = 100ms;
-
-        while (running_.load())
+        for (auto &p : batch)
         {
-            std::this_thread::sleep_for(interval);
-            std::lock_guard<std::mutex> lk(mu_);
-            if (written_lsn_ > durable_lsn_)
+            if (fd_ < 0)
+                ThrowSys("WAL writer fd invalid");
+            WriteAll(fd_, p.buf->data(), p.buf->size());
             {
-                if (fd_ >= 0)
-                {
-                    if (::fdatasync(fd_) != 0)
-                        std::cerr << "[WAL] fdatasync failed in fsync loop: " << std::strerror(errno) << "\n";
-                }
-                durable_lsn_ = written_lsn_;
+                std::lock_guard<std::mutex> lk(mu_);
+                written_lsn_ = p.lsn;
                 cv_.notify_all();
             }
+        }
+
+        if (fd_ >= 0)
+        {
+            if (::fdatasync(fd_) != 0)
+                std::cerr << "[WAL] fdatasync failed in writer: " << std::strerror(errno) << "\n";
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            durable_lsn_ = written_lsn_;
+            cv_.notify_all();
+        }
+    }
+
+    void Wal::SubmitBatchUring(std::deque<Pending> &&batch)
+    {
+#ifdef __linux__
+        if (batch.empty())
+            return;
+
+        Lsn start_lsn = batch.front().lsn;
+        Lsn end_lsn = batch.back().lsn;
+        auto inflight = std::make_unique<InflightBatch>();
+        inflight->start_lsn = start_lsn;
+        inflight->end_lsn = end_lsn;
+        const std::size_t max_iovecs = options_.max_iovecs == 0 ? batch.size() : options_.max_iovecs;
+        inflight->iovecs.reserve(std::min(batch.size(), max_iovecs));
+
+        while (!batch.empty() && inflight->iovecs.size() < max_iovecs)
+        {
+            Pending p = std::move(batch.front());
+            batch.pop_front();
+            iovec io{};
+            io.iov_base = p.buf->data();
+            io.iov_len = p.buf->size();
+            inflight->iovecs.push_back(io);
+            inflight->buffers.push_back(std::move(p.buf));
+        }
+
+        io_uring_sqe *sqe = uring_.GetSqe();
+        io_uring_sqe *sync_sqe = uring_.GetSqe();
+        if (!sqe || !sync_sqe)
+            ThrowSys("io_uring SQE exhaustion");
+        WalUring::PrepWritev(sqe, fd_, inflight->iovecs.data(), static_cast<unsigned>(inflight->iovecs.size()), -1);
+        sqe->flags |= IOSQE_IO_LINK;
+        sqe->user_data = reinterpret_cast<__u64>(inflight.get());
+
+        WalUring::PrepFdatasync(sync_sqe, fd_);
+        sync_sqe->user_data = reinterpret_cast<__u64>(inflight.get()) | 1ULL;
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            written_lsn_ = end_lsn;
+            inflight_batches_++;
+            inflight_.push_back(std::move(inflight));
+            cv_.notify_all();
+        }
+
+        int ret = uring_.Submit(0);
+        if (ret < 0)
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            wal_error_ = true;
+            wal_error_msg_ = std::strerror(errno);
+            cv_.notify_all();
+        }
+#else
+        SubmitBatchSync(std::move(batch));
+#endif
+    }
+
+    void Wal::CompletionLoop()
+    {
+        while (true)
+        {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!running_.load() && inflight_.empty())
+                    break;
+            }
+#ifdef __linux__
+            if (!uring_enabled_)
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait_for(lk, std::chrono::milliseconds(10), [&]
+                             { return !running_.load(); });
+                continue;
+            }
+            io_uring_cqe *cqe = nullptr;
+            if (uring_.WaitCqe(&cqe) != 0)
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                wal_error_ = true;
+                wal_error_msg_ = std::strerror(errno);
+                cv_.notify_all();
+                break;
+            }
+            const uint64_t data = cqe->user_data;
+            const bool is_sync = (data & 1ULL) != 0;
+            auto *batch = reinterpret_cast<InflightBatch *>(data & ~1ULL);
+            const int res = cqe->res;
+            uring_.AdvanceCq(1);
+            if (res < 0)
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                wal_error_ = true;
+                wal_error_msg_ = std::strerror(-res);
+                cv_.notify_all();
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                for (auto &entry : inflight_)
+                {
+                    if (entry.get() == batch)
+                    {
+                        if (is_sync)
+                            entry->sync_done = true;
+                        else
+                            entry->write_done = true;
+                        break;
+                    }
+                }
+                while (!inflight_.empty() && inflight_.front()->write_done)
+                {
+                    written_lsn_ = inflight_.front()->end_lsn;
+                    if (!inflight_.front()->sync_done)
+                        break;
+                    durable_lsn_ = inflight_.front()->end_lsn;
+                    inflight_.pop_front();
+                    inflight_batches_ = inflight_batches_ > 0 ? inflight_batches_ - 1 : 0;
+                }
+                cv_.notify_all();
+            }
+#else
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait_for(lk, std::chrono::milliseconds(10), [&]
+                         { return !running_.load(); });
+#endif
         }
     }
 
@@ -340,26 +551,13 @@ namespace pomai
 
         if (::fdatasync(fd_) != 0)
             ThrowSys("fdatasync failed after truncate");
-
-        int dfd = ::open(wal_dir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (dfd >= 0)
-        {
-            if (::fsync(dfd) != 0)
-            {
-                ::close(dfd);
-                ThrowSys("fsync(dir) failed after truncate");
-            }
-            ::close(dfd);
-        }
-        else
-        {
-            ThrowSys("open(wal_dir) for fsync after truncate failed");
-        }
+        FsyncDir(wal_dir_);
 
         next_lsn_.store(1, std::memory_order_relaxed);
         written_lsn_ = 0;
         durable_lsn_ = 0;
         pending_writes_.clear();
+        pending_bytes_ = 0;
         cv_.notify_all();
     }
 

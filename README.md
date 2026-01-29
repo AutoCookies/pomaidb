@@ -110,6 +110,7 @@ Custom bump-pointer allocator with...
 ### 6. **Write-Ahead Log (WAL) and Crash Recovery**
 Not “just for show.” WAL is implemented with:
 
+- **Async group commit via io_uring with fdatasync durability.**
 - **Simple, CRC32-checksummed logs.** - **Atomic file operations** (rename patterns).
 - **Crash resilience:** DB is consistent after power loss (we replay the WAL until successful).
 
