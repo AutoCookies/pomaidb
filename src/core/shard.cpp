@@ -202,7 +202,7 @@ namespace pomai
 
     std::shared_ptr<GrainIndex> Shard::BuildGrainIndex(const Seed::Snapshot &snap) const
     {
-        if (!snap || snap->ids.empty())
+        if (!snap || snap->ids.empty() || snap->qdata.empty())
             return nullptr;
         const std::size_t n = snap->ids.size();
         const std::size_t k = TargetCentroidCount(n);
