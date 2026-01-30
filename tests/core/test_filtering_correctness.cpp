@@ -62,7 +62,7 @@ TEST_CASE("Namespace filter correctness recall", "[core][filter][recall]")
     const std::size_t dim = 16;
     auto opts = DefaultDbOptions(dir.str(), dim, 1);
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::vector<UpsertRequest> batch;
     batch.reserve(200);
@@ -73,7 +73,8 @@ TEST_CASE("Namespace filter correctness recall", "[core][filter][recall]")
         batch.push_back(MakeUpsert(static_cast<Id>(i), dim, 0.01f * static_cast<float>(i), ns));
         id_to_ns.emplace(static_cast<Id>(i), ns);
     }
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     Filter filter;
     filter.namespace_id = 1;
@@ -81,8 +82,10 @@ TEST_CASE("Namespace filter correctness recall", "[core][filter][recall]")
     req.search_mode = SearchMode::Quality;
     req.filter = std::make_shared<Filter>(filter);
 
-    auto resp = db.Search(req);
-    db.Stop();
+    auto resp_res = db.Search(req);
+    REQUIRE(resp_res.ok());
+    auto resp = resp_res.move_value();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE(resp.status == SearchStatus::Ok);
     for (const auto &item : resp.items)
@@ -106,7 +109,7 @@ TEST_CASE("Tags any/all correctness recall", "[core][filter][recall]")
     const std::size_t dim = 16;
     auto opts = DefaultDbOptions(dir.str(), dim, 1);
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::vector<UpsertRequest> batch;
     batch.reserve(200);
@@ -121,23 +124,28 @@ TEST_CASE("Tags any/all correctness recall", "[core][filter][recall]")
         batch.push_back(MakeUpsert(static_cast<Id>(i), dim, 0.02f * static_cast<float>(i), 0, tags));
         tag_map.emplace(static_cast<Id>(i), tags);
     }
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     Filter any_filter;
     any_filter.require_any_tags = {2, 3};
     SearchRequest any_req = MakeSearchRequest(batch[0].vec, 10);
     any_req.search_mode = SearchMode::Quality;
     any_req.filter = std::make_shared<Filter>(any_filter);
-    auto any_resp = db.Search(any_req);
+    auto any_resp_res = db.Search(any_req);
+    REQUIRE(any_resp_res.ok());
+    auto any_resp = any_resp_res.move_value();
 
     Filter all_filter;
     all_filter.require_all_tags = {2, 3};
     SearchRequest all_req = MakeSearchRequest(batch[0].vec, 10);
     all_req.search_mode = SearchMode::Quality;
     all_req.filter = std::make_shared<Filter>(all_filter);
-    auto all_resp = db.Search(all_req);
+    auto all_resp_res = db.Search(all_req);
+    REQUIRE(all_resp_res.ok());
+    auto all_resp = all_resp_res.move_value();
 
-    db.Stop();
+    REQUIRE(db.Stop().ok());
 
     for (const auto &item : any_resp.items)
         REQUIRE(MatchesTagsAny(item.id, tag_map, any_filter.require_any_tags));

@@ -11,7 +11,7 @@
 
 #include <pomai/api/pomai_db.h>
 #include <pomai/server/config.h>
-#include <pomai/server/logger.h>
+#include <pomai/util/logger.h>
 
 namespace pomai::server
 {
@@ -19,7 +19,7 @@ namespace pomai::server
     class PomaiServer
     {
     public:
-        PomaiServer(ServerConfig cfg, Logger *log);
+        PomaiServer(ServerConfig cfg, pomai::Logger *log);
         ~PomaiServer();
 
         bool Start();
@@ -56,7 +56,7 @@ namespace pomai::server
         void SaveCollectionMeta(const std::string &name, const DbOptions &opt);
 
         ServerConfig cfg_;
-        Logger *log_{nullptr};
+        pomai::Logger *log_{nullptr};
         std::atomic<bool> running_{false};
 
         // TCP Socket

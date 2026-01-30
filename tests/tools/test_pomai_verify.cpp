@@ -18,11 +18,14 @@ TEST_CASE("pomai_verify equivalent succeeds", "[tools][verify]")
     auto opts = DefaultDbOptions(dir.str(), 6, 1);
 
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
     auto batch = MakeBatch(10, 6, 0.1f, 2);
-    db.UpsertBatch(batch, true).get();
-    REQUIRE(db.RequestCheckpoint().get());
-    db.Stop();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
+    auto checkpoint_res = db.RequestCheckpoint().get();
+    REQUIRE(checkpoint_res.ok());
+    REQUIRE(checkpoint_res.value());
+    REQUIRE(db.Stop().ok());
 
     pomai::storage::Manifest manifest;
     std::string err;

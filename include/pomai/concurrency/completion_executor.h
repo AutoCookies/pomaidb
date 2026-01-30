@@ -10,14 +10,17 @@
 #include <thread>
 #include <utility>
 
+#include <pomai/util/logger.h>
+
 namespace pomai
 {
 
     class CompletionExecutor
     {
     public:
-        explicit CompletionExecutor(std::size_t max_queue = 1024)
-            : max_queue_(max_queue == 0 ? 1 : max_queue) {}
+        explicit CompletionExecutor(std::size_t max_queue = 1024, Logger *logger = nullptr)
+            : max_queue_(max_queue == 0 ? 1 : max_queue),
+              logger_(logger) {}
 
         ~CompletionExecutor() { Stop(); }
 
@@ -117,6 +120,8 @@ namespace pomai
                 }
                 catch (...)
                 {
+                    if (logger_)
+                        logger_->Error("completion.task", "Completion task threw an exception");
                 }
                 lk.lock();
             }
@@ -129,6 +134,7 @@ namespace pomai
         mutable std::mutex mu_;
         std::condition_variable cv_;
         std::priority_queue<Task, std::vector<Task>, TaskCmp> tasks_;
+        Logger *logger_{nullptr};
     };
 
 } // namespace pomai

@@ -65,6 +65,9 @@ namespace pomai
         // Scan knobs
         std::size_t scan_batch_cap{4096};
         std::size_t scan_id_order_max_rows{1000000};
+
+        // Observability
+        bool debug_logging{false};
     };
 
 } // namespace pomai

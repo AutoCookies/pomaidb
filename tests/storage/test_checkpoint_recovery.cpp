@@ -17,22 +17,27 @@ TEST_CASE("Checkpoint recovery restores data", "[storage][checkpoint]")
 
     {
         PomaiDB db(opts);
-        db.Start();
+        REQUIRE(db.Start().ok());
         auto batch = MakeBatch(30, 6, 0.1f, 2);
-        db.UpsertBatch(batch, true).get();
+        auto upsert_res = db.UpsertBatch(batch, true).get();
+        REQUIRE(upsert_res.ok());
         auto checkpoint = db.RequestCheckpoint();
-        REQUIRE(checkpoint.get());
+        auto checkpoint_res = checkpoint.get();
+        REQUIRE(checkpoint_res.ok());
+        REQUIRE(checkpoint_res.value());
         WARN("Simulating crash by skipping explicit Stop(); destructor will still clean up threads.");
     }
 
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     SearchRequest req = MakeSearchRequest(MakeVector(6, 0.1f), 5);
-    auto resp = db.Search(req);
+    auto resp_res = db.Search(req);
+    REQUIRE(resp_res.ok());
+    auto resp = resp_res.move_value();
     auto count = db.TotalApproxCountUnsafe();
 
-    db.Stop();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE_FALSE(resp.items.empty());
     REQUIRE(count >= 30);

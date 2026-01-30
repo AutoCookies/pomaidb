@@ -1,7 +1,7 @@
 #include <catch2/catch.hpp>
 
 #include <pomai/core/seed.h>
-#include <pomai/util/memory_manager.h>
+#include <pomai/concurrency/memory_manager.h>
 
 #include "common/test_utils.h"
 

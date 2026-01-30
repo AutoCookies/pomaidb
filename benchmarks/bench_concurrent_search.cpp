@@ -11,7 +11,7 @@
 #include <vector>
 #include <sys/resource.h>
 
-#include <pomai/util/index_build_pool.h>
+#include <pomai/concurrency/index_build_pool.h>
 #include <pomai/core/shard.h>
 
 using namespace pomai;

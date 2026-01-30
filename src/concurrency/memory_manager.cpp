@@ -1,4 +1,4 @@
-#include <pomai/util/memory_manager.h>
+#include <pomai/concurrency/memory_manager.h>
 
 #if defined(__has_include)
 #if __has_include(<unistd.h>)

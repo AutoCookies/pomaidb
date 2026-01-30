@@ -178,7 +178,12 @@ int main(int argc, char **argv)
 
     std::filesystem::remove_all(opt.wal_dir);
     PomaiDB db(opt);
-    db.Start();
+    auto start_status = db.Start();
+    if (!start_status.ok())
+    {
+        std::cerr << "DB start failed: " << start_status.msg << "\n";
+        return 1;
+    }
     db.SetProbeCount(probe_p);
 
     // Lưu trữ toàn bộ dữ liệu trong RAM để tính Ground Truth (tốn ~2GB cho 1M vectors)
@@ -204,7 +209,12 @@ int main(int argc, char **argv)
             batch[0].vec.data[d] = v;
             all_vectors[i * dim + d] = v;
         }
-        db.UpsertBatch(std::move(batch), false).get();
+        auto upsert_res = db.UpsertBatch(std::move(batch), false).get();
+        if (!upsert_res.ok())
+        {
+            std::cerr << "Upsert failed: " << upsert_res.status().msg << "\n";
+            return 1;
+        }
     }
     // Kích hoạt training đồng bộ để Shards nhận diện đúng cấu trúc vùng (Voronoi)
     std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -231,7 +241,12 @@ int main(int argc, char **argv)
                 all_vectors[idx * dim + d] = v;
             }
         }
-        db.UpsertBatch(std::move(batch), false).get();
+        auto upsert_res = db.UpsertBatch(std::move(batch), false).get();
+        if (!upsert_res.ok())
+        {
+            std::cerr << "Upsert failed: " << upsert_res.status().msg << "\n";
+            return 1;
+        }
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -262,7 +277,13 @@ int main(int argc, char **argv)
         req.query.data = query_vec;
 
         auto q0 = std::chrono::high_resolution_clock::now();
-        auto resp = db.Search(req);
+        auto resp_res = db.Search(req);
+        if (!resp_res.ok())
+        {
+            std::cerr << "Search failed: " << resp_res.status().msg << "\n";
+            return 1;
+        }
+        auto resp = resp_res.move_value();
         auto q1 = std::chrono::high_resolution_clock::now();
 
         latencies.push_back(std::chrono::duration<double, std::micro>(q1 - q0).count());
@@ -391,7 +412,13 @@ int main(int argc, char **argv)
                 req.search_mode = mode;
 
                 auto q0 = std::chrono::high_resolution_clock::now();
-                auto resp = db.Search(req);
+                auto resp_res = db.Search(req);
+                if (!resp_res.ok())
+                {
+                    std::cerr << "Search failed: " << resp_res.status().msg << "\n";
+                    return 1;
+                }
+                auto resp = resp_res.move_value();
                 auto q1 = std::chrono::high_resolution_clock::now();
                 f_latencies.push_back(std::chrono::duration<double, std::micro>(q1 - q0).count());
                 if (resp.partial)

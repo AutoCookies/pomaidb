@@ -20,7 +20,9 @@ TEST_CASE("Shard upsert/search round-trip", "[core][shard]")
 
     auto batch = MakeBatch(25, 8, 0.1f);
     auto fut = shard.EnqueueUpserts(batch, true);
-    REQUIRE(fut.get() > 0);
+    auto upsert_res = fut.get();
+    REQUIRE(upsert_res.ok());
+    REQUIRE(upsert_res.value() > 0);
 
     SearchRequest req = MakeSearchRequest(batch[10].vec, 5);
     pomai::ai::Budget budget{};
