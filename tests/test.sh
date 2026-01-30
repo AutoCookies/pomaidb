@@ -1,63 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${ROOT_DIR}/build"
 
-# Build everything (use existing build script)
-cd "${ROOT_DIR}"
-./build.sh
+ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+BUILD_DIR=${BUILD_DIR:-"$ROOT_DIR/build"}
+JOBS=${JOBS:-"$(getconf _NPROCESSORS_ONLN || echo 4)"}
 
-WAL_UNIT="${BUILD_DIR}/wal_unit_tests"
-WAL_WRITER="${BUILD_DIR}/wal_integration_writer"
-WAL_INSPECT="${BUILD_DIR}/wal_replay_inspect"
+mkdir -p "$BUILD_DIR"
 
-if [[ ! -x "${WAL_UNIT}" ]]; then
-    echo "Unit test binary not found: ${WAL_UNIT}"
-    exit 2
+cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -DPOMAI_BUILD_TESTS=ON
+cmake --build "$BUILD_DIR" -j "$JOBS"
+
+OUTPUT_FILE=$(mktemp)
+set +e
+ctest --output-on-failure -j "$JOBS" --test-dir "$BUILD_DIR" | tee "$OUTPUT_FILE"
+CTEST_STATUS=${PIPESTATUS[0]}
+set -e
+
+passed=0
+failed=0
+failed_names=()
+
+while IFS= read -r line; do
+    if [[ $line =~ Test\ #[0-9]+:\ (.*)\ \.\.\.\ Passed ]]; then
+        ((passed+=1))
+    elif [[ $line =~ Test\ #[0-9]+:\ (.*)\ \.\.\.\ \*\*\*Failed ]]; then
+        failed_names+=("${BASH_REMATCH[1]}")
+        ((failed+=1))
+    elif [[ $line =~ Test\ #[0-9]+:\ (.*)\ \.\.\.\ Failed ]]; then
+        failed_names+=("${BASH_REMATCH[1]}")
+        ((failed+=1))
+    fi
+done < "$OUTPUT_FILE"
+
+GREEN="\033[0;32m"
+RED="\033[0;31m"
+NC="\033[0m"
+
+echo -e "PASSED: ${GREEN}${passed}${NC}"
+echo -e "FAILED: ${RED}${failed}${NC}"
+
+if ((failed > 0)); then
+    echo "Failed tests:"
+    for name in "${failed_names[@]}"; do
+        echo "  - ${name}"
+    done
 fi
 
-echo "=== Running WAL unit tests ==="
-"${WAL_UNIT}"
-echo "=== WAL unit tests completed ==="
+rm -f "$OUTPUT_FILE"
 
-echo "=== Running integration sync writer test (deterministic) ==="
-TMPDIR=$(mktemp -d /tmp/pomai_integ.XXXXXX)
-echo "Using temp dir: ${TMPDIR}"
-
-# launch writer that writes 20 batches of 10 vectors with wait_durable=1 (sync)
-"${WAL_WRITER}" "${TMPDIR}" 20 10 1 > "${TMPDIR}/writer.log" 2>&1 &
-WR_PID=$!
-# wait for writer to finish
-wait ${WR_PID}
-
-echo "Writer finished; now running replay inspect..."
-"${WAL_INSPECT}" "${TMPDIR}" 8
-
-# Check replay output contains expected vector count (20 * 10 = 200)
-REPLAY_LINE=$( "${WAL_INSPECT}" "${TMPDIR}" 8 )
-echo "${REPLAY_LINE}"
-VECTORS=$(echo "${REPLAY_LINE}" | sed -n 's/.*vectors_applied=\([0-9]*\).*/\1/p')
-if [[ "${VECTORS}" != "200" ]]; then
-    echo "Integration sync test FAILED: expected 200 vectors, got ${VECTORS}"
-    exit 3
+if ((failed > 0)); then
+    exit 1
 fi
-echo "Integration sync test PASSED"
 
-# Optional non-deterministic kill-9 scenario: start writer async and kill mid-run
-echo "=== Running optional kill-9 async test (informational) ==="
-TMPDIR2=$(mktemp -d /tmp/pomai_integ_async.XXXXXX)
-echo "Using temp dir: ${TMPDIR2}"
-# run writer with wait_durable=0
-"${WAL_WRITER}" "${TMPDIR2}" 100 10 0 > "${TMPDIR2}/writer.log" 2>&1 &
-PID=$!
-# sleep shortly then kill -9
-sleep 0.25
-echo "Killing writer (${PID}) with SIGKILL..."
-kill -9 ${PID} || true
-wait ${PID} 2>/dev/null || true
-
-echo "After hard kill, replay stats:"
-"${WAL_INSPECT}" "${TMPDIR2}" 8 || true
-
-echo "All tests run. Note: kill-9 async test is informational and may be non-deterministic."
-exit 0
+exit $CTEST_STATUS

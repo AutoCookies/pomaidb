@@ -194,6 +194,17 @@ chmod +x ./build.sh
 ./build.sh
 ```
 
+### Sanitizer Builds
+
+PomaiDB supports optional sanitizer builds via CMake:
+
+```bash
+mkdir -p build
+cd build
+cmake .. -DPOMAI_SANITIZE=ASAN   # or UBSAN / TSAN
+cmake --build . -j
+```
+
 Binaries:
 
 * `pomai_server` — main server
