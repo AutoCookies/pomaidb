@@ -6,6 +6,7 @@
 #include <immintrin.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -815,10 +816,38 @@ namespace pomai
         const bool has_filter = req.filter && !req.filter->empty();
         const std::size_t candidate_k = has_filter && req.filtered_candidate_k > 0 ? std::max<std::size_t>(req.filtered_candidate_k, req.topk)
                                                                                    : NormalizeCandidateK(req);
+        const std::size_t max_visits = has_filter ? std::max<std::size_t>(req.filter_max_visits, candidate_k) : 0;
+        const std::uint64_t time_budget_us = has_filter ? req.filter_time_budget_us : 0;
+        const auto start_time = std::chrono::steady_clock::now();
+        bool time_budget_hit = false;
+        bool visit_budget_hit = false;
+        std::size_t visit_count = 0;
         FixedTopK candidate_topk(candidate_k);
         const std::uint8_t *qbase = snap->qdata.data();
         for (std::size_t row = 0; row < n; ++row)
         {
+            if (has_filter)
+            {
+                if (candidate_topk.Size() >= candidate_k)
+                    break;
+                if (max_visits > 0 && visit_count >= max_visits)
+                {
+                    visit_budget_hit = true;
+                    break;
+                }
+                if (time_budget_us > 0 && (visit_count % 64 == 0))
+                {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - start_time)
+                                       .count();
+                    if (elapsed >= static_cast<std::int64_t>(time_budget_us))
+                    {
+                        time_budget_hit = true;
+                        break;
+                    }
+                }
+                ++visit_count;
+            }
             if (has_filter && !snap->MatchFilter(row, *req.filter))
                 continue;
             float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, qquant.data(), dim);
@@ -838,6 +867,15 @@ namespace pomai
         final_topk.FillSorted(resp.items);
         SortAndDedupeResults(resp.items, req.topk);
         resp.stats.filtered_candidates = candidate_topk.Size();
+        const bool filtered_partial = has_filter && candidate_topk.Size() < candidate_k;
+        const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit) && filtered_partial;
+        if (budget_exhausted && req.search_mode == SearchMode::Quality)
+            throw std::runtime_error("filtered scan budget exhausted");
+        resp.stats.filtered_partial = filtered_partial;
+        resp.stats.filtered_time_budget_hit = time_budget_hit;
+        resp.stats.filtered_visit_budget_hit = visit_budget_hit;
+        resp.stats.filtered_budget_exhausted = budget_exhausted;
+        resp.partial = resp.partial || resp.stats.filtered_partial;
         resp.stats.partial = resp.partial;
         return resp;
     }

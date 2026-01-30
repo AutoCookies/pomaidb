@@ -385,6 +385,8 @@ namespace pomai
             normalized.filter_expand_factor = expand;
             std::uint32_t max_visits = normalized.filter_max_visits == 0 ? filter_config_.filter_max_visits : normalized.filter_max_visits;
             normalized.filter_max_visits = max_visits;
+            std::uint64_t time_budget_us = normalized.filter_time_budget_us == 0 ? filter_config_.filter_time_budget_us : normalized.filter_time_budget_us;
+            normalized.filter_time_budget_us = time_budget_us;
         }
 
         if (health == pomai::ai::WhisperGrain::BudgetHealth::Tight)
@@ -459,6 +461,9 @@ namespace pomai
 
         std::size_t completed = 0;
         bool filtered_partial = false;
+        bool filtered_time_budget_hit = false;
+        bool filtered_visit_budget_hit = false;
+        bool filtered_budget_exhausted = false;
         for (auto &f : futs)
         {
             if (f.wait_until(deadline) == std::future_status::ready)
@@ -469,6 +474,9 @@ namespace pomai
                     for (const auto &item : r.items)
                         merge_topk->Push(item.score, item.id);
                     filtered_partial = filtered_partial || r.stats.filtered_partial;
+                    filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
+                    filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
+                    filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
                     ++completed;
                 }
                 catch (...)
@@ -481,6 +489,9 @@ namespace pomai
             for (const auto &item : r.items)
                 merge_topk->Push(item.score, item.id);
             filtered_partial = filtered_partial || r.stats.filtered_partial;
+            filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
+            filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
+            filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
             ++completed;
         }
 
@@ -495,6 +506,9 @@ namespace pomai
         }
         out.stats.partial = out.partial;
         out.stats.filtered_partial = filtered_partial;
+        out.stats.filtered_time_budget_hit = filtered_time_budget_hit;
+        out.stats.filtered_visit_budget_hit = filtered_visit_budget_hit;
+        out.stats.filtered_budget_exhausted = filtered_budget_exhausted;
         float lat = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
         brain_.observe_latency(lat);
 
