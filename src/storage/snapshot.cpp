@@ -12,6 +12,7 @@
 #include <iterator>
 #include <string>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace pomai::storage
@@ -121,7 +122,7 @@ namespace pomai::storage
         {
             if (len == 0)
                 return;
-            crc = crc64(crc, data, len);
+            crc = crc64(crc, reinterpret_cast<const unsigned char *>(data), len);
         }
 
         bool WriteSectionHeader(int fd, std::uint32_t type, std::uint64_t size, std::uint64_t crc, std::uint64_t &total_crc, std::uint64_t &total_size)
@@ -709,8 +710,6 @@ namespace pomai::storage
             }
 
             std::uint64_t shard_crc = 0;
-            std::uint32_t shard_id_le = HostToLe32(shard.shard_id);
-            std::uint32_t segs_le = HostToLe32(static_cast<std::uint32_t>(shard.segments.size()));
             if (!WriteFull(fd, &shard_id_le, sizeof(shard_id_le)) || !WriteFull(fd, &segs_le, sizeof(segs_le)))
             {
                 ::close(fd);
@@ -754,9 +753,13 @@ namespace pomai::storage
             PutU64(buf, tags.size());
             dict_crc = crc64(0, buf.data(), buf.size());
             if (!namespaces.empty())
-                dict_crc = crc64(dict_crc, namespaces.data(), namespaces.size() * sizeof(std::uint32_t));
+                dict_crc = crc64(dict_crc,
+                                 reinterpret_cast<const unsigned char *>(namespaces.data()),
+                                 namespaces.size() * sizeof(std::uint32_t));
             if (!tags.empty())
-                dict_crc = crc64(dict_crc, tags.data(), tags.size() * sizeof(TagId));
+                dict_crc = crc64(dict_crc,
+                                 reinterpret_cast<const unsigned char *>(tags.data()),
+                                 tags.size() * sizeof(TagId));
         }
         if (!WriteSectionHeader(fd, kSectionDictionary, dict_size, dict_crc, total_crc, total_size))
         {
@@ -1045,7 +1048,9 @@ namespace pomai::storage
                             *err = "snapshot dict read failed";
                         return false;
                     }
-                    calc = crc64(calc, namespaces.data(), namespaces.size() * sizeof(std::uint32_t));
+                    calc = crc64(calc,
+                                 reinterpret_cast<const unsigned char *>(namespaces.data()),
+                                 namespaces.size() * sizeof(std::uint32_t));
                 }
                 if (tags > 0)
                 {
@@ -1056,7 +1061,9 @@ namespace pomai::storage
                             *err = "snapshot dict read failed";
                         return false;
                     }
-                    calc = crc64(calc, tag_ids.data(), tag_ids.size() * sizeof(TagId));
+                    calc = crc64(calc,
+                                 reinterpret_cast<const unsigned char *>(tag_ids.data()),
+                                 tag_ids.size() * sizeof(TagId));
                 }
                 if (calc != crc)
                 {
