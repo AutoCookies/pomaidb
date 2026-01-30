@@ -180,9 +180,12 @@ namespace pomai::server
                 }
                 else
                 {
-                    // Set permission rộng rãi để dễ dev (777)
-                    // Trong production nên dùng 660 và group ownership
-                    ::chmod(cfg_.unix_socket.c_str(), 0777);
+                    mode_t socket_mode = cfg_.dev_mode ? 0777 : 0660;
+                    if (::chmod(cfg_.unix_socket.c_str(), socket_mode) != 0)
+                    {
+                        if (log_)
+                            log_->Warn("server.ipc", "IPC chmod failed: " + cfg_.unix_socket + " (" + std::strerror(errno) + ")");
+                    }
 
                     if (::listen(ipc_fd_, 128) != 0)
                     {

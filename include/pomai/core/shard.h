@@ -79,6 +79,7 @@ namespace pomai
     {
     public:
         Shard(std::string name,
+              std::uint32_t shard_id,
               std::size_t dim,
               std::size_t queue_cap,
               std::string wal_dir,
@@ -86,7 +87,7 @@ namespace pomai
               Logger *logger = nullptr);
         ~Shard();
 
-        void Start();
+        Status Start();
         void Stop();
 
         std::future<Result<Lsn>> EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable);
@@ -127,6 +128,7 @@ namespace pomai
 
     private:
         std::string name_;
+        std::uint32_t shard_id_{0};
         std::string wal_dir_;
         Wal wal_;
         Seed seed_;

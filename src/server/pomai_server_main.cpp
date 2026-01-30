@@ -8,8 +8,6 @@
 #include <string>
 #include <thread>
 #include <chrono>
-#include <filesystem>
-#include <fstream>
 #include <cstring>
 
 // This main provides a simple, safe signal handling pattern:
@@ -47,41 +45,6 @@ static void InstallSignalHandlers()
     std::signal(SIGPIPE, SIG_IGN);
 }
 
-// Simple helper to load server config.
-// If parsing a YAML/config file is already implemented in your codebase, replace
-// this with your existing loader. For now we provide a fallback with sane defaults.
-static pomai::server::ServerConfig LoadConfigOrDefault(const std::string &path)
-{
-    pomai::server::ServerConfig cfg;
-
-    // Set defaults first (these should match your project's defaults).
-    cfg.data_dir = "./data";
-    cfg.listen_host = "127.0.0.1";
-    cfg.listen_port = 7744;
-    cfg.unix_socket = "/tmp/pomai.sock";
-    cfg.shards = 4;
-    cfg.shard_queue_capacity = 65536;
-    cfg.default_dim = 128;
-
-    // NEW: default server-level policy for allowing per-append synchronous fdatasync
-    cfg.allow_sync_on_append = true;
-
-    if (std::filesystem::exists(path))
-    {
-        // If you have a YAML config parser in-tree, use it instead.
-        std::cout << "[init] Loading config from: " << path << "\n";
-        // TODO: hook into your real parser here, e.g. cfg = ParseConfig(path);
-    }
-    else
-    {
-        std::cout << "[init] Config file not found: " << path << " — using defaults\n";
-    }
-
-    std::cout << "[init] allow_sync_on_append = " << (cfg.allow_sync_on_append ? "true" : "false") << "\n";
-
-    return cfg;
-}
-
 int main(int argc, char **argv)
 {
     std::string cfg_path = "config/pomai.yaml";
@@ -102,7 +65,7 @@ int main(int argc, char **argv)
     InstallSignalHandlers();
 
     // Load configuration (replace with your real loader if available).
-    auto cfg = LoadConfigOrDefault(cfg_path);
+    auto cfg = pomai::server::LoadConfigFile(cfg_path);
 
     // Create a logger. Replace with your project's logger construction if it's different.
     // We assume server::Logger has a constructor that accepts no args or simple options.

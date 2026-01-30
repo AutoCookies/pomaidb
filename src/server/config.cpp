@@ -1,4 +1,5 @@
 #include <pomai/server/config.h>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -15,6 +16,15 @@ namespace pomai::server
         while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t' || s[b - 1] == '\r'))
             --b;
         return s.substr(a, b - a);
+    }
+
+    static bool ParseBool(const std::string &val)
+    {
+        std::string lower;
+        lower.reserve(val.size());
+        for (char c : val)
+            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        return lower == "true" || lower == "1" || lower == "yes" || lower == "on";
     }
 
     ServerConfig LoadConfigFile(const std::string &path)
@@ -71,6 +81,8 @@ namespace pomai::server
                 cfg.log_path = val;
             else if (key == "log_level")
                 cfg.log_level = val;
+            else if (key == "dev_mode")
+                cfg.dev_mode = ParseBool(val);
 
             // Whisper Config Override
             else if (key == "whisper_latency_target_ms")

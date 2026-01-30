@@ -217,15 +217,19 @@ namespace pomai
             }
         }
 
-        std::vector<std::future<void>> futures;
+        std::vector<std::future<Status>> futures;
         futures.reserve(shards_.size());
         for (auto &s : shards_)
         {
             futures.push_back(std::async(std::launch::async, [&s]()
-                                         { s->Start(); }));
+                                         { return s->Start(); }));
         }
         for (auto &f : futures)
-            f.get();
+        {
+            auto st = f.get();
+            if (!st.ok())
+                return st;
+        }
         return Status::Ok();
     }
 
