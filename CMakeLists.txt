@@ -70,6 +70,10 @@ target_include_directories(pomai_util PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_IN
 target_link_libraries(pomai_util PUBLIC pomai_compiler_flags)
 
 set(STORAGE_SOURCES
+    src/storage/file_util.cpp
+    src/storage/manifest.cpp
+    src/storage/snapshot.cpp
+    src/storage/verify.cpp
     src/storage/wal.cpp
     src/storage/wal_uring.cpp
     src/storage/crc64.c
@@ -154,10 +158,15 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     add_pomai_test(pomai_shutdown_concurrency_tests tests/pomai_shutdown_concurrency_tests.cpp)
     add_pomai_test(wal_append_regression_tests tests/wal_append_regression_tests.cpp)
     add_pomai_test(tsan_smoke_tests tests/tsan_smoke_tests.cpp)
+    add_pomai_test(storage_contract_tests tests/storage_contract_tests.cpp)
 endif()
 
 # --- 8. TOOLS ---
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/repro_segfault.cpp")
     add_executable(repro_segfault tools/repro_segfault.cpp)
     target_link_libraries(repro_segfault PRIVATE pomai_api)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/pomai_verify.cpp")
+    add_executable(pomai_verify tools/pomai_verify.cpp)
+    target_link_libraries(pomai_verify PRIVATE pomai_api)
 endif()

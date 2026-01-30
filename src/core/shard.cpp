@@ -73,31 +73,6 @@ namespace pomai
             return out;
         }
 
-        void CheckedWrite(int fd, const void *buf, size_t count)
-        {
-            const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
-            size_t rem = count;
-            while (rem > 0)
-            {
-                ssize_t res = ::write(fd, p, rem);
-                if (res < 0)
-                {
-                    if (errno == EINTR)
-                        continue;
-                    throw std::runtime_error("Disk write failed");
-                }
-                p += static_cast<size_t>(res);
-                rem -= static_cast<size_t>(res);
-            }
-        }
-
-        std::size_t PeakRssBytes()
-        {
-            struct rusage usage;
-            if (getrusage(RUSAGE_SELF, &usage) != 0)
-                return 0;
-            return static_cast<std::size_t>(usage.ru_maxrss) * 1024;
-        }
     }
 
     Shard::Shard(std::string name, std::size_t dim, std::size_t queue_cap, std::string wal_dir, LogFn info, LogFn error)
@@ -120,21 +95,24 @@ namespace pomai
     {
         try
         {
-            WalReplayStats stats = wal_.ReplayToSeed(seed_);
+            WalReplayStats stats = checkpoint_lsn_ ? wal_.ReplayToSeed(seed_, *checkpoint_lsn_) : wal_.ReplayToSeed(seed_);
             if (log_info_)
                 log_info_("[" + name_ + "] WAL Replay: records=" + std::to_string(stats.records_applied));
         }
         catch (...)
         {
         }
-        auto live_snap = seed_.MakeSnapshot();
-        auto next = std::make_shared<ShardState>();
-        next->live_snap = live_snap;
-        next->live_grains.reset();
-        PublishState(std::move(next));
-        ScheduleLiveGrainBuild(live_snap);
-        if (seed_.Count() > 0)
-            MaybeFreezeSegment();
+        if (!recovered_)
+        {
+            auto live_snap = seed_.MakeSnapshot();
+            auto next = std::make_shared<ShardState>();
+            next->live_snap = live_snap;
+            next->live_grains.reset();
+            PublishState(std::move(next));
+            ScheduleLiveGrainBuild(live_snap);
+            if (seed_.Count() > 0)
+                MaybeFreezeSegment();
+        }
         wal_.Start();
         owner_ = std::thread(&Shard::RunLoop, this);
     }
@@ -176,6 +154,21 @@ namespace pomai
         if (!ingest_q_.Push(std::move(t)))
         {
             std::promise<bool> p;
+            p.set_exception(std::make_exception_ptr(std::runtime_error("closed")));
+            return p.get_future();
+        }
+        return fut;
+    }
+
+    std::future<ShardCheckpointState> Shard::RequestCheckpointState()
+    {
+        UpsertTask t;
+        t.is_checkpoint_state = true;
+        t.checkpoint_state_done.emplace();
+        auto fut = t.checkpoint_state_done->get_future();
+        if (!ingest_q_.Push(std::move(t)))
+        {
+            std::promise<ShardCheckpointState> p;
             p.set_exception(std::make_exception_ptr(std::runtime_error("closed")));
             return p.get_future();
         }
@@ -421,33 +414,53 @@ namespace pomai
             UpsertTask task = std::move(*opt);
             if (task.is_checkpoint)
             {
+                if (task.checkpoint_done)
+                    task.checkpoint_done->set_value(true);
+                continue;
+            }
+            if (task.is_checkpoint_state)
+            {
                 try
                 {
                     wal_.WaitDurable(wal_.WrittenLsn());
-                    auto snap = seed_.MakeSnapshot();
-                    std::string path = wal_dir_ + "/cp-" + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()) + ".bin";
-                    int fd = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
-                    if (fd >= 0)
+                    ShardCheckpointState state;
+                    state.shard_id = 0;
+                    state.durable_lsn = wal_.WrittenLsn();
+                    auto snapshot = state_.load(std::memory_order_acquire);
+                    if (snapshot)
                     {
-                        uint16_t d = static_cast<uint16_t>(snap->dim);
-                        uint64_t c = static_cast<uint64_t>(snap->ids.size());
-                        CheckedWrite(fd, &d, 2);
-                        CheckedWrite(fd, &c, 8);
-                        CheckedWrite(fd, snap->qmins.data(), snap->qmins.size() * 4);
-                        CheckedWrite(fd, snap->qscales.data(), snap->qscales.size() * 4);
-                        CheckedWrite(fd, snap->ids.data(), snap->ids.size() * 8);
-                        CheckedWrite(fd, snap->qdata.data(), snap->qdata.size());
-                        ::fdatasync(fd);
-                        ::close(fd);
-                        wal_.TruncateToZero();
-                        if (task.checkpoint_done)
-                            task.checkpoint_done->set_value(true);
+                        state.segments.reserve(snapshot->segments.size());
+                        for (const auto &seg : snapshot->segments)
+                        {
+                            if (!seg.snap)
+                                continue;
+                            std::vector<float> qmaxs;
+                            qmaxs.resize(seg.snap->qmins.size());
+                            for (std::size_t d = 0; d < seg.snap->qmins.size(); ++d)
+                                qmaxs[d] = seg.snap->qmins[d] + seg.snap->qscales[d] * 255.0f;
+                            state.segments.push_back(Seed::PersistedState{
+                                static_cast<std::uint32_t>(seg.snap->dim),
+                                seg.snap->ids,
+                                seg.snap->qdata,
+                                seg.snap->qmins,
+                                std::move(qmaxs),
+                                seg.snap->qscales,
+                                seg.snap->namespace_ids,
+                                seg.snap->tag_offsets,
+                                seg.snap->tag_ids,
+                                true,
+                                0,
+                                0});
+                        }
                     }
+                    state.live = seed_.ExportPersistedState();
+                    if (task.checkpoint_state_done)
+                        task.checkpoint_state_done->set_value(std::move(state));
                 }
                 catch (...)
                 {
-                    if (task.checkpoint_done)
-                        task.checkpoint_done->set_value(false);
+                    if (task.checkpoint_state_done)
+                        task.checkpoint_state_done->set_exception(std::current_exception());
                 }
                 continue;
             }
@@ -576,7 +589,6 @@ namespace pomai
         auto next = std::make_shared<ShardState>(*prev);
         next->segments[pos].index = std::move(idx);
         next->segments[pos].grains = std::move(grains);
-        next->segments[pos].snap.reset();
         PublishState(std::move(next));
     }
 
@@ -637,5 +649,22 @@ namespace pomai
             }
         }
         return res;
+    }
+
+    void Shard::LoadFromCheckpoint(const ShardCheckpointState &state, Lsn checkpoint_lsn)
+    {
+        seed_.LoadPersistedState(state.live);
+        auto next = std::make_shared<ShardState>();
+        next->segments.reserve(state.segments.size());
+        for (const auto &seg : state.segments)
+        {
+            auto snap = Seed::SnapshotFromState(seg);
+            next->segments.push_back({snap, nullptr, nullptr});
+        }
+        next->live_snap = seed_.MakeSnapshot();
+        next->live_grains.reset();
+        PublishState(std::move(next));
+        checkpoint_lsn_ = checkpoint_lsn;
+        recovered_ = true;
     }
 }

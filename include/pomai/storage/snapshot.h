@@ -20,13 +20,15 @@ namespace pomai::storage
     struct ShardSnapshot
     {
         std::uint32_t shard_id{0};
-        Seed::PersistedState state;
+        std::vector<Seed::PersistedState> segments;
+        Seed::PersistedState live;
     };
 
     struct SnapshotData
     {
         SchemaConfig schema;
         std::vector<ShardSnapshot> shards;
+        std::vector<std::uint64_t> shard_lsns;
     };
 
     struct SnapshotWriteResult
@@ -50,9 +52,9 @@ namespace pomai::storage
         Manifest manifest;
     };
 
-    bool CommitCheckpoint(const std::string &db_dir,
-                          const SnapshotData &snapshot,
-                          const std::vector<IndexArtifactData> &index_artifacts,
-                          CommitResult *out,
-                          std::string *err = nullptr);
+    bool CommitCheckpointAtomically(const std::string &db_dir,
+                                    const SnapshotData &snapshot,
+                                    const std::vector<IndexArtifactData> &index_artifacts,
+                                    CommitResult *out,
+                                    std::string *err = nullptr);
 }

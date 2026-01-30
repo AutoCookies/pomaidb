@@ -1,5 +1,6 @@
 #include <pomai/storage/file_util.h>
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <filesystem>
@@ -10,6 +11,10 @@
 
 namespace pomai::storage
 {
+    namespace
+    {
+        std::atomic<std::uint64_t> g_dir_fsync_count{0};
+    }
     DbPaths MakeDbPaths(const std::string &db_dir)
     {
         DbPaths out;
@@ -100,6 +105,8 @@ namespace pomai::storage
             return false;
         int rc = ::fsync(dfd);
         ::close(dfd);
+        if (rc == 0)
+            g_dir_fsync_count.fetch_add(1, std::memory_order_relaxed);
         return rc == 0;
     }
 
@@ -126,5 +133,15 @@ namespace pomai::storage
         (void)name;
         return false;
 #endif
+    }
+
+    void ResetDirFsyncCounter()
+    {
+        g_dir_fsync_count.store(0, std::memory_order_relaxed);
+    }
+
+    std::uint64_t DirFsyncCounter()
+    {
+        return g_dir_fsync_count.load(std::memory_order_relaxed);
     }
 }
