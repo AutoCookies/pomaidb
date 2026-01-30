@@ -59,8 +59,14 @@ namespace pomai
             QData qdata;
             std::vector<float> qmins;
             std::vector<float> qscales;
+            std::vector<std::uint32_t> namespace_ids;
+            std::vector<std::uint64_t> user_ids;
+            std::vector<std::uint32_t> tag_offsets;
+            std::vector<TagId> tag_ids;
             std::size_t accounted_bytes{0};
             std::atomic<bool> is_quantized{false};
+
+            bool MatchFilter(std::size_t row, const Filter &filter) const;
         };
 
         using Snapshot = std::shared_ptr<const Store>;
@@ -102,6 +108,9 @@ namespace pomai
         std::vector<float> qinv_scales_;
         std::unordered_map<Id, std::uint32_t> pos_;
         std::size_t accounted_bytes_{0};
+        std::vector<std::uint32_t> namespace_ids_;
+        std::vector<std::uint64_t> user_ids_;
+        std::vector<std::vector<TagId>> tags_;
 
         std::size_t qrows_{0};
         std::size_t qcap_{0};

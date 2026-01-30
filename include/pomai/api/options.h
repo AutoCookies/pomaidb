@@ -42,6 +42,14 @@ namespace pomai
         // NEW: search pool worker count (0 = auto)
         std::size_t search_pool_workers{0};
         std::size_t search_timeout_ms{500};
+
+        // Metadata filter knobs
+        std::size_t filtered_candidate_k{5000};
+        std::uint32_t filter_expand_factor{4};
+        std::uint32_t filter_max_visits{20000};
+        std::size_t tag_dictionary_max_size{100000};
+        std::size_t max_tags_per_vector{32};
+        std::size_t max_filter_tags{64};
     };
 
 } // namespace pomai
