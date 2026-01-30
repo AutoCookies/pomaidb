@@ -1,6 +1,15 @@
 #include <pomai/util/memory_manager.h>
 
+#if defined(__has_include)
+#if __has_include(<unistd.h>)
 #include <unistd.h>
+#define POMAI_HAS_UNISTD 1
+#endif
+#endif
+
+#if defined(_WIN32)
+#undef POMAI_HAS_UNISTD
+#endif
 
 namespace pomai
 {
@@ -11,11 +20,15 @@ namespace pomai
 
         std::size_t DetectTotalMemoryBytes()
         {
+#if defined(POMAI_HAS_UNISTD) && defined(_SC_PHYS_PAGES) && defined(_SC_PAGE_SIZE)
             long pages = ::sysconf(_SC_PHYS_PAGES);
             long page_size = ::sysconf(_SC_PAGE_SIZE);
             if (pages <= 0 || page_size <= 0)
                 return 8ULL * 1024ULL * 1024ULL * 1024ULL;
             return static_cast<std::size_t>(pages) * static_cast<std::size_t>(page_size);
+#else
+            return 8ULL * 1024ULL * 1024ULL * 1024ULL;
+#endif
         }
 
         std::size_t ClampToSize(std::int64_t value)
