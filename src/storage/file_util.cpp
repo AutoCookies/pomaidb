@@ -1,4 +1,5 @@
 #include <pomai/storage/file_util.h>
+#include <pomai/core/posix_compat.h>
 
 #include <atomic>
 #include <cerrno>

@@ -1,4 +1,5 @@
 #include <pomai/storage/verify.h>
+#include <pomai/core/posix_compat.h>
 #include <pomai/storage/file_util.h>
 #include <pomai/storage/crc64.h>
 

@@ -1,4 +1,5 @@
 #include <pomai/storage/wal.h>
+#include <pomai/core/posix_compat.h>
 #include <pomai/storage/crc64.h>
 
 #include <fcntl.h>
