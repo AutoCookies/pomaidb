@@ -10,7 +10,7 @@
 
 #include <sys/resource.h>
 
-#include "wal.h"
+#include <pomai/storage/wal.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

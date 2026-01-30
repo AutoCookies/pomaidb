@@ -11,8 +11,8 @@
 #include <vector>
 #include <sys/resource.h>
 
-#include "index_build_pool.h"
-#include "shard.h"
+#include <pomai/util/index_build_pool.h>
+#include <pomai/core/shard.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

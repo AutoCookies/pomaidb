@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "wal.h"
+#include <pomai/storage/wal.h>
 
 using namespace pomai;
 

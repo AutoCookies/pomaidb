@@ -1,7 +1,7 @@
 // Full server.cpp with DbOptions.allow_sync_on_append passed into created DbOptions
-#include "server/server.h"
-#include "server/protocol.h"
-#include "types.h"
+#include <pomai/server/server.h>
+#include <pomai/server/protocol.h>
+#include <pomai/core/types.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

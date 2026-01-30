@@ -12,7 +12,7 @@
 #include <filesystem>
 #include <cerrno>
 
-#include "pomai_db.h"
+#include <pomai/api/pomai_db.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

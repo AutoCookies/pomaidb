@@ -1,8 +1,8 @@
 #include <iostream>
 #include <string>
 
-#include "wal.h"
-#include "seed.h"
+#include <pomai/storage/wal.h>
+#include <pomai/core/seed.h>
 
 using namespace pomai;
 

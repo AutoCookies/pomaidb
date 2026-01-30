@@ -5,7 +5,7 @@
 #include <vector>
 #include <cstdlib>
 
-#include "wal.h"
+#include <pomai/storage/wal.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

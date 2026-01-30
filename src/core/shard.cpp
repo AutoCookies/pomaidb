@@ -1,4 +1,4 @@
-#include "shard.h"
+#include <pomai/core/shard.h>
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
@@ -13,12 +13,12 @@
 #include <random>
 #include <limits>
 #include <cmath>
-#include "fixed_topk.h"
-#include "search_utils.h"
-#include "cpu_kernels.h"
-#include "spatial_router.h"
-#include "pomai_assert.h"
-#include "memory_manager.h"
+#include <pomai/util/fixed_topk.h>
+#include <pomai/util/search_utils.h>
+#include <pomai/util/cpu_kernels.h>
+#include <pomai/core/spatial_router.h>
+#include <pomai/util/pomai_assert.h>
+#include <pomai/util/memory_manager.h>
 
 namespace pomai
 {
