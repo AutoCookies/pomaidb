@@ -125,7 +125,8 @@ static void WriteCentroidsFile(const std::string &path,
 static std::unique_ptr<MembraneRouter> MakeRouter(std::size_t dim, const std::string &wal_dir)
 {
     std::vector<std::unique_ptr<Shard>> shards;
-    shards.push_back(std::make_unique<Shard>("shard-0", dim, 16, wal_dir));
+    CompactionConfig compaction_cfg;
+    shards.push_back(std::make_unique<Shard>("shard-0", dim, 16, wal_dir, compaction_cfg));
     pomai::WhisperConfig cfg;
     return std::make_unique<MembraneRouter>(std::move(shards),
                                             cfg,
@@ -133,6 +134,8 @@ static std::unique_ptr<MembraneRouter> MakeRouter(std::size_t dim, const std::st
                                             Metric::L2,
                                             0,
                                             500,
+                                            4096,
+                                            1000000,
                                             MembraneRouter::FilterConfig::Default(),
                                             []() {});
 }
