@@ -78,5 +78,5 @@ TEST_CASE("OrbitIndex filtered search respects namespace", "[core][orbit]")
     auto resp = index.SearchFiltered(req, budget, filter, *snap);
     REQUIRE_FALSE(resp.items.empty());
     for (const auto &item : resp.items)
-        REQUIRE(item.id == 1 || item.id == 3);
+        REQUIRE((item.id == 1 || item.id == 3));
 }
