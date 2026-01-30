@@ -92,8 +92,6 @@ namespace pomai
             return false;
         if (filter.namespace_id && (row >= namespace_ids.size() || namespace_ids[row] != *filter.namespace_id))
             return false;
-        if (filter.user_id && (row >= user_ids.size() || user_ids[row] != *filter.user_id))
-            return false;
         const std::uint32_t start = (row < tag_offsets.size()) ? tag_offsets[row] : 0;
         const std::uint32_t end = (row + 1 < tag_offsets.size()) ? tag_offsets[row + 1] : start;
         const TagId *tags = (start < tag_ids.size()) ? tag_ids.data() + start : nullptr;
@@ -501,7 +499,6 @@ namespace pomai
                 ids_.push_back(req.id);
                 pos_[req.id] = row;
                 namespace_ids_.push_back(req.metadata.namespace_id);
-                user_ids_.push_back(req.metadata.user_id);
                 tags_.push_back(req.metadata.tag_ids);
             }
             else
@@ -509,13 +506,10 @@ namespace pomai
 
             if (row >= namespace_ids_.size())
                 namespace_ids_.resize(ids_.size(), 0);
-            if (row >= user_ids_.size())
-                user_ids_.resize(ids_.size(), 0);
             if (row >= tags_.size())
                 tags_.resize(ids_.size());
 
             namespace_ids_[row] = req.metadata.namespace_id;
-            user_ids_[row] = req.metadata.user_id;
             tags_[row] = req.metadata.tag_ids;
 
             bool out_of_range = false;
@@ -565,7 +559,6 @@ namespace pomai
         out->qmins = qmins_;
         out->qscales = qscales_;
         out->namespace_ids = namespace_ids_;
-        out->user_ids = user_ids_;
         out->tag_offsets.clear();
         out->tag_ids.clear();
         out->tag_offsets.reserve(out->ids.size() + 1);
@@ -573,8 +566,6 @@ namespace pomai
         std::size_t total_tags = 0;
         if (out->namespace_ids.size() < out->ids.size())
             out->namespace_ids.resize(out->ids.size(), 0);
-        if (out->user_ids.size() < out->ids.size())
-            out->user_ids.resize(out->ids.size(), 0);
         for (const auto &tags : tags_)
             total_tags += tags.size();
         out->tag_ids.reserve(total_tags);
@@ -590,7 +581,6 @@ namespace pomai
         out->is_quantized.store(true, std::memory_order_release);
         out->accounted_bytes = out->ids.size() * sizeof(Id) + out->qdata.size() * sizeof(std::uint8_t) + (out->qmins.size() + out->qscales.size()) * sizeof(float);
         out->accounted_bytes += out->namespace_ids.size() * sizeof(std::uint32_t) +
-                                out->user_ids.size() * sizeof(std::uint64_t) +
                                 out->tag_offsets.size() * sizeof(std::uint32_t) +
                                 out->tag_ids.size() * sizeof(TagId);
         if (out->accounted_bytes > 0)

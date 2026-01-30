@@ -42,7 +42,7 @@ namespace pomai
                                 std::size_t dim,
                                 std::size_t search_pool_workers = 0,
                                 std::size_t search_timeout_ms = 500,
-                                FilterConfig filter_config = {},
+                                FilterConfig filter_config = FilterConfig{},
                                 std::function<void()> on_rejected_upsert = {});
 
         void Start();
@@ -105,7 +105,7 @@ namespace pomai
         std::shared_ptr<const DictionarySnapshot> SnapshotDictionary() const;
         std::shared_ptr<const DictionarySnapshot> ExtendDictionary(const std::vector<std::string> &namespaces,
                                                                    const std::vector<std::string> &tags);
-        Metadata NormalizeMetadata(const Metadata &meta) const;
+        Metadata NormalizeMetadata(const Metadata &meta);
         std::shared_ptr<const Filter> NormalizeFilter(const SearchRequest &req) const;
 
         std::vector<std::unique_ptr<Shard>> shards_;

@@ -287,7 +287,7 @@ namespace pomai
         return dict_.load(std::memory_order_acquire);
     }
 
-    Metadata MembraneRouter::NormalizeMetadata(const Metadata &meta) const
+    Metadata MembraneRouter::NormalizeMetadata(const Metadata &meta)
     {
         Metadata out = meta;
         std::vector<std::string> ns_names;
