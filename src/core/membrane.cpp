@@ -6,6 +6,7 @@
 #include <pomai/util/fixed_topk.h>
 #include <pomai/storage/snapshot.h>
 #include <pomai/storage/verify.h>
+#include <pomai/core/posix_compat.h>
 
 #include <stdexcept>
 #include <algorithm>

@@ -6,6 +6,9 @@
 #include <vector>
 #include <atomic>
 #include <cstdlib>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <new>
 #include <algorithm>
 #include <pomai/core/types.h>
@@ -33,12 +36,25 @@ namespace pomai
             if (n == 0)
                 return nullptr;
             void *ptr = nullptr;
+#if defined(_WIN32)
+            ptr = _aligned_malloc(n * sizeof(T), Alignment);
+            if (!ptr)
+                throw std::bad_alloc();
+#else
             if (posix_memalign(&ptr, Alignment, n * sizeof(T)) != 0)
                 throw std::bad_alloc();
+#endif
             return static_cast<T *>(ptr);
         }
 
-        void deallocate(T *p, std::size_t) noexcept { std::free(p); }
+        void deallocate(T *p, std::size_t) noexcept
+        {
+#if defined(_WIN32)
+            _aligned_free(p);
+#else
+            std::free(p);
+#endif
+        }
     };
 
     template <typename T, std::size_t A, typename U, std::size_t B>

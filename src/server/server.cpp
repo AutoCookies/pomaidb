@@ -2,6 +2,7 @@
 #include <pomai/server/server.h>
 #include <pomai/server/protocol.h>
 #include <pomai/core/types.h>
+#include <pomai/core/posix_compat.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

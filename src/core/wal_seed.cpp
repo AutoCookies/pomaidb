@@ -1,6 +1,7 @@
 #include <pomai/storage/wal.h>
 #include <pomai/core/seed.h>
 #include <pomai/storage/crc64.h>
+#include <pomai/core/posix_compat.h>
 
 #include <cerrno>
 #include <fcntl.h>

@@ -1,6 +1,7 @@
 #include <pomai/storage/manifest.h>
 #include <pomai/storage/file_util.h>
 #include <pomai/storage/crc64.h>
+#include <pomai/core/posix_compat.h>
 
 #include <array>
 #include <cerrno>
