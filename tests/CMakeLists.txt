@@ -41,7 +41,7 @@ target_link_libraries(pomai_tests PRIVATE
     pomai_core
     pomai_storage
     pomai_index
-    pomai_util
+    pomai_concurrency
     Catch2::Catch2
 )
 

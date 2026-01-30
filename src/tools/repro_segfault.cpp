@@ -44,7 +44,8 @@ int main()
     opt.centroids_load_mode = MembraneRouter::CentroidsLoadMode::None;
 
     PomaiDB db(opt);
-    db.Start();
+    if (!db.Start().ok())
+        throw std::runtime_error("db start failed");
 
     std::mt19937_64 rng(1337);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -63,13 +64,17 @@ int main()
 
         if (batch.size() == batch_size || i + 1 == train_vectors)
         {
-            db.UpsertBatch(batch, false).get();
+            auto res = db.UpsertBatch(batch, false).get();
+            if (!res.ok())
+                throw std::runtime_error("upsert failed: " + res.status().msg);
             batch.clear();
         }
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    db.RecomputeCentroids(32, train_vectors).get();
+    auto centroids = db.RecomputeCentroids(32, train_vectors).get();
+    if (!centroids.ok())
+        throw std::runtime_error("recompute centroids failed: " + centroids.status().msg);
 
     db.Stop();
     RemoveDir(dir);

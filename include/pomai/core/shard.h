@@ -10,12 +10,14 @@
 #include <atomic>
 
 #include <pomai/core/types.h>
+#include <pomai/core/status.h>
 #include <pomai/storage/wal.h>
 #include <pomai/core/seed.h>
 #include <pomai/index/orbit_index.h>
-#include <pomai/util/bounded_queue.h>
+#include <pomai/concurrency/bounded_queue.h>
 #include <pomai/index/whispergrain.h>
-#include <pomai/util/index_build_pool.h>
+#include <pomai/concurrency/index_build_pool.h>
+#include <pomai/util/logger.h>
 
 namespace pomai
 {
@@ -31,11 +33,11 @@ namespace pomai
     {
         std::vector<UpsertRequest> batch;
         bool wait_durable{true};
-        std::promise<Lsn> done;
+        std::promise<Result<Lsn>> done;
         bool is_checkpoint{false};
         bool is_checkpoint_state{false};
-        std::optional<std::promise<bool>> checkpoint_done;
-        std::optional<std::promise<ShardCheckpointState>> checkpoint_state_done;
+        std::optional<std::promise<Result<bool>>> checkpoint_done;
+        std::optional<std::promise<Result<ShardCheckpointState>>> checkpoint_state_done;
         bool is_emergency_freeze{false};
     };
 
@@ -76,23 +78,20 @@ namespace pomai
     class Shard
     {
     public:
-        using LogFn = std::function<void(const std::string &msg)>;
-
         Shard(std::string name,
               std::size_t dim,
               std::size_t queue_cap,
               std::string wal_dir,
               CompactionConfig compaction,
-              LogFn info = nullptr,
-              LogFn error = nullptr);
+              Logger *logger = nullptr);
         ~Shard();
 
         void Start();
         void Stop();
 
-        std::future<Lsn> EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable);
-        std::future<bool> RequestCheckpoint();
-        std::future<ShardCheckpointState> RequestCheckpointState();
+        std::future<Result<Lsn>> EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable);
+        std::future<Result<bool>> RequestCheckpoint();
+        std::future<Result<ShardCheckpointState>> RequestCheckpointState();
         void RequestEmergencyFreeze();
 
         SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
@@ -133,8 +132,7 @@ namespace pomai
         Seed seed_;
         BoundedQueue<UpsertTask> ingest_q_;
         IndexBuildPool *build_pool_{nullptr};
-        LogFn log_info_;
-        LogFn log_error_;
+        Logger *logger_{nullptr};
         mutable std::mutex writer_mu_;
         std::atomic<std::shared_ptr<const ShardState>> state_{nullptr};
         std::thread owner_;

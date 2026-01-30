@@ -8,7 +8,7 @@
 //   std::vector<std::function<Ret()>> jobs = { ... };
 //   auto futs = ParallelSubmit(pool, std::move(jobs));
 //   for (auto &f : futs) result = f.get();
-#include <pomai/util/search_thread_pool.h>
+#include <pomai/concurrency/search_thread_pool.h>
 
 #include <vector>
 #include <type_traits>

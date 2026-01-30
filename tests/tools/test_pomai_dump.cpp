@@ -20,9 +20,10 @@ TEST_CASE("pomai_dump style scan writes output", "[tools][dump]")
     auto opts = DefaultDbOptions(dir.str(), 5, 1);
 
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
     auto batch = MakeBatch(8, 5, 0.1f, 1);
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     auto output_path = std::filesystem::path(dir.str()) / "dump.tsv";
     std::ofstream out(output_path);
@@ -37,7 +38,9 @@ TEST_CASE("pomai_dump style scan writes output", "[tools][dump]")
     while (true)
     {
         req.cursor = cursor;
-        auto resp = db.Scan(req);
+        auto resp_res = db.Scan(req);
+        REQUIRE(resp_res.ok());
+        auto resp = resp_res.move_value();
         REQUIRE(resp.status == ScanStatus::Ok);
         for (const auto &item : resp.items)
         {
@@ -64,7 +67,7 @@ TEST_CASE("pomai_dump style scan writes output", "[tools][dump]")
     }
 
     out.close();
-    db.Stop();
+    REQUIRE(db.Stop().ok());
 
     std::ifstream in(output_path);
     REQUIRE(in.good());

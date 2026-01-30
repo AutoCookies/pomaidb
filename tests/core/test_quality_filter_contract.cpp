@@ -16,7 +16,7 @@ TEST_CASE("Quality namespace filter returns full results without cap hits", "[co
     const std::size_t dim = 8;
     auto opts = DefaultDbOptions(dir.str(), dim, 1);
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::vector<UpsertRequest> batch;
     batch.reserve(100);
@@ -25,7 +25,8 @@ TEST_CASE("Quality namespace filter returns full results without cap hits", "[co
         std::uint32_t ns = static_cast<std::uint32_t>(i % 10);
         batch.push_back(MakeUpsert(static_cast<Id>(i + 1), dim, 0.1f + static_cast<float>(i) * 0.01f, ns));
     }
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     Filter filter;
     filter.namespace_id = 3;
@@ -33,8 +34,10 @@ TEST_CASE("Quality namespace filter returns full results without cap hits", "[co
     req.search_mode = SearchMode::Quality;
     req.filter = std::make_shared<Filter>(filter);
 
-    auto resp = db.Search(req);
-    db.Stop();
+    auto resp_res = db.Search(req);
+    REQUIRE(resp_res.ok());
+    auto resp = resp_res.move_value();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE(resp.status == SearchStatus::Ok);
     REQUIRE(resp.items.size() >= req.topk);
@@ -58,7 +61,7 @@ TEST_CASE("Quality filtered search expands to satisfy low selectivity", "[core][
     opts.max_filtered_candidate_k = 10;
     opts.filter_max_retries = 5;
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::vector<UpsertRequest> batch;
     batch.reserve(200);
@@ -71,7 +74,8 @@ TEST_CASE("Quality filtered search expands to satisfy low selectivity", "[core][
             tags = {static_cast<TagId>(i % 5)};
         batch.push_back(MakeUpsert(static_cast<Id>(i + 1), dim, 0.2f + static_cast<float>(i) * 0.01f, 0, tags));
     }
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     Filter filter;
     filter.require_all_tags = {1, 2};
@@ -79,8 +83,10 @@ TEST_CASE("Quality filtered search expands to satisfy low selectivity", "[core][
     req.search_mode = SearchMode::Quality;
     req.filter = std::make_shared<Filter>(filter);
 
-    auto resp = db.Search(req);
-    db.Stop();
+    auto resp_res = db.Search(req);
+    REQUIRE(resp_res.ok());
+    auto resp = resp_res.move_value();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE(resp.status == SearchStatus::Ok);
     REQUIRE(resp.items.size() >= req.topk);
@@ -101,7 +107,7 @@ TEST_CASE("Latency mode reports partials and budget hits", "[core][filter][laten
     opts.max_filtered_candidate_k = 5;
     opts.filter_max_retries = 2;
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::vector<UpsertRequest> batch;
     batch.reserve(200);
@@ -114,7 +120,8 @@ TEST_CASE("Latency mode reports partials and budget hits", "[core][filter][laten
             tags = {static_cast<TagId>(i % 5)};
         batch.push_back(MakeUpsert(static_cast<Id>(i + 1), dim, 0.3f + static_cast<float>(i) * 0.01f, 0, tags));
     }
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     Filter filter;
     filter.require_all_tags = {1, 2};
@@ -122,8 +129,10 @@ TEST_CASE("Latency mode reports partials and budget hits", "[core][filter][laten
     req.search_mode = SearchMode::Latency;
     req.filter = std::make_shared<Filter>(filter);
 
-    auto resp = db.Search(req);
-    db.Stop();
+    auto resp_res = db.Search(req);
+    REQUIRE(resp_res.ok());
+    auto resp = resp_res.move_value();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE(resp.status == SearchStatus::Ok);
     REQUIRE(resp.partial);
@@ -143,7 +152,7 @@ TEST_CASE("Quality mode fails loudly on insufficient filtered results", "[core][
     opts.max_filtered_candidate_k = 5;
     opts.filter_max_retries = 1;
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::vector<UpsertRequest> batch;
     batch.reserve(200);
@@ -156,7 +165,8 @@ TEST_CASE("Quality mode fails loudly on insufficient filtered results", "[core][
             tags = {static_cast<TagId>(i % 5)};
         batch.push_back(MakeUpsert(static_cast<Id>(i + 1), dim, 0.4f + static_cast<float>(i) * 0.01f, 0, tags));
     }
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     Filter filter;
     filter.require_all_tags = {1, 2};
@@ -164,8 +174,10 @@ TEST_CASE("Quality mode fails loudly on insufficient filtered results", "[core][
     req.search_mode = SearchMode::Quality;
     req.filter = std::make_shared<Filter>(filter);
 
-    auto resp = db.Search(req);
-    db.Stop();
+    auto resp_res = db.Search(req);
+    REQUIRE(resp_res.ok());
+    auto resp = resp_res.move_value();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE(resp.status == SearchStatus::InsufficientResults);
     REQUIRE(resp.stats.quality_failure);
@@ -185,7 +197,7 @@ TEST_CASE("Quality mode errors on exhausted filter budgets", "[core][filter][qua
     opts.max_filtered_candidate_k = 2;
     opts.filter_max_retries = 1;
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::vector<UpsertRequest> batch;
     batch.reserve(100);
@@ -198,7 +210,8 @@ TEST_CASE("Quality mode errors on exhausted filter budgets", "[core][filter][qua
             tags = {static_cast<TagId>(i % 5)};
         batch.push_back(MakeUpsert(static_cast<Id>(i + 1), dim, 0.5f + static_cast<float>(i) * 0.01f, 0, tags));
     }
-    db.UpsertBatch(batch, true).get();
+    auto upsert_res = db.UpsertBatch(batch, true).get();
+    REQUIRE(upsert_res.ok());
 
     Filter filter;
     filter.require_all_tags = {1, 2};
@@ -206,8 +219,10 @@ TEST_CASE("Quality mode errors on exhausted filter budgets", "[core][filter][qua
     req.search_mode = SearchMode::Quality;
     req.filter = std::make_shared<Filter>(filter);
 
-    auto resp = db.Search(req);
-    db.Stop();
+    auto resp_res = db.Search(req);
+    REQUIRE(resp_res.ok());
+    auto resp = resp_res.move_value();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE(resp.status == SearchStatus::InsufficientResults);
     REQUIRE(resp.stats.quality_failure);

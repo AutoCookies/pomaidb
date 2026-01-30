@@ -72,12 +72,13 @@ endif()
 set(POMAI_PUBLIC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # --- 4. MODULE LIBRARIES ---
-set(UTIL_SOURCES
-    src/util/memory_manager.cpp
+set(CONCURRENCY_SOURCES
+    src/concurrency/memory_manager.cpp
+    src/util/logger.cpp
 )
-add_library(pomai_util STATIC ${UTIL_SOURCES})
-target_include_directories(pomai_util PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_util PUBLIC pomai_compiler_flags)
+add_library(pomai_concurrency STATIC ${CONCURRENCY_SOURCES})
+target_include_directories(pomai_concurrency PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
+target_link_libraries(pomai_concurrency PUBLIC pomai_compiler_flags)
 
 set(STORAGE_SOURCES
     src/storage/file_util.cpp
@@ -90,7 +91,7 @@ set(STORAGE_SOURCES
 )
 add_library(pomai_storage STATIC ${STORAGE_SOURCES})
 target_include_directories(pomai_storage PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_storage PUBLIC pomai_util Threads::Threads pomai_compiler_flags)
+target_link_libraries(pomai_storage PUBLIC pomai_concurrency Threads::Threads pomai_compiler_flags)
 
 set(INDEX_SOURCES
     src/index/orbit_index.cpp
@@ -98,7 +99,7 @@ set(INDEX_SOURCES
 )
 add_library(pomai_index STATIC ${INDEX_SOURCES})
 target_include_directories(pomai_index PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_index PUBLIC pomai_util pomai_compiler_flags)
+target_link_libraries(pomai_index PUBLIC pomai_concurrency pomai_compiler_flags)
 
 set(CORE_SOURCES
     src/core/membrane.cpp
@@ -109,7 +110,7 @@ set(CORE_SOURCES
 )
 add_library(pomai_core STATIC ${CORE_SOURCES})
 target_include_directories(pomai_core PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_core PUBLIC pomai_util pomai_storage pomai_index Threads::Threads pomai_compiler_flags)
+target_link_libraries(pomai_core PUBLIC pomai_concurrency pomai_storage pomai_index Threads::Threads pomai_compiler_flags)
 
 set(API_SOURCES
     src/api/pomai_db.cpp
@@ -123,7 +124,6 @@ set(SERVER_SOURCES
     src/server/server.cpp
     src/server/protocol.cpp
     src/server/pomai_server_main.cpp
-    src/server/logger.cpp
     src/server/config.cpp
 )
 
@@ -149,15 +149,15 @@ if(POMAI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 endif()
 
 # --- 8. TOOLS ---
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/repro_segfault.cpp")
-    add_executable(repro_segfault tools/repro_segfault.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/repro_segfault.cpp")
+    add_executable(repro_segfault src/tools/repro_segfault.cpp)
     target_link_libraries(repro_segfault PRIVATE pomai_api)
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/pomai_verify.cpp")
-    add_executable(pomai_verify tools/pomai_verify.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/pomai_verify.cpp")
+    add_executable(pomai_verify src/tools/pomai_verify.cpp)
     target_link_libraries(pomai_verify PRIVATE pomai_api)
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/pomai_dump.cpp")
-    add_executable(pomai_dump tools/pomai_dump.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/pomai_dump.cpp")
+    add_executable(pomai_dump src/tools/pomai_dump.cpp)
     target_link_libraries(pomai_dump PRIVATE pomai_api)
 endif()

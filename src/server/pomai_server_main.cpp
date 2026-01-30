@@ -1,6 +1,6 @@
 #include <pomai/server/server.h>
 #include <pomai/server/config.h>
-#include <pomai/server/logger.h>
+#include <pomai/util/logger.h>
 
 #include <atomic>
 #include <csignal>
@@ -84,7 +84,19 @@ static pomai::server::ServerConfig LoadConfigOrDefault(const std::string &path)
 
 int main(int argc, char **argv)
 {
-    const std::string cfg_path = (argc > 1) ? argv[1] : "config/pomai.yaml";
+    std::string cfg_path = "config/pomai.yaml";
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+        if ((arg == "--config" || arg == "-c") && i + 1 < argc)
+        {
+            cfg_path = argv[++i];
+        }
+        else if (!arg.empty() && arg[0] != '-')
+        {
+            cfg_path = arg;
+        }
+    }
 
     // Install signal handlers early so we can react to Ctrl+C during init.
     InstallSignalHandlers();
@@ -94,7 +106,20 @@ int main(int argc, char **argv)
 
     // Create a logger. Replace with your project's logger construction if it's different.
     // We assume server::Logger has a constructor that accepts no args or simple options.
-    pomai::server::Logger logger; // adjust if your Logger requires parameters
+    pomai::Logger logger;
+    if (!cfg.log_path.empty())
+        logger.SetFile(cfg.log_path);
+    if (cfg.log_level == "debug")
+    {
+        logger.SetLevel(pomai::LogLevel::debug);
+        logger.EnableDebug(true);
+    }
+    else if (cfg.log_level == "info")
+        logger.SetLevel(pomai::LogLevel::info);
+    else if (cfg.log_level == "warn")
+        logger.SetLevel(pomai::LogLevel::warn);
+    else if (cfg.log_level == "error")
+        logger.SetLevel(pomai::LogLevel::error);
 
     std::cout << R"(
 
@@ -108,7 +133,7 @@ int main(int argc, char **argv)
 
 )" << std::endl;
 
-    logger.Info("[init] Starting Pomai server");
+    logger.Info("server.init", "Starting Pomai server");
 
     // Construct server
     pomai::server::PomaiServer server(cfg, &logger);
@@ -134,13 +159,13 @@ int main(int argc, char **argv)
     }
 
     // Termination requested: perform graceful shutdown.
-    logger.Info("[init] Shutdown signal received, stopping server...");
+    logger.Info("server.shutdown", "Shutdown signal received, stopping server...");
     server.Stop();
 
     // Join server thread; server.Start() should return after Stop().
     if (server_thread.joinable())
         server_thread.join();
 
-    logger.Info("[init] Server stopped, exiting.");
+    logger.Info("server.shutdown", "Server stopped, exiting.");
     return 0;
 }

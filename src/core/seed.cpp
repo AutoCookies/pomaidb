@@ -1,8 +1,9 @@
 #include <pomai/core/seed.h>
 #include <pomai/util/search_utils.h>
+#include <pomai/core/search_contract.h>
 #include <pomai/util/cpu_kernels.h>
 #include <pomai/util/fixed_topk.h>
-#include <pomai/util/memory_manager.h>
+#include <pomai/concurrency/memory_manager.h>
 #include <immintrin.h>
 #include <algorithm>
 #include <array>
@@ -801,7 +802,8 @@ namespace pomai
         SearchResponse resp;
         if (!snap || snap->dim == 0 || req.query.data.size() != snap->dim)
             return resp;
-        if (req.metric != Metric::L2)
+        SearchRequest normalized = NormalizeSearchRequest(req);
+        if (normalized.metric != Metric::L2)
             return resp;
         const std::size_t dim = snap->dim;
         const std::size_t n = snap->ids.size();
@@ -813,11 +815,11 @@ namespace pomai
             float qv = (snap->qscales[d] > 0.0f) ? ((req.query.data[d] - snap->qmins[d]) / snap->qscales[d]) : 0.0f;
             qquant[d] = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::nearbyint(qv)), 0, 255));
         }
-        const bool has_filter = req.filter && !req.filter->empty();
-        const std::size_t candidate_k = has_filter && req.filtered_candidate_k > 0 ? std::max<std::size_t>(req.filtered_candidate_k, req.topk)
-                                                                                   : NormalizeCandidateK(req);
-        const std::size_t max_visits = has_filter ? std::max<std::size_t>(req.filter_max_visits, candidate_k) : 0;
-        const std::uint64_t time_budget_us = has_filter ? req.filter_time_budget_us : 0;
+        const bool has_filter = normalized.filter && !normalized.filter->empty();
+        const std::size_t candidate_k = has_filter && normalized.filtered_candidate_k > 0 ? std::max<std::size_t>(normalized.filtered_candidate_k, normalized.topk)
+                                                                                         : normalized.candidate_k;
+        const std::size_t max_visits = has_filter ? std::max<std::size_t>(normalized.filter_max_visits, candidate_k) : 0;
+        const std::uint64_t time_budget_us = has_filter ? normalized.filter_time_budget_us : 0;
         const auto start_time = std::chrono::steady_clock::now();
         bool time_budget_hit = false;
         bool visit_budget_hit = false;
@@ -848,12 +850,12 @@ namespace pomai
                 }
                 ++visit_count;
             }
-            if (has_filter && !snap->MatchFilter(row, *req.filter))
+            if (has_filter && !snap->MatchFilter(row, *normalized.filter))
                 continue;
             float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, qquant.data(), dim);
             candidate_topk.Push(-d, static_cast<Id>(row));
         }
-        FixedTopK final_topk(req.topk);
+        FixedTopK final_topk(normalized.topk);
         thread_local std::vector<float, AlignedAllocator<float, 64>> dequant;
         if (dequant.size() < dim)
             dequant.resize(dim);
@@ -869,8 +871,8 @@ namespace pomai
                 return false;
             if (row * dim + dim > snap->qdata.size())
                 return false;
-            if (has_filter && req.filter && req.filter->namespace_id &&
-                snap->namespace_ids[row] != *req.filter->namespace_id)
+            if (has_filter && normalized.filter && normalized.filter->namespace_id &&
+                snap->namespace_ids[row] != *normalized.filter->namespace_id)
                 return false;
             return true;
         };
@@ -883,10 +885,10 @@ namespace pomai
                 continue;
             }
             DequantizeRow(snap, cand_row, dequant.data());
-            final_topk.Push(-kernels::L2Sqr(dequant.data(), req.query.data.data(), dim), snap->ids[cand_row]);
+            final_topk.Push(-kernels::L2Sqr(dequant.data(), normalized.query.data.data(), dim), snap->ids[cand_row]);
         }
         final_topk.FillSorted(resp.items);
-        SortAndDedupeResults(resp.items, req.topk);
+        SortAndDedupeResults(resp.items, normalized.topk);
         if (invalid_mapping)
         {
             resp.partial = true;
@@ -897,7 +899,7 @@ namespace pomai
         resp.stats.filtered_reranked = candidate_topk.Size();
         resp.stats.filtered_candidates = candidate_topk.Size();
         resp.stats.filtered_visits = visit_count;
-        const bool filtered_partial = has_filter && resp.items.size() < req.topk;
+        const bool filtered_partial = has_filter && resp.items.size() < normalized.topk;
         const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit);
         resp.stats.filtered_partial = filtered_partial;
         resp.stats.filtered_time_budget_hit = time_budget_hit;

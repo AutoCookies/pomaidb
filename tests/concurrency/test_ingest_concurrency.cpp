@@ -17,7 +17,7 @@ TEST_CASE("Concurrent ingest", "[concurrency][ingest]")
     TempDir dir;
     auto opts = DefaultDbOptions(dir.str(), 8, 2);
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     constexpr std::size_t per_thread = 20;
     std::vector<std::thread> threads;
@@ -32,7 +32,8 @@ TEST_CASE("Concurrent ingest", "[concurrency][ingest]")
                                      Id id = static_cast<Id>(t * per_thread + i + 1);
                                      batch.push_back(MakeUpsert(id, 8, 0.1f + static_cast<float>(id), 1));
                                  }
-                                 db.UpsertBatch(batch, true).get();
+                                 auto res = db.UpsertBatch(batch, true).get();
+                                 REQUIRE(res.ok());
                              });
     }
 
@@ -43,7 +44,7 @@ TEST_CASE("Concurrent ingest", "[concurrency][ingest]")
     req.batch_size = 256;
     auto ids = ScanAll(db, req);
 
-    db.Stop();
+    REQUIRE(db.Stop().ok());
 
     REQUIRE(ids.size() == per_thread * 4);
 }

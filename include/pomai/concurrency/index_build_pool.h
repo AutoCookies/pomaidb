@@ -14,7 +14,7 @@
 
 #include <pomai/core/seed.h>
 #include <pomai/index/orbit_index.h>
-#include <pomai/util/memory_manager.h>
+#include <pomai/concurrency/memory_manager.h>
 
 namespace pomai
 {

@@ -1,8 +1,10 @@
 #include <pomai/core/membrane.h>
 #include <pomai/util/search_utils.h>
+#include <pomai/core/search_contract.h>
 #include <pomai/core/spatial_router.h>
-#include <pomai/util/search_fanout.h>
-#include <pomai/util/memory_manager.h>
+#include <pomai/core/filter.h>
+#include <pomai/concurrency/search_fanout.h>
+#include <pomai/concurrency/memory_manager.h>
 #include <pomai/util/fixed_topk.h>
 #include <pomai/storage/snapshot.h>
 #include <pomai/storage/verify.h>
@@ -182,7 +184,8 @@ namespace pomai
                                    std::size_t scan_batch_cap,
                                    std::size_t scan_id_order_max_rows,
                                    FilterConfig filter_config,
-                                   std::function<void()> on_rejected_upsert)
+                                   std::function<void()> on_rejected_upsert,
+                                   Logger *logger)
         : shards_(std::move(shards)),
           brain_(w_cfg),
           probe_P_(2),
@@ -193,20 +196,24 @@ namespace pomai
           scan_id_order_max_rows_(scan_id_order_max_rows),
           filter_config_(filter_config),
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size())),
-          on_rejected_upsert_(std::move(on_rejected_upsert))
+          completion_(1024, logger),
+          on_rejected_upsert_(std::move(on_rejected_upsert)),
+          logger_(logger)
     {
-        if (shards_.empty())
-            throw std::runtime_error("must have at least 1 shard");
     }
 
-    void MembraneRouter::Start()
+    Status MembraneRouter::Start()
     {
+        if (shards_.empty())
+            return Status::Invalid("must have at least 1 shard");
         completion_.Start();
         if (centroids_load_mode_ != CentroidsLoadMode::None && centroids_load_mode_ != CentroidsLoadMode::Async)
         {
             if (!centroids_path_.empty() && FileExists(centroids_path_))
             {
-                LoadCentroidsFromFile(centroids_path_);
+                auto st = LoadCentroidsFromFile(centroids_path_);
+                if (!st.ok() && logger_)
+                    logger_->Warn("membrane.centroids", st.msg);
             }
         }
 
@@ -219,14 +226,16 @@ namespace pomai
         }
         for (auto &f : futures)
             f.get();
+        return Status::Ok();
     }
 
-    void MembraneRouter::Stop()
+    Status MembraneRouter::Stop()
     {
         for (auto &s : shards_)
             s->Stop();
         search_pool_.Stop();
         completion_.Stop();
+        return Status::Ok();
     }
 
     std::size_t MembraneRouter::PickShardById(Id id) const
@@ -247,43 +256,35 @@ namespace pomai
             }
             catch (...)
             {
+                if (logger_)
+                    logger_->Debug("membrane.route", "PickShardForInsert failed, falling back to id routing");
             }
         }
         return PickShardById(id);
     }
 
-    Metadata MembraneRouter::NormalizeMetadata(const Metadata &meta)
+    Result<Metadata> MembraneRouter::NormalizeMetadata(const Metadata &meta)
     {
         Metadata out = meta;
         std::vector<TagId> tag_ids = meta.tag_ids;
-        std::sort(tag_ids.begin(), tag_ids.end());
-        tag_ids.erase(std::unique(tag_ids.begin(), tag_ids.end()), tag_ids.end());
+        SortAndDedupeTags(tag_ids);
         if (tag_ids.size() > filter_config_.max_tags_per_vector)
-            throw std::runtime_error("max_tags_per_vector exceeded");
+            return Result<Metadata>(Status::Invalid("max_tags_per_vector exceeded"));
         out.tag_ids = std::move(tag_ids);
-        return out;
+        return Result<Metadata>(std::move(out));
     }
 
-    std::shared_ptr<const Filter> MembraneRouter::NormalizeFilter(const SearchRequest &req) const
+    Result<std::shared_ptr<const Filter>> MembraneRouter::NormalizeFilter(const SearchRequest &req) const
     {
         if (!req.filter)
-            return nullptr;
-        Filter f = *req.filter;
-        auto normalize_vec = [](std::vector<TagId> &tags)
-        {
-            std::sort(tags.begin(), tags.end());
-            tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
-        };
-        normalize_vec(f.require_all_tags);
-        normalize_vec(f.require_any_tags);
-        normalize_vec(f.exclude_tags);
-        const std::size_t total_tags = f.require_all_tags.size() + f.require_any_tags.size() + f.exclude_tags.size();
-        if (total_tags > filter_config_.max_filter_tags)
-            throw std::runtime_error("max_filter_tags exceeded");
-        return std::make_shared<Filter>(std::move(f));
+            return Result<std::shared_ptr<const Filter>>(std::shared_ptr<const Filter>{});
+        auto normalized = pomai::NormalizeFilter(*req.filter, filter_config_.max_filter_tags);
+        if (!normalized.ok())
+            return Result<std::shared_ptr<const Filter>>(normalized.status());
+        return Result<std::shared_ptr<const Filter>>(std::make_shared<Filter>(std::move(normalized.move_value())));
     }
 
-    std::future<Lsn> MembraneRouter::Upsert(Id id, Vector vec, bool wait_durable)
+    std::future<Result<Lsn>> MembraneRouter::Upsert(Id id, Vector vec, bool wait_durable)
     {
         UpsertRequest r;
         r.id = id;
@@ -293,29 +294,41 @@ namespace pomai
         return UpsertBatch(std::move(batch), wait_durable);
     }
 
-    std::future<Lsn> MembraneRouter::UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable)
+    std::future<Result<Lsn>> MembraneRouter::UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable)
     {
         if (batch.empty())
         {
-            std::promise<Lsn> p;
-            p.set_value(0);
+            std::promise<Result<Lsn>> p;
+            p.set_value(Result<Lsn>(static_cast<Lsn>(0)));
             return p.get_future();
         }
 
         std::size_t est_bytes = 0;
         for (auto &r : batch)
         {
-            if (r.vec.data.size() == dim_)
-                est_bytes += sizeof(Id) + dim_ * sizeof(float);
-            r.metadata = NormalizeMetadata(r.metadata);
+            if (r.vec.data.size() != dim_)
+            {
+                std::promise<Result<Lsn>> p;
+                p.set_value(Result<Lsn>(Status::Invalid("upsert vector dimension mismatch")));
+                return p.get_future();
+            }
+            est_bytes += sizeof(Id) + dim_ * sizeof(float);
+            auto meta_res = NormalizeMetadata(r.metadata);
+            if (!meta_res.ok())
+            {
+                std::promise<Result<Lsn>> p;
+                p.set_value(Result<Lsn>(meta_res.status()));
+                return p.get_future();
+            }
+            r.metadata = std::move(meta_res.move_value());
         }
 
         if (!MemoryManager::Instance().CanAllocate(est_bytes))
         {
             if (on_rejected_upsert_)
                 on_rejected_upsert_();
-            std::promise<Lsn> p;
-            p.set_exception(std::make_exception_ptr(std::runtime_error("UpsertBatch rejected: memory pressure")));
+            std::promise<Result<Lsn>> p;
+            p.set_value(Result<Lsn>(Status::Exhausted("UpsertBatch rejected: memory pressure")));
             return p.get_future();
         }
 
@@ -325,33 +338,32 @@ namespace pomai
             parts[PickShard(r.id, &r.vec)].push_back(std::move(r));
         }
 
-        std::vector<std::future<Lsn>> futs;
+        std::vector<std::future<Result<Lsn>>> futs;
         for (std::size_t i = 0; i < parts.size(); ++i)
         {
             if (!parts[i].empty())
                 futs.push_back(shards_[i]->EnqueueUpserts(std::move(parts[i]), wait_durable));
         }
 
-        auto done = std::make_shared<std::promise<Lsn>>();
+        auto done = std::make_shared<std::promise<Result<Lsn>>>();
         auto out = done->get_future();
-        auto shared_futs = std::make_shared<std::vector<std::future<Lsn>>>(std::move(futs));
+        auto shared_futs = std::make_shared<std::vector<std::future<Result<Lsn>>>>(std::move(futs));
         auto task = [shared_futs, done]() mutable
         {
             Lsn max_lsn = 0;
-            try
+            for (auto &f : *shared_futs)
             {
-                for (auto &f : *shared_futs)
+                auto r = f.get();
+                if (!r.ok())
                 {
-                    Lsn l = f.get();
-                    if (l > max_lsn)
-                        max_lsn = l;
+                    done->set_value(Result<Lsn>(r.status()));
+                    return;
                 }
-                done->set_value(max_lsn);
+                Lsn l = r.value();
+                if (l > max_lsn)
+                    max_lsn = l;
             }
-            catch (...)
-            {
-                done->set_exception(std::current_exception());
-            }
+            done->set_value(Result<Lsn>(max_lsn));
         };
         if (!completion_.Enqueue(std::move(task)))
             task();
@@ -367,18 +379,25 @@ namespace pomai
         return sum;
     }
 
-    SearchResponse MembraneRouter::Search(const SearchRequest &req) const
+    Result<SearchResponse> MembraneRouter::Search(const SearchRequest &req) const
     {
+        if (req.query.data.size() != dim_)
+            return Result<SearchResponse>(Status::Invalid("query dimension mismatch"));
+        if (req.topk == 0)
+            return Result<SearchResponse>(Status::Invalid("topk must be > 0"));
         auto start = std::chrono::steady_clock::now();
         auto deadline = start + std::chrono::milliseconds(search_timeout_ms_);
         auto budget = brain_.compute_budget(false);
         auto health = brain_.health();
         std::size_t adaptive_probe = probe_P_;
         SearchRequest normalized = req;
-        normalized.filter = NormalizeFilter(req);
+        auto filter_res = NormalizeFilter(req);
+        if (!filter_res.ok())
+            return Result<SearchResponse>(filter_res.status());
+        normalized.filter = filter_res.move_value();
         const bool has_filter = normalized.filter && !normalized.filter->empty();
         if (normalized.filter && normalized.filter->match_none)
-            return {};
+            return Result<SearchResponse>(SearchResponse{});
         std::size_t candidate_k = 0;
         std::uint32_t graph_ef = 0;
         std::size_t max_visits = 0;
@@ -445,6 +464,8 @@ namespace pomai
         }
         catch (...)
         {
+            if (logger_)
+                logger_->Debug("membrane.route", "CandidateShardsForQuery failed, falling back to full fanout");
             target_ids.resize(shards_.size());
             std::iota(target_ids.begin(), target_ids.end(), 0);
         }
@@ -452,9 +473,7 @@ namespace pomai
         const std::size_t shard_topk = std::max<std::size_t>(normalized.topk, normalized.topk * kShardCandidateMultiplier);
         auto run_attempt = [&](const SearchRequest &attempt_req)
         {
-            SearchRequest shard_req = attempt_req;
-            shard_req.candidate_k = NormalizeCandidateK(shard_req);
-            shard_req.max_rerank_k = NormalizeMaxRerankK(shard_req);
+            SearchRequest shard_req = NormalizeSearchRequest(attempt_req);
             const std::size_t graph_candidate_k = has_filter ? std::max<std::size_t>(shard_req.filtered_candidate_k, shard_req.topk)
                                                              : shard_req.candidate_k;
             shard_req.graph_ef = NormalizeGraphEf(shard_req, graph_candidate_k);
@@ -468,6 +487,7 @@ namespace pomai
 
             std::vector<std::future<SearchResponse>> futs;
             std::vector<SearchResponse> inline_responses;
+            bool search_error = false;
             futs.reserve(target_ids.size());
             inline_responses.reserve(target_ids.size());
             for (auto sid : target_ids)
@@ -490,6 +510,7 @@ namespace pomai
                         }
                         catch (...)
                         {
+                            search_error = true;
                         }
                     }
                 }
@@ -511,7 +532,6 @@ namespace pomai
             std::size_t filtered_candidates_generated = 0;
             std::size_t filtered_candidates_passed = 0;
             std::size_t filtered_reranked = 0;
-            bool search_error = false;
             for (auto &f : futs)
             {
                 if (f.wait_until(deadline) == std::future_status::ready)
@@ -690,7 +710,7 @@ namespace pomai
                 hotspot_.reset();
         }
 
-        return out;
+        return Result<SearchResponse>(std::move(out));
     }
 
     std::shared_ptr<const MembraneRouter::ScanView> MembraneRouter::FindView(std::uint64_t epoch) const
@@ -792,7 +812,7 @@ namespace pomai
         return true;
     }
 
-    ScanResponse MembraneRouter::Scan(const ScanRequest &req) const
+    Result<ScanResponse> MembraneRouter::Scan(const ScanRequest &req) const
     {
         ScanResponse resp;
         const std::size_t batch_cap = scan_batch_cap_ == 0 ? 1024 : scan_batch_cap_;
@@ -802,24 +822,14 @@ namespace pomai
             resp.vectors.reserve(batch_size * dim_);
         if (req.include_metadata)
             resp.tags.reserve(batch_size * 8);
-        Filter normalized_filter = req.filter;
-        auto normalize_vec = [](std::vector<TagId> &tags)
-        {
-            std::sort(tags.begin(), tags.end());
-            tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
-        };
-        normalize_vec(normalized_filter.require_all_tags);
-        normalize_vec(normalized_filter.require_any_tags);
-        normalize_vec(normalized_filter.exclude_tags);
-        const std::size_t total_tags = normalized_filter.require_all_tags.size() +
-                                       normalized_filter.require_any_tags.size() +
-                                       normalized_filter.exclude_tags.size();
-        if (total_tags > filter_config_.max_filter_tags)
+        auto filter_res = pomai::NormalizeFilter(req.filter, filter_config_.max_filter_tags);
+        if (!filter_res.ok())
         {
             resp.status = ScanStatus::InvalidRequest;
-            resp.error = "scan filter tags exceeded";
-            return resp;
+            resp.error = filter_res.status().msg;
+            return Result<ScanResponse>(resp);
         }
+        Filter normalized_filter = std::move(filter_res.move_value());
         std::uint64_t epoch = 0;
         std::size_t grain_idx = 0;
         std::size_t row_idx = 0;
@@ -830,14 +840,14 @@ namespace pomai
             {
                 resp.status = ScanStatus::InvalidCursor;
                 resp.error = "invalid cursor format";
-                return resp;
+                return Result<ScanResponse>(resp);
             }
             view = FindView(epoch);
             if (!view)
             {
                 resp.status = ScanStatus::InvalidCursor;
                 resp.error = "cursor expired";
-                return resp;
+                return Result<ScanResponse>(resp);
             }
             if (req.order == ScanOrder::IdAsc)
             {
@@ -845,20 +855,20 @@ namespace pomai
                 {
                     resp.status = ScanStatus::InvalidCursor;
                     resp.error = "cursor out of range";
-                    return resp;
+                    return Result<ScanResponse>(resp);
                 }
             }
             else if (grain_idx > view->grains.size())
             {
                 resp.status = ScanStatus::InvalidCursor;
                 resp.error = "cursor out of range";
-                return resp;
+                return Result<ScanResponse>(resp);
             }
             if (req.order == ScanOrder::Natural && grain_idx < view->grain_row_counts.size() && row_idx > view->grain_row_counts[grain_idx])
             {
                 resp.status = ScanStatus::InvalidCursor;
                 resp.error = "cursor row out of range";
-                return resp;
+                return Result<ScanResponse>(resp);
             }
         }
         else
@@ -869,7 +879,7 @@ namespace pomai
             {
                 resp.status = status;
                 resp.error = "scan order unsupported for snapshot size";
-                return resp;
+                return Result<ScanResponse>(resp);
             }
             epoch = view->epoch;
             grain_idx = 0;
@@ -879,7 +889,7 @@ namespace pomai
         {
             resp.status = ScanStatus::InvalidCursor;
             resp.error = "no view";
-            return resp;
+            return Result<ScanResponse>(resp);
         }
 
         std::vector<float> scratch(dim_);
@@ -1019,18 +1029,18 @@ namespace pomai
             }
         }
 
-        return resp;
+        return Result<ScanResponse>(resp);
     }
 
-    std::future<bool> MembraneRouter::RequestCheckpoint()
+    std::future<Result<bool>> MembraneRouter::RequestCheckpoint()
     {
-        std::vector<std::future<ShardCheckpointState>> futs;
+        std::vector<std::future<Result<ShardCheckpointState>>> futs;
         futs.reserve(shards_.size());
         for (auto &s : shards_)
             futs.push_back(s->RequestCheckpointState());
-        auto done = std::make_shared<std::promise<bool>>();
+        auto done = std::make_shared<std::promise<Result<bool>>>();
         auto out = done->get_future();
-        auto shared_futs = std::make_shared<std::vector<std::future<ShardCheckpointState>>>(std::move(futs));
+        auto shared_futs = std::make_shared<std::vector<std::future<Result<ShardCheckpointState>>>>(std::move(futs));
         auto task = [this, shared_futs, done]() mutable
         {
             try
@@ -1047,7 +1057,13 @@ namespace pomai
                 std::size_t shard_id = 0;
                 for (auto &f : *shared_futs)
                 {
-                    auto state = f.get();
+                    auto state_res = f.get();
+                    if (!state_res.ok())
+                    {
+                        done->set_value(Result<bool>(state_res.status()));
+                        return;
+                    }
+                    auto state = state_res.move_value();
                     state.shard_id = static_cast<std::uint32_t>(shard_id);
                     storage::ShardSnapshot shard;
                     shard.shard_id = state.shard_id;
@@ -1062,20 +1078,20 @@ namespace pomai
                 std::string err;
                 if (db_dir_.empty())
                 {
-                    done->set_value(false);
+                    done->set_value(Result<bool>(Status::Invalid("db_dir is empty")));
                     return;
                 }
                 if (!storage::CommitCheckpointAtomically(db_dir_, snapshot, {}, &res, &err))
                 {
-                    done->set_value(false);
+                    done->set_value(Result<bool>(Status::Io("checkpoint commit failed: " + err)));
                     return;
                 }
                 last_checkpoint_lsn_.store(res.manifest.checkpoint_lsn, std::memory_order_relaxed);
-                done->set_value(true);
+                done->set_value(Result<bool>(true));
             }
             catch (...)
             {
-                done->set_exception(std::current_exception());
+                done->set_value(Result<bool>(Status::Internal("checkpoint task failed")));
             }
         };
         if (!completion_.Enqueue(std::move(task)))
@@ -1166,10 +1182,10 @@ namespace pomai
         return completion_.Enqueue(std::move(fn), delay);
     }
 
-    bool MembraneRouter::ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples)
+    Result<void> MembraneRouter::ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples)
     {
         if (shards_.empty())
-            return false;
+            return Result<void>(Status::Invalid("no shards available for centroid computation"));
         const std::size_t S = shards_.size();
         std::size_t sample_size = std::clamp<std::size_t>(total_samples, 50000, 200000);
         auto &mm = MemoryManager::Instance();
@@ -1178,7 +1194,7 @@ namespace pomai
         const std::size_t avail = (hard > total) ? (hard - total) : 0;
         const std::size_t max_samples_by_mem = (dim_ > 0) ? (avail / (dim_ * sizeof(float))) : 0;
         if (max_samples_by_mem == 0)
-            return false;
+            return Result<void>(Status::Exhausted("insufficient memory for centroid sampling"));
         sample_size = std::min(sample_size, max_samples_by_mem);
         std::vector<std::future<std::vector<Vector>>> futs;
         for (std::size_t i = 0; i < S; ++i)
@@ -1197,34 +1213,40 @@ namespace pomai
             }
             catch (...)
             {
+                if (logger_)
+                    logger_->Debug("membrane.centroids", "Sample collection failed for shard");
             }
         }
         if (aggregate.empty())
-            return false;
+            return Result<void>(Status::Unavailable("no samples available for centroid computation"));
         try
         {
             auto c = SpatialRouter::BuildKMeans(aggregate, k == 0 ? S * 32 : k, 10);
             ConfigureCentroids(c);
             if (!centroids_path_.empty())
-                SaveCentroidsToFile(centroids_path_);
-            return true;
+            {
+                auto st = SaveCentroidsToFile(centroids_path_);
+                if (!st.ok())
+                    return Result<void>(st);
+            }
+            return Result<void>();
         }
         catch (...)
         {
-            return false;
+            return Result<void>(Status::Internal("centroid computation failed"));
         }
     }
 
-    bool MembraneRouter::LoadCentroidsFromFile(const std::string &path)
+    Status MembraneRouter::LoadCentroidsFromFile(const std::string &path)
     {
         int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0)
-            return false;
+            return Status::FromErrno(PomaiErrc::IoError, "open centroids failed");
         struct stat st;
         if (::fstat(fd, &st) != 0)
         {
             ::close(fd);
-            return false;
+            return Status::FromErrno(PomaiErrc::IoError, "fstat centroids failed");
         }
         std::array<char, 8> magic;
         std::uint32_t ver_le;
@@ -1233,7 +1255,7 @@ namespace pomai
         if (!ReadFull(fd, magic.data(), 8) || !ReadFull(fd, &ver_le, 4) || !ReadFull(fd, &dim_le, 2) || !ReadFull(fd, &count_le, 8))
         {
             ::close(fd);
-            return false;
+            return Status::Corrupt("centroids header read failed");
         }
         std::size_t count = Le64ToHost(count_le);
         std::size_t dim = Le16ToHost(dim_le);
@@ -1241,7 +1263,7 @@ namespace pomai
         if (!ReadFull(fd, flat.data(), count * dim * 4))
         {
             ::close(fd);
-            return false;
+            return Status::Corrupt("centroids payload read failed");
         }
         std::uint64_t m_count_le;
         ReadFull(fd, &m_count_le, 8);
@@ -1260,18 +1282,18 @@ namespace pomai
         centroid_to_shard_.clear();
         for (auto val : m)
             centroid_to_shard_.push_back(val % shards_.size());
-        return true;
+        return Status::Ok();
     }
 
-    bool MembraneRouter::SaveCentroidsToFile(const std::string &path) const
+    Status MembraneRouter::SaveCentroidsToFile(const std::string &path) const
     {
         auto c = router_.SnapshotCentroids();
         if (c.empty())
-            return false;
+            return Status::Invalid("no centroids available to save");
         std::string tmp = path + ".tmp";
         int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd < 0)
-            return false;
+            return Status::FromErrno(PomaiErrc::IoError, "open centroids temp failed");
         WriteFull(fd, kCentroidsMagic, 8);
         std::uint32_t v_le = HostToLe32(kCentroidsVersion);
         std::uint16_t d_le = HostToLe16(static_cast<std::uint16_t>(dim_));
@@ -1292,7 +1314,7 @@ namespace pomai
         ::close(fd);
         ::rename(tmp.c_str(), path.c_str());
         FsyncDir(path);
-        return true;
+        return Status::Ok();
     }
 
     void MembraneRouter::SetCentroidsFilePath(const std::string &path) { centroids_path_ = path; }

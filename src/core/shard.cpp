@@ -17,10 +17,11 @@
 #include <unordered_map>
 #include <pomai/util/fixed_topk.h>
 #include <pomai/util/search_utils.h>
+#include <pomai/core/search_contract.h>
 #include <pomai/util/cpu_kernels.h>
 #include <pomai/core/spatial_router.h>
 #include <pomai/util/pomai_assert.h>
-#include <pomai/util/memory_manager.h>
+#include <pomai/concurrency/memory_manager.h>
 
 namespace pomai
 {
@@ -82,16 +83,14 @@ namespace pomai
                  std::size_t queue_cap,
                  std::string wal_dir,
                  CompactionConfig compaction,
-                 LogFn info,
-                 LogFn error)
+                 Logger *logger)
         : name_(std::move(name)),
           wal_dir_(std::move(wal_dir)),
           wal_(name_, wal_dir_, dim),
           seed_(dim),
           ingest_q_(queue_cap),
           build_pool_(nullptr),
-          log_info_(std::move(info)),
-          log_error_(std::move(error)),
+          logger_(logger),
           compaction_(compaction)
     {
         auto live_snap = seed_.MakeSnapshot();
@@ -112,11 +111,18 @@ namespace pomai
         try
         {
             WalReplayStats stats = checkpoint_lsn_ ? wal_.ReplayToSeed(seed_, *checkpoint_lsn_) : wal_.ReplayToSeed(seed_);
-            if (log_info_)
-                log_info_("[" + name_ + "] WAL Replay: records=" + std::to_string(stats.records_applied));
+            if (logger_)
+                logger_->Info("shard.wal.replay", "[" + name_ + "] WAL Replay: records=" + std::to_string(stats.records_applied));
+        }
+        catch (const std::exception &e)
+        {
+            if (logger_)
+                logger_->Error("shard.wal.replay", "[" + name_ + "] WAL Replay failed: " + std::string(e.what()));
         }
         catch (...)
         {
+            if (logger_)
+                logger_->Error("shard.wal.replay", "[" + name_ + "] WAL Replay failed: unknown exception");
         }
         if (!recovered_)
         {
@@ -176,7 +182,7 @@ namespace pomai
         return wal_.WrittenLsn();
     }
 
-    std::future<Lsn> Shard::EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable)
+    std::future<Result<Lsn>> Shard::EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable)
     {
         UpsertTask t;
         t.batch = std::move(batch);
@@ -184,14 +190,14 @@ namespace pomai
         auto fut = t.done.get_future();
         if (!ingest_q_.Push(std::move(t)))
         {
-            std::promise<Lsn> p;
-            p.set_exception(std::make_exception_ptr(std::runtime_error("closed")));
+            std::promise<Result<Lsn>> p;
+            p.set_value(Result<Lsn>(Status::Unavailable("ingest queue closed")));
             return p.get_future();
         }
         return fut;
     }
 
-    std::future<bool> Shard::RequestCheckpoint()
+    std::future<Result<bool>> Shard::RequestCheckpoint()
     {
         UpsertTask t;
         t.is_checkpoint = true;
@@ -199,14 +205,14 @@ namespace pomai
         auto fut = t.checkpoint_done->get_future();
         if (!ingest_q_.Push(std::move(t)))
         {
-            std::promise<bool> p;
-            p.set_exception(std::make_exception_ptr(std::runtime_error("closed")));
+            std::promise<Result<bool>> p;
+            p.set_value(Result<bool>(Status::Unavailable("ingest queue closed")));
             return p.get_future();
         }
         return fut;
     }
 
-    std::future<ShardCheckpointState> Shard::RequestCheckpointState()
+    std::future<Result<ShardCheckpointState>> Shard::RequestCheckpointState()
     {
         UpsertTask t;
         t.is_checkpoint_state = true;
@@ -214,8 +220,8 @@ namespace pomai
         auto fut = t.checkpoint_state_done->get_future();
         if (!ingest_q_.Push(std::move(t)))
         {
-            std::promise<ShardCheckpointState> p;
-            p.set_exception(std::make_exception_ptr(std::runtime_error("closed")));
+            std::promise<Result<ShardCheckpointState>> p;
+            p.set_value(Result<ShardCheckpointState>(Status::Unavailable("ingest queue closed")));
             return p.get_future();
         }
         return fut;
@@ -255,8 +261,8 @@ namespace pomai
             return nullptr;
         if (!snap->is_quantized.load(std::memory_order_acquire) || snap->qdata.empty())
         {
-            if (log_info_)
-                log_info_("[" + name_ + "] BuildGrainIndex: snapshot not quantized, skipping index build");
+            if (logger_)
+                logger_->Debug("shard.index", "[" + name_ + "] BuildGrainIndex: snapshot not quantized, skipping index build");
             return nullptr;
         }
         const std::size_t n = snap->ids.size();
@@ -278,8 +284,8 @@ namespace pomai
         std::vector<Vector> sample = SampleSnapshotVectors(snap, sample_cap);
         if (sample.empty())
         {
-            if (log_info_)
-                log_info_("[" + name_ + "] BuildGrainIndex: no valid samples, skipping index build");
+            if (logger_)
+                logger_->Debug("shard.index", "[" + name_ + "] BuildGrainIndex: no valid samples, skipping index build");
             return nullptr;
         }
         std::vector<Vector> centroids;
@@ -361,7 +367,7 @@ namespace pomai
             return resp;
         const bool has_filter = req.filter && !req.filter->empty();
         const std::size_t candidate_k = has_filter && req.filtered_candidate_k > 0 ? std::max<std::size_t>(req.filtered_candidate_k, req.topk)
-                                                                                   : NormalizeCandidateK(req);
+                                                                                   : req.candidate_k;
         const std::size_t topk = std::min<std::size_t>(req.topk, candidate_k);
         const std::size_t max_visits = has_filter ? std::max<std::size_t>(req.filter_max_visits, candidate_k) : 0;
         const std::uint64_t time_budget_us = has_filter ? req.filter_time_budget_us : 0;
@@ -500,10 +506,7 @@ namespace pomai
         SearchResponse out;
         if (!snapshot)
             return out;
-        SearchRequest normalized = req;
-        normalized.candidate_k = NormalizeCandidateK(req);
-        normalized.max_rerank_k = NormalizeMaxRerankK(req);
-        normalized.graph_ef = NormalizeGraphEf(req, normalized.candidate_k);
+        SearchRequest normalized = NormalizeSearchRequest(req);
         normalized.metric = req.metric;
         pomai::ai::Budget effective_budget = budget;
         if (normalized.graph_ef > 0)
@@ -563,7 +566,7 @@ namespace pomai
             if (task.is_checkpoint)
             {
                 if (task.checkpoint_done)
-                    task.checkpoint_done->set_value(true);
+                    task.checkpoint_done->set_value(Result<bool>(true));
                 continue;
             }
             if (task.is_checkpoint_state)
@@ -603,12 +606,14 @@ namespace pomai
                     }
                     state.live = seed_.ExportPersistedState();
                     if (task.checkpoint_state_done)
-                        task.checkpoint_state_done->set_value(std::move(state));
+                        task.checkpoint_state_done->set_value(Result<ShardCheckpointState>(std::move(state)));
                 }
                 catch (...)
                 {
+                    if (logger_)
+                        logger_->Error("shard.checkpoint", "[" + name_ + "] checkpoint state capture failed");
                     if (task.checkpoint_state_done)
-                        task.checkpoint_state_done->set_exception(std::current_exception());
+                        task.checkpoint_state_done->set_value(Result<ShardCheckpointState>(Status::Internal("checkpoint state capture failed")));
                 }
                 continue;
             }
@@ -623,8 +628,8 @@ namespace pomai
                 Lsn lsn = wal_.AppendUpserts(task.batch, task.wait_durable);
                 seed_.ApplyUpserts(task.batch);
                 std::uint64_t clamped = seed_.ConsumeOutOfRangeCount();
-                if (clamped > 0 && log_error_)
-                    log_error_("[" + name_ + "] quantization clamp rows=" + std::to_string(clamped));
+                if (clamped > 0 && logger_)
+                    logger_->Warn("shard.quantization", "[" + name_ + "] quantization clamp rows=" + std::to_string(clamped));
                 since_freeze_ += task.batch.size();
                 if (since_freeze_ >= kFreezeEveryVectors)
                 {
@@ -647,11 +652,13 @@ namespace pomai
                 }
                 if (task.wait_durable)
                     wal_.WaitDurable(lsn);
-                task.done.set_value(lsn);
+                task.done.set_value(Result<Lsn>(lsn));
             }
             catch (...)
             {
-                task.done.set_exception(std::current_exception());
+                if (logger_)
+                    logger_->Error("shard.upsert", "[" + name_ + "] upsert batch failed");
+                task.done.set_value(Result<Lsn>(Status::Internal("upsert batch failed")));
             }
         }
         MaybeFreezeSegment();
@@ -665,8 +672,8 @@ namespace pomai
         auto current = state_.load(std::memory_order_acquire);
             if (current && current->segments.size() >= kMaxSegments)
             {
-                if (log_error_)
-                    log_error_("[" + name_ + "] segment cap reached, skipping freeze to bound segment count");
+                if (logger_)
+                    logger_->Warn("shard.segment", "[" + name_ + "] segment cap reached, skipping freeze to bound segment count");
                 return;
             }
         std::size_t pos;
@@ -713,8 +720,8 @@ namespace pomai
             return;
         if (!build_pool_)
         {
-            if (log_info_)
-                log_info_("[" + name_ + "] ScheduleLiveGrainBuild: no build pool, skipping live grains build");
+            if (logger_)
+                logger_->Debug("shard.index", "[" + name_ + "] ScheduleLiveGrainBuild: no build pool, skipping live grains build");
             return;
         }
         bool queued = build_pool_->EnqueueTask([this, snap]()
@@ -722,8 +729,8 @@ namespace pomai
                                                    auto grains = BuildGrainIndex(snap);
                                                    AttachLiveGrains(snap, std::move(grains));
                                                });
-        if (!queued && log_info_)
-            log_info_("[" + name_ + "] ScheduleLiveGrainBuild: queue full, skipping live grains build");
+        if (!queued && logger_)
+            logger_->Debug("shard.index", "[" + name_ + "] ScheduleLiveGrainBuild: queue full, skipping live grains build");
     }
 
     void Shard::AttachIndex(std::size_t pos, Seed::Snapshot snap, std::shared_ptr<pomai::core::OrbitIndex> idx, std::shared_ptr<GrainIndex> grains)

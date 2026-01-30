@@ -144,7 +144,7 @@ namespace pomai::server
         if (!EnsureDir(cfg_.data_dir))
         {
             if (log_)
-                log_->Error("Failed to create/open data_dir: " + cfg_.data_dir);
+                log_->Error("server.start", "Failed to create/open data_dir: " + cfg_.data_dir);
             running_ = false;
             return false;
         }
@@ -162,7 +162,7 @@ namespace pomai::server
             if (ipc_fd_ < 0)
             {
                 if (log_)
-                    log_->Error("IPC socket creation failed: " + std::string(std::strerror(errno)));
+                    log_->Error("server.ipc", "IPC socket creation failed: " + std::string(std::strerror(errno)));
             }
             else
             {
@@ -174,7 +174,7 @@ namespace pomai::server
                 if (::bind(ipc_fd_, (sockaddr *)&addr_un, sizeof(addr_un)) != 0)
                 {
                     if (log_)
-                        log_->Error("IPC bind failed: " + cfg_.unix_socket + " (" + std::strerror(errno) + ")");
+                        log_->Error("server.ipc", "IPC bind failed: " + cfg_.unix_socket + " (" + std::strerror(errno) + ")");
                     ::close(ipc_fd_);
                     ipc_fd_ = -1;
                 }
@@ -187,14 +187,14 @@ namespace pomai::server
                     if (::listen(ipc_fd_, 128) != 0)
                     {
                         if (log_)
-                            log_->Error("IPC listen failed");
+                            log_->Error("server.ipc", "IPC listen failed");
                         ::close(ipc_fd_);
                         ipc_fd_ = -1;
                     }
                     else
                     {
                         if (log_)
-                            log_->Info("IPC Listening on " + cfg_.unix_socket);
+                            log_->Info("server.ipc", "IPC Listening on " + cfg_.unix_socket);
                         // Chạy AcceptLoopIPC trên thread riêng
                         ipc_thread_ = std::thread([this]()
                                                   { this->AcceptLoopIPC(); });
@@ -208,7 +208,7 @@ namespace pomai::server
         if (listen_fd_ < 0)
         {
             if (log_)
-                log_->Error("TCP socket failed: " + std::string(std::strerror(errno)));
+                log_->Error("server.tcp", "TCP socket failed: " + std::string(std::strerror(errno)));
             // Nếu TCP lỗi nhưng IPC chạy thì vẫn OK? Thôi cứ coi như lỗi nghiêm trọng.
             running_ = false;
             return false;
@@ -223,7 +223,7 @@ namespace pomai::server
         if (inet_pton(AF_INET, cfg_.listen_host.c_str(), &addr.sin_addr) != 1)
         {
             if (log_)
-                log_->Error("inet_pton failed for host: " + cfg_.listen_host);
+                log_->Error("server.tcp", "inet_pton failed for host: " + cfg_.listen_host);
             Stop();
             return false;
         }
@@ -231,7 +231,7 @@ namespace pomai::server
         if (bind(listen_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0)
         {
             if (log_)
-                log_->Error("bind failed: " + std::string(std::strerror(errno)));
+                log_->Error("server.tcp", "bind failed: " + std::string(std::strerror(errno)));
             Stop();
             return false;
         }
@@ -239,13 +239,13 @@ namespace pomai::server
         if (listen(listen_fd_, 128) != 0)
         {
             if (log_)
-                log_->Error("listen failed: " + std::string(std::strerror(errno)));
+                log_->Error("server.tcp", "listen failed: " + std::string(std::strerror(errno)));
             Stop();
             return false;
         }
 
         if (log_)
-            log_->Info("TCP Listening on " + cfg_.listen_host + ":" + std::to_string(cfg_.listen_port));
+            log_->Info("server.tcp", "TCP Listening on " + cfg_.listen_host + ":" + std::to_string(cfg_.listen_port));
 
         // Chạy AcceptLoop TCP trên thread hiện tại (blocking main thread)
         AcceptLoop();
@@ -295,20 +295,22 @@ namespace pomai::server
             for (auto &kv : cols_)
             {
                 if (kv.second.db)
-                    kv.second.db->Stop();
+                    auto st = kv.second.db->Stop();
+                    if (!st.ok() && log_)
+                        log_->Warn("server.stop", "Stop failed for collection '" + kv.second.name + "': " + st.msg);
             }
             cols_.clear();
             name_to_id_.clear();
         }
 
         if (log_)
-            log_->Info("PomaiServer stopped");
+            log_->Info("server.stop", "PomaiServer stopped");
     }
 
     void PomaiServer::LoadCatalog()
     {
         if (log_)
-            log_->Info("Scanning catalog in: " + cfg_.data_dir);
+            log_->Info("server.catalog", "Scanning catalog in: " + cfg_.data_dir);
 
         for (const auto &entry : fs::directory_iterator(cfg_.data_dir))
         {
@@ -341,7 +343,7 @@ namespace pomai::server
                 {
                     // No meta and no wal files -> skip
                     if (log_)
-                        log_->Debug("Skipping directory (no meta.bin, no wal files): " + entry.path().string());
+                        log_->Debug("server.catalog", "Skipping directory (no meta.bin, no wal files): " + entry.path().string());
                     continue;
                 }
 
@@ -362,8 +364,8 @@ namespace pomai::server
 
                 // Persist meta so we don't have to re-infer next time
                 SaveCollectionMeta(name, opt);
-                if (log_)
-                    log_->Info("Synthesized meta.bin for collection '" + name +
+                    if (log_)
+                        log_->Info("server.catalog", "Synthesized meta.bin for collection '" + name +
                                "' (inferred dim=" + std::to_string(opt.dim) +
                                ", shards=" + std::to_string(opt.shards) + ")");
             }
@@ -392,7 +394,7 @@ namespace pomai::server
             if (!in)
             {
                 if (log_)
-                    log_->Error("Corrupt meta for collection: " + name);
+                    log_->Error("server.catalog", "Corrupt meta for collection: " + name);
                 continue;
             }
 
@@ -407,21 +409,12 @@ namespace pomai::server
             opt.allow_sync_on_append = cfg_.allow_sync_on_append;
 
             if (log_)
-                log_->Info("Recovering collection: " + name + " (dim=" + std::to_string(dim) + ")");
+                log_->Info("server.catalog", "Recovering collection: " + name + " (dim=" + std::to_string(dim) + ")");
 
-            // Build small forwarding lambdas into server logger (server owns Logger symbols)
-            pomai::PomaiDB::LogFn info_cb;
-            pomai::PomaiDB::LogFn error_cb;
-            if (log_)
-            {
-                info_cb = [this](const std::string &m)
-                { log_->Info(m); };
-                error_cb = [this](const std::string &m)
-                { log_->Error(m); };
-            }
-
-            auto db = std::make_shared<pomai::PomaiDB>(opt, info_cb, error_cb);
-            db->Start();
+            auto db = std::make_shared<pomai::PomaiDB>(opt, log_);
+            auto st = db->Start();
+            if (!st.ok() && log_)
+                log_->Error("server.catalog", "Failed to start collection '" + name + "': " + st.msg);
 
             std::lock_guard<std::mutex> lk(cols_mu_);
             std::uint32_t id = next_col_id_++;
@@ -464,16 +457,16 @@ namespace pomai::server
                     continue;
                 if (!running_)
                     break;
-                if (log_)
-                    log_->Error("TCP accept failed: " + std::string(std::strerror(errno)));
+                    if (log_)
+                        log_->Error("server.tcp", "TCP accept failed: " + std::string(std::strerror(errno)));
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
 
             if (active_connections_ >= MAX_CONNECTIONS)
             {
-                if (log_)
-                    log_->Warn("Max connections reached. Rejecting TCP client.");
+                    if (log_)
+                        log_->Warn("server.tcp", "Max connections reached. Rejecting TCP client.");
                 ::close(client_fd);
                 continue;
             }
@@ -555,7 +548,7 @@ namespace pomai::server
         } guard{this, fd};
 
         if (log_)
-            log_->Debug("Client connected. Active: " + std::to_string(active_connections_));
+            log_->Debug("server.client", "Client connected. Active: " + std::to_string(active_connections_));
 
         std::vector<std::uint8_t> payload, out_payload;
         while (running_)
@@ -571,7 +564,7 @@ namespace pomai::server
             catch (const std::exception &e)
             {
                 if (log_)
-                    log_->Error(std::string("Exception in handler: ") + e.what());
+                    log_->Error("server.client", std::string("Exception in handler: ") + e.what());
                 break;
             }
 
@@ -698,19 +691,10 @@ namespace pomai::server
         // SAVE META
         SaveCollectionMeta(name, opt);
 
-        // Pass logging callbacks so shard/db can log WAL replay outcome during Start()
-        pomai::PomaiDB::LogFn info_cb;
-        pomai::PomaiDB::LogFn error_cb;
-        if (log_)
-        {
-            info_cb = [this](const std::string &m)
-            { log_->Info(m); };
-            error_cb = [this](const std::string &m)
-            { log_->Error(m); };
-        }
-
-        auto db = std::make_shared<pomai::PomaiDB>(opt, info_cb, error_cb);
-        db->Start();
+        auto db = std::make_shared<pomai::PomaiDB>(opt, log_);
+        auto start_status = db->Start();
+        if (!start_status.ok() && log_)
+            log_->Error("server.collection", "Failed to start collection '" + name + "': " + start_status.msg);
 
         std::uint32_t id = next_col_id_++;
         cols_[id] = Col{name, dim, opt.metric, db};
@@ -722,7 +706,7 @@ namespace pomai::server
         out_payload = std::move(b.data);
 
         if (log_)
-            log_->Info("Created collection '" + name + "' id=" + std::to_string(id));
+            log_->Info("server.collection", "Created collection '" + name + "' id=" + std::to_string(id));
         return true;
     }
 
@@ -794,23 +778,21 @@ namespace pomai::server
             batch.push_back(std::move(r));
         }
 
-        try
+        // Forward the per-request wait_durable flag into the DB call.
+        // PomaiDB is expected to consult its DbOptions.allow_sync_on_append
+        // and decide whether to honor per-request synchronous durability.
+        auto fut = db->UpsertBatch(std::move(batch), wait_durable);
+        auto res = fut.get();
+        if (!res.ok())
         {
-            // Forward the per-request wait_durable flag into the DB call.
-            // PomaiDB is expected to consult its DbOptions.allow_sync_on_append
-            // and decide whether to honor per-request synchronous durability.
-            auto fut = db->UpsertBatch(std::move(batch), wait_durable);
-            pomai::Lsn lsn = fut.get();
+            RespErr(out_payload, std::string("upsert_batch failed: ") + res.status().msg);
+            return true;
+        }
 
-            Buf b;
-            PutU8(b, 1);
-            PutU64(b, (std::uint64_t)lsn);
-            out_payload = std::move(b.data);
-        }
-        catch (const std::exception &e)
-        {
-            RespErr(out_payload, std::string("upsert_batch failed: ") + e.what());
-        }
+        Buf b;
+        PutU8(b, 1);
+        PutU64(b, (std::uint64_t)res.value());
+        out_payload = std::move(b.data);
         return true;
     }
 
@@ -856,7 +838,13 @@ namespace pomai::server
         req.topk = topk;
         req.query.data = std::move(q);
 
-        pomai::SearchResponse resp = db->Search(req);
+        auto resp_res = db->Search(req);
+        if (!resp_res.ok())
+        {
+            RespErr(out_payload, std::string("search failed: ") + resp_res.status().msg);
+            return true;
+        }
+        pomai::SearchResponse resp = resp_res.move_value();
 
         Buf b;
         PutU8(b, 1);

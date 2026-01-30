@@ -1,12 +1,12 @@
-#include <pomai/server/logger.h>
+#include <pomai/util/logger.h>
+
 #include <chrono>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 
-namespace pomai::server
+namespace pomai
 {
-
     void Logger::SetFile(std::string path)
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -17,6 +17,14 @@ namespace pomai::server
     {
         std::lock_guard<std::mutex> lk(mu_);
         level_ = lvl;
+    }
+
+    void Logger::EnableDebug(bool enabled)
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        debug_enabled_ = enabled;
+        if (enabled && level_ > LogLevel::debug)
+            level_ = LogLevel::debug;
     }
 
     const char *Logger::ToStr(LogLevel lvl)
@@ -35,10 +43,12 @@ namespace pomai::server
         return "INFO";
     }
 
-    void Logger::Log(LogLevel lvl, const std::string &msg)
+    void Logger::Log(LogLevel lvl, std::string_view event, std::string_view msg)
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (static_cast<int>(lvl) < static_cast<int>(level_))
+            return;
+        if (lvl == LogLevel::debug && !debug_enabled_)
             return;
 
         auto now = std::chrono::system_clock::now();
@@ -47,7 +57,15 @@ namespace pomai::server
         char timebuf[64];
         std::strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
 
-        std::string line = std::string(timebuf) + " [" + ToStr(lvl) + "] " + msg + "\n";
+        std::string line = std::string(timebuf) + " [" + ToStr(lvl) + "] ";
+        if (!event.empty())
+        {
+            line += "[";
+            line += event;
+            line += "] ";
+        }
+        line += msg;
+        line += "\n";
 
         if (!file_path_.empty())
         {
@@ -63,9 +81,8 @@ namespace pomai::server
         }
     }
 
-    void Logger::Debug(const std::string &msg) { Log(LogLevel::debug, msg); }
-    void Logger::Info(const std::string &msg) { Log(LogLevel::info, msg); }
-    void Logger::Warn(const std::string &msg) { Log(LogLevel::warn, msg); }
-    void Logger::Error(const std::string &msg) { Log(LogLevel::error, msg); }
-
-} // namespace pomai::server
+    void Logger::Debug(std::string_view event, std::string_view msg) { Log(LogLevel::debug, event, msg); }
+    void Logger::Info(std::string_view event, std::string_view msg) { Log(LogLevel::info, event, msg); }
+    void Logger::Warn(std::string_view event, std::string_view msg) { Log(LogLevel::warn, event, msg); }
+    void Logger::Error(std::string_view event, std::string_view msg) { Log(LogLevel::error, event, msg); }
+} // namespace pomai

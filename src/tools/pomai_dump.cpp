@@ -58,7 +58,11 @@ int main(int argc, char **argv)
         opts.metric = static_cast<pomai::Metric>(snapshot.schema.metric);
     }
     pomai::PomaiDB db(opts);
-    db.Start();
+    if (!db.Start().ok())
+    {
+        std::cerr << "Failed to start database\n";
+        return 1;
+    }
 
     std::ofstream out(output_path);
     if (!out)
@@ -79,7 +83,14 @@ int main(int argc, char **argv)
     while (true)
     {
         req.cursor = next;
-        auto resp = db.Scan(req);
+        auto resp_res = db.Scan(req);
+        if (!resp_res.ok())
+        {
+            std::cerr << "Scan failed: " << resp_res.status().msg << "\n";
+            db.Stop();
+            return 1;
+        }
+        auto resp = resp_res.move_value();
         if (resp.status != pomai::ScanStatus::Ok)
         {
             std::cerr << "Scan failed: " << resp.error << "\n";

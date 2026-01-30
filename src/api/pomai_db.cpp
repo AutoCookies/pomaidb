@@ -4,7 +4,7 @@
 #include <utility>
 #include <future>
 #include <chrono>
-#include <pomai/util/memory_manager.h>
+#include <pomai/concurrency/memory_manager.h>
 #include <pomai/storage/file_util.h>
 
 namespace pomai
@@ -28,9 +28,11 @@ namespace pomai
         return 2;
     }
 
-    PomaiDB::PomaiDB(DbOptions opt, LogFn info, LogFn error)
-        : opt_(std::move(opt)), log_info_(std::move(info)), log_error_(std::move(error))
+    PomaiDB::PomaiDB(DbOptions opt, Logger *logger)
+        : opt_(std::move(opt)), logger_(logger)
     {
+        if (logger_ && opt_.debug_logging)
+            logger_->EnableDebug(true);
         if (opt_.centroids_path.empty() && opt_.centroids_load_mode != MembraneRouter::CentroidsLoadMode::None)
         {
             opt_.centroids_path = opt_.wal_dir + "/centroids.bin";
@@ -61,8 +63,7 @@ namespace pomai
                 opt_.shard_queue_capacity,
                 paths.wal_dir,
                 compaction_cfg,
-                log_info_,
-                log_error_);
+                logger_);
             sh->SetIndexBuildPool(build_pool_.get());
             shards.push_back(std::move(sh));
         }
@@ -93,33 +94,34 @@ namespace pomai
                                                      [this]()
                                                      {
                                                          metrics_.rejected_upsert_batches_total.fetch_add(1, std::memory_order_relaxed);
-                                                     });
+                                                     },
+                                                     logger_);
 
         membrane_->SetCentroidsFilePath(opt_.centroids_path);
         membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
         membrane_->SetDbDir(opt_.wal_dir);
     }
 
-    void PomaiDB::Start()
+    Status PomaiDB::Start()
     {
         if (started_)
-            return;
+            return Status::Ok();
         started_ = true;
 
         if (build_pool_)
             build_pool_->Start();
-        try
+        std::string err;
+        if (!membrane_->RecoverFromStorage(opt_.wal_dir, &err))
         {
-            std::string err;
-            membrane_->RecoverFromStorage(opt_.wal_dir, &err);
+            if (logger_)
+                logger_->Warn("db.recover", "Recovery failed: " + err);
         }
-        catch (...)
-        {
-        }
-        membrane_->Start();
+        auto st = membrane_->Start();
+        if (!st.ok())
+            return st;
 
         if (opt_.centroids_load_mode == MembraneRouter::CentroidsLoadMode::None)
-            return;
+            return Status::Ok();
 
         auto task = [this]()
         {
@@ -140,26 +142,28 @@ namespace pomai
             std::this_thread::sleep_for(std::chrono::seconds(1));
             task();
         }
+        return Status::Ok();
     }
 
-    void PomaiDB::Stop()
+    Status PomaiDB::Stop()
     {
         if (!started_)
-            return;
+            return Status::Ok();
         started_ = false;
-        membrane_->Stop();
+        auto st = membrane_->Stop();
         if (build_pool_)
             build_pool_->Stop();
+        return st;
     }
 
-    std::future<Lsn> PomaiDB::Upsert(Id id, Vector vec, bool wait_durable)
+    std::future<Result<Lsn>> PomaiDB::Upsert(Id id, Vector vec, bool wait_durable)
     {
         std::vector<UpsertRequest> batch;
         batch.push_back({id, std::move(vec)});
         return UpsertBatch(std::move(batch), wait_durable);
     }
 
-    std::future<Lsn> PomaiDB::UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable)
+    std::future<Result<Lsn>> PomaiDB::UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable)
     {
         if (MemoryManager::Instance().AtOrAboveSoftWatermark())
         {
@@ -170,8 +174,8 @@ namespace pomai
         if (!MemoryManager::Instance().CanAllocate(estimated_bytes))
         {
             metrics_.rejected_upsert_batches_total.fetch_add(1, std::memory_order_relaxed);
-            std::promise<Lsn> p;
-            p.set_exception(std::make_exception_ptr(std::runtime_error("PomaiDB: Hard memory limit reached. Batch rejected.")));
+            std::promise<Result<Lsn>> p;
+            p.set_value(Result<Lsn>(Status::Exhausted("PomaiDB: Hard memory limit reached. Batch rejected.")));
             return p.get_future();
         }
 
@@ -179,14 +183,36 @@ namespace pomai
         return membrane_->UpsertBatch(std::move(batch), effective_wait);
     }
 
-    SearchResponse PomaiDB::Search(const SearchRequest &req) const
+    Result<SearchResponse> PomaiDB::Search(const SearchRequest &req) const
     {
-        return membrane_->Search(req);
+        try
+        {
+            return membrane_->Search(req);
+        }
+        catch (const std::exception &e)
+        {
+            return Result<SearchResponse>(Status::Internal(std::string("search failed: ") + e.what()));
+        }
+        catch (...)
+        {
+            return Result<SearchResponse>(Status::Internal("search failed: unknown exception"));
+        }
     }
 
-    ScanResponse PomaiDB::Scan(const ScanRequest &req) const
+    Result<ScanResponse> PomaiDB::Scan(const ScanRequest &req) const
     {
-        return membrane_->Scan(req);
+        try
+        {
+            return membrane_->Scan(req);
+        }
+        catch (const std::exception &e)
+        {
+            return Result<ScanResponse>(Status::Internal(std::string("scan failed: ") + e.what()));
+        }
+        catch (...)
+        {
+            return Result<ScanResponse>(Status::Internal("scan failed: unknown exception"));
+        }
     }
 
     void PomaiDB::SetProbeCount(std::size_t p)
@@ -243,30 +269,36 @@ namespace pomai
         return ss.str();
     }
 
-    std::future<bool> PomaiDB::RecomputeCentroids(std::size_t k, std::size_t total_samples)
+    std::future<Result<bool>> PomaiDB::RecomputeCentroids(std::size_t k, std::size_t total_samples)
     {
         if (k == 0)
         {
-            std::promise<bool> p;
-            p.set_value(false);
+            std::promise<Result<bool>> p;
+            p.set_value(Result<bool>(Status::Invalid("RecomputeCentroids requires k > 0")));
             return p.get_future();
         }
 
-        return std::async(std::launch::async, [this, k, total_samples]() -> bool
+        return std::async(std::launch::async, [this, k, total_samples]() -> Result<bool>
                           {
             try {
                 auto flush_fut = membrane_->RequestCheckpoint();
-                flush_fut.get();
-                return membrane_->ComputeAndConfigureCentroids(k, total_samples);
+                auto flush_res = flush_fut.get();
+                if (!flush_res.ok())
+                    return flush_res.status();
+                auto res = membrane_->ComputeAndConfigureCentroids(k, total_samples);
+                if (!res.ok())
+                    return res.status();
+                return Result<bool>(true);
             } catch (const std::exception &e) {
-                if (log_error_) log_error_(std::string("RecomputeCentroids failed: ") + e.what());
-                return false;
+                if (logger_) logger_->Error("db.centroids", std::string("RecomputeCentroids failed: ") + e.what());
+                return Result<bool>(Status::Internal(std::string("RecomputeCentroids failed: ") + e.what()));
             } catch (...) {
-                return false;
+                if (logger_) logger_->Error("db.centroids", "RecomputeCentroids failed: unknown exception");
+                return Result<bool>(Status::Internal("RecomputeCentroids failed: unknown exception"));
             } });
     }
 
     std::size_t PomaiDB::TotalApproxCountUnsafe() const { return membrane_->TotalApproxCountUnsafe(); }
-    std::future<bool> PomaiDB::RequestCheckpoint() { return membrane_->RequestCheckpoint(); }
+    std::future<Result<bool>> PomaiDB::RequestCheckpoint() { return membrane_->RequestCheckpoint(); }
 
 }

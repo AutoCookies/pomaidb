@@ -123,7 +123,10 @@ namespace pomai::test
         while (true)
         {
             req.cursor = cursor;
-            auto resp = db.Scan(req);
+            auto resp_res = db.Scan(req);
+            if (!resp_res.ok())
+                break;
+            auto resp = resp_res.move_value();
             if (resp.status != ScanStatus::Ok)
                 break;
             for (const auto &item : resp.items)

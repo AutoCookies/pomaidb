@@ -15,8 +15,10 @@
 #include <pomai/api/scan.h>
 #include <pomai/index/whispergrain.h>
 #include <pomai/core/spatial_router.h>
-#include <pomai/util/search_thread_pool.h> // new
-#include <pomai/util/completion_executor.h>
+#include <pomai/concurrency/search_thread_pool.h> // new
+#include <pomai/concurrency/completion_executor.h>
+#include <pomai/core/status.h>
+#include <pomai/util/logger.h>
 
 namespace pomai
 {
@@ -55,19 +57,20 @@ namespace pomai
                                 std::size_t scan_batch_cap,
                                 std::size_t scan_id_order_max_rows,
                                 FilterConfig filter_config,
-                                std::function<void()> on_rejected_upsert);
+                                std::function<void()> on_rejected_upsert,
+                                Logger *logger = nullptr);
 
-        void Start();
-        void Stop();
+        Status Start();
+        Status Stop();
 
-        std::future<Lsn> Upsert(Id id, Vector vec, bool wait_durable = true);
-        std::future<Lsn> UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable = true);
-        SearchResponse Search(const SearchRequest &req) const;
-        ScanResponse Scan(const ScanRequest &req) const;
+        std::future<Result<Lsn>> Upsert(Id id, Vector vec, bool wait_durable = true);
+        std::future<Result<Lsn>> UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable = true);
+        Result<SearchResponse> Search(const SearchRequest &req) const;
+        Result<ScanResponse> Scan(const ScanRequest &req) const;
 
         std::size_t ShardCount() const { return shards_.size(); }
         std::size_t TotalApproxCountUnsafe() const;
-        std::future<bool> RequestCheckpoint();
+        std::future<Result<bool>> RequestCheckpoint();
         bool RecoverFromStorage(const std::string &db_dir, std::string *err = nullptr);
         void SetDbDir(const std::string &dir) { db_dir_ = dir; }
 
@@ -103,10 +106,10 @@ namespace pomai
         // - k: number of centroids to produce.
         // - total_samples: target total number of sample vectors aggregated across all shards.
         // Returns true on success.
-        bool ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples = 4096);
+        Result<void> ComputeAndConfigureCentroids(std::size_t k, std::size_t total_samples = 4096);
 
-        bool LoadCentroidsFromFile(const std::string &path);
-        bool SaveCentroidsToFile(const std::string &path) const;
+        Status LoadCentroidsFromFile(const std::string &path);
+        Status SaveCentroidsToFile(const std::string &path) const;
         void SetCentroidsFilePath(const std::string &path);
         void SetCentroidsLoadMode(CentroidsLoadMode mode);
         bool HasCentroids() const;
@@ -119,8 +122,8 @@ namespace pomai
         // Smart pick: prefer vector-based routing if vec_opt provided and router configured
         std::size_t PickShard(Id id, const Vector *vec_opt = nullptr) const;
 
-        Metadata NormalizeMetadata(const Metadata &meta);
-        std::shared_ptr<const Filter> NormalizeFilter(const SearchRequest &req) const;
+        Result<Metadata> NormalizeMetadata(const Metadata &meta);
+        Result<std::shared_ptr<const Filter>> NormalizeFilter(const SearchRequest &req) const;
 
         std::vector<std::unique_ptr<Shard>> shards_;
         mutable pomai::ai::WhisperGrain brain_;
@@ -144,9 +147,10 @@ namespace pomai
 
         // Thread-pool for bounded parallel search fanout. Mutable so Search() can be const.
         mutable SearchThreadPool search_pool_;
-        mutable CompletionExecutor completion_{1024};
+        mutable CompletionExecutor completion_;
 
         std::function<void()> on_rejected_upsert_;
+        Logger *logger_{nullptr};
 
         mutable std::mutex hotspot_mu_;
         mutable std::optional<HotspotInfo> hotspot_;

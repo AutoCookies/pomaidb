@@ -18,7 +18,7 @@ TEST_CASE("Shutdown races do not crash", "[concurrency][shutdown]")
     TempDir dir;
     auto opts = DefaultDbOptions(dir.str(), 8, 2);
     PomaiDB db(opts);
-    db.Start();
+    REQUIRE(db.Start().ok());
 
     std::atomic<bool> stop{false};
     std::atomic<int> failures{0};
@@ -30,14 +30,9 @@ TEST_CASE("Shutdown races do not crash", "[concurrency][shutdown]")
                                  if (stop.load(std::memory_order_acquire))
                                      break;
                                  auto req = MakeUpsert(500 + i, 8, 1.1f + static_cast<float>(i), 1);
-                                 try
-                                 {
-                                     db.UpsertBatch({req}, true).get();
-                                 }
-                                 catch (...)
-                                 {
+                                 auto res = db.UpsertBatch({req}, true).get();
+                                 if (!res.ok())
                                      failures.fetch_add(1, std::memory_order_relaxed);
-                                 }
                              }
                          });
 
@@ -48,13 +43,13 @@ TEST_CASE("Shutdown races do not crash", "[concurrency][shutdown]")
                                  if (stop.load(std::memory_order_acquire))
                                      break;
                                  SearchRequest req = MakeSearchRequest(MakeVector(8, 0.1f), 5);
-                                 auto resp = db.Search(req);
-                                 if (resp.items.empty())
+                                 auto resp_res = db.Search(req);
+                                 if (!resp_res.ok() || resp_res.value().items.empty())
                                      failures.fetch_add(1, std::memory_order_relaxed);
                              }
                          });
 
-    db.Stop();
+    REQUIRE(db.Stop().ok());
     stop.store(true, std::memory_order_release);
 
     ingester.join();
