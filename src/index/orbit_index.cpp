@@ -481,6 +481,102 @@ namespace pomai::core
         return out;
     }
 
+    std::vector<std::uint32_t> OrbitIndex::FindNeighborsSearchFiltered(const float *q,
+                                                                       std::size_t ef,
+                                                                       std::size_t candidate_k,
+                                                                       std::size_t max_visits,
+                                                                       std::size_t expand_factor,
+                                                                       const Filter &filter,
+                                                                       const Seed::Store &meta,
+                                                                       bool &partial) const
+    {
+        const std::size_t N = total_vectors_.load(std::memory_order_acquire);
+        if (N == 0)
+            return {};
+
+        tls.Reset(N);
+        partial = false;
+
+        std::priority_queue<std::pair<float, std::uint32_t>,
+                            std::vector<std::pair<float, std::uint32_t>>,
+                            MinCmp>
+            candidates;
+
+        std::priority_queue<std::pair<float, std::uint32_t>,
+                            std::vector<std::pair<float, std::uint32_t>>,
+                            MaxCmp>
+            best;
+
+        std::uint32_t ep0 = 0;
+        std::uint32_t ep1 = (N > 1) ? (std::uint32_t)(N / 2) : 0;
+        std::uint32_t ep2 = (N > 2) ? (std::uint32_t)(N - 1) : 0;
+
+        auto push_ep = [&](std::uint32_t ep)
+        {
+            if (ep >= N)
+                return;
+            if (tls.IsVisited(ep))
+                return;
+            tls.Mark(ep);
+            const float *v = data_.data() + (std::size_t)ep * dim_;
+            float d = pomai::kernels::L2Sqr(q, v, dim_);
+            candidates.push({d, ep});
+            if (meta.MatchFilter(ep, filter))
+                best.push({d, ep});
+        };
+
+        push_ep(ep0);
+        push_ep(ep1);
+        push_ep(ep2);
+
+        std::size_t expansions = 0;
+        const std::size_t target = std::max<std::size_t>(1, candidate_k);
+        const std::size_t ef_target = std::max<std::size_t>(ef, target * std::max<std::size_t>(1, expand_factor));
+        const std::size_t visit_limit = std::min<std::size_t>(ef_target, max_visits);
+
+        while (!candidates.empty() && expansions < visit_limit)
+        {
+            auto cur = candidates.top();
+            candidates.pop();
+            ++expansions;
+
+            if (best.size() >= target && cur.first > best.top().first)
+                break;
+
+            for (std::uint32_t nb : graph_[cur.second])
+            {
+                if (nb >= N)
+                    continue;
+                if (tls.IsVisited(nb))
+                    continue;
+                tls.Mark(nb);
+
+                const float *v = data_.data() + (std::size_t)nb * dim_;
+                float d = pomai::kernels::L2Sqr(q, v, dim_);
+
+                candidates.push({d, nb});
+                if (meta.MatchFilter(nb, filter))
+                {
+                    best.push({d, nb});
+                    if (best.size() > target)
+                        best.pop();
+                }
+            }
+        }
+
+        if (best.size() < target)
+            partial = true;
+
+        std::vector<std::uint32_t> out;
+        out.reserve(best.size());
+        while (!best.empty())
+        {
+            out.push_back(best.top().second);
+            best.pop();
+        }
+        return out;
+    }
+
     SearchResponse OrbitIndex::Search(const SearchRequest &req, const pomai::ai::Budget &budget) const
     {
         SearchResponse resp;
@@ -533,6 +629,75 @@ namespace pomai::core
         }
 
         SortAndDedupeResults(resp.items, req.topk);
+        resp.stats.filtered_candidates = scored.size();
+        resp.stats.partial = resp.partial;
+
+        return resp;
+    }
+
+    SearchResponse OrbitIndex::SearchFiltered(const SearchRequest &req,
+                                              const pomai::ai::Budget &budget,
+                                              const Filter &filter,
+                                              const Seed::Store &meta) const
+    {
+        SearchResponse resp;
+
+        if (!built_.load(std::memory_order_acquire))
+            return resp;
+        if (req.query.data.size() != dim_)
+            return resp;
+        if (req.metric != Metric::L2)
+            return resp;
+        if (filter.empty())
+            return Search(req, budget);
+
+        const std::size_t N = total_vectors_.load(std::memory_order_acquire);
+        if (N == 0)
+            return resp;
+
+        const std::size_t candidate_k = (req.filtered_candidate_k > 0) ? std::max(req.filtered_candidate_k, req.topk)
+                                                                        : NormalizeCandidateK(req);
+        const std::uint32_t ef = NormalizeGraphEf(req, candidate_k);
+        const std::size_t ops_budget = (budget.ops_budget == 0) ? ef : std::max<std::size_t>(budget.ops_budget, ef);
+        const std::size_t search_ef = std::max<std::size_t>(ops_budget, candidate_k);
+        const std::size_t max_visits = (req.filter_max_visits == 0) ? search_ef : std::max<std::size_t>(req.filter_max_visits, search_ef);
+        const std::size_t expand_factor = (req.filter_expand_factor == 0) ? 1 : req.filter_expand_factor;
+
+        bool partial = false;
+        const float *q = req.query.data.data();
+        std::vector<std::uint32_t> cand = FindNeighborsSearchFiltered(q, search_ef, candidate_k, max_visits, expand_factor, filter, meta, partial);
+
+        std::vector<std::pair<float, std::uint32_t>> scored;
+        scored.reserve(cand.size());
+        for (auto idx : cand)
+        {
+            const float *v = data_.data() + (std::size_t)idx * dim_;
+            float d = pomai::kernels::L2Sqr(v, q, dim_);
+            scored.push_back({d, idx});
+        }
+
+        std::sort(scored.begin(), scored.end(),
+                  [](const auto &a, const auto &b)
+                  {
+                      if (a.first == b.first)
+                          return a.second < b.second;
+                      return a.first < b.first;
+                  });
+
+        const std::size_t limit = std::min<std::size_t>(req.topk, scored.size());
+        resp.items.resize(limit);
+
+        for (std::size_t i = 0; i < limit; ++i)
+        {
+            const auto idx = scored[i].second;
+            resp.items[i] = {ids_[idx], -scored[i].first};
+        }
+
+        SortAndDedupeResults(resp.items, req.topk);
+        resp.stats.filtered_candidates = scored.size();
+        resp.stats.filtered_partial = partial;
+        resp.partial = resp.partial || partial;
+        resp.stats.partial = resp.partial;
 
         return resp;
     }

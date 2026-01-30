@@ -14,6 +14,97 @@
 
 namespace pomai
 {
+    namespace
+    {
+        bool HasAnyTag(const TagId *tags, std::size_t count, const std::vector<TagId> &want)
+        {
+            if (count == 0 || want.empty())
+                return false;
+            std::size_t i = 0;
+            std::size_t j = 0;
+            while (i < count && j < want.size())
+            {
+                TagId a = tags[i];
+                TagId b = want[j];
+                if (a == b)
+                    return true;
+                if (a < b)
+                    ++i;
+                else
+                    ++j;
+            }
+            return false;
+        }
+
+        bool HasAllTags(const TagId *tags, std::size_t count, const std::vector<TagId> &want)
+        {
+            if (want.empty())
+                return true;
+            if (count == 0)
+                return false;
+            std::size_t i = 0;
+            std::size_t j = 0;
+            while (i < count && j < want.size())
+            {
+                TagId a = tags[i];
+                TagId b = want[j];
+                if (a == b)
+                {
+                    ++i;
+                    ++j;
+                }
+                else if (a < b)
+                {
+                    ++i;
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            return j == want.size();
+        }
+
+        bool HasExcludedTags(const TagId *tags, std::size_t count, const std::vector<TagId> &exclude)
+        {
+            if (count == 0 || exclude.empty())
+                return false;
+            std::size_t i = 0;
+            std::size_t j = 0;
+            while (i < count && j < exclude.size())
+            {
+                TagId a = tags[i];
+                TagId b = exclude[j];
+                if (a == b)
+                    return true;
+                if (a < b)
+                    ++i;
+                else
+                    ++j;
+            }
+            return false;
+        }
+    }
+
+    bool Seed::Store::MatchFilter(std::size_t row, const Filter &filter) const
+    {
+        if (filter.match_none)
+            return false;
+        if (filter.namespace_id && (row >= namespace_ids.size() || namespace_ids[row] != *filter.namespace_id))
+            return false;
+        const std::uint32_t start = (row < tag_offsets.size()) ? tag_offsets[row] : 0;
+        const std::uint32_t end = (row + 1 < tag_offsets.size()) ? tag_offsets[row + 1] : start;
+        const TagId *tags = (start < tag_ids.size()) ? tag_ids.data() + start : nullptr;
+        const std::size_t count = (end >= start) ? static_cast<std::size_t>(end - start) : 0;
+        if (!filter.exclude_tags.empty() && HasExcludedTags(tags, count, filter.exclude_tags))
+            return false;
+        if (!filter.require_all_tags.empty() && !HasAllTags(tags, count, filter.require_all_tags))
+            return false;
+        if (!filter.require_any_tags.empty() && !HasAnyTag(tags, count, filter.require_any_tags))
+            return false;
+        return true;
+    }
+
     Seed::QuantizeRowFn Seed::quantize_row_impl_ = nullptr;
 
     std::uint8_t *Seed::AlignedAllocBytes(std::size_t bytes)
@@ -407,9 +498,19 @@ namespace pomai
                 row = static_cast<std::uint32_t>(ids_.size());
                 ids_.push_back(req.id);
                 pos_[req.id] = row;
+                namespace_ids_.push_back(req.metadata.namespace_id);
+                tags_.push_back(req.metadata.tag_ids);
             }
             else
                 row = it->second;
+
+            if (row >= namespace_ids_.size())
+                namespace_ids_.resize(ids_.size(), 0);
+            if (row >= tags_.size())
+                tags_.resize(ids_.size());
+
+            namespace_ids_[row] = req.metadata.namespace_id;
+            tags_[row] = req.metadata.tag_ids;
 
             bool out_of_range = false;
             if (is_fixed_)
@@ -457,8 +558,31 @@ namespace pomai
         out->qdata = qdata_;
         out->qmins = qmins_;
         out->qscales = qscales_;
+        out->namespace_ids = namespace_ids_;
+        out->tag_offsets.clear();
+        out->tag_ids.clear();
+        out->tag_offsets.reserve(out->ids.size() + 1);
+        out->tag_offsets.push_back(0);
+        std::size_t total_tags = 0;
+        if (out->namespace_ids.size() < out->ids.size())
+            out->namespace_ids.resize(out->ids.size(), 0);
+        for (const auto &tags : tags_)
+            total_tags += tags.size();
+        out->tag_ids.reserve(total_tags);
+        for (std::size_t row = 0; row < out->ids.size(); ++row)
+        {
+            if (row < tags_.size())
+            {
+                const auto &tags = tags_[row];
+                out->tag_ids.insert(out->tag_ids.end(), tags.begin(), tags.end());
+            }
+            out->tag_offsets.push_back(static_cast<std::uint32_t>(out->tag_ids.size()));
+        }
         out->is_quantized.store(true, std::memory_order_release);
         out->accounted_bytes = out->ids.size() * sizeof(Id) + out->qdata.size() * sizeof(std::uint8_t) + (out->qmins.size() + out->qscales.size()) * sizeof(float);
+        out->accounted_bytes += out->namespace_ids.size() * sizeof(std::uint32_t) +
+                                out->tag_offsets.size() * sizeof(std::uint32_t) +
+                                out->tag_ids.size() * sizeof(TagId);
         if (out->accounted_bytes > 0)
             MemoryManager::Instance().AddUsage(MemoryManager::Pool::Search, out->accounted_bytes);
         return std::const_pointer_cast<const Store>(out);
@@ -570,11 +694,15 @@ namespace pomai
             float qv = (snap->qscales[d] > 0.0f) ? ((req.query.data[d] - snap->qmins[d]) / snap->qscales[d]) : 0.0f;
             qquant[d] = static_cast<std::uint8_t>(std::clamp<int>(static_cast<int>(std::nearbyint(qv)), 0, 255));
         }
-        const std::size_t candidate_k = NormalizeCandidateK(req);
+        const bool has_filter = req.filter && !req.filter->empty();
+        const std::size_t candidate_k = has_filter && req.filtered_candidate_k > 0 ? std::max<std::size_t>(req.filtered_candidate_k, req.topk)
+                                                                                   : NormalizeCandidateK(req);
         FixedTopK candidate_topk(candidate_k);
         const std::uint8_t *qbase = snap->qdata.data();
         for (std::size_t row = 0; row < n; ++row)
         {
+            if (has_filter && !snap->MatchFilter(row, *req.filter))
+                continue;
             float d = kernels::L2Sqr_SQ8_AVX2(qbase + row * dim, qquant.data(), dim);
             candidate_topk.Push(-d, static_cast<Id>(row));
         }
@@ -591,6 +719,8 @@ namespace pomai
         }
         final_topk.FillSorted(resp.items);
         SortAndDedupeResults(resp.items, req.topk);
+        resp.stats.filtered_candidates = candidate_topk.Size();
+        resp.stats.partial = resp.partial;
         return resp;
     }
 }

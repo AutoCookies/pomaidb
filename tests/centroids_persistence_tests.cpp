@@ -127,7 +127,13 @@ static std::unique_ptr<MembraneRouter> MakeRouter(std::size_t dim, const std::st
     std::vector<std::unique_ptr<Shard>> shards;
     shards.push_back(std::make_unique<Shard>("shard-0", dim, 16, wal_dir));
     pomai::WhisperConfig cfg;
-    return std::make_unique<MembraneRouter>(std::move(shards), cfg, dim);
+    return std::make_unique<MembraneRouter>(std::move(shards),
+                                            cfg,
+                                            dim,
+                                            0,
+                                            500,
+                                            MembraneRouter::FilterConfig::Default(),
+                                            []() {});
 }
 
 int main()

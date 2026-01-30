@@ -1,7 +1,8 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
-#include <string>
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace pomai
@@ -9,6 +10,7 @@ namespace pomai
 
     using Id = std::uint64_t;
     using Lsn = std::uint64_t;
+    using TagId = std::uint32_t;
 
     enum class Metric : std::uint8_t
     {
@@ -30,10 +32,32 @@ namespace pomai
         std::vector<float> data;
     };
 
+    struct Metadata
+    {
+        std::uint32_t namespace_id{0};
+        std::vector<TagId> tag_ids;
+    };
+
+    struct Filter
+    {
+        std::optional<std::uint32_t> namespace_id;
+        std::vector<TagId> require_all_tags;
+        std::vector<TagId> require_any_tags;
+        std::vector<TagId> exclude_tags;
+        bool match_none{false};
+
+        bool empty() const
+        {
+            return !match_none && !namespace_id &&
+                   require_all_tags.empty() && require_any_tags.empty() && exclude_tags.empty();
+        }
+    };
+
     struct UpsertRequest
     {
         Id id{};
         Vector vec;
+        Metadata metadata;
     };
 
     struct SearchRequest
@@ -44,6 +68,10 @@ namespace pomai
         std::size_t max_rerank_k{2000};
         std::uint32_t graph_ef{0};
         Metric metric{Metric::L2};
+        std::size_t filtered_candidate_k{0};
+        std::uint32_t filter_expand_factor{0};
+        std::uint32_t filter_max_visits{0};
+        std::shared_ptr<const Filter> filter;
     };
 
     struct SearchResultItem
@@ -52,10 +80,18 @@ namespace pomai
         float score{};
     };
 
+    struct SearchStats
+    {
+        bool partial{false};
+        bool filtered_partial{false};
+        std::size_t filtered_candidates{0};
+    };
+
     struct SearchResponse
     {
         std::vector<SearchResultItem> items;
         bool partial{false};
+        SearchStats stats;
     };
 
     inline std::size_t NormalizeMaxRerankK(const SearchRequest &req)

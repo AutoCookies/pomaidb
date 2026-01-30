@@ -35,6 +35,8 @@ namespace pomai
         std::vector<Vector> centroids;
         std::vector<std::size_t> offsets;
         std::vector<std::uint32_t> postings;
+        std::vector<std::uint32_t> namespace_min;
+        std::vector<std::uint32_t> namespace_max;
     };
 
     struct IndexedSegment
