@@ -630,6 +630,7 @@ namespace pomai
             }
             try
             {
+                bool live_published = false;
                 Lsn lsn = wal_.AppendUpserts(task.batch, task.wait_durable);
                 seed_.ApplyUpserts(task.batch);
                 std::uint64_t clamped = seed_.ConsumeOutOfRangeCount();
@@ -640,23 +641,45 @@ namespace pomai
                 {
                     since_freeze_ = 0;
                     MaybeFreezeSegment();
+                    live_published = true;
                 }
-                else if (since_live_publish_++ >= kPublishLiveEveryVectors)
+                else
                 {
-                    since_live_publish_ = 0;
-                    auto s = seed_.MakeSnapshot();
+                    since_live_publish_ += task.batch.size();
+                    if (since_live_publish_ >= kPublishLiveEveryVectors)
                     {
-                        std::lock_guard<std::mutex> lk(writer_mu_);
-                        auto prev = state_.load(std::memory_order_acquire);
-                        auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
-                        next->live_snap = s;
-                        next->live_grains.reset();
-                        PublishState(std::move(next));
+                        since_live_publish_ = 0;
+                        auto s = seed_.MakeSnapshot();
+                        {
+                            std::lock_guard<std::mutex> lk(writer_mu_);
+                            auto prev = state_.load(std::memory_order_acquire);
+                            auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
+                            next->live_snap = s;
+                            next->live_grains.reset();
+                            PublishState(std::move(next));
+                        }
+                        ScheduleLiveGrainBuild(s);
+                        live_published = true;
                     }
-                    ScheduleLiveGrainBuild(s);
                 }
                 if (task.wait_durable)
+                {
                     wal_.WaitDurable(lsn);
+                    if (!live_published)
+                    {
+                        auto s = seed_.MakeSnapshot();
+                        {
+                            std::lock_guard<std::mutex> lk(writer_mu_);
+                            auto prev = state_.load(std::memory_order_acquire);
+                            auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
+                            next->live_snap = s;
+                            next->live_grains.reset();
+                            PublishState(std::move(next));
+                        }
+                        ScheduleLiveGrainBuild(s);
+                        since_live_publish_ = 0;
+                    }
+                }
                 task.done.set_value(Result<Lsn>(lsn));
             }
             catch (...)
