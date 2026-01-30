@@ -173,3 +173,44 @@ TEST_CASE("Quality mode fails loudly on insufficient filtered results", "[core][
     REQUIRE_FALSE(resp.partial);
     REQUIRE_FALSE(resp.error.empty());
 }
+
+TEST_CASE("Quality mode errors on exhausted filter budgets", "[core][filter][quality]")
+{
+    TempDir dir;
+    const std::size_t dim = 8;
+    auto opts = DefaultDbOptions(dir.str(), dim, 1);
+    opts.filtered_candidate_k = 2;
+    opts.filter_max_visits = 2;
+    opts.max_filter_visits = 2;
+    opts.max_filtered_candidate_k = 2;
+    opts.filter_max_retries = 1;
+    PomaiDB db(opts);
+    db.Start();
+
+    std::vector<UpsertRequest> batch;
+    batch.reserve(100);
+    for (std::size_t i = 0; i < 100; ++i)
+    {
+        std::vector<TagId> tags;
+        if (i == 0)
+            tags = {1, 2};
+        else
+            tags = {static_cast<TagId>(i % 5)};
+        batch.push_back(MakeUpsert(static_cast<Id>(i + 1), dim, 0.5f + static_cast<float>(i) * 0.01f, 0, tags));
+    }
+    db.UpsertBatch(batch, true).get();
+
+    Filter filter;
+    filter.require_all_tags = {1, 2};
+    SearchRequest req = MakeSearchRequest(batch[0].vec, 5);
+    req.search_mode = SearchMode::Quality;
+    req.filter = std::make_shared<Filter>(filter);
+
+    auto resp = db.Search(req);
+    db.Stop();
+
+    REQUIRE(resp.status == SearchStatus::InsufficientResults);
+    REQUIRE(resp.stats.quality_failure);
+    REQUIRE(resp.stats.filtered_budget_exhausted);
+    REQUIRE(resp.items.empty());
+}

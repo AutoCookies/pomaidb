@@ -443,20 +443,48 @@ namespace pomai
         thread_local std::vector<float, AlignedAllocator<float, 64>> dequant;
         if (dequant.size() < dim)
             dequant.resize(dim);
+        bool invalid_mapping = false;
+        auto valid_row = [&](std::size_t row)
+        {
+            if (row >= snap->ids.size())
+                return false;
+            if (row >= snap->namespace_ids.size())
+                return false;
+            if (row + 1 >= snap->tag_offsets.size())
+                return false;
+            if (row * dim + dim > snap->qdata.size())
+                return false;
+            if (has_filter && req.filter && req.filter->namespace_id &&
+                snap->namespace_ids[row] != *req.filter->namespace_id)
+                return false;
+            return true;
+        };
         for (std::size_t i = 0; i < candidates.Size(); ++i)
         {
             std::size_t row = static_cast<std::size_t>(candidates.Data()[i].id);
+            if (!valid_row(row))
+            {
+                invalid_mapping = true;
+                continue;
+            }
             Seed::DequantizeRow(snap, row, dequant.data());
             final_topk.Push(-kernels::L2Sqr(dequant.data(), req.query.data.data(), dim), snap->ids[row]);
         }
         final_topk.FillSorted(resp.items);
         SortAndDedupeResults(resp.items, topk);
+        if (invalid_mapping)
+        {
+            resp.partial = true;
+            resp.stats.partial = true;
+        }
+        resp.stats.filtered_candidates_generated = visit_count;
+        resp.stats.filtered_candidates_passed_filter = candidates.Size();
+        resp.stats.filtered_reranked = candidates.Size();
         resp.stats.filtered_candidates = candidates.Size();
         resp.stats.filtered_visits = visit_count;
-        const bool filtered_partial = has_filter && candidates.Size() < candidate_k;
-        const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit) && filtered_partial;
-        if (filtered_partial)
-            resp.stats.filtered_partial = true;
+        const bool filtered_partial = has_filter && resp.items.size() < req.topk;
+        const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit);
+        resp.stats.filtered_partial = filtered_partial;
         resp.stats.filtered_time_budget_hit = time_budget_hit;
         resp.stats.filtered_visit_budget_hit = visit_budget_hit;
         resp.stats.filtered_budget_exhausted = budget_exhausted;
@@ -498,6 +526,9 @@ namespace pomai
             out.stats.filtered_time_budget_hit = out.stats.filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
             out.stats.filtered_visit_budget_hit = out.stats.filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
             out.stats.filtered_budget_exhausted = out.stats.filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
+            out.stats.filtered_candidates_generated += r.stats.filtered_candidates_generated;
+            out.stats.filtered_candidates_passed_filter += r.stats.filtered_candidates_passed_filter;
+            out.stats.filtered_reranked += r.stats.filtered_reranked;
             out.stats.filtered_candidates += r.stats.filtered_candidates;
             out.stats.filtered_visits += r.stats.filtered_visits;
         }
@@ -513,6 +544,9 @@ namespace pomai
         out.stats.filtered_time_budget_hit = out.stats.filtered_time_budget_hit || lr.stats.filtered_time_budget_hit;
         out.stats.filtered_visit_budget_hit = out.stats.filtered_visit_budget_hit || lr.stats.filtered_visit_budget_hit;
         out.stats.filtered_budget_exhausted = out.stats.filtered_budget_exhausted || lr.stats.filtered_budget_exhausted;
+        out.stats.filtered_candidates_generated += lr.stats.filtered_candidates_generated;
+        out.stats.filtered_candidates_passed_filter += lr.stats.filtered_candidates_passed_filter;
+        out.stats.filtered_reranked += lr.stats.filtered_reranked;
         out.stats.filtered_candidates += lr.stats.filtered_candidates;
         out.stats.filtered_visits += lr.stats.filtered_visits;
         SortAndDedupeResults(out.items, req.topk);

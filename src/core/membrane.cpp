@@ -508,6 +508,9 @@ namespace pomai
             bool filtered_budget_exhausted = false;
             std::size_t filtered_candidates = 0;
             std::size_t filtered_visits = 0;
+            std::size_t filtered_candidates_generated = 0;
+            std::size_t filtered_candidates_passed = 0;
+            std::size_t filtered_reranked = 0;
             bool search_error = false;
             for (auto &f : futs)
             {
@@ -518,12 +521,16 @@ namespace pomai
                         auto r = f.get();
                         for (const auto &item : r.items)
                             merge_topk->Push(item.score, item.id);
+                        out.partial = out.partial || r.partial;
                         filtered_partial = filtered_partial || r.stats.filtered_partial;
                         filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
                         filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
                         filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
                         filtered_candidates += r.stats.filtered_candidates;
                         filtered_visits += r.stats.filtered_visits;
+                        filtered_candidates_generated += r.stats.filtered_candidates_generated;
+                        filtered_candidates_passed += r.stats.filtered_candidates_passed_filter;
+                        filtered_reranked += r.stats.filtered_reranked;
                         ++completed;
                     }
                     catch (...)
@@ -536,12 +543,16 @@ namespace pomai
             {
                 for (const auto &item : r.items)
                     merge_topk->Push(item.score, item.id);
+                out.partial = out.partial || r.partial;
                 filtered_partial = filtered_partial || r.stats.filtered_partial;
                 filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
                 filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
                 filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
                 filtered_candidates += r.stats.filtered_candidates;
                 filtered_visits += r.stats.filtered_visits;
+                filtered_candidates_generated += r.stats.filtered_candidates_generated;
+                filtered_candidates_passed += r.stats.filtered_candidates_passed_filter;
+                filtered_reranked += r.stats.filtered_reranked;
                 ++completed;
             }
 
@@ -555,6 +566,9 @@ namespace pomai
             out.stats.filtered_time_budget_hit = filtered_time_budget_hit;
             out.stats.filtered_visit_budget_hit = filtered_visit_budget_hit;
             out.stats.filtered_budget_exhausted = filtered_budget_exhausted;
+            out.stats.filtered_candidates_generated = filtered_candidates_generated;
+            out.stats.filtered_candidates_passed_filter = filtered_candidates_passed;
+            out.stats.filtered_reranked = filtered_reranked;
             out.stats.filtered_candidates = filtered_candidates;
             out.stats.filtered_visits = filtered_visits;
             return out;
@@ -572,7 +586,7 @@ namespace pomai
             for (;;)
             {
                 out = run_attempt(attempt_req);
-                if (out.items.size() >= req.topk)
+                if (out.items.size() >= req.topk && !out.stats.filtered_budget_exhausted)
                     break;
                 if (retries >= max_retries)
                     break;
@@ -619,8 +633,16 @@ namespace pomai
             out.partial = out.partial || filtered_missing;
             out.stats.partial = out.partial;
         }
-        if (out.stats.filtered_visits > 0)
-            out.stats.filtered_selectivity = static_cast<double>(out.stats.filtered_candidates) / static_cast<double>(out.stats.filtered_visits);
+        if (out.stats.filtered_candidates_generated > 0)
+        {
+            out.stats.filtered_selectivity = static_cast<double>(out.stats.filtered_candidates_passed_filter) /
+                                             static_cast<double>(out.stats.filtered_candidates_generated);
+        }
+        else if (out.stats.filtered_visits > 0)
+        {
+            out.stats.filtered_selectivity = static_cast<double>(out.stats.filtered_candidates) /
+                                             static_cast<double>(out.stats.filtered_visits);
+        }
         out.stats.filtered_retries = retries;
         out.stats.filtered_candidate_k = has_filter ? candidate_k : 0;
         out.stats.filtered_graph_ef = has_filter ? graph_ef : 0;
