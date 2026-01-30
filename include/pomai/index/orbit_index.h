@@ -6,6 +6,7 @@
 #include <memory>
 #include <vector>
 
+#include <pomai/core/seed.h>
 #include <pomai/core/types.h>
 #include <pomai/index/whispergrain.h>
 
@@ -24,6 +25,10 @@ namespace pomai::core
 
         // Thread-safe after Build() (read-only).
         SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
+        SearchResponse SearchFiltered(const SearchRequest &req,
+                                      const pomai::ai::Budget &budget,
+                                      const Filter &filter,
+                                      const Seed::Store &meta) const;
 
         std::size_t TotalVectors() const noexcept { return total_vectors_.load(std::memory_order_acquire); }
         std::size_t Dim() const noexcept { return dim_; }
@@ -41,6 +46,14 @@ namespace pomai::core
 
         // Search-time neighbor discovery (limits expansions by ops_budget)
         std::vector<std::uint32_t> FindNeighborsSearch(const float *q, std::size_t ef, std::size_t candidate_k) const;
+        std::vector<std::uint32_t> FindNeighborsSearchFiltered(const float *q,
+                                                               std::size_t ef,
+                                                               std::size_t candidate_k,
+                                                               std::size_t max_visits,
+                                                               std::size_t expand_factor,
+                                                               const Filter &filter,
+                                                               const Seed::Store &meta,
+                                                               bool &partial) const;
 
         void Connect(std::uint32_t a, std::uint32_t b);
         void Prune(std::uint32_t node);

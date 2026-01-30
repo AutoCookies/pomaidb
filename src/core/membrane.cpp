@@ -170,17 +170,21 @@ namespace pomai
                                    std::size_t dim,
                                    std::size_t search_pool_workers,
                                    std::size_t search_timeout_ms,
+                                   FilterConfig filter_config,
                                    std::function<void()> on_rejected_upsert)
         : shards_(std::move(shards)),
           brain_(w_cfg),
           probe_P_(2),
           dim_(dim),
           search_timeout_ms_(search_timeout_ms),
+          filter_config_(filter_config),
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size())),
           on_rejected_upsert_(std::move(on_rejected_upsert))
     {
         if (shards_.empty())
             throw std::runtime_error("must have at least 1 shard");
+        auto snap = std::make_shared<DictionarySnapshot>();
+        dict_.store(snap, std::memory_order_release);
     }
 
     void MembraneRouter::Start()
@@ -236,6 +240,155 @@ namespace pomai
         return PickShardById(id);
     }
 
+    std::shared_ptr<const MembraneRouter::DictionarySnapshot> MembraneRouter::SnapshotDictionary() const
+    {
+        return dict_.load(std::memory_order_acquire);
+    }
+
+    std::shared_ptr<const MembraneRouter::DictionarySnapshot> MembraneRouter::ExtendDictionary(const std::vector<std::string> &namespaces,
+                                                                                               const std::vector<std::string> &tags)
+    {
+        if (namespaces.empty() && tags.empty())
+            return SnapshotDictionary();
+
+        std::lock_guard<std::mutex> lk(dict_mu_);
+        auto current = dict_.load(std::memory_order_acquire);
+        auto next = std::make_shared<DictionarySnapshot>(*current);
+        bool changed = false;
+
+        for (const auto &name : namespaces)
+        {
+            if (name.empty())
+                continue;
+            if (next->namespaces.find(name) == next->namespaces.end())
+            {
+                std::uint32_t id = static_cast<std::uint32_t>(next->namespaces.size() + 1);
+                next->namespaces.emplace(name, id);
+                changed = true;
+            }
+        }
+
+        for (const auto &tag : tags)
+        {
+            if (tag.empty())
+                continue;
+            if (next->tags.find(tag) == next->tags.end())
+            {
+                if (next->tags.size() >= filter_config_.tag_dictionary_max_size)
+                    throw std::runtime_error("tag dictionary max size exceeded");
+                TagId id = static_cast<TagId>(next->tags.size());
+                next->tags.emplace(tag, id);
+                changed = true;
+            }
+        }
+
+        if (changed)
+            dict_.store(next, std::memory_order_release);
+        return dict_.load(std::memory_order_acquire);
+    }
+
+    Metadata MembraneRouter::NormalizeMetadata(const Metadata &meta) const
+    {
+        Metadata out = meta;
+        std::vector<std::string> ns_names;
+        std::vector<std::string> tag_names;
+        if (!meta.namespace_name.empty())
+            ns_names.push_back(meta.namespace_name);
+        if (!meta.tags.empty())
+            tag_names = meta.tags;
+
+        auto snap = ExtendDictionary(ns_names, tag_names);
+        if (!meta.namespace_name.empty())
+        {
+            auto it = snap->namespaces.find(meta.namespace_name);
+            if (it != snap->namespaces.end())
+                out.namespace_id = it->second;
+            else
+                out.namespace_id = 0;
+        }
+
+        std::vector<TagId> tag_ids = meta.tag_ids;
+        if (!meta.tags.empty())
+        {
+            tag_ids.reserve(tag_ids.size() + meta.tags.size());
+            for (const auto &tag : meta.tags)
+            {
+                auto it = snap->tags.find(tag);
+                if (it != snap->tags.end())
+                    tag_ids.push_back(it->second);
+            }
+        }
+        std::sort(tag_ids.begin(), tag_ids.end());
+        tag_ids.erase(std::unique(tag_ids.begin(), tag_ids.end()), tag_ids.end());
+        if (tag_ids.size() > filter_config_.max_tags_per_vector)
+            throw std::runtime_error("max_tags_per_vector exceeded");
+        out.tag_ids = std::move(tag_ids);
+        out.tags.clear();
+        out.namespace_name.clear();
+        return out;
+    }
+
+    std::shared_ptr<const Filter> MembraneRouter::NormalizeFilter(const SearchRequest &req) const
+    {
+        if (!req.filter)
+            return nullptr;
+        Filter f = *req.filter;
+        auto snap = SnapshotDictionary();
+        if (!f.namespace_name.empty())
+        {
+            auto it = snap->namespaces.find(f.namespace_name);
+            if (it == snap->namespaces.end())
+            {
+                f.match_none = true;
+            }
+            else
+            {
+                f.namespace_id = it->second;
+            }
+        }
+
+        auto append_tags = [&](const std::vector<std::string> &names, std::vector<TagId> &out, bool require_all, bool require_any)
+        {
+            if (names.empty() || f.match_none)
+                return;
+            std::size_t found = 0;
+            for (const auto &name : names)
+            {
+                auto it = snap->tags.find(name);
+                if (it != snap->tags.end())
+                {
+                    out.push_back(it->second);
+                    ++found;
+                }
+            }
+            if (require_all && found != names.size())
+                f.match_none = true;
+            if (require_any && found == 0)
+                f.match_none = true;
+        };
+
+        append_tags(f.require_all_tag_names, f.require_all_tags, true, false);
+        append_tags(f.require_any_tag_names, f.require_any_tags, false, true);
+        append_tags(f.exclude_tag_names, f.exclude_tags, false, false);
+
+        auto normalize_vec = [](std::vector<TagId> &tags)
+        {
+            std::sort(tags.begin(), tags.end());
+            tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+        };
+        normalize_vec(f.require_all_tags);
+        normalize_vec(f.require_any_tags);
+        normalize_vec(f.exclude_tags);
+        const std::size_t total_tags = f.require_all_tags.size() + f.require_any_tags.size() + f.exclude_tags.size();
+        if (total_tags > filter_config_.max_filter_tags)
+            throw std::runtime_error("max_filter_tags exceeded");
+        f.require_all_tag_names.clear();
+        f.require_any_tag_names.clear();
+        f.exclude_tag_names.clear();
+        f.namespace_name.clear();
+        return std::make_shared<Filter>(std::move(f));
+    }
+
     std::future<Lsn> MembraneRouter::Upsert(Id id, Vector vec, bool wait_durable)
     {
         UpsertRequest r;
@@ -256,10 +409,11 @@ namespace pomai
         }
 
         std::size_t est_bytes = 0;
-        for (const auto &r : batch)
+        for (auto &r : batch)
         {
             if (r.vec.data.size() == dim_)
                 est_bytes += sizeof(Id) + dim_ * sizeof(float);
+            r.metadata = NormalizeMetadata(r.metadata);
         }
 
         if (!MemoryManager::Instance().CanAllocate(est_bytes))
@@ -326,6 +480,23 @@ namespace pomai
         auto budget = brain_.compute_budget(false);
         auto health = brain_.health();
         std::size_t adaptive_probe = probe_P_;
+        SearchRequest normalized = req;
+        normalized.filter = NormalizeFilter(req);
+        const bool has_filter = normalized.filter && !normalized.filter->empty();
+        if (normalized.filter && normalized.filter->match_none)
+            return {};
+        if (has_filter)
+        {
+            std::size_t base = std::max<std::size_t>(normalized.topk * 50, 500);
+            std::size_t cap = filter_config_.filtered_candidate_k == 0 ? base : filter_config_.filtered_candidate_k;
+            normalized.filtered_candidate_k = normalized.filtered_candidate_k == 0 ? std::min(base, cap) : std::max(normalized.filtered_candidate_k, normalized.topk);
+            normalized.filtered_candidate_k = std::max(normalized.filtered_candidate_k, normalized.topk);
+            std::uint32_t expand = normalized.filter_expand_factor == 0 ? filter_config_.filter_expand_factor : normalized.filter_expand_factor;
+            expand = std::clamp<std::uint32_t>(expand, 1, 16);
+            normalized.filter_expand_factor = expand;
+            std::uint32_t max_visits = normalized.filter_max_visits == 0 ? filter_config_.filter_max_visits : normalized.filter_max_visits;
+            normalized.filter_max_visits = max_visits;
+        }
 
         if (health == pomai::ai::WhisperGrain::BudgetHealth::Tight)
             adaptive_probe = std::max<std::size_t>(1, probe_P_ / 2);
@@ -335,7 +506,7 @@ namespace pomai
         std::vector<std::size_t> target_ids;
         try
         {
-            auto c_idxs = router_.CandidateShardsForQuery(req.query, adaptive_probe);
+            auto c_idxs = router_.CandidateShardsForQuery(normalized.query, adaptive_probe);
             if (c_idxs.empty())
             {
                 target_ids.resize(shards_.size());
@@ -361,11 +532,11 @@ namespace pomai
             std::iota(target_ids.begin(), target_ids.end(), 0);
         }
 
-        const std::size_t shard_topk = std::max<std::size_t>(req.topk, req.topk * kShardCandidateMultiplier);
-        SearchRequest shard_req = req;
-        shard_req.candidate_k = NormalizeCandidateK(req);
-        shard_req.max_rerank_k = NormalizeMaxRerankK(req);
-        shard_req.graph_ef = NormalizeGraphEf(req, shard_req.candidate_k);
+        const std::size_t shard_topk = std::max<std::size_t>(normalized.topk, normalized.topk * kShardCandidateMultiplier);
+        SearchRequest shard_req = normalized;
+        shard_req.candidate_k = NormalizeCandidateK(shard_req);
+        shard_req.max_rerank_k = NormalizeMaxRerankK(shard_req);
+        shard_req.graph_ef = NormalizeGraphEf(shard_req, shard_req.candidate_k);
         shard_req.topk = shard_topk;
         if (shard_req.graph_ef > 0)
             budget.ops_budget = shard_req.graph_ef;
@@ -398,6 +569,7 @@ namespace pomai
         merge_topk->Reset(req.topk);
 
         std::size_t completed = 0;
+        bool filtered_partial = false;
         for (auto &f : futs)
         {
             if (f.wait_until(deadline) == std::future_status::ready)
@@ -407,6 +579,7 @@ namespace pomai
                     auto r = f.get();
                     for (const auto &item : r.items)
                         merge_topk->Push(item.score, item.id);
+                    filtered_partial = filtered_partial || r.stats.filtered_partial;
                     ++completed;
                 }
                 catch (...)
@@ -418,6 +591,7 @@ namespace pomai
         {
             for (const auto &item : r.items)
                 merge_topk->Push(item.score, item.id);
+            filtered_partial = filtered_partial || r.stats.filtered_partial;
             ++completed;
         }
 
@@ -430,6 +604,8 @@ namespace pomai
             out.partial = true;
             search_partial_.fetch_add(1, std::memory_order_relaxed);
         }
+        out.stats.partial = out.partial;
+        out.stats.filtered_partial = filtered_partial;
         float lat = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
         brain_.observe_latency(lat);
 

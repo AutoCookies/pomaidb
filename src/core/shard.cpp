@@ -284,6 +284,23 @@ namespace pomai
         std::vector<std::size_t> cursor = grains->offsets;
         for (std::size_t row = 0; row < n; ++row)
             grains->postings[cursor[assignments[row]]++] = static_cast<std::uint32_t>(row);
+        grains->namespace_min.resize(grains->centroids.size(), std::numeric_limits<std::uint32_t>::max());
+        grains->namespace_max.resize(grains->centroids.size(), 0);
+        if (!snap->namespace_ids.empty())
+        {
+            for (std::size_t row = 0; row < n; ++row)
+            {
+                std::size_t c = assignments[row];
+                std::uint32_t ns = snap->namespace_ids[row];
+                grains->namespace_min[c] = std::min(grains->namespace_min[c], ns);
+                grains->namespace_max[c] = std::max(grains->namespace_max[c], ns);
+            }
+        }
+        else
+        {
+            std::fill(grains->namespace_min.begin(), grains->namespace_min.end(), 0);
+            std::fill(grains->namespace_max.begin(), grains->namespace_max.end(), 0);
+        }
         return grains;
     }
 
@@ -296,7 +313,9 @@ namespace pomai
         POMAI_ASSERT(snap->qdata.size() == snap->ids.size() * dim, "SearchGrains qdata size mismatch");
         if (req.metric != Metric::L2)
             return resp;
-        const std::size_t candidate_k = NormalizeCandidateK(req);
+        const bool has_filter = req.filter && !req.filter->empty();
+        const std::size_t candidate_k = has_filter && req.filtered_candidate_k > 0 ? std::max<std::size_t>(req.filtered_candidate_k, req.topk)
+                                                                                   : NormalizeCandidateK(req);
         const std::size_t topk = std::min<std::size_t>(req.topk, candidate_k);
         std::size_t probe = budget.bucket_budget > 0 ? budget.bucket_budget : std::min<std::size_t>(16, grains.centroids.size());
         probe = std::min({probe, grains.centroids.size(), (std::size_t)128});
@@ -317,9 +336,17 @@ namespace pomai
         for (std::size_t i = 0; i < centroid_topk.Size(); ++i)
         {
             std::size_t c = static_cast<std::size_t>(c_data[i].id);
+            if (has_filter && req.filter->namespace_id && !grains.namespace_min.empty())
+            {
+                std::uint32_t ns = *req.filter->namespace_id;
+                if (ns < grains.namespace_min[c] || ns > grains.namespace_max[c])
+                    continue;
+            }
             for (std::size_t j = grains.offsets[c]; j < grains.offsets[c + 1]; ++j)
             {
                 std::size_t row = grains.postings[j];
+                if (has_filter && !snap->MatchFilter(row, *req.filter))
+                    continue;
                 float d = kernels::L2Sqr_SQ8_AVX2(snap->qdata.data() + row * dim, qquant.data(), dim);
                 candidates.Push(-d, static_cast<Id>(row));
             }
@@ -336,6 +363,8 @@ namespace pomai
         }
         final_topk.FillSorted(resp.items);
         SortAndDedupeResults(resp.items, topk);
+        resp.stats.filtered_candidates = candidates.Size();
+        resp.stats.partial = resp.partial;
         return resp;
     }
 
@@ -359,11 +388,16 @@ namespace pomai
             SearchResponse r;
             if (s.grains && s.snap)
                 r = SearchGrains(s.snap, *s.grains, normalized, effective_budget);
+            else if (s.index && normalized.filter && s.snap)
+                r = s.index->SearchFiltered(normalized, effective_budget, *normalized.filter, *s.snap);
             else if (s.index)
                 r = s.index->Search(normalized, effective_budget);
             else if (s.snap)
                 r = Seed::SearchSnapshot(s.snap, normalized);
             MergeTopK(out, r, req.topk);
+            out.partial = out.partial || r.partial;
+            out.stats.partial = out.stats.partial || r.stats.partial;
+            out.stats.filtered_partial = out.stats.filtered_partial || r.stats.filtered_partial;
         }
         SearchResponse lr;
         if (snapshot->live_snap && snapshot->live_grains)
@@ -371,6 +405,9 @@ namespace pomai
         else if (snapshot->live_snap)
             lr = Seed::SearchSnapshot(snapshot->live_snap, normalized);
         MergeTopK(out, lr, req.topk);
+        out.partial = out.partial || lr.partial;
+        out.stats.partial = out.stats.partial || lr.stats.partial;
+        out.stats.filtered_partial = out.stats.filtered_partial || lr.stats.filtered_partial;
         SortAndDedupeResults(out.items, req.topk);
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > 40)
             const_cast<Shard *>(this)->RequestEmergencyFreeze();

@@ -47,6 +47,96 @@ static std::vector<Id> CalculateGroundTruth(const std::vector<float> &all_data,
     return out;
 }
 
+struct FilteredGroundTruth
+{
+    std::vector<Id> ids;
+    std::size_t filtered_count{0};
+};
+
+static bool MatchesFilter(std::size_t id, const Filter &filter)
+{
+    if (filter.match_none)
+        return false;
+    std::uint32_t ns = static_cast<std::uint32_t>(id % 10);
+    std::uint64_t user_id = static_cast<std::uint64_t>(id % 1000);
+    TagId t1 = static_cast<TagId>(id % 7);
+    TagId t2 = static_cast<TagId>(id % 11);
+    if (filter.namespace_id && ns != *filter.namespace_id)
+        return false;
+    if (filter.user_id && user_id != *filter.user_id)
+        return false;
+    if (!filter.exclude_tags.empty())
+    {
+        for (TagId tag : filter.exclude_tags)
+        {
+            if (tag == t1 || tag == t2)
+                return false;
+        }
+    }
+    if (!filter.require_all_tags.empty())
+    {
+        for (TagId tag : filter.require_all_tags)
+        {
+            if (!(tag == t1 || tag == t2))
+                return false;
+        }
+    }
+    if (!filter.require_any_tags.empty())
+    {
+        bool any = false;
+        for (TagId tag : filter.require_any_tags)
+        {
+            if (tag == t1 || tag == t2)
+            {
+                any = true;
+                break;
+            }
+        }
+        if (!any)
+            return false;
+    }
+    return true;
+}
+
+static FilteredGroundTruth CalculateGroundTruthFiltered(const std::vector<float> &all_data,
+                                                        std::size_t N, std::size_t dim,
+                                                        const std::vector<float> &query,
+                                                        std::size_t k,
+                                                        const Filter &filter)
+{
+    struct Pair
+    {
+        float d;
+        Id id;
+    };
+    std::vector<Pair> dists;
+    dists.reserve(N);
+
+    for (std::size_t i = 0; i < N; ++i)
+    {
+        if (!MatchesFilter(i, filter))
+            continue;
+        float d = 0;
+        const float *v = &all_data[i * dim];
+        for (std::size_t j = 0; j < dim; ++j)
+        {
+            float diff = v[j] - query[j];
+            d += diff * diff;
+        }
+        dists.push_back({d, (Id)i});
+    }
+
+    std::partial_sort(dists.begin(), dists.begin() + std::min(k, dists.size()), dists.end(),
+                      [](const Pair &a, const Pair &b)
+                      { return a.d < b.d; });
+
+    FilteredGroundTruth out;
+    out.filtered_count = dists.size();
+    for (std::size_t i = 0; i < std::min(k, dists.size()); ++i)
+        out.ids.push_back(dists[i].id);
+    return out;
+}
+
 int main(int argc, char **argv)
 {
     std::cout << ":: POMAI PRODUCTION-GRADE BENCHMARK (IVF-SQ8 READY) ::\n";
@@ -107,6 +197,10 @@ int main(int argc, char **argv)
         std::vector<UpsertRequest> batch(1);
         batch[0].id = i;
         batch[0].vec.data.resize(dim);
+        batch[0].metadata.namespace_id = static_cast<std::uint32_t>(i % 10);
+        batch[0].metadata.user_id = static_cast<std::uint64_t>(i % 1000);
+        batch[0].metadata.tag_ids = {static_cast<TagId>(i % 7), static_cast<TagId>(i % 11)};
+        std::sort(batch[0].metadata.tag_ids.begin(), batch[0].metadata.tag_ids.end());
         for (size_t d = 0; d < dim; ++d)
         {
             float v = val(rng);
@@ -130,6 +224,10 @@ int main(int argc, char **argv)
             size_t idx = base + i;
             batch[i].id = idx;
             batch[i].vec.data.resize(dim);
+            batch[i].metadata.namespace_id = static_cast<std::uint32_t>(idx % 10);
+            batch[i].metadata.user_id = static_cast<std::uint64_t>(idx % 1000);
+            batch[i].metadata.tag_ids = {static_cast<TagId>(idx % 7), static_cast<TagId>(idx % 11)};
+            std::sort(batch[i].metadata.tag_ids.begin(), batch[i].metadata.tag_ids.end());
             for (size_t d = 0; d < dim; ++d)
             {
                 float v = val(rng);
@@ -204,7 +302,85 @@ int main(int argc, char **argv)
     std::uint32_t effective_graph_ef = NormalizeGraphEf(summary_req, effective_rerank_k);
     std::cout << "Candidate_k: " << effective_rerank_k << "\n";
     std::cout << "Graph_ef   : " << effective_graph_ef << "\n";
+    std::cout << "Filtered candidate_k cap: " << opt.filtered_candidate_k << "\n";
+    std::cout << "Filter expand factor    : " << opt.filter_expand_factor << "\n";
+    std::cout << "Filter max visits       : " << opt.filter_max_visits << "\n";
+    std::cout << "Tag dictionary max size : " << opt.tag_dictionary_max_size << "\n";
+    std::cout << "Max tags per vector     : " << opt.max_tags_per_vector << "\n";
+    std::cout << "Max filter tags         : " << opt.max_filter_tags << "\n";
     std::cout << "=======================================================================\n";
+
+    std::cout << "[Phase 4] Running filtered queries...\n";
+    struct FilterCase
+    {
+        std::string name;
+        Filter filter;
+    };
+    std::vector<FilterCase> cases;
+    Filter ns_only;
+    ns_only.namespace_id = 3;
+    cases.push_back({"namespace_only", ns_only});
+    Filter ns_user;
+    ns_user.namespace_id = 4;
+    ns_user.user_id = 128;
+    cases.push_back({"namespace_user", ns_user});
+    Filter tags_any;
+    tags_any.require_any_tags = {1, 5};
+    std::sort(tags_any.require_any_tags.begin(), tags_any.require_any_tags.end());
+    cases.push_back({"tags_any", tags_any});
+    Filter tags_all;
+    tags_all.require_all_tags = {2, 7};
+    std::sort(tags_all.require_all_tags.begin(), tags_all.require_all_tags.end());
+    cases.push_back({"tags_all", tags_all});
+
+    for (const auto &c : cases)
+    {
+        std::vector<double> f_latencies;
+        double f_recall = 0.0;
+        double selectivity = 0.0;
+        for (size_t qi = 0; qi < query_count; ++qi)
+        {
+            size_t target_id = std::uniform_int_distribution<size_t>(0, N - 1)(rng);
+            std::vector<float> query_vec(dim);
+            std::copy(all_vectors.begin() + target_id * dim,
+                      all_vectors.begin() + (target_id + 1) * dim, query_vec.begin());
+
+            auto gt = CalculateGroundTruthFiltered(all_vectors, N, dim, query_vec, topk, c.filter);
+            selectivity += static_cast<double>(gt.filtered_count) / static_cast<double>(N);
+
+            SearchRequest req;
+            req.topk = topk;
+            req.metric = Metric::L2;
+            req.query.data = query_vec;
+            req.filter = std::make_shared<Filter>(c.filter);
+
+            auto q0 = std::chrono::high_resolution_clock::now();
+            auto resp = db.Search(req);
+            auto q1 = std::chrono::high_resolution_clock::now();
+            f_latencies.push_back(std::chrono::duration<double, std::micro>(q1 - q0).count());
+
+            size_t hits = 0;
+            for (auto tid : gt.ids)
+            {
+                for (const auto &item : resp.items)
+                {
+                    if (item.id == tid)
+                    {
+                        hits++;
+                        break;
+                    }
+                }
+            }
+            if (!gt.ids.empty())
+                f_recall += static_cast<double>(hits) / static_cast<double>(gt.ids.size());
+        }
+        std::sort(f_latencies.begin(), f_latencies.end());
+        std::cout << "Filter case: " << c.name << "\n";
+        std::cout << "  Recall@10      : " << (f_recall / query_count * 100.0) << "%\n";
+        std::cout << "  Selectivity    : " << (selectivity / query_count * 100.0) << "%\n";
+        std::cout << "  Latency p50 us : " << f_latencies[query_count / 2] << "\n";
+        std::cout << "  Latency p99 us : " << f_latencies[query_count * 99 / 100] << "\n";
+    }
 
     db.Stop();
     return 0;
