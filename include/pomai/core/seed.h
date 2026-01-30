@@ -60,7 +60,6 @@ namespace pomai
             std::vector<float> qmins;
             std::vector<float> qscales;
             std::vector<std::uint32_t> namespace_ids;
-            std::vector<std::uint64_t> user_ids;
             std::vector<std::uint32_t> tag_offsets;
             std::vector<TagId> tag_ids;
             std::size_t accounted_bytes{0};
@@ -109,7 +108,6 @@ namespace pomai
         std::unordered_map<Id, std::uint32_t> pos_;
         std::size_t accounted_bytes_{0};
         std::vector<std::uint32_t> namespace_ids_;
-        std::vector<std::uint64_t> user_ids_;
         std::vector<std::vector<TagId>> tags_;
 
         std::size_t qrows_{0};

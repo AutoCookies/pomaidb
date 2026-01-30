@@ -38,7 +38,6 @@ namespace pomai
     {
         std::uint32_t namespace_id{0};
         std::string namespace_name{};
-        std::uint64_t user_id{0};
         std::vector<TagId> tag_ids;
         std::vector<std::string> tags;
     };
@@ -47,7 +46,6 @@ namespace pomai
     {
         std::optional<std::uint32_t> namespace_id;
         std::string namespace_name{};
-        std::optional<std::uint64_t> user_id;
         std::vector<TagId> require_all_tags;
         std::vector<TagId> require_any_tags;
         std::vector<TagId> exclude_tags;
@@ -59,7 +57,7 @@ namespace pomai
 
         bool empty() const
         {
-            return !match_none && !namespace_id && !user_id &&
+            return !match_none && !namespace_id &&
                    namespace_name.empty() &&
                    require_all_tags.empty() && require_any_tags.empty() && exclude_tags.empty() &&
                    require_all_tag_names.empty() && require_any_tag_names.empty() && exclude_tag_names.empty() &&

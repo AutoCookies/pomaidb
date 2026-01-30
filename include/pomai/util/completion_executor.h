@@ -108,7 +108,7 @@ namespace pomai
                 {
                     continue;
                 }
-                Task task = std::move(tasks_.top());
+                Task task = tasks_.top();
                 tasks_.pop();
                 lk.unlock();
                 try
