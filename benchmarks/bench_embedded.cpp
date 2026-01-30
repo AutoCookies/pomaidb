@@ -7,6 +7,7 @@
 #include <cstring>
 #include <algorithm>
 #include <iomanip>
+#include <limits>
 #include <numeric>
 #include <thread>
 
@@ -301,6 +302,11 @@ int main(int argc, char **argv)
     std::cout << "Filter expand factor    : " << opt.filter_expand_factor << "\n";
     std::cout << "Filter max visits       : " << opt.filter_max_visits << "\n";
     std::cout << "Filter time budget (us) : " << opt.filter_time_budget_us << "\n";
+    std::cout << "Max filter candidate_k  : " << opt.max_filtered_candidate_k << "\n";
+    std::cout << "Max filter graph ef     : " << opt.max_filter_graph_ef << "\n";
+    std::cout << "Max filter visits       : " << opt.max_filter_visits << "\n";
+    std::cout << "Max filter time (us)    : " << opt.max_filter_time_budget_us << "\n";
+    std::cout << "Filter max retries      : " << opt.filter_max_retries << "\n";
     std::cout << "Tag dictionary max size : " << opt.tag_dictionary_max_size << "\n";
     std::cout << "Max tags per vector     : " << opt.max_tags_per_vector << "\n";
     std::cout << "Max filter tags         : " << opt.max_filter_tags << "\n";
@@ -326,73 +332,149 @@ int main(int argc, char **argv)
     cases.push_back({"tags_all", tags_all});
 
     double namespace_p99 = 0.0;
-    for (const auto &c : cases)
+    struct RangeStats
     {
-        std::vector<double> f_latencies;
-        double f_recall = 0.0;
-        double selectivity = 0.0;
-        std::size_t partial_count = 0;
-        std::size_t time_budget_hits = 0;
-        std::size_t visit_budget_hits = 0;
-        std::size_t budget_exhausted_hits = 0;
-        for (size_t qi = 0; qi < query_count; ++qi)
+        std::size_t min{std::numeric_limits<std::size_t>::max()};
+        std::size_t max{0};
+        double sum{0.0};
+        void Add(std::size_t v)
         {
-            size_t target_id = std::uniform_int_distribution<size_t>(0, N - 1)(rng);
-            std::vector<float> query_vec(dim);
-            std::copy(all_vectors.begin() + target_id * dim,
-                      all_vectors.begin() + (target_id + 1) * dim, query_vec.begin());
+            min = std::min(min, v);
+            max = std::max(max, v);
+            sum += static_cast<double>(v);
+        }
+        double Avg(std::size_t n) const
+        {
+            return n == 0 ? 0.0 : (sum / static_cast<double>(n));
+        }
+    };
 
-            auto gt = CalculateGroundTruthFiltered(all_vectors, N, dim, query_vec, topk, c.filter);
-            selectivity += static_cast<double>(gt.filtered_count) / static_cast<double>(N);
+    auto run_filtered_cases = [&](SearchMode mode, const std::string &label, bool fail_on_partial) -> bool
+    {
+        std::cout << "=== Filtered suite (" << label << ") ===\n";
+        bool failed = false;
+        for (const auto &c : cases)
+        {
+            std::vector<double> f_latencies;
+            double f_recall = 0.0;
+            double selectivity = 0.0;
+            std::size_t partial_count = 0;
+            std::size_t time_budget_hits = 0;
+            std::size_t visit_budget_hits = 0;
+            std::size_t budget_exhausted_hits = 0;
+            std::size_t missing_hits_total = 0;
+            std::size_t candidate_cap_hits = 0;
+            std::size_t graph_cap_hits = 0;
+            std::size_t visit_cap_hits = 0;
+            std::size_t time_cap_hits = 0;
+            RangeStats retry_stats;
+            RangeStats candidate_stats;
+            RangeStats graph_stats;
+            RangeStats visit_stats;
+            RangeStats time_stats;
 
-            SearchRequest req;
-            req.topk = topk;
-            req.metric = Metric::L2;
-            req.query.data = query_vec;
-            req.filter = std::make_shared<Filter>(c.filter);
-
-            auto q0 = std::chrono::high_resolution_clock::now();
-            auto resp = db.Search(req);
-            auto q1 = std::chrono::high_resolution_clock::now();
-            f_latencies.push_back(std::chrono::duration<double, std::micro>(q1 - q0).count());
-            if (resp.stats.filtered_partial)
-                partial_count++;
-            if (resp.stats.filtered_time_budget_hit)
-                time_budget_hits++;
-            if (resp.stats.filtered_visit_budget_hit)
-                visit_budget_hits++;
-            if (resp.stats.filtered_budget_exhausted)
-                budget_exhausted_hits++;
-
-            size_t hits = 0;
-            for (auto tid : gt.ids)
+            for (size_t qi = 0; qi < query_count; ++qi)
             {
-                for (const auto &item : resp.items)
+                size_t target_id = std::uniform_int_distribution<size_t>(0, N - 1)(rng);
+                std::vector<float> query_vec(dim);
+                std::copy(all_vectors.begin() + target_id * dim,
+                          all_vectors.begin() + (target_id + 1) * dim, query_vec.begin());
+
+                auto gt = CalculateGroundTruthFiltered(all_vectors, N, dim, query_vec, topk, c.filter);
+                selectivity += static_cast<double>(gt.filtered_count) / static_cast<double>(N);
+
+                SearchRequest req;
+                req.topk = topk;
+                req.metric = Metric::L2;
+                req.query.data = query_vec;
+                req.filter = std::make_shared<Filter>(c.filter);
+                req.search_mode = mode;
+
+                auto q0 = std::chrono::high_resolution_clock::now();
+                auto resp = db.Search(req);
+                auto q1 = std::chrono::high_resolution_clock::now();
+                f_latencies.push_back(std::chrono::duration<double, std::micro>(q1 - q0).count());
+                if (resp.partial)
+                    partial_count++;
+                if (resp.stats.filtered_time_budget_hit)
+                    time_budget_hits++;
+                if (resp.stats.filtered_visit_budget_hit)
+                    visit_budget_hits++;
+                if (resp.stats.filtered_budget_exhausted)
+                    budget_exhausted_hits++;
+                if (resp.stats.filtered_candidate_cap_hit)
+                    candidate_cap_hits++;
+                if (resp.stats.filtered_graph_ef_cap_hit)
+                    graph_cap_hits++;
+                if (resp.stats.filtered_visit_cap_hit)
+                    visit_cap_hits++;
+                if (resp.stats.filtered_time_cap_hit)
+                    time_cap_hits++;
+
+                missing_hits_total += resp.stats.filtered_missing_hits;
+                retry_stats.Add(resp.stats.filtered_retries);
+                candidate_stats.Add(resp.stats.filtered_candidate_k);
+                graph_stats.Add(resp.stats.filtered_graph_ef);
+                visit_stats.Add(resp.stats.filtered_max_visits);
+                time_stats.Add(static_cast<std::size_t>(resp.stats.filtered_time_budget_us));
+
+                if (fail_on_partial && (resp.status != SearchStatus::Ok || resp.partial))
+                    failed = true;
+
+                size_t hits = 0;
+                for (auto tid : gt.ids)
                 {
-                    if (item.id == tid)
+                    for (const auto &item : resp.items)
                     {
-                        hits++;
-                        break;
+                        if (item.id == tid)
+                        {
+                            hits++;
+                            break;
+                        }
                     }
                 }
+                if (!gt.ids.empty())
+                    f_recall += static_cast<double>(hits) / static_cast<double>(gt.ids.size());
             }
-            if (!gt.ids.empty())
-                f_recall += static_cast<double>(hits) / static_cast<double>(gt.ids.size());
+            std::sort(f_latencies.begin(), f_latencies.end());
+            std::cout << "Filter case: " << c.name << "\n";
+            std::cout << "  Recall@10       : " << (f_recall / query_count * 100.0) << "%\n";
+            std::cout << "  Selectivity     : " << (selectivity / query_count * 100.0) << "%\n";
+            std::cout << "  Latency p50 us  : " << f_latencies[query_count / 2] << "\n";
+            std::cout << "  Latency p95 us  : " << f_latencies[query_count * 95 / 100] << "\n";
+            std::cout << "  Latency p99 us  : " << f_latencies[query_count * 99 / 100] << "\n";
+            std::cout << "  Partial results: " << partial_count << "/" << query_count << "\n";
+            std::cout << "  Missing hits   : " << missing_hits_total << "\n";
+            std::cout << "  Retries (min/avg/max): " << retry_stats.min << "/"
+                      << std::fixed << std::setprecision(2) << retry_stats.Avg(query_count) << "/"
+                      << retry_stats.max << "\n";
+            std::cout << "  Final budgets (min/avg/max): candidate_k="
+                      << candidate_stats.min << "/" << candidate_stats.Avg(query_count) << "/" << candidate_stats.max
+                      << ", graph_ef=" << graph_stats.min << "/" << graph_stats.Avg(query_count) << "/" << graph_stats.max
+                      << ", visits=" << visit_stats.min << "/" << visit_stats.Avg(query_count) << "/" << visit_stats.max
+                      << ", time_us=" << time_stats.min << "/" << time_stats.Avg(query_count) << "/" << time_stats.max
+                      << "\n";
+            std::cout << "  Cap hits       : candidate=" << candidate_cap_hits
+                      << ", graph_ef=" << graph_cap_hits
+                      << ", visits=" << visit_cap_hits
+                      << ", time=" << time_cap_hits << "\n";
+            std::cout << "  Budget hits    : time=" << time_budget_hits
+                      << ", visits=" << visit_budget_hits
+                      << ", exhausted=" << budget_exhausted_hits << "\n";
+            if (mode == SearchMode::Quality && c.name == "namespace_only")
+                namespace_p99 = f_latencies[query_count * 99 / 100];
         }
-        std::sort(f_latencies.begin(), f_latencies.end());
-        std::cout << "Filter case: " << c.name << "\n";
-        std::cout << "  Recall@10      : " << (f_recall / query_count * 100.0) << "%\n";
-        std::cout << "  Selectivity    : " << (selectivity / query_count * 100.0) << "%\n";
-        std::cout << "  Latency p50 us : " << f_latencies[query_count / 2] << "\n";
-        std::cout << "  Latency p95 us : " << f_latencies[query_count * 95 / 100] << "\n";
-        std::cout << "  Latency p99 us : " << f_latencies[query_count * 99 / 100] << "\n";
-        std::cout << "  Partial results: " << partial_count << "/" << query_count << "\n";
-        std::cout << "  Budget hits    : time=" << time_budget_hits
-                  << ", visits=" << visit_budget_hits
-                  << ", exhausted=" << budget_exhausted_hits << "\n";
-        if (c.name == "namespace_only")
-            namespace_p99 = f_latencies[query_count * 99 / 100];
+        return failed;
+    };
+
+    bool quality_failed = run_filtered_cases(SearchMode::Quality, "QUALITY", true);
+    if (quality_failed)
+    {
+        std::cerr << "FAILURE: Quality mode returned partial or insufficient results.\n";
+        db.Stop();
+        return 1;
     }
+    run_filtered_cases(SearchMode::Latency, "LATENCY", false);
 
     db.Stop();
     if (namespace_p99 > 200000.0)

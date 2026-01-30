@@ -32,6 +32,11 @@ namespace pomai
             std::uint32_t filter_expand_factor{4};
             std::uint32_t filter_max_visits{20000};
             std::uint64_t filter_time_budget_us{5000};
+            std::size_t max_filtered_candidate_k{20000};
+            std::uint32_t max_filter_graph_ef{2048};
+            std::size_t max_filter_visits{100000};
+            std::uint64_t max_filter_time_budget_us{50000};
+            std::size_t filter_max_retries{3};
             std::size_t tag_dictionary_max_size{100000};
             std::size_t max_tags_per_vector{32};
             std::size_t max_filter_tags{64};
