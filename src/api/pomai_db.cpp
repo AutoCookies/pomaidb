@@ -66,6 +66,7 @@ namespace pomai
         filter_cfg.filtered_candidate_k = opt_.filtered_candidate_k;
         filter_cfg.filter_expand_factor = opt_.filter_expand_factor;
         filter_cfg.filter_max_visits = opt_.filter_max_visits;
+        filter_cfg.filter_time_budget_us = opt_.filter_time_budget_us;
         filter_cfg.tag_dictionary_max_size = opt_.tag_dictionary_max_size;
         filter_cfg.max_tags_per_vector = opt_.max_tags_per_vector;
         filter_cfg.max_filter_tags = opt_.max_filter_tags;

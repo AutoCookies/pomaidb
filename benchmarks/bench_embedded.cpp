@@ -300,6 +300,7 @@ int main(int argc, char **argv)
     std::cout << "Filtered candidate_k cap: " << opt.filtered_candidate_k << "\n";
     std::cout << "Filter expand factor    : " << opt.filter_expand_factor << "\n";
     std::cout << "Filter max visits       : " << opt.filter_max_visits << "\n";
+    std::cout << "Filter time budget (us) : " << opt.filter_time_budget_us << "\n";
     std::cout << "Tag dictionary max size : " << opt.tag_dictionary_max_size << "\n";
     std::cout << "Max tags per vector     : " << opt.max_tags_per_vector << "\n";
     std::cout << "Max filter tags         : " << opt.max_filter_tags << "\n";
@@ -324,11 +325,16 @@ int main(int argc, char **argv)
     std::sort(tags_all.require_all_tags.begin(), tags_all.require_all_tags.end());
     cases.push_back({"tags_all", tags_all});
 
+    double namespace_p99 = 0.0;
     for (const auto &c : cases)
     {
         std::vector<double> f_latencies;
         double f_recall = 0.0;
         double selectivity = 0.0;
+        std::size_t partial_count = 0;
+        std::size_t time_budget_hits = 0;
+        std::size_t visit_budget_hits = 0;
+        std::size_t budget_exhausted_hits = 0;
         for (size_t qi = 0; qi < query_count; ++qi)
         {
             size_t target_id = std::uniform_int_distribution<size_t>(0, N - 1)(rng);
@@ -349,6 +355,14 @@ int main(int argc, char **argv)
             auto resp = db.Search(req);
             auto q1 = std::chrono::high_resolution_clock::now();
             f_latencies.push_back(std::chrono::duration<double, std::micro>(q1 - q0).count());
+            if (resp.stats.filtered_partial)
+                partial_count++;
+            if (resp.stats.filtered_time_budget_hit)
+                time_budget_hits++;
+            if (resp.stats.filtered_visit_budget_hit)
+                visit_budget_hits++;
+            if (resp.stats.filtered_budget_exhausted)
+                budget_exhausted_hits++;
 
             size_t hits = 0;
             for (auto tid : gt.ids)
@@ -370,9 +384,21 @@ int main(int argc, char **argv)
         std::cout << "  Recall@10      : " << (f_recall / query_count * 100.0) << "%\n";
         std::cout << "  Selectivity    : " << (selectivity / query_count * 100.0) << "%\n";
         std::cout << "  Latency p50 us : " << f_latencies[query_count / 2] << "\n";
+        std::cout << "  Latency p95 us : " << f_latencies[query_count * 95 / 100] << "\n";
         std::cout << "  Latency p99 us : " << f_latencies[query_count * 99 / 100] << "\n";
+        std::cout << "  Partial results: " << partial_count << "/" << query_count << "\n";
+        std::cout << "  Budget hits    : time=" << time_budget_hits
+                  << ", visits=" << visit_budget_hits
+                  << ", exhausted=" << budget_exhausted_hits << "\n";
+        if (c.name == "namespace_only")
+            namespace_p99 = f_latencies[query_count * 99 / 100];
     }
 
     db.Stop();
+    if (namespace_p99 > 200000.0)
+    {
+        std::cerr << "Regression: namespace_only p99 exceeded 200ms (" << namespace_p99 << " us)\n";
+        return 1;
+    }
     return 0;
 }

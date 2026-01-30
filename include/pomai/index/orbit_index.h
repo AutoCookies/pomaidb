@@ -50,10 +50,13 @@ namespace pomai::core
                                                                std::size_t ef,
                                                                std::size_t candidate_k,
                                                                std::size_t max_visits,
+                                                               std::uint64_t time_budget_us,
                                                                std::size_t expand_factor,
                                                                const Filter &filter,
                                                                const Seed::Store &meta,
-                                                               bool &partial) const;
+                                                               bool &partial,
+                                                               bool &time_budget_hit,
+                                                               bool &visit_budget_hit) const;
 
         void Connect(std::uint32_t a, std::uint32_t b);
         void Prune(std::uint32_t node);

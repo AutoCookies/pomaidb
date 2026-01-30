@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <queue>
 #include <random>
 #include <stdexcept>
@@ -485,10 +486,13 @@ namespace pomai::core
                                                                        std::size_t ef,
                                                                        std::size_t candidate_k,
                                                                        std::size_t max_visits,
+                                                                       std::uint64_t time_budget_us,
                                                                        std::size_t expand_factor,
                                                                        const Filter &filter,
                                                                        const Seed::Store &meta,
-                                                                       bool &partial) const
+                                                                       bool &partial,
+                                                                       bool &time_budget_hit,
+                                                                       bool &visit_budget_hit) const
     {
         const std::size_t N = total_vectors_.load(std::memory_order_acquire);
         if (N == 0)
@@ -496,6 +500,8 @@ namespace pomai::core
 
         tls.Reset(N);
         partial = false;
+        time_budget_hit = false;
+        visit_budget_hit = false;
 
         std::priority_queue<std::pair<float, std::uint32_t>,
                             std::vector<std::pair<float, std::uint32_t>>,
@@ -533,6 +539,7 @@ namespace pomai::core
         const std::size_t target = std::max<std::size_t>(1, candidate_k);
         const std::size_t ef_target = std::max<std::size_t>(ef, target * std::max<std::size_t>(1, expand_factor));
         const std::size_t visit_limit = std::min<std::size_t>(ef_target, max_visits);
+        const auto start_time = std::chrono::steady_clock::now();
 
         while (!candidates.empty() && expansions < visit_limit)
         {
@@ -562,7 +569,22 @@ namespace pomai::core
                         best.pop();
                 }
             }
+
+            if (time_budget_us > 0 && (expansions % 64 == 0))
+            {
+                auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - start_time)
+                                   .count();
+                if (elapsed >= static_cast<std::int64_t>(time_budget_us))
+                {
+                    time_budget_hit = true;
+                    break;
+                }
+            }
         }
+
+        if (expansions >= visit_limit && best.size() < target)
+            visit_budget_hit = true;
 
         if (best.size() < target)
             partial = true;
@@ -662,10 +684,23 @@ namespace pomai::core
         const std::size_t search_ef = std::max<std::size_t>(ops_budget, candidate_k);
         const std::size_t max_visits = (req.filter_max_visits == 0) ? search_ef : std::max<std::size_t>(req.filter_max_visits, search_ef);
         const std::size_t expand_factor = (req.filter_expand_factor == 0) ? 1 : req.filter_expand_factor;
+        const std::uint64_t time_budget_us = req.filter_time_budget_us;
 
         bool partial = false;
+        bool time_budget_hit = false;
+        bool visit_budget_hit = false;
         const float *q = req.query.data.data();
-        std::vector<std::uint32_t> cand = FindNeighborsSearchFiltered(q, search_ef, candidate_k, max_visits, expand_factor, filter, meta, partial);
+        std::vector<std::uint32_t> cand = FindNeighborsSearchFiltered(q,
+                                                                      search_ef,
+                                                                      candidate_k,
+                                                                      max_visits,
+                                                                      time_budget_us,
+                                                                      expand_factor,
+                                                                      filter,
+                                                                      meta,
+                                                                      partial,
+                                                                      time_budget_hit,
+                                                                      visit_budget_hit);
 
         std::vector<std::pair<float, std::uint32_t>> scored;
         scored.reserve(cand.size());
@@ -696,6 +731,11 @@ namespace pomai::core
         SortAndDedupeResults(resp.items, req.topk);
         resp.stats.filtered_candidates = scored.size();
         resp.stats.filtered_partial = partial;
+        resp.stats.filtered_time_budget_hit = time_budget_hit;
+        resp.stats.filtered_visit_budget_hit = visit_budget_hit;
+        resp.stats.filtered_budget_exhausted = (time_budget_hit || visit_budget_hit) && partial;
+        if (resp.stats.filtered_budget_exhausted && req.search_mode == pomai::SearchMode::Quality)
+            throw std::runtime_error("filtered search budget exhausted");
         resp.partial = resp.partial || partial;
         resp.stats.partial = resp.partial;
 
