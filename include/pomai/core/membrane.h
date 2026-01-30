@@ -193,6 +193,7 @@ namespace pomai
         mutable std::mutex scan_stats_mu_;
         mutable std::chrono::steady_clock::time_point scan_last_time_{};
         mutable std::uint64_t scan_last_count_{0};
+        pomai::Logger* log_{nullptr};
     };
 
 }

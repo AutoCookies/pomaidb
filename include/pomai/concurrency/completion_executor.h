@@ -9,6 +9,7 @@
 #include <queue>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <pomai/util/logger.h>
 
@@ -32,21 +33,38 @@ namespace pomai
             bool expected = false;
             if (!running_.compare_exchange_strong(expected, true))
                 return;
+
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                stop_requested_ = false;
+                // Do NOT clear tasks_.
+            }
+
             worker_ = std::thread([this]()
                                   { WorkerLoop(); });
+
+            // Optional: wake in case worker starts and tasks arrive concurrently.
+            cv_.notify_all();
         }
 
         void Stop()
         {
-            bool expected = true;
-            if (!running_.compare_exchange_strong(expected, false))
-                return;
+            // Make Stop idempotent and ALWAYS set stop_requested_.
             {
                 std::lock_guard<std::mutex> lk(mu_);
+                if (stop_requested_)
+                    return;
                 stop_requested_ = true;
+
+                // Policy: cancel pending tasks to guarantee fast shutdown.
+                while (!tasks_.empty())
+                    tasks_.pop();
             }
+
             cv_.notify_all();
-            if (worker_.joinable())
+
+            // Only join if we actually started the worker thread.
+            if (running_.exchange(false) && worker_.joinable())
                 worker_.join();
         }
 
@@ -54,11 +72,11 @@ namespace pomai
         {
             if (!fn)
                 return false;
-            if (!running_.load(std::memory_order_acquire))
-                return false;
+
             Task task;
             task.fn = std::move(fn);
             task.run_at = std::chrono::steady_clock::now() + delay;
+
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 if (stop_requested_)
@@ -67,7 +85,9 @@ namespace pomai
                     return false;
                 tasks_.push(std::move(task));
             }
-            cv_.notify_all();
+
+            // Notify only matters if the worker is running; safe to notify anyway.
+            cv_.notify_one();
             return true;
         }
 
@@ -88,6 +108,7 @@ namespace pomai
         {
             bool operator()(const Task &a, const Task &b) const
             {
+                // priority_queue puts "largest" on top; we want earliest run_at
                 return a.run_at > b.run_at;
             }
         };
@@ -95,41 +116,65 @@ namespace pomai
         void WorkerLoop()
         {
             std::unique_lock<std::mutex> lk(mu_);
-            while (true)
+
+            for (;;)
             {
-                if (stop_requested_ && tasks_.empty())
+                // Wait until there is work, or stop is requested.
+                cv_.wait(lk, [this]()
+                         { return stop_requested_ || !tasks_.empty(); });
+
+                if (stop_requested_)
                     return;
-                if (tasks_.empty())
+
+                // There is at least one task.
+                while (!tasks_.empty())
                 {
-                    cv_.wait(lk, [this]()
-                             { return stop_requested_ || !tasks_.empty(); });
-                    continue;
+                    if (stop_requested_)
+                        return;
+
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto next_time = tasks_.top().run_at;
+
+                    // If the next task is scheduled in the future, wait until that time
+                    // OR until the queue changes (new earlier task) OR stop is requested.
+                    if (next_time > now)
+                    {
+                        cv_.wait_until(lk, next_time, [this, next_time]()
+                                       {
+                                           return stop_requested_ ||
+                                                  tasks_.empty() ||
+                                                  tasks_.top().run_at < next_time; // earlier task inserted
+                                       });
+
+                        // Loop back to re-evaluate stop/queue/time
+                        continue;
+                    }
+
+                    // Task is ready to run now.
+                    Task task = tasks_.top();
+                    tasks_.pop();
+
+                    lk.unlock();
+                    try
+                    {
+                        task.fn();
+                    }
+                    catch (...)
+                    {
+                        if (logger_)
+                            logger_->Error("completion.task", "Completion task threw an exception");
+                    }
+                    lk.lock();
                 }
-                auto next_time = tasks_.top().run_at;
-                if (cv_.wait_until(lk, next_time, [this, next_time]()
-                                   { return stop_requested_ || tasks_.empty() || tasks_.top().run_at != next_time; }))
-                {
-                    continue;
-                }
-                Task task = tasks_.top();
-                tasks_.pop();
-                lk.unlock();
-                try
-                {
-                    task.fn();
-                }
-                catch (...)
-                {
-                    if (logger_)
-                        logger_->Error("completion.task", "Completion task threw an exception");
-                }
-                lk.lock();
             }
         }
 
         std::size_t max_queue_{1024};
         std::atomic<bool> running_{false};
+
+        // Guarded by mu_
         bool stop_requested_{false};
+
         std::thread worker_;
         mutable std::mutex mu_;
         std::condition_variable cv_;

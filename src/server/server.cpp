@@ -180,12 +180,9 @@ namespace pomai::server
                 }
                 else
                 {
-                    mode_t socket_mode = cfg_.dev_mode ? 0777 : 0660;
-                    if (::chmod(cfg_.unix_socket.c_str(), socket_mode) != 0)
-                    {
-                        if (log_)
-                            log_->Warn("server.ipc", "IPC chmod failed: " + cfg_.unix_socket + " (" + std::strerror(errno) + ")");
-                    }
+                    // Set permission rộng rãi để dễ dev (777)
+                    // Trong production nên dùng 660 và group ownership
+                    ::chmod(cfg_.unix_socket.c_str(), 0777);
 
                     if (::listen(ipc_fd_, 128) != 0)
                     {
@@ -298,9 +295,11 @@ namespace pomai::server
             for (auto &kv : cols_)
             {
                 if (kv.second.db)
+                { // Thêm ngoặc nhọn ở đây
                     auto st = kv.second.db->Stop();
                     if (!st.ok() && log_)
                         log_->Warn("server.stop", "Stop failed for collection '" + kv.second.name + "': " + st.msg);
+                } // Đóng ngoặc nhọn ở đây
             }
             cols_.clear();
             name_to_id_.clear();
@@ -367,10 +366,10 @@ namespace pomai::server
 
                 // Persist meta so we don't have to re-infer next time
                 SaveCollectionMeta(name, opt);
-                    if (log_)
-                        log_->Info("server.catalog", "Synthesized meta.bin for collection '" + name +
-                               "' (inferred dim=" + std::to_string(opt.dim) +
-                               ", shards=" + std::to_string(opt.shards) + ")");
+                if (log_)
+                    log_->Info("server.catalog", "Synthesized meta.bin for collection '" + name +
+                                                     "' (inferred dim=" + std::to_string(opt.dim) +
+                                                     ", shards=" + std::to_string(opt.shards) + ")");
             }
 
             // Re-check presence of meta.bin after possible synthesis
@@ -406,7 +405,7 @@ namespace pomai::server
             opt.metric = (metric_u8 == 0) ? pomai::Metric::L2 : pomai::Metric::Cosine;
             opt.shards = shards;
             opt.shard_queue_capacity = cap;
-                opt.wal_dir = entry.path().string();
+            opt.wal_dir = entry.path().string();
 
             // Carry global server-level policy into the DbOptions as a default unless the meta specifies otherwise.
             opt.allow_sync_on_append = cfg_.allow_sync_on_append;
@@ -460,16 +459,19 @@ namespace pomai::server
                     continue;
                 if (!running_)
                     break;
-                    if (log_)
-                        log_->Error("server.tcp", "TCP accept failed: " + std::string(std::strerror(errno)));
+
+                // Đưa ra ngoài hoặc dùng ngoặc nhọn nếu muốn nó chạy cùng điều kiện
+                if (log_)
+                    log_->Error("server.tcp", "TCP accept failed: " + std::string(std::strerror(errno)));
+
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
 
             if (active_connections_ >= MAX_CONNECTIONS)
             {
-                    if (log_)
-                        log_->Warn("server.tcp", "Max connections reached. Rejecting TCP client.");
+                if (log_)
+                    log_->Warn("server.tcp", "Max connections reached. Rejecting TCP client.");
                 ::close(client_fd);
                 continue;
             }

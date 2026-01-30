@@ -184,21 +184,35 @@ namespace pomai
             std::lock_guard<std::mutex> lk(mu_);
             stop_requested_ = true;
         }
-        cv_.notify_all();
+        cv_.notify_all(); // Đánh thức WriterLoop
+
+#ifdef __linux__
+        // CHIÊU THỨC BIG TECH: Gửi lệnh NOP để đánh thức CompletionLoop khỏi WaitCqe
+        if (uring_enabled_)
+        {
+            io_uring_sqe *sqe = uring_.GetSqe();
+            if (sqe)
+            {
+                std::memset(sqe, 0, sizeof(*sqe));
+                sqe->opcode = IORING_OP_NOP;
+                sqe->user_data = 0; // Tag 0 dành riêng cho Wakeup
+                uring_.Submit(0);
+            }
+        }
+#endif
+
+        // Đợi các batch cuối cùng trở nên durable
         try
         {
-            WaitDurable(WrittenLsn());
+            WaitDurable(next_lsn_.load() - 1);
         }
         catch (...)
         {
         }
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&]
-                     { return wal_error_.load() || (pending_writes_.empty() && inflight_.empty()); });
-        }
+
         running_.store(false);
         cv_.notify_all();
+
         if (writer_th_.joinable())
             writer_th_.join();
         if (completion_th_.joinable())
@@ -304,12 +318,10 @@ namespace pomai
             if (!running_.load())
                 ThrowSys("WAL not started");
             cv_.wait(lk, [&]
-                     {
-                         return !running_.load() ||
-                                (!stop_requested_ &&
-                                 pending_writes_.size() < options_.max_pending_records &&
-                                 pending_bytes_ + buf->size() <= options_.max_queued_bytes);
-                     });
+                     { return !running_.load() ||
+                              (!stop_requested_ &&
+                               pending_writes_.size() < options_.max_pending_records &&
+                               pending_bytes_ + buf->size() <= options_.max_queued_bytes); });
             if (wal_error_.load())
                 throw std::runtime_error("WAL error: " + wal_error_msg_);
             if (!running_.load() || stop_requested_)
@@ -334,10 +346,8 @@ namespace pomai
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 cv_.wait(lk, [&]
-                         {
-                             return wal_error_.load() || !running_.load() ||
-                                    !pending_writes_.empty();
-                         });
+                         { return wal_error_.load() || !running_.load() ||
+                                  !pending_writes_.empty(); });
                 if (wal_error_.load())
                     break;
                 if (!running_.load() && pending_writes_.empty())
@@ -345,10 +355,8 @@ namespace pomai
                 if (options_.max_inflight_batches > 0)
                 {
                     cv_.wait(lk, [&]
-                             {
-                                 return wal_error_.load() || inflight_batches_ < options_.max_inflight_batches ||
-                                        !running_.load();
-                             });
+                             { return wal_error_.load() || inflight_batches_ < options_.max_inflight_batches ||
+                                      !running_.load(); });
                     if (wal_error_.load())
                         break;
                     if (!running_.load() && pending_writes_.empty())
@@ -473,35 +481,30 @@ namespace pomai
 #ifdef __linux__
             if (!uring_enabled_)
             {
-                std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait_for(lk, std::chrono::milliseconds(10), [&]
-                             { return !running_.load(); });
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
             io_uring_cqe *cqe = nullptr;
             if (uring_.WaitCqe(&cqe) != 0)
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                wal_error_ = true;
-                wal_error_msg_ = std::strerror(errno);
-                cv_.notify_all();
-                break;
-            }
-            const uint64_t data = cqe->user_data;
-            const bool is_sync = (data & 1ULL) != 0;
-            auto *batch = reinterpret_cast<InflightBatch *>(data & ~1ULL);
-            const int res = cqe->res;
+                continue;
+
+            uint64_t data = cqe->user_data;
+            int res = cqe->res;
             uring_.AdvanceCq(1);
-            if (res < 0)
+
+            if (data == 0)
+                continue; // NOP wake-up
+
+            bool is_sync = (data & 1ULL) != 0;
+            auto *batch = reinterpret_cast<InflightBatch *>(data & ~1ULL);
+
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                wal_error_ = true;
-                wal_error_msg_ = std::strerror(-res);
-                cv_.notify_all();
-                break;
-            }
-            {
-                std::lock_guard<std::mutex> lk(mu_);
+                if (res < 0 && res != -ECANCELED)
+                {
+                    wal_error_ = true;
+                    wal_error_msg_ = std::strerror(-res);
+                }
                 for (auto &entry : inflight_)
                 {
                     if (entry.get() == batch)
@@ -520,14 +523,13 @@ namespace pomai
                         break;
                     durable_lsn_ = inflight_.front()->end_lsn;
                     inflight_.pop_front();
-                    inflight_batches_ = inflight_batches_ > 0 ? inflight_batches_ - 1 : 0;
+                    if (inflight_batches_ > 0)
+                        inflight_batches_--;
                 }
                 cv_.notify_all();
             }
 #else
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait_for(lk, std::chrono::milliseconds(10), [&]
-                         { return !running_.load(); });
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
 #endif
         }
     }

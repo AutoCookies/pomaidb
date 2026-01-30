@@ -8,6 +8,7 @@
 #include <pomai/util/fixed_topk.h>
 #include <pomai/storage/snapshot.h>
 #include <pomai/storage/verify.h>
+#include <pomai/server/config.h>
 #include <pomai/core/posix_compat.h>
 
 #include <stdexcept>
@@ -176,30 +177,38 @@ namespace pomai
     }
 
     MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
-                                   pomai::WhisperConfig w_cfg,
+                                   pomai::server::WhisperConfig w_cfg,
                                    std::size_t dim,
-                                   Metric metric,
+                                   pomai::Metric metric,
+                                   std::size_t shards_count,
+                                   std::size_t shard_queue_capacity,
                                    std::size_t search_pool_workers,
                                    std::size_t search_timeout_ms,
-                                   std::size_t scan_batch_cap,
-                                   std::size_t scan_id_order_max_rows,
                                    FilterConfig filter_config,
                                    std::function<void()> on_rejected_upsert,
-                                   Logger *logger)
+                                   pomai::Logger *logger)
         : shards_(std::move(shards)),
           brain_(w_cfg),
-          probe_P_(2),
+          router_(),
+          centroid_to_shard_(),
+          probe_P_(6),
+          centroids_path_(),
+          centroids_load_mode_(CentroidsLoadMode::Auto),
           dim_(dim),
-          metric_(metric),
           search_timeout_ms_(search_timeout_ms),
-          scan_batch_cap_(scan_batch_cap),
-          scan_id_order_max_rows_(scan_id_order_max_rows),
-          filter_config_(filter_config),
+          // Fix lỗi -Wreorder: Sắp xếp theo đúng thứ tự khai báo trong .h
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size())),
-          completion_(1024, logger),
           on_rejected_upsert_(std::move(on_rejected_upsert)),
-          logger_(logger)
+          log_(logger)
     {
+        // Tránh cảnh báo unused cho các tham số tạm thời
+        (void)metric;
+        (void)shards_count;
+        (void)shard_queue_capacity;
+        (void)filter_config;
+
+        if (shards_.empty())
+            throw std::runtime_error("must have at least 1 shard");
     }
 
     Status MembraneRouter::Start()

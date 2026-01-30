@@ -37,12 +37,14 @@ namespace pomai
     private:
         int fd_{-1};
         bool enabled_{false};
+        bool sqpoll_enabled_{false}; // Lưu trạng thái SQPOLL
         unsigned sq_entries_{0};
 
         void *sq_ptr_{nullptr};
         void *cq_ptr_{nullptr};
         void *sqes_ptr_{nullptr};
 
+        // Các con trỏ điều khiển ring được ánh xạ từ mmap
         unsigned *sq_head_{nullptr};
         unsigned *sq_tail_{nullptr};
         unsigned *sq_mask_{nullptr};
