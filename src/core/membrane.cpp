@@ -178,6 +178,8 @@ namespace pomai
                                    Metric metric,
                                    std::size_t search_pool_workers,
                                    std::size_t search_timeout_ms,
+                                   std::size_t scan_batch_cap,
+                                   std::size_t scan_id_order_max_rows,
                                    FilterConfig filter_config,
                                    std::function<void()> on_rejected_upsert)
         : shards_(std::move(shards)),
@@ -186,6 +188,8 @@ namespace pomai
           dim_(dim),
           metric_(metric),
           search_timeout_ms_(search_timeout_ms),
+          scan_batch_cap_(scan_batch_cap),
+          scan_id_order_max_rows_(scan_id_order_max_rows),
           filter_config_(filter_config),
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size())),
           on_rejected_upsert_(std::move(on_rejected_upsert))
@@ -509,6 +513,12 @@ namespace pomai
         out.stats.filtered_time_budget_hit = filtered_time_budget_hit;
         out.stats.filtered_visit_budget_hit = filtered_visit_budget_hit;
         out.stats.filtered_budget_exhausted = filtered_budget_exhausted;
+        if (filtered_time_budget_hit)
+            search_budget_time_hit_.fetch_add(1, std::memory_order_relaxed);
+        if (filtered_visit_budget_hit)
+            search_budget_visit_hit_.fetch_add(1, std::memory_order_relaxed);
+        if (filtered_budget_exhausted)
+            search_budget_exhausted_.fetch_add(1, std::memory_order_relaxed);
         float lat = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
         brain_.observe_latency(lat);
 
@@ -529,6 +539,335 @@ namespace pomai
         }
 
         return out;
+    }
+
+    std::shared_ptr<const MembraneRouter::ScanView> MembraneRouter::FindView(std::uint64_t epoch) const
+    {
+        std::lock_guard<std::mutex> lk(scan_views_mu_);
+        for (const auto &view : scan_views_)
+        {
+            if (view && view->epoch == epoch)
+                return view;
+        }
+        return nullptr;
+    }
+
+    std::shared_ptr<const MembraneRouter::ScanView> MembraneRouter::GetOrCreateView(ScanOrder order, ScanStatus &status) const
+    {
+        auto view = std::make_shared<ScanView>();
+        view->epoch = scan_epoch_.fetch_add(1, std::memory_order_relaxed);
+        view->total_rows = 0;
+        for (std::size_t i = 0; i < shards_.size(); ++i)
+        {
+            auto state = shards_[i]->SnapshotState();
+            if (!state)
+                continue;
+            for (const auto &seg : state->segments)
+            {
+                if (!seg.snap)
+                    continue;
+                view->grains.push_back({seg.snap, i});
+                view->grain_row_counts.push_back(seg.snap->ids.size());
+                view->total_rows += seg.snap->ids.size();
+            }
+            if (state->live_snap)
+            {
+                view->grains.push_back({state->live_snap, i});
+                view->grain_row_counts.push_back(state->live_snap->ids.size());
+                view->total_rows += state->live_snap->ids.size();
+            }
+        }
+        if (order == ScanOrder::IdAsc)
+        {
+            if (view->total_rows > scan_id_order_max_rows_)
+            {
+                status = ScanStatus::UnsupportedOrder;
+                return nullptr;
+            }
+            view->id_index.reserve(view->total_rows);
+            for (std::size_t g = 0; g < view->grains.size(); ++g)
+            {
+                auto snap = view->grains[g].snap;
+                if (!snap)
+                    continue;
+                for (std::size_t row = 0; row < snap->ids.size(); ++row)
+                    view->id_index.emplace_back(g, row);
+            }
+            std::sort(view->id_index.begin(), view->id_index.end(),
+                      [view](const auto &a, const auto &b)
+                      {
+                          const auto &sa = view->grains[a.first].snap;
+                          const auto &sb = view->grains[b.first].snap;
+                          Id ia = sa ? sa->ids[a.second] : 0;
+                          Id ib = sb ? sb->ids[b.second] : 0;
+                          return ia < ib;
+                      });
+        }
+        {
+            std::lock_guard<std::mutex> lk(scan_views_mu_);
+            scan_views_.push_back(view);
+            while (scan_views_.size() > 8)
+                scan_views_.pop_front();
+        }
+        return view;
+    }
+
+    std::string MembraneRouter::EncodeCursor(std::uint64_t epoch, std::size_t grain, std::size_t row) const
+    {
+        return std::to_string(epoch) + ":" + std::to_string(grain) + ":" + std::to_string(row);
+    }
+
+    bool MembraneRouter::DecodeCursor(const std::string &cursor, std::uint64_t &epoch, std::size_t &grain, std::size_t &row) const
+    {
+        if (cursor.empty())
+            return false;
+        std::size_t p1 = cursor.find(':');
+        if (p1 == std::string::npos)
+            return false;
+        std::size_t p2 = cursor.find(':', p1 + 1);
+        if (p2 == std::string::npos)
+            return false;
+        try
+        {
+            epoch = std::stoull(cursor.substr(0, p1));
+            grain = static_cast<std::size_t>(std::stoull(cursor.substr(p1 + 1, p2 - p1 - 1)));
+            row = static_cast<std::size_t>(std::stoull(cursor.substr(p2 + 1)));
+        }
+        catch (...)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    ScanResponse MembraneRouter::Scan(const ScanRequest &req) const
+    {
+        ScanResponse resp;
+        const std::size_t batch_cap = scan_batch_cap_ == 0 ? 1024 : scan_batch_cap_;
+        const std::size_t batch_size = std::min(req.batch_size == 0 ? std::size_t(1024) : req.batch_size, batch_cap);
+        resp.items.reserve(batch_size);
+        if (req.include_vectors)
+            resp.vectors.reserve(batch_size * dim_);
+        if (req.include_metadata)
+            resp.tags.reserve(batch_size * 8);
+        Filter normalized_filter = req.filter;
+        auto normalize_vec = [](std::vector<TagId> &tags)
+        {
+            std::sort(tags.begin(), tags.end());
+            tags.erase(std::unique(tags.begin(), tags.end()), tags.end());
+        };
+        normalize_vec(normalized_filter.require_all_tags);
+        normalize_vec(normalized_filter.require_any_tags);
+        normalize_vec(normalized_filter.exclude_tags);
+        const std::size_t total_tags = normalized_filter.require_all_tags.size() +
+                                       normalized_filter.require_any_tags.size() +
+                                       normalized_filter.exclude_tags.size();
+        if (total_tags > filter_config_.max_filter_tags)
+        {
+            resp.status = ScanStatus::InvalidRequest;
+            resp.error = "scan filter tags exceeded";
+            return resp;
+        }
+        std::uint64_t epoch = 0;
+        std::size_t grain_idx = 0;
+        std::size_t row_idx = 0;
+        std::shared_ptr<const ScanView> view;
+        if (!req.cursor.empty())
+        {
+            if (!DecodeCursor(req.cursor, epoch, grain_idx, row_idx))
+            {
+                resp.status = ScanStatus::InvalidCursor;
+                resp.error = "invalid cursor format";
+                return resp;
+            }
+            view = FindView(epoch);
+            if (!view)
+            {
+                resp.status = ScanStatus::InvalidCursor;
+                resp.error = "cursor expired";
+                return resp;
+            }
+            if (req.order == ScanOrder::IdAsc)
+            {
+                if (grain_idx > view->id_index.size())
+                {
+                    resp.status = ScanStatus::InvalidCursor;
+                    resp.error = "cursor out of range";
+                    return resp;
+                }
+            }
+            else if (grain_idx > view->grains.size())
+            {
+                resp.status = ScanStatus::InvalidCursor;
+                resp.error = "cursor out of range";
+                return resp;
+            }
+            if (req.order == ScanOrder::Natural && grain_idx < view->grain_row_counts.size() && row_idx > view->grain_row_counts[grain_idx])
+            {
+                resp.status = ScanStatus::InvalidCursor;
+                resp.error = "cursor row out of range";
+                return resp;
+            }
+        }
+        else
+        {
+            ScanStatus status = ScanStatus::Ok;
+            view = GetOrCreateView(req.order, status);
+            if (!view)
+            {
+                resp.status = status;
+                resp.error = "scan order unsupported for snapshot size";
+                return resp;
+            }
+            epoch = view->epoch;
+            grain_idx = 0;
+            row_idx = 0;
+        }
+        if (!view)
+        {
+            resp.status = ScanStatus::InvalidCursor;
+            resp.error = "no view";
+            return resp;
+        }
+
+        std::vector<float> scratch(dim_);
+        bool filter_active = !normalized_filter.empty();
+        while (resp.items.size() < batch_size)
+        {
+            if (req.order == ScanOrder::IdAsc)
+            {
+                if (grain_idx >= view->id_index.size())
+                    break;
+                const auto [g, r] = view->id_index[grain_idx];
+                auto snap = view->grains[g].snap;
+                if (!snap || r >= snap->ids.size())
+                {
+                    ++grain_idx;
+                    continue;
+                }
+                resp.stats.scanned++;
+                if (filter_active && !snap->MatchFilter(r, normalized_filter))
+                {
+                    ++grain_idx;
+                    continue;
+                }
+                ScanItem item;
+                item.id = snap->ids[r];
+                if (req.include_metadata)
+                {
+                    if (r < snap->namespace_ids.size())
+                        item.namespace_id = snap->namespace_ids[r];
+                    std::uint32_t start = (r < snap->tag_offsets.size()) ? snap->tag_offsets[r] : 0;
+                    std::uint32_t end = (r + 1 < snap->tag_offsets.size()) ? snap->tag_offsets[r + 1] : start;
+                    if (start <= end && end <= snap->tag_ids.size())
+                    {
+                        item.tag_offset = resp.tags.size();
+                        item.tag_count = end - start;
+                        resp.tags.insert(resp.tags.end(), snap->tag_ids.begin() + start, snap->tag_ids.begin() + end);
+                    }
+                }
+                if (req.include_vectors)
+                {
+                    item.vector_offset = resp.vectors.size();
+                    Seed::DequantizeRow(snap, r, scratch.data());
+                    resp.vectors.insert(resp.vectors.end(), scratch.begin(), scratch.end());
+                }
+                resp.items.push_back(item);
+                resp.stats.returned++;
+                ++grain_idx;
+                continue;
+            }
+
+            if (grain_idx >= view->grains.size())
+                break;
+            auto snap = view->grains[grain_idx].snap;
+            if (!snap)
+            {
+                ++grain_idx;
+                row_idx = 0;
+                continue;
+            }
+            if (row_idx >= snap->ids.size())
+            {
+                ++grain_idx;
+                row_idx = 0;
+                continue;
+            }
+            resp.stats.scanned++;
+            if (filter_active && !snap->MatchFilter(row_idx, normalized_filter))
+            {
+                ++row_idx;
+                continue;
+            }
+            ScanItem item;
+            item.id = snap->ids[row_idx];
+            if (req.include_metadata)
+            {
+                if (row_idx < snap->namespace_ids.size())
+                    item.namespace_id = snap->namespace_ids[row_idx];
+                std::uint32_t start = (row_idx < snap->tag_offsets.size()) ? snap->tag_offsets[row_idx] : 0;
+                std::uint32_t end = (row_idx + 1 < snap->tag_offsets.size()) ? snap->tag_offsets[row_idx + 1] : start;
+                if (start <= end && end <= snap->tag_ids.size())
+                {
+                    item.tag_offset = resp.tags.size();
+                    item.tag_count = end - start;
+                    resp.tags.insert(resp.tags.end(), snap->tag_ids.begin() + start, snap->tag_ids.begin() + end);
+                }
+            }
+            if (req.include_vectors)
+            {
+                item.vector_offset = resp.vectors.size();
+                Seed::DequantizeRow(snap, row_idx, scratch.data());
+                resp.vectors.insert(resp.vectors.end(), scratch.begin(), scratch.end());
+            }
+            resp.items.push_back(item);
+            resp.stats.returned++;
+            ++row_idx;
+        }
+
+        if (req.order == ScanOrder::IdAsc)
+        {
+            if (grain_idx < view->id_index.size())
+            {
+                resp.next_cursor = EncodeCursor(epoch, grain_idx, 0);
+                resp.stats.partial = true;
+            }
+        }
+        else
+        {
+            if (grain_idx < view->grains.size())
+            {
+                resp.next_cursor = EncodeCursor(epoch, grain_idx, row_idx);
+                if (row_idx < view->grain_row_counts[grain_idx])
+                    resp.stats.partial = true;
+            }
+        }
+
+        if (resp.stats.returned >= batch_size && !resp.next_cursor.empty())
+            resp.stats.partial = true;
+        if (resp.stats.returned > 0)
+        {
+            auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lk(scan_stats_mu_);
+            if (scan_last_time_.time_since_epoch().count() == 0)
+            {
+                scan_last_time_ = now;
+                scan_last_count_ = resp.stats.returned;
+            }
+            else
+            {
+                scan_last_count_ += resp.stats.returned;
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - scan_last_time_);
+                if (elapsed.count() > 0)
+                {
+                    scan_items_per_sec_.store(scan_last_count_ / static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
+                    scan_last_time_ = now;
+                    scan_last_count_ = 0;
+                }
+            }
+        }
+
+        return resp;
     }
 
     std::future<bool> MembraneRouter::RequestCheckpoint()
@@ -579,6 +918,7 @@ namespace pomai
                     done->set_value(false);
                     return;
                 }
+                last_checkpoint_lsn_.store(res.manifest.checkpoint_lsn, std::memory_order_relaxed);
                 done->set_value(true);
             }
             catch (...)
@@ -597,6 +937,7 @@ namespace pomai
         storage::Manifest manifest;
         if (!storage::RecoverLatestCheckpoint(db_dir, snapshot, manifest, err))
             return false;
+        last_checkpoint_lsn_.store(manifest.checkpoint_lsn, std::memory_order_relaxed);
         if (snapshot.schema.dim != dim_ || snapshot.schema.shards != shards_.size())
         {
             if (err)
@@ -633,6 +974,34 @@ namespace pomai
 
     void MembraneRouter::SetProbeCount(std::size_t p) { probe_P_ = (p == 0 ? 1 : p); }
     double MembraneRouter::SearchQueueAvgLatencyMs() const { return search_pool_.QueueWaitEmaMs(); }
+    std::size_t MembraneRouter::CompactionBacklog() const
+    {
+        std::size_t total = 0;
+        for (const auto &s : shards_)
+            total += s->CompactionBacklog();
+        return total;
+    }
+
+    std::uint64_t MembraneRouter::LastCompactionDurationMs() const
+    {
+        std::uint64_t last = 0;
+        for (const auto &s : shards_)
+            last = std::max(last, s->LastCompactionDurationMs());
+        return last;
+    }
+
+    std::vector<std::uint64_t> MembraneRouter::WalLagLsns() const
+    {
+        std::vector<std::uint64_t> out;
+        out.reserve(shards_.size());
+        for (const auto &s : shards_)
+        {
+            auto written = s->WrittenLsn();
+            auto durable = s->DurableLsn();
+            out.push_back(written > durable ? written - durable : 0);
+        }
+        return out;
+    }
     std::optional<MembraneRouter::HotspotInfo> MembraneRouter::CurrentHotspot() const
     {
         std::lock_guard<std::mutex> lk(hotspot_mu_);

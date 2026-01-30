@@ -51,11 +51,16 @@ namespace pomai
         {
             std::ostringstream ss;
             ss << "shard-" << i;
+            CompactionConfig compaction_cfg;
+            compaction_cfg.level_fanout = opt_.level_fanout;
+            compaction_cfg.max_concurrent_compactions = opt_.max_concurrent_compactions;
+            compaction_cfg.compaction_trigger_threshold = opt_.compaction_trigger_threshold;
             auto sh = std::make_unique<Shard>(
                 ss.str(),
                 opt_.dim,
                 opt_.shard_queue_capacity,
                 paths.wal_dir,
+                compaction_cfg,
                 log_info_,
                 log_error_);
             sh->SetIndexBuildPool(build_pool_.get());
@@ -77,6 +82,8 @@ namespace pomai
                                                      opt_.metric,
                                                      opt_.search_pool_workers,
                                                      opt_.search_timeout_ms,
+                                                     opt_.scan_batch_cap,
+                                                     opt_.scan_id_order_max_rows,
                                                      filter_cfg,
                                                      [this]()
                                                      {
@@ -172,6 +179,11 @@ namespace pomai
         return membrane_->Search(req);
     }
 
+    ScanResponse PomaiDB::Scan(const ScanRequest &req) const
+    {
+        return membrane_->Scan(req);
+    }
+
     void PomaiDB::SetProbeCount(std::size_t p)
     {
         membrane_->SetProbeCount(p);
@@ -187,6 +199,22 @@ namespace pomai
         ss << ",\"search_overload_total\":" << membrane_->SearchOverloadCount();
         ss << ",\"search_inline_total\":" << membrane_->SearchInlineCount();
         ss << ",\"search_partial_total\":" << membrane_->SearchPartialCount();
+        ss << ",\"search_budget_time_hit_total\":" << membrane_->SearchBudgetTimeHitCount();
+        ss << ",\"search_budget_visit_hit_total\":" << membrane_->SearchBudgetVisitHitCount();
+        ss << ",\"search_budget_exhausted_total\":" << membrane_->SearchBudgetExhaustedCount();
+        ss << ",\"scan_items_per_sec\":" << membrane_->ScanItemsPerSec();
+        ss << ",\"compaction_backlog\":" << membrane_->CompactionBacklog();
+        ss << ",\"last_compaction_ms\":" << membrane_->LastCompactionDurationMs();
+        ss << ",\"last_checkpoint_lsn\":" << membrane_->LastCheckpointLsn();
+        ss << ",\"wal_lag_lsns\":[";
+        auto lags = membrane_->WalLagLsns();
+        for (std::size_t i = 0; i < lags.size(); ++i)
+        {
+            if (i > 0)
+                ss << ",";
+            ss << lags[i];
+        }
+        ss << "]";
         ss << ",\"active_index_builds\":" << (build_pool_ ? build_pool_->ActiveBuilds() : 0);
         ss << ",\"memory_usage_bytes\":{";
         ss << "\"snapshot\":" << mm.Usage(MemoryManager::Pool::Search);

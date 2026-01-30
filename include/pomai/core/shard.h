@@ -54,6 +54,8 @@ namespace pomai
         Seed::Snapshot snap;
         std::shared_ptr<const GrainIndex> grains;
         std::shared_ptr<const pomai::core::OrbitIndex> index;
+        std::uint32_t level{0};
+        std::uint64_t created_at{0};
     };
 
     struct ShardState
@@ -61,6 +63,13 @@ namespace pomai
         std::vector<IndexedSegment> segments;
         Seed::Snapshot live_snap;
         std::shared_ptr<const GrainIndex> live_grains;
+    };
+
+    struct CompactionConfig
+    {
+        std::size_t level_fanout{4};
+        std::size_t max_concurrent_compactions{1};
+        std::size_t compaction_trigger_threshold{4};
     };
 
 
@@ -73,6 +82,7 @@ namespace pomai
               std::size_t dim,
               std::size_t queue_cap,
               std::string wal_dir,
+              CompactionConfig compaction,
               LogFn info = nullptr,
               LogFn error = nullptr);
         ~Shard();
@@ -87,6 +97,11 @@ namespace pomai
 
         SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
         std::size_t ApproxCountUnsafe() const;
+        std::shared_ptr<const ShardState> SnapshotState() const;
+        std::size_t CompactionBacklog() const;
+        std::uint64_t LastCompactionDurationMs() const;
+        Lsn DurableLsn() const;
+        Lsn WrittenLsn() const;
         std::vector<Vector> SampleVectors(std::size_t max_samples) const;
         void LoadFromCheckpoint(const ShardCheckpointState &state, Lsn checkpoint_lsn);
 
@@ -105,6 +120,11 @@ namespace pomai
         static void MergeTopK(SearchResponse &out, const SearchResponse &in, std::size_t k);
         std::shared_ptr<GrainIndex> BuildGrainIndex(const Seed::Snapshot &snap) const;
         SearchResponse SearchGrains(const Seed::Snapshot &snap, const GrainIndex &grains, const SearchRequest &req, const pomai::ai::Budget &budget) const;
+        void RunCompactionLoop();
+        void MaybeScheduleCompaction();
+        bool CompactLevel(std::uint32_t level);
+        std::size_t ComputeCompactionBacklog(const std::shared_ptr<const ShardState> &state) const;
+        Seed MergeSnapshots(const std::vector<Seed::Snapshot> &snaps) const;
 
     private:
         std::string name_;
@@ -118,6 +138,7 @@ namespace pomai
         mutable std::mutex writer_mu_;
         std::atomic<std::shared_ptr<const ShardState>> state_{nullptr};
         std::thread owner_;
+        std::thread compactor_;
         static constexpr std::size_t kFreezeEveryVectors = 50000;
         std::size_t since_freeze_{0};
         static constexpr std::size_t kMaxSegments = 64;
@@ -126,6 +147,12 @@ namespace pomai
         std::atomic<bool> emergency_freeze_pending_{false};
         std::optional<Lsn> checkpoint_lsn_;
         bool recovered_{false};
+        CompactionConfig compaction_;
+        std::atomic<bool> compactor_running_{false};
+        std::atomic<std::size_t> active_compactions_{0};
+        std::atomic<std::uint64_t> last_compaction_ms_{0};
+        std::atomic<std::size_t> compaction_backlog_{0};
+        std::atomic<std::uint64_t> segment_epoch_{0};
 
     public:
         void SetIndexBuildPool(IndexBuildPool *pool) { build_pool_ = pool; }

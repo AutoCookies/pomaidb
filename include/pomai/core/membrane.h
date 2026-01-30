@@ -3,6 +3,7 @@
 #include <memory>
 #include <future>
 #include <string>
+#include <deque>
 #include <optional>
 #include <functional>
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <pomai/core/shard.h>
 #include <pomai/api/options.h>
+#include <pomai/api/scan.h>
 #include <pomai/index/whispergrain.h>
 #include <pomai/core/spatial_router.h>
 #include <pomai/util/search_thread_pool.h> // new
@@ -45,6 +47,8 @@ namespace pomai
                                 Metric metric,
                                 std::size_t search_pool_workers,
                                 std::size_t search_timeout_ms,
+                                std::size_t scan_batch_cap,
+                                std::size_t scan_id_order_max_rows,
                                 FilterConfig filter_config,
                                 std::function<void()> on_rejected_upsert);
 
@@ -54,6 +58,7 @@ namespace pomai
         std::future<Lsn> Upsert(Id id, Vector vec, bool wait_durable = true);
         std::future<Lsn> UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable = true);
         SearchResponse Search(const SearchRequest &req) const;
+        ScanResponse Scan(const ScanRequest &req) const;
 
         std::size_t ShardCount() const { return shards_.size(); }
         std::size_t TotalApproxCountUnsafe() const;
@@ -71,6 +76,14 @@ namespace pomai
         std::uint64_t SearchOverloadCount() const { return search_overload_.load(std::memory_order_relaxed); }
         std::uint64_t SearchInlineCount() const { return search_inline_.load(std::memory_order_relaxed); }
         std::uint64_t SearchPartialCount() const { return search_partial_.load(std::memory_order_relaxed); }
+        std::uint64_t SearchBudgetTimeHitCount() const { return search_budget_time_hit_.load(std::memory_order_relaxed); }
+        std::uint64_t SearchBudgetVisitHitCount() const { return search_budget_visit_hit_.load(std::memory_order_relaxed); }
+        std::uint64_t SearchBudgetExhaustedCount() const { return search_budget_exhausted_.load(std::memory_order_relaxed); }
+        std::uint64_t ScanItemsPerSec() const { return scan_items_per_sec_.load(std::memory_order_relaxed); }
+        std::size_t CompactionBacklog() const;
+        std::uint64_t LastCompactionDurationMs() const;
+        std::uint64_t LastCheckpointLsn() const { return last_checkpoint_lsn_.load(std::memory_order_relaxed); }
+        std::vector<std::uint64_t> WalLagLsns() const;
 
         struct HotspotInfo
         {
@@ -137,6 +150,40 @@ namespace pomai
         mutable std::atomic<std::uint64_t> search_overload_{0};
         mutable std::atomic<std::uint64_t> search_inline_{0};
         mutable std::atomic<std::uint64_t> search_partial_{0};
+        mutable std::atomic<std::uint64_t> search_budget_time_hit_{0};
+        mutable std::atomic<std::uint64_t> search_budget_visit_hit_{0};
+        mutable std::atomic<std::uint64_t> search_budget_exhausted_{0};
+
+        struct ScanGrain
+        {
+            Seed::Snapshot snap;
+            std::size_t shard_id{0};
+        };
+
+        struct ScanView
+        {
+            std::uint64_t epoch{0};
+            std::vector<ScanGrain> grains;
+            std::vector<std::size_t> grain_row_counts;
+            std::vector<std::pair<std::size_t, std::size_t>> id_index;
+            std::size_t total_rows{0};
+        };
+
+        std::shared_ptr<const ScanView> GetOrCreateView(ScanOrder order, ScanStatus &status) const;
+        std::shared_ptr<const ScanView> FindView(std::uint64_t epoch) const;
+        std::string EncodeCursor(std::uint64_t epoch, std::size_t grain, std::size_t row) const;
+        bool DecodeCursor(const std::string &cursor, std::uint64_t &epoch, std::size_t &grain, std::size_t &row) const;
+
+        mutable std::mutex scan_views_mu_;
+        mutable std::deque<std::shared_ptr<const ScanView>> scan_views_;
+        mutable std::atomic<std::uint64_t> scan_epoch_{1};
+        std::size_t scan_batch_cap_{4096};
+        std::size_t scan_id_order_max_rows_{1000000};
+        mutable std::atomic<std::uint64_t> scan_items_per_sec_{0};
+        mutable std::atomic<std::uint64_t> last_checkpoint_lsn_{0};
+        mutable std::mutex scan_stats_mu_;
+        mutable std::chrono::steady_clock::time_point scan_last_time_{};
+        mutable std::uint64_t scan_last_count_{0};
     };
 
 }

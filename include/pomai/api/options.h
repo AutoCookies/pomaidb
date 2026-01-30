@@ -51,6 +51,15 @@ namespace pomai
         std::size_t tag_dictionary_max_size{100000};
         std::size_t max_tags_per_vector{32};
         std::size_t max_filter_tags{64};
+
+        // Compaction knobs
+        std::size_t level_fanout{4};
+        std::size_t max_concurrent_compactions{1};
+        std::size_t compaction_trigger_threshold{4};
+
+        // Scan knobs
+        std::size_t scan_batch_cap{4096};
+        std::size_t scan_id_order_max_rows{1000000};
     };
 
 } // namespace pomai
