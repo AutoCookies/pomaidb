@@ -2,7 +2,7 @@
 
 #include <pomai/storage/wal.h>
 
-#include "tests/common/test_utils.h"
+#include "common/test_utils.h"
 
 #include <algorithm>
 #include <thread>

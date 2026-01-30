@@ -3,7 +3,7 @@
 #include <pomai/core/shard.h>
 #include <pomai/index/whispergrain.h>
 
-#include "tests/common/test_utils.h"
+#include "common/test_utils.h"
 
 namespace
 {

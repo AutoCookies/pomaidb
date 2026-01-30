@@ -2,7 +2,7 @@
 
 #include <pomai/api/pomai_db.h>
 
-#include "tests/common/test_utils.h"
+#include "common/test_utils.h"
 
 #include <unordered_set>
 
