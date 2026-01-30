@@ -588,6 +588,124 @@ namespace pomai
         return std::const_pointer_cast<const Store>(out);
     }
 
+    Seed::PersistedState Seed::ExportPersistedState() const
+    {
+        PersistedState out;
+        out.dim = static_cast<std::uint32_t>(dim_);
+        out.ids = ids_;
+        out.qdata = qdata_;
+        out.qmins = qmins_;
+        out.qmaxs = qmaxs_;
+        out.qscales = qscales_;
+        out.namespace_ids = namespace_ids_;
+        out.tag_offsets.clear();
+        out.tag_ids.clear();
+        out.tag_offsets.reserve(out.ids.size() + 1);
+        out.tag_offsets.push_back(0);
+        std::size_t total_tags = 0;
+        for (const auto &tags : tags_)
+            total_tags += tags.size();
+        out.tag_ids.reserve(total_tags);
+        for (std::size_t row = 0; row < out.ids.size(); ++row)
+        {
+            if (row < tags_.size())
+            {
+                const auto &tags = tags_[row];
+                out.tag_ids.insert(out.tag_ids.end(), tags.begin(), tags.end());
+            }
+            out.tag_offsets.push_back(static_cast<std::uint32_t>(out.tag_ids.size()));
+        }
+        out.is_fixed = is_fixed_;
+        out.total_ingested = total_ingested_;
+        out.fixed_bounds_after = fixed_bounds_after_;
+        return out;
+    }
+
+    void Seed::LoadPersistedState(PersistedState state)
+    {
+        if (state.dim != dim_)
+            throw std::runtime_error("LoadPersistedState dim mismatch");
+        ReleaseMemtableAccounting();
+        ids_ = std::move(state.ids);
+        qdata_ = std::move(state.qdata);
+        qmins_ = std::move(state.qmins);
+        qmaxs_ = std::move(state.qmaxs);
+        qscales_ = std::move(state.qscales);
+        qinv_scales_.resize(qscales_.size());
+        for (std::size_t d = 0; d < qscales_.size(); ++d)
+            qinv_scales_[d] = (qscales_[d] > 0.0f) ? (1.0f / qscales_[d]) : 0.0f;
+        pos_.clear();
+        pos_.reserve(ids_.size());
+        for (std::size_t i = 0; i < ids_.size(); ++i)
+            pos_[ids_[i]] = static_cast<std::uint32_t>(i);
+        namespace_ids_ = std::move(state.namespace_ids);
+        tags_.clear();
+        tags_.reserve(ids_.size());
+        const auto &offsets = state.tag_offsets;
+        const auto &tags = state.tag_ids;
+        if (offsets.size() >= ids_.size() + 1)
+        {
+            for (std::size_t row = 0; row < ids_.size(); ++row)
+            {
+                std::uint32_t start = offsets[row];
+                std::uint32_t end = offsets[row + 1];
+                if (start > end || end > tags.size())
+                {
+                    tags_.push_back({});
+                    continue;
+                }
+                tags_.push_back(std::vector<TagId>(tags.begin() + start, tags.begin() + end));
+            }
+        }
+        else
+        {
+            tags_.resize(ids_.size());
+        }
+        qrows_ = ids_.size();
+        qcap_ = qdata_.size() / (dim_ == 0 ? 1 : dim_);
+        if (qcap_ < qrows_)
+            qcap_ = qrows_;
+        sample_buf_.clear();
+        sample_ids_.clear();
+        sample_rows_ = 0;
+        calibrated_ = true;
+        is_fixed_ = state.is_fixed;
+        total_ingested_ = state.total_ingested;
+        fixed_bounds_after_ = state.fixed_bounds_after == 0 ? fixed_bounds_after_ : state.fixed_bounds_after;
+        UpdateMemtableAccounting();
+    }
+
+    Seed::Snapshot Seed::SnapshotFromState(const PersistedState &state)
+    {
+        auto deleter = [](Store *store)
+        {
+            if (!store)
+                return;
+            if (store->accounted_bytes > 0)
+                MemoryManager::Instance().ReleaseUsage(MemoryManager::Pool::Search, store->accounted_bytes);
+            delete store;
+        };
+        std::shared_ptr<Store> out(new Store(), deleter);
+        out->dim = state.dim;
+        out->ids = state.ids;
+        out->qdata = state.qdata;
+        out->qmins = state.qmins;
+        out->qscales = state.qscales;
+        out->namespace_ids = state.namespace_ids;
+        out->tag_offsets = state.tag_offsets;
+        out->tag_ids = state.tag_ids;
+        out->is_quantized.store(true, std::memory_order_release);
+        out->accounted_bytes = out->ids.size() * sizeof(Id) +
+                               out->qdata.size() * sizeof(std::uint8_t) +
+                               (out->qmins.size() + out->qscales.size()) * sizeof(float);
+        out->accounted_bytes += out->namespace_ids.size() * sizeof(std::uint32_t) +
+                                out->tag_offsets.size() * sizeof(std::uint32_t) +
+                                out->tag_ids.size() * sizeof(TagId);
+        if (out->accounted_bytes > 0)
+            MemoryManager::Instance().AddUsage(MemoryManager::Pool::Search, out->accounted_bytes);
+        return std::const_pointer_cast<const Store>(out);
+    }
+
     void Seed::Quantize(MutableSnapshot snap)
     {
         if (!snap)

@@ -323,9 +323,10 @@ namespace pomai::server
                 // Look for shard-*.wal files in this directory
                 bool found_any_wal = false;
                 uint16_t inferred_dim = 0;
+                std::string wal_dir = entry.path().string() + "/wal";
                 for (std::size_t i = 0; i < cfg_.shards; ++i)
                 {
-                    std::string wp = entry.path().string() + "/shard-" + std::to_string(i) + ".wal";
+                    std::string wp = wal_dir + "/shard-" + std::to_string(i) + ".wal";
                     if (fs::exists(wp))
                     {
                         found_any_wal = true;
@@ -399,7 +400,7 @@ namespace pomai::server
             opt.metric = (metric_u8 == 0) ? pomai::Metric::L2 : pomai::Metric::Cosine;
             opt.shards = shards;
             opt.shard_queue_capacity = cap;
-            opt.wal_dir = entry.path().string();
+                opt.wal_dir = entry.path().string();
 
             // Carry global server-level policy into the DbOptions as a default unless the meta specifies otherwise.
             opt.allow_sync_on_append = cfg_.allow_sync_on_append;

@@ -63,6 +63,7 @@ namespace pomai
     void WaitDurable(Lsn lsn);
 
     WalReplayStats ReplayToSeed(class Seed &seed);
+    WalReplayStats ReplayToSeed(class Seed &seed, Lsn min_lsn);
 
     Lsn WrittenLsn() const;
 
