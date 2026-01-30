@@ -2,7 +2,7 @@
 
 #include <pomai/index/orbit_index.h>
 
-#include "tests/common/test_utils.h"
+#include "common/test_utils.h"
 
 namespace
 {

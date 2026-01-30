@@ -1,4 +1,4 @@
-#include "tests/common/test_utils.h"
+#include "common/test_utils.h"
 
 #include <pomai/util/search_utils.h>
 

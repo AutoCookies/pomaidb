@@ -3,7 +3,7 @@
 #include <pomai/storage/wal.h>
 #include <pomai/core/seed.h>
 
-#include "tests/common/test_utils.h"
+#include "common/test_utils.h"
 
 #include <filesystem>
 
