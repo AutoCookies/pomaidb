@@ -29,6 +29,7 @@ namespace pomai
             std::size_t filtered_candidate_k{5000};
             std::uint32_t filter_expand_factor{4};
             std::uint32_t filter_max_visits{20000};
+            std::uint64_t filter_time_budget_us{5000};
             std::size_t tag_dictionary_max_size{100000};
             std::size_t max_tags_per_vector{32};
             std::size_t max_filter_tags{64};
@@ -41,6 +42,7 @@ namespace pomai
         explicit MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                 pomai::WhisperConfig w_cfg,
                                 std::size_t dim,
+                                Metric metric,
                                 std::size_t search_pool_workers,
                                 std::size_t search_timeout_ms,
                                 FilterConfig filter_config,
@@ -56,6 +58,8 @@ namespace pomai
         std::size_t ShardCount() const { return shards_.size(); }
         std::size_t TotalApproxCountUnsafe() const;
         std::future<bool> RequestCheckpoint();
+        bool RecoverFromStorage(const std::string &db_dir, std::string *err = nullptr);
+        void SetDbDir(const std::string &dir) { db_dir_ = dir; }
 
         // Admin helpers to manage routing / centroids
         // - ConfigureCentroids: replace router centroids (atomic) and assign centroids to shards.
@@ -115,6 +119,8 @@ namespace pomai
         std::string centroids_path_;
         CentroidsLoadMode centroids_load_mode_{CentroidsLoadMode::Auto};
         std::size_t dim_{0};
+        Metric metric_{Metric::L2};
+        std::string db_dir_;
         std::size_t search_timeout_ms_{500};
         FilterConfig filter_config_{};
 

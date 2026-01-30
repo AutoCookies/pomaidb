@@ -19,13 +19,23 @@
 
 namespace pomai
 {
+    struct ShardCheckpointState
+    {
+        std::uint32_t shard_id{0};
+        Seed::PersistedState live;
+        std::vector<Seed::PersistedState> segments;
+        Lsn durable_lsn{0};
+    };
+
     struct UpsertTask
     {
         std::vector<UpsertRequest> batch;
         bool wait_durable{true};
         std::promise<Lsn> done;
         bool is_checkpoint{false};
+        bool is_checkpoint_state{false};
         std::optional<std::promise<bool>> checkpoint_done;
+        std::optional<std::promise<ShardCheckpointState>> checkpoint_state_done;
         bool is_emergency_freeze{false};
     };
 
@@ -35,8 +45,8 @@ namespace pomai
         std::vector<Vector> centroids;
         std::vector<std::size_t> offsets;
         std::vector<std::uint32_t> postings;
-        std::vector<std::uint32_t> namespace_min;
-        std::vector<std::uint32_t> namespace_max;
+        std::vector<std::size_t> namespace_offsets;
+        std::vector<std::uint32_t> namespace_ids;
     };
 
     struct IndexedSegment
@@ -52,6 +62,7 @@ namespace pomai
         Seed::Snapshot live_snap;
         std::shared_ptr<const GrainIndex> live_grains;
     };
+
 
     class Shard
     {
@@ -71,11 +82,13 @@ namespace pomai
 
         std::future<Lsn> EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable);
         std::future<bool> RequestCheckpoint();
+        std::future<ShardCheckpointState> RequestCheckpointState();
         void RequestEmergencyFreeze();
 
         SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
         std::size_t ApproxCountUnsafe() const;
         std::vector<Vector> SampleVectors(std::size_t max_samples) const;
+        void LoadFromCheckpoint(const ShardCheckpointState &state, Lsn checkpoint_lsn);
 
     private:
         void RunLoop();
@@ -111,6 +124,8 @@ namespace pomai
         static constexpr std::size_t kPublishLiveEveryVectors = 10000;
         std::size_t since_live_publish_{0};
         std::atomic<bool> emergency_freeze_pending_{false};
+        std::optional<Lsn> checkpoint_lsn_;
+        bool recovered_{false};
 
     public:
         void SetIndexBuildPool(IndexBuildPool *pool) { build_pool_ = pool; }

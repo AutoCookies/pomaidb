@@ -4,6 +4,8 @@
 #include <pomai/util/search_fanout.h>
 #include <pomai/util/memory_manager.h>
 #include <pomai/util/fixed_topk.h>
+#include <pomai/storage/snapshot.h>
+#include <pomai/storage/verify.h>
 
 #include <stdexcept>
 #include <algorithm>
@@ -173,6 +175,7 @@ namespace pomai
     MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                    pomai::WhisperConfig w_cfg,
                                    std::size_t dim,
+                                   Metric metric,
                                    std::size_t search_pool_workers,
                                    std::size_t search_timeout_ms,
                                    FilterConfig filter_config,
@@ -181,6 +184,7 @@ namespace pomai
           brain_(w_cfg),
           probe_P_(2),
           dim_(dim),
+          metric_(metric),
           search_timeout_ms_(search_timeout_ms),
           filter_config_(filter_config),
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size())),
@@ -381,6 +385,8 @@ namespace pomai
             normalized.filter_expand_factor = expand;
             std::uint32_t max_visits = normalized.filter_max_visits == 0 ? filter_config_.filter_max_visits : normalized.filter_max_visits;
             normalized.filter_max_visits = max_visits;
+            std::uint64_t time_budget_us = normalized.filter_time_budget_us == 0 ? filter_config_.filter_time_budget_us : normalized.filter_time_budget_us;
+            normalized.filter_time_budget_us = time_budget_us;
         }
 
         if (health == pomai::ai::WhisperGrain::BudgetHealth::Tight)
@@ -455,6 +461,9 @@ namespace pomai
 
         std::size_t completed = 0;
         bool filtered_partial = false;
+        bool filtered_time_budget_hit = false;
+        bool filtered_visit_budget_hit = false;
+        bool filtered_budget_exhausted = false;
         for (auto &f : futs)
         {
             if (f.wait_until(deadline) == std::future_status::ready)
@@ -465,6 +474,9 @@ namespace pomai
                     for (const auto &item : r.items)
                         merge_topk->Push(item.score, item.id);
                     filtered_partial = filtered_partial || r.stats.filtered_partial;
+                    filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
+                    filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
+                    filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
                     ++completed;
                 }
                 catch (...)
@@ -477,6 +489,9 @@ namespace pomai
             for (const auto &item : r.items)
                 merge_topk->Push(item.score, item.id);
             filtered_partial = filtered_partial || r.stats.filtered_partial;
+            filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
+            filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
+            filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
             ++completed;
         }
 
@@ -491,6 +506,9 @@ namespace pomai
         }
         out.stats.partial = out.partial;
         out.stats.filtered_partial = filtered_partial;
+        out.stats.filtered_time_budget_hit = filtered_time_budget_hit;
+        out.stats.filtered_visit_budget_hit = filtered_visit_budget_hit;
+        out.stats.filtered_budget_exhausted = filtered_budget_exhausted;
         float lat = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
         brain_.observe_latency(lat);
 
@@ -515,23 +533,51 @@ namespace pomai
 
     std::future<bool> MembraneRouter::RequestCheckpoint()
     {
-        std::vector<std::future<bool>> futs;
+        std::vector<std::future<ShardCheckpointState>> futs;
+        futs.reserve(shards_.size());
         for (auto &s : shards_)
-            futs.push_back(s->RequestCheckpoint());
+            futs.push_back(s->RequestCheckpointState());
         auto done = std::make_shared<std::promise<bool>>();
         auto out = done->get_future();
-        auto shared_futs = std::make_shared<std::vector<std::future<bool>>>(std::move(futs));
-        auto task = [shared_futs, done]() mutable
+        auto shared_futs = std::make_shared<std::vector<std::future<ShardCheckpointState>>>(std::move(futs));
+        auto task = [this, shared_futs, done]() mutable
         {
             try
             {
+                storage::SnapshotData snapshot;
+                snapshot.schema.dim = static_cast<std::uint32_t>(dim_);
+                snapshot.schema.metric = static_cast<std::uint32_t>(metric_);
+                snapshot.schema.shards = static_cast<std::uint32_t>(shards_.size());
+                snapshot.schema.index_kind = 0;
+                snapshot.shards.clear();
+                snapshot.shard_lsns.clear();
+                snapshot.shards.reserve(shared_futs->size());
+                snapshot.shard_lsns.reserve(shared_futs->size());
+                std::size_t shard_id = 0;
                 for (auto &f : *shared_futs)
                 {
-                    if (!f.get())
-                    {
-                        done->set_value(false);
-                        return;
-                    }
+                    auto state = f.get();
+                    state.shard_id = static_cast<std::uint32_t>(shard_id);
+                    storage::ShardSnapshot shard;
+                    shard.shard_id = state.shard_id;
+                    shard.segments = std::move(state.segments);
+                    shard.live = std::move(state.live);
+                    snapshot.shards.push_back(std::move(shard));
+                    snapshot.shard_lsns.push_back(state.durable_lsn);
+                    ++shard_id;
+                }
+
+                storage::CommitResult res;
+                std::string err;
+                if (db_dir_.empty())
+                {
+                    done->set_value(false);
+                    return;
+                }
+                if (!storage::CommitCheckpointAtomically(db_dir_, snapshot, {}, &res, &err))
+                {
+                    done->set_value(false);
+                    return;
                 }
                 done->set_value(true);
             }
@@ -543,6 +589,38 @@ namespace pomai
         if (!completion_.Enqueue(std::move(task)))
             task();
         return out;
+    }
+
+    bool MembraneRouter::RecoverFromStorage(const std::string &db_dir, std::string *err)
+    {
+        storage::SnapshotData snapshot;
+        storage::Manifest manifest;
+        if (!storage::RecoverLatestCheckpoint(db_dir, snapshot, manifest, err))
+            return false;
+        if (snapshot.schema.dim != dim_ || snapshot.schema.shards != shards_.size())
+        {
+            if (err)
+                *err = "snapshot schema mismatch";
+            return false;
+        }
+        std::vector<ShardCheckpointState> states;
+        states.reserve(snapshot.shards.size());
+        for (const auto &shard : snapshot.shards)
+        {
+            ShardCheckpointState state;
+            state.shard_id = shard.shard_id;
+            state.live = shard.live;
+            state.segments = shard.segments;
+            state.durable_lsn = 0;
+            if (shard.shard_id < manifest.shard_lsns.size())
+                state.durable_lsn = manifest.shard_lsns[shard.shard_id];
+            else
+                state.durable_lsn = manifest.checkpoint_lsn;
+            states.push_back(std::move(state));
+        }
+        for (std::size_t i = 0; i < shards_.size() && i < states.size(); ++i)
+            shards_[i]->LoadFromCheckpoint(states[i], states[i].durable_lsn);
+        return true;
     }
 
     void MembraneRouter::ConfigureCentroids(const std::vector<Vector> &centroids)

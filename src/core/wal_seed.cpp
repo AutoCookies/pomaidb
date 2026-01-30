@@ -18,6 +18,11 @@ namespace pomai
 
     WalReplayStats Wal::ReplayToSeed(Seed &seed)
     {
+        return ReplayToSeed(seed, 0);
+    }
+
+    WalReplayStats Wal::ReplayToSeed(Seed &seed, Lsn min_lsn)
+    {
         crc64_init();
 
         if (seed.Dim() != dim_)
@@ -277,22 +282,26 @@ namespace pomai
                 batch.push_back(std::move(r));
             }
 
-            try
+            if (lsn64 > min_lsn)
             {
-                seed.ApplyUpserts(batch);
-            }
-            catch (const std::exception &e)
-            {
-                std::cerr << "[WAL] Error applying batch during replay: " << e.what() << "\n";
-                if (ftruncate(rfd, rec_start) != 0)
-                    std::cerr << "[WAL] Warning: ftruncate failed after apply error: " << std::strerror(errno) << "\n";
-                truncated_bytes = original_size - rec_start;
-                break;
+                try
+                {
+                    seed.ApplyUpserts(batch);
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "[WAL] Error applying batch during replay: " << e.what() << "\n";
+                    if (ftruncate(rfd, rec_start) != 0)
+                        std::cerr << "[WAL] Warning: ftruncate failed after apply error: " << std::strerror(errno) << "\n";
+                    truncated_bytes = original_size - rec_start;
+                    break;
+                }
+
+                total_replayed++;
+                total_vectors += count;
             }
 
             last_lsn = lsn64;
-            total_replayed++;
-            total_vectors += count;
 
             off_t cur = lseek(rfd, 0, SEEK_CUR);
             if (cur == -1)

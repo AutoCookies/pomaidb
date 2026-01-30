@@ -130,6 +130,7 @@ static std::unique_ptr<MembraneRouter> MakeRouter(std::size_t dim, const std::st
     return std::make_unique<MembraneRouter>(std::move(shards),
                                             cfg,
                                             dim,
+                                            Metric::L2,
                                             0,
                                             500,
                                             MembraneRouter::FilterConfig::Default(),

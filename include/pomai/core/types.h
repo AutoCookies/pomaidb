@@ -18,6 +18,12 @@ namespace pomai
         Cosine = 1
     };
 
+    enum class SearchMode : std::uint8_t
+    {
+        Latency = 0,
+        Quality = 1
+    };
+
 
     enum class CentroidsLoadMode : std::uint8_t
     {
@@ -71,6 +77,8 @@ namespace pomai
         std::size_t filtered_candidate_k{0};
         std::uint32_t filter_expand_factor{0};
         std::uint32_t filter_max_visits{0};
+        std::uint64_t filter_time_budget_us{0};
+        SearchMode search_mode{SearchMode::Latency};
         std::shared_ptr<const Filter> filter;
     };
 
@@ -84,6 +92,9 @@ namespace pomai
     {
         bool partial{false};
         bool filtered_partial{false};
+        bool filtered_time_budget_hit{false};
+        bool filtered_visit_budget_hit{false};
+        bool filtered_budget_exhausted{false};
         std::size_t filtered_candidates{0};
     };
 

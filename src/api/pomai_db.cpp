@@ -5,6 +5,7 @@
 #include <future>
 #include <chrono>
 #include <pomai/util/memory_manager.h>
+#include <pomai/storage/file_util.h>
 
 namespace pomai
 {
@@ -44,6 +45,8 @@ namespace pomai
         std::vector<std::unique_ptr<Shard>> shards;
         shards.reserve(opt_.shards);
 
+        pomai::storage::DbPaths paths = pomai::storage::MakeDbPaths(opt_.wal_dir);
+        pomai::storage::EnsureDbDirs(paths);
         for (std::size_t i = 0; i < opt_.shards; ++i)
         {
             std::ostringstream ss;
@@ -52,7 +55,7 @@ namespace pomai
                 ss.str(),
                 opt_.dim,
                 opt_.shard_queue_capacity,
-                opt_.wal_dir,
+                paths.wal_dir,
                 log_info_,
                 log_error_);
             sh->SetIndexBuildPool(build_pool_.get());
@@ -63,6 +66,7 @@ namespace pomai
         filter_cfg.filtered_candidate_k = opt_.filtered_candidate_k;
         filter_cfg.filter_expand_factor = opt_.filter_expand_factor;
         filter_cfg.filter_max_visits = opt_.filter_max_visits;
+        filter_cfg.filter_time_budget_us = opt_.filter_time_budget_us;
         filter_cfg.tag_dictionary_max_size = opt_.tag_dictionary_max_size;
         filter_cfg.max_tags_per_vector = opt_.max_tags_per_vector;
         filter_cfg.max_filter_tags = opt_.max_filter_tags;
@@ -70,6 +74,7 @@ namespace pomai
         membrane_ = std::make_unique<MembraneRouter>(std::move(shards),
                                                      opt_.whisper,
                                                      opt_.dim,
+                                                     opt_.metric,
                                                      opt_.search_pool_workers,
                                                      opt_.search_timeout_ms,
                                                      filter_cfg,
@@ -80,6 +85,7 @@ namespace pomai
 
         membrane_->SetCentroidsFilePath(opt_.centroids_path);
         membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
+        membrane_->SetDbDir(opt_.wal_dir);
     }
 
     void PomaiDB::Start()
@@ -90,6 +96,14 @@ namespace pomai
 
         if (build_pool_)
             build_pool_->Start();
+        try
+        {
+            std::string err;
+            membrane_->RecoverFromStorage(opt_.wal_dir, &err);
+        }
+        catch (...)
+        {
+        }
         membrane_->Start();
 
         if (opt_.centroids_load_mode == MembraneRouter::CentroidsLoadMode::None)

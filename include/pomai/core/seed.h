@@ -71,6 +71,22 @@ namespace pomai
         using Snapshot = std::shared_ptr<const Store>;
         using MutableSnapshot = std::shared_ptr<Store>;
 
+        struct PersistedState
+        {
+            std::uint32_t dim{0};
+            std::vector<Id> ids;
+            QData qdata;
+            std::vector<float> qmins;
+            std::vector<float> qmaxs;
+            std::vector<float> qscales;
+            std::vector<std::uint32_t> namespace_ids;
+            std::vector<std::uint32_t> tag_offsets;
+            std::vector<TagId> tag_ids;
+            bool is_fixed{false};
+            std::uint64_t total_ingested{0};
+            std::uint64_t fixed_bounds_after{0};
+        };
+
         explicit Seed(std::size_t dim);
         Seed(const Seed &other);
         Seed &operator=(const Seed &other);
@@ -80,6 +96,9 @@ namespace pomai
 
         void ApplyUpserts(const std::vector<UpsertRequest> &batch);
         Snapshot MakeSnapshot() const;
+        PersistedState ExportPersistedState() const;
+        void LoadPersistedState(PersistedState state);
+        static Snapshot SnapshotFromState(const PersistedState &state);
 
         static void Quantize(MutableSnapshot snap);
         static void DequantizeRow(const Snapshot &snap, std::size_t row, float *out);

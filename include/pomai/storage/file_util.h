@@ -33,4 +33,7 @@ namespace pomai::storage
     bool AtomicRename(const std::string &tmp_path, const std::string &final_path);
 
     bool FailpointHit(std::string_view name);
+
+    void ResetDirFsyncCounter();
+    std::uint64_t DirFsyncCounter();
 }
