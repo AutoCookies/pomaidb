@@ -15,8 +15,8 @@ TEST_CASE("Membrane router configures centroids", "[core][membrane]")
     TempDir dir;
     std::vector<std::unique_ptr<Shard>> shards;
     CompactionConfig compaction{};
-    shards.push_back(std::make_unique<Shard>("shard-0", 4, 64, dir.str(), compaction));
-    shards.push_back(std::make_unique<Shard>("shard-1", 4, 64, dir.str(), compaction));
+    shards.push_back(std::make_unique<Shard>("shard-0", 0, 4, 64, dir.str(), compaction));
+    shards.push_back(std::make_unique<Shard>("shard-1", 1, 4, 64, dir.str(), compaction));
 
     MembraneRouter::FilterConfig filter_cfg = MembraneRouter::FilterConfig::Default();
     MembraneRouter membrane(std::move(shards),
