@@ -50,15 +50,14 @@ namespace pomai
         void Stop()
         {
             // Make Stop idempotent and ALWAYS set stop_requested_.
+            std::priority_queue<Task, std::vector<Task>, TaskCmp> pending;
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 if (stop_requested_)
                     return;
                 stop_requested_ = true;
 
-                // Policy: cancel pending tasks to guarantee fast shutdown.
-                while (!tasks_.empty())
-                    tasks_.pop();
+                pending.swap(tasks_);
             }
 
             cv_.notify_all();
@@ -66,6 +65,22 @@ namespace pomai
             // Only join if we actually started the worker thread.
             if (running_.exchange(false) && worker_.joinable())
                 worker_.join();
+
+            while (!pending.empty())
+            {
+                Task task = pending.top();
+                pending.pop();
+                try
+                {
+                    if (task.fn)
+                        task.fn();
+                }
+                catch (...)
+                {
+                    if (logger_)
+                        logger_->Error("completion.task", "Completion task threw an exception");
+                }
+            }
         }
 
         bool Enqueue(std::function<void()> fn, std::chrono::steady_clock::duration delay = {})
