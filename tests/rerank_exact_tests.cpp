@@ -7,8 +7,8 @@
 #include <vector>
 #include <new>
 
-#include "search_utils.h"
-#include "seed.h"
+#include <pomai/util/search_utils.h>
+#include <pomai/core/seed.h>
 
 namespace
 {

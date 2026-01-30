@@ -14,8 +14,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "wal.h"
-#include "seed.h"
+#include <pomai/storage/wal.h>
+#include <pomai/core/seed.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

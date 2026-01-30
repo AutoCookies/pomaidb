@@ -5,8 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "memory_manager.h"
-#include "pomai_db.h"
+#include <pomai/util/memory_manager.h>
+#include <pomai/api/pomai_db.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

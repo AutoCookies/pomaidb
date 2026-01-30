@@ -1,4 +1,4 @@
-#include "server/config.h"
+#include <pomai/server/config.h>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>

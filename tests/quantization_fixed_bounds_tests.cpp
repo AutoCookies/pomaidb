@@ -3,7 +3,7 @@
 #include <iostream>
 #include <vector>
 
-#include "seed.h"
+#include <pomai/core/seed.h>
 
 using namespace pomai;
 

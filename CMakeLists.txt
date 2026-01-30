@@ -10,17 +10,26 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 
 # --- 3. CẤU HÌNH COMPILER FLAGS (TARGET-BASED) ---
-# Tạo một interface library để quản lý compiler flags chung cho toàn dự án
 add_library(pomai_compiler_flags INTERFACE)
 target_compile_features(pomai_compiler_flags INTERFACE cxx_std_20)
 
+option(POMAI_WERROR "Treat warnings as errors" OFF)
+option(POMAI_ASAN "Enable AddressSanitizer" OFF)
+option(POMAI_TSAN "Enable ThreadSanitizer" OFF)
+option(POMAI_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+
 if(MSVC)
-    target_compile_options(pomai_compiler_flags INTERFACE /W4 /WX)
+    target_compile_options(pomai_compiler_flags INTERFACE /W4)
+    if(POMAI_WERROR)
+        target_compile_options(pomai_compiler_flags INTERFACE /WX)
+    endif()
 else()
     target_compile_options(pomai_compiler_flags INTERFACE -Wall -Wextra -Wpedantic -mavx2 -mfma)
+    if(POMAI_WERROR)
+        target_compile_options(pomai_compiler_flags INTERFACE -Werror)
+    endif()
     if(CMAKE_BUILD_TYPE MATCHES Release)
         target_compile_options(pomai_compiler_flags INTERFACE -O3 -march=native -ffast-math -funroll-loops)
-        # Kích hoạt Interprocedural Optimization (LTO) nếu trình biên dịch hỗ trợ
         include(CheckIPOSupported)
         check_ipo_supported(RESULT ipo_supported OUTPUT error)
         if(ipo_supported)
@@ -34,48 +43,66 @@ else()
     target_link_options(pomai_compiler_flags INTERFACE -rdynamic)
 endif()
 
-set(POMAI_SANITIZE "" CACHE STRING "Enable sanitizers: ASAN_UBSAN or TSAN")
-set_property(CACHE POMAI_SANITIZE PROPERTY STRINGS "" ASAN_UBSAN TSAN)
-if(POMAI_SANITIZE STREQUAL "ASAN_UBSAN")
-    target_compile_options(pomai_compiler_flags INTERFACE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
-    target_link_options(pomai_compiler_flags INTERFACE -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
-elseif(POMAI_SANITIZE STREQUAL "TSAN")
-    target_compile_options(pomai_compiler_flags INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
-    target_link_options(pomai_compiler_flags INTERFACE -fsanitize=thread -fno-omit-frame-pointer)
+set(pomai_sanitize_flags "")
+if(POMAI_ASAN)
+    list(APPEND pomai_sanitize_flags address)
+endif()
+if(POMAI_UBSAN)
+    list(APPEND pomai_sanitize_flags undefined)
+endif()
+if(POMAI_TSAN)
+    list(APPEND pomai_sanitize_flags thread)
+endif()
+if(pomai_sanitize_flags)
+    list(JOIN pomai_sanitize_flags "," pomai_sanitize_flags_joined)
+    target_compile_options(pomai_compiler_flags INTERFACE -fsanitize=${pomai_sanitize_flags_joined} -fno-omit-frame-pointer)
+    target_link_options(pomai_compiler_flags INTERFACE -fsanitize=${pomai_sanitize_flags_joined} -fno-omit-frame-pointer)
 endif()
 
-# --- 4. CORE LIBRARY (pomai_core) ---
-# Tiêu chuẩn Big Tech: Liệt kê tường minh các tệp nguồn để tránh lỗi "ma" từ GLOB
+set(POMAI_PUBLIC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# --- 4. MODULE LIBRARIES ---
+set(UTIL_SOURCES
+    src/util/memory_manager.cpp
+)
+add_library(pomai_util STATIC ${UTIL_SOURCES})
+target_include_directories(pomai_util PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
+target_link_libraries(pomai_util PUBLIC pomai_compiler_flags)
+
+set(STORAGE_SOURCES
+    src/storage/wal.cpp
+    src/storage/wal_uring.cpp
+    src/storage/crc64.c
+)
+add_library(pomai_storage STATIC ${STORAGE_SOURCES})
+target_include_directories(pomai_storage PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
+target_link_libraries(pomai_storage PUBLIC pomai_util Threads::Threads pomai_compiler_flags)
+
+set(INDEX_SOURCES
+    src/index/orbit_index.cpp
+    src/index/whispergrain.cpp
+)
+add_library(pomai_index STATIC ${INDEX_SOURCES})
+target_include_directories(pomai_index PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
+target_link_libraries(pomai_index PUBLIC pomai_util pomai_compiler_flags)
+
 set(CORE_SOURCES
     src/core/membrane.cpp
-    src/core/pomai_db.cpp
-    src/core/shard.cpp
-    src/core/wal.cpp
-    src/core/wal_uring.cpp
     src/core/seed.cpp
+    src/core/shard.cpp
     src/core/spatial_router.cpp
-    src/core/orbit_index.cpp
-    src/core/memory_manager.cpp
-    src/core/whispergrain.cpp
-    src/core/crc64.c
+    src/core/wal_seed.cpp
 )
-
 add_library(pomai_core STATIC ${CORE_SOURCES})
+target_include_directories(pomai_core PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
+target_link_libraries(pomai_core PUBLIC pomai_util pomai_storage pomai_index Threads::Threads pomai_compiler_flags)
 
-# Cấu hình include theo Target: Không dùng include_directories toàn cục
-target_include_directories(pomai_core 
-    PUBLIC 
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    PRIVATE 
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/core
+set(API_SOURCES
+    src/api/pomai_db.cpp
 )
-
-target_link_libraries(pomai_core 
-    PUBLIC 
-        Threads::Threads
-        pomai_compiler_flags
-)
+add_library(pomai_api STATIC ${API_SOURCES})
+target_include_directories(pomai_api PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
+target_link_libraries(pomai_api PUBLIC pomai_core pomai_compiler_flags)
 
 # --- 5. SERVER DAEMON (pomai-server) ---
 set(SERVER_SOURCES
@@ -87,31 +114,28 @@ set(SERVER_SOURCES
 )
 
 add_executable(pomai-server ${SERVER_SOURCES})
-target_include_directories(pomai-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/server)
-target_link_libraries(pomai-server PRIVATE pomai_core)
+target_link_libraries(pomai-server PRIVATE pomai_api)
 
 # --- 6. EMBEDDED BENCHMARKS ---
-function(add_pomai_benchmark name src)
+function(add_pomai_benchmark name src lib)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${src}")
         add_executable(${name} ${src})
-        target_link_libraries(${name} PRIVATE pomai_core)
+        target_link_libraries(${name} PRIVATE ${lib})
     endif()
 endfunction()
 
-add_pomai_benchmark(bench_embedded benchmarks/bench_embedded.cpp)
-add_pomai_benchmark(bench_phase3 benchmarks/bench_phase3.cpp)
-add_pomai_benchmark(bench_concurrent benchmarks/bench_concurrent.cpp)
-add_pomai_benchmark(bench_concurrent_search benchmarks/bench_concurrent_search.cpp)
-add_pomai_benchmark(bench_wal bench/bench_wal.cpp)
+add_pomai_benchmark(bench_embedded benchmarks/bench_embedded.cpp pomai_api)
+add_pomai_benchmark(bench_concurrent_search benchmarks/bench_concurrent_search.cpp pomai_core)
+add_pomai_benchmark(bench_wal benchmarks/bench_wal.cpp pomai_storage)
 
 # --- 7. AUTOMATED TESTS ---
 option(BUILD_TESTING "Build the test suite" ON)
 if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
     enable_testing()
-    
+
     macro(add_pomai_test name src)
         add_executable(${name} ${src})
-        target_link_libraries(${name} PRIVATE pomai_core)
+        target_link_libraries(${name} PRIVATE pomai_api)
         add_test(NAME ${name} COMMAND ${name})
     endmacro()
 
@@ -132,12 +156,7 @@ if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 endif()
 
 # --- 8. TOOLS ---
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/wal_crash_test.cpp")
-    add_executable(wal_crash_test tools/wal_crash_test.cpp)
-    target_link_libraries(wal_crash_test PRIVATE pomai_core)
-endif()
-
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/repro_segfault.cpp")
     add_executable(repro_segfault tools/repro_segfault.cpp)
-    target_link_libraries(repro_segfault PRIVATE pomai_core)
+    target_link_libraries(repro_segfault PRIVATE pomai_api)
 endif()
