@@ -36,7 +36,7 @@ TEST_CASE("Search filter namespaces only", "[core][filter]")
 
     REQUIRE_FALSE(resp.items.empty());
     for (const auto &item : resp.items)
-        REQUIRE(item.id == 1 || item.id == 3);
+        REQUIRE((item.id == 1 || item.id == 3));
 }
 
 TEST_CASE("Search filter tags any/all", "[core][filter]")
