@@ -867,10 +867,9 @@ namespace pomai
         final_topk.FillSorted(resp.items);
         SortAndDedupeResults(resp.items, req.topk);
         resp.stats.filtered_candidates = candidate_topk.Size();
+        resp.stats.filtered_visits = visit_count;
         const bool filtered_partial = has_filter && candidate_topk.Size() < candidate_k;
         const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit) && filtered_partial;
-        if (budget_exhausted && req.search_mode == SearchMode::Quality)
-            throw std::runtime_error("filtered scan budget exhausted");
         resp.stats.filtered_partial = filtered_partial;
         resp.stats.filtered_time_budget_hit = time_budget_hit;
         resp.stats.filtered_visit_budget_hit = visit_budget_hit;

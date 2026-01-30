@@ -56,7 +56,8 @@ namespace pomai::core
                                                                const Seed::Store &meta,
                                                                bool &partial,
                                                                bool &time_budget_hit,
-                                                               bool &visit_budget_hit) const;
+                                                               bool &visit_budget_hit,
+                                                               std::size_t &visits) const;
 
         void Connect(std::uint32_t a, std::uint32_t b);
         void Prune(std::uint32_t node);

@@ -379,19 +379,40 @@ namespace pomai
         const bool has_filter = normalized.filter && !normalized.filter->empty();
         if (normalized.filter && normalized.filter->match_none)
             return {};
+        std::size_t candidate_k = 0;
+        std::uint32_t graph_ef = 0;
+        std::size_t max_visits = 0;
+        std::uint64_t time_budget_us = 0;
+        std::size_t max_candidate_k = 0;
+        std::uint32_t max_graph_ef = 0;
+        std::size_t max_filter_visits = 0;
+        std::uint64_t max_filter_time_us = 0;
+        std::size_t max_retries = 0;
         if (has_filter)
         {
             std::size_t base = std::max<std::size_t>(normalized.topk * 50, 500);
-            std::size_t cap = filter_config_.filtered_candidate_k == 0 ? base : filter_config_.filtered_candidate_k;
-            normalized.filtered_candidate_k = normalized.filtered_candidate_k == 0 ? std::min(base, cap) : std::max(normalized.filtered_candidate_k, normalized.topk);
+            std::size_t default_candidate = filter_config_.filtered_candidate_k == 0 ? base : filter_config_.filtered_candidate_k;
+            normalized.filtered_candidate_k = normalized.filtered_candidate_k == 0 ? std::min(base, default_candidate) : std::max(normalized.filtered_candidate_k, normalized.topk);
             normalized.filtered_candidate_k = std::max(normalized.filtered_candidate_k, normalized.topk);
             std::uint32_t expand = normalized.filter_expand_factor == 0 ? filter_config_.filter_expand_factor : normalized.filter_expand_factor;
             expand = std::clamp<std::uint32_t>(expand, 1, 16);
             normalized.filter_expand_factor = expand;
-            std::uint32_t max_visits = normalized.filter_max_visits == 0 ? filter_config_.filter_max_visits : normalized.filter_max_visits;
-            normalized.filter_max_visits = max_visits;
-            std::uint64_t time_budget_us = normalized.filter_time_budget_us == 0 ? filter_config_.filter_time_budget_us : normalized.filter_time_budget_us;
-            normalized.filter_time_budget_us = time_budget_us;
+            std::uint32_t seed_visits = normalized.filter_max_visits == 0 ? filter_config_.filter_max_visits : normalized.filter_max_visits;
+            normalized.filter_max_visits = seed_visits;
+            std::uint64_t seed_time = normalized.filter_time_budget_us == 0 ? filter_config_.filter_time_budget_us : normalized.filter_time_budget_us;
+            normalized.filter_time_budget_us = seed_time;
+
+            max_candidate_k = std::max<std::size_t>(filter_config_.max_filtered_candidate_k, normalized.topk);
+            max_graph_ef = filter_config_.max_filter_graph_ef == 0 ? 2048 : filter_config_.max_filter_graph_ef;
+            max_filter_visits = std::max<std::size_t>(filter_config_.max_filter_visits, max_candidate_k);
+            max_filter_time_us = filter_config_.max_filter_time_budget_us;
+            max_retries = filter_config_.filter_max_retries;
+
+            candidate_k = std::min<std::size_t>(normalized.filtered_candidate_k, max_candidate_k);
+            max_visits = std::min<std::size_t>(std::max<std::size_t>(normalized.filter_max_visits, candidate_k), max_filter_visits);
+            time_budget_us = (max_filter_time_us == 0) ? normalized.filter_time_budget_us : std::min<std::uint64_t>(normalized.filter_time_budget_us, max_filter_time_us);
+            graph_ef = NormalizeGraphEf(normalized, candidate_k);
+            graph_ef = std::min<std::uint32_t>(graph_ef, max_graph_ef);
         }
 
         if (health == pomai::ai::WhisperGrain::BudgetHealth::Tight)
@@ -429,97 +450,205 @@ namespace pomai
         }
 
         const std::size_t shard_topk = std::max<std::size_t>(normalized.topk, normalized.topk * kShardCandidateMultiplier);
-        SearchRequest shard_req = normalized;
-        shard_req.candidate_k = NormalizeCandidateK(shard_req);
-        shard_req.max_rerank_k = NormalizeMaxRerankK(shard_req);
-        shard_req.graph_ef = NormalizeGraphEf(shard_req, shard_req.candidate_k);
-        shard_req.topk = shard_topk;
-        if (shard_req.graph_ef > 0)
-            budget.ops_budget = shard_req.graph_ef;
-        auto req_ptr = std::make_shared<SearchRequest>(std::move(shard_req));
-
-        std::vector<std::future<SearchResponse>> futs;
-        std::vector<SearchResponse> inline_responses;
-        for (auto sid : target_ids)
+        auto run_attempt = [&](const SearchRequest &attempt_req)
         {
-            Shard *sh_ptr = shards_[sid].get();
-            try
-            {
-                futs.emplace_back(search_pool_.Submit([req_ptr, budget, sh_ptr]()
-                                                      { return sh_ptr->Search(*req_ptr, budget); }));
-            }
-            catch (...)
-            {
-                search_overload_.fetch_add(1, std::memory_order_relaxed);
-                if (std::chrono::steady_clock::now() < deadline)
-                {
-                    inline_responses.push_back(sh_ptr->Search(*req_ptr, budget));
-                    search_inline_.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
+            SearchRequest shard_req = attempt_req;
+            shard_req.candidate_k = NormalizeCandidateK(shard_req);
+            shard_req.max_rerank_k = NormalizeMaxRerankK(shard_req);
+            const std::size_t graph_candidate_k = has_filter ? std::max<std::size_t>(shard_req.filtered_candidate_k, shard_req.topk)
+                                                             : shard_req.candidate_k;
+            shard_req.graph_ef = NormalizeGraphEf(shard_req, graph_candidate_k);
+            if (has_filter)
+                shard_req.graph_ef = std::min<std::uint32_t>(shard_req.graph_ef, max_graph_ef);
+            shard_req.topk = shard_topk;
+            auto attempt_budget = budget;
+            if (shard_req.graph_ef > 0)
+                attempt_budget.ops_budget = shard_req.graph_ef;
+            auto req_ptr = std::make_shared<SearchRequest>(std::move(shard_req));
 
-        thread_local std::unique_ptr<FixedTopK> merge_topk;
-        if (!merge_topk)
-            merge_topk = std::make_unique<FixedTopK>(req.topk);
-        merge_topk->Reset(req.topk);
-
-        std::size_t completed = 0;
-        bool filtered_partial = false;
-        bool filtered_time_budget_hit = false;
-        bool filtered_visit_budget_hit = false;
-        bool filtered_budget_exhausted = false;
-        for (auto &f : futs)
-        {
-            if (f.wait_until(deadline) == std::future_status::ready)
+            std::vector<std::future<SearchResponse>> futs;
+            std::vector<SearchResponse> inline_responses;
+            futs.reserve(target_ids.size());
+            inline_responses.reserve(target_ids.size());
+            for (auto sid : target_ids)
             {
+                Shard *sh_ptr = shards_[sid].get();
                 try
                 {
-                    auto r = f.get();
-                    for (const auto &item : r.items)
-                        merge_topk->Push(item.score, item.id);
-                    filtered_partial = filtered_partial || r.stats.filtered_partial;
-                    filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
-                    filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
-                    filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
-                    ++completed;
+                    futs.emplace_back(search_pool_.Submit([req_ptr, attempt_budget, sh_ptr]()
+                                                          { return sh_ptr->Search(*req_ptr, attempt_budget); }));
                 }
                 catch (...)
                 {
+                    search_overload_.fetch_add(1, std::memory_order_relaxed);
+                    if (std::chrono::steady_clock::now() < deadline)
+                    {
+                        try
+                        {
+                            inline_responses.push_back(sh_ptr->Search(*req_ptr, attempt_budget));
+                            search_inline_.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        catch (...)
+                        {
+                        }
+                    }
                 }
             }
-        }
-        for (const auto &r : inline_responses)
-        {
-            for (const auto &item : r.items)
-                merge_topk->Push(item.score, item.id);
-            filtered_partial = filtered_partial || r.stats.filtered_partial;
-            filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
-            filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
-            filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
-            ++completed;
-        }
+
+            thread_local std::unique_ptr<FixedTopK> merge_topk;
+            if (!merge_topk)
+                merge_topk = std::make_unique<FixedTopK>(req.topk);
+            merge_topk->Reset(req.topk);
+
+            SearchResponse out;
+            std::size_t completed = 0;
+            bool filtered_partial = false;
+            bool filtered_time_budget_hit = false;
+            bool filtered_visit_budget_hit = false;
+            bool filtered_budget_exhausted = false;
+            std::size_t filtered_candidates = 0;
+            std::size_t filtered_visits = 0;
+            bool search_error = false;
+            for (auto &f : futs)
+            {
+                if (f.wait_until(deadline) == std::future_status::ready)
+                {
+                    try
+                    {
+                        auto r = f.get();
+                        for (const auto &item : r.items)
+                            merge_topk->Push(item.score, item.id);
+                        filtered_partial = filtered_partial || r.stats.filtered_partial;
+                        filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
+                        filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
+                        filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
+                        filtered_candidates += r.stats.filtered_candidates;
+                        filtered_visits += r.stats.filtered_visits;
+                        ++completed;
+                    }
+                    catch (...)
+                    {
+                        search_error = true;
+                    }
+                }
+            }
+            for (const auto &r : inline_responses)
+            {
+                for (const auto &item : r.items)
+                    merge_topk->Push(item.score, item.id);
+                filtered_partial = filtered_partial || r.stats.filtered_partial;
+                filtered_time_budget_hit = filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
+                filtered_visit_budget_hit = filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
+                filtered_budget_exhausted = filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
+                filtered_candidates += r.stats.filtered_candidates;
+                filtered_visits += r.stats.filtered_visits;
+                ++completed;
+            }
+
+            merge_topk->FillSorted(out.items);
+            SortAndDedupeResults(out.items, req.topk);
+            const std::size_t total_targets = futs.size() + inline_responses.size();
+            if (completed < total_targets || search_error)
+                out.partial = true;
+            out.stats.partial = out.partial;
+            out.stats.filtered_partial = filtered_partial;
+            out.stats.filtered_time_budget_hit = filtered_time_budget_hit;
+            out.stats.filtered_visit_budget_hit = filtered_visit_budget_hit;
+            out.stats.filtered_budget_exhausted = filtered_budget_exhausted;
+            out.stats.filtered_candidates = filtered_candidates;
+            out.stats.filtered_visits = filtered_visits;
+            return out;
+        };
 
         SearchResponse out;
-        merge_topk->FillSorted(out.items);
-        SortAndDedupeResults(out.items, req.topk);
-        const std::size_t total_targets = futs.size() + inline_responses.size();
-        if (completed < total_targets)
+        std::size_t retries = 0;
+        if (has_filter)
         {
-            out.partial = true;
-            search_partial_.fetch_add(1, std::memory_order_relaxed);
+            SearchRequest attempt_req = normalized;
+            attempt_req.filtered_candidate_k = candidate_k;
+            attempt_req.graph_ef = graph_ef;
+            attempt_req.filter_max_visits = max_visits;
+            attempt_req.filter_time_budget_us = time_budget_us;
+            for (;;)
+            {
+                out = run_attempt(attempt_req);
+                if (out.items.size() >= req.topk)
+                    break;
+                if (retries >= max_retries)
+                    break;
+                bool expanded = false;
+                if (candidate_k < max_candidate_k)
+                {
+                    candidate_k = std::min<std::size_t>(candidate_k * 2, max_candidate_k);
+                    expanded = true;
+                }
+                if (graph_ef < max_graph_ef)
+                {
+                    graph_ef = std::min<std::uint32_t>(static_cast<std::uint32_t>(graph_ef * 2), max_graph_ef);
+                    expanded = true;
+                }
+                if (max_visits < max_filter_visits)
+                {
+                    max_visits = std::min<std::size_t>(max_visits * 2, max_filter_visits);
+                    expanded = true;
+                }
+                if (time_budget_us > 0 && max_filter_time_us > 0 && time_budget_us < max_filter_time_us)
+                {
+                    time_budget_us = std::min<std::uint64_t>(time_budget_us * 2, max_filter_time_us);
+                    expanded = true;
+                }
+                if (!expanded)
+                    break;
+                ++retries;
+                attempt_req.filtered_candidate_k = candidate_k;
+                attempt_req.graph_ef = graph_ef;
+                attempt_req.filter_max_visits = max_visits;
+                attempt_req.filter_time_budget_us = time_budget_us;
+            }
         }
-        out.stats.partial = out.partial;
-        out.stats.filtered_partial = filtered_partial;
-        out.stats.filtered_time_budget_hit = filtered_time_budget_hit;
-        out.stats.filtered_visit_budget_hit = filtered_visit_budget_hit;
-        out.stats.filtered_budget_exhausted = filtered_budget_exhausted;
-        if (filtered_time_budget_hit)
+        else
+        {
+            out = run_attempt(normalized);
+        }
+
+        const bool filtered_missing = has_filter && out.items.size() < req.topk;
+        out.stats.filtered_partial = filtered_missing;
+        if (filtered_missing)
+        {
+            out.stats.filtered_missing_hits = req.topk - out.items.size();
+            out.partial = out.partial || filtered_missing;
+            out.stats.partial = out.partial;
+        }
+        if (out.stats.filtered_visits > 0)
+            out.stats.filtered_selectivity = static_cast<double>(out.stats.filtered_candidates) / static_cast<double>(out.stats.filtered_visits);
+        out.stats.filtered_retries = retries;
+        out.stats.filtered_candidate_k = has_filter ? candidate_k : 0;
+        out.stats.filtered_graph_ef = has_filter ? graph_ef : 0;
+        out.stats.filtered_max_visits = has_filter ? max_visits : 0;
+        out.stats.filtered_time_budget_us = has_filter ? time_budget_us : 0;
+        out.stats.filtered_candidate_cap_hit = has_filter && (candidate_k >= max_candidate_k);
+        out.stats.filtered_graph_ef_cap_hit = has_filter && (graph_ef >= max_graph_ef);
+        out.stats.filtered_visit_cap_hit = has_filter && (max_visits >= max_filter_visits);
+        out.stats.filtered_time_cap_hit = has_filter && (max_filter_time_us > 0 && time_budget_us >= max_filter_time_us);
+
+        if (out.stats.filtered_time_budget_hit)
             search_budget_time_hit_.fetch_add(1, std::memory_order_relaxed);
-        if (filtered_visit_budget_hit)
+        if (out.stats.filtered_visit_budget_hit)
             search_budget_visit_hit_.fetch_add(1, std::memory_order_relaxed);
-        if (filtered_budget_exhausted)
+        if (out.stats.filtered_budget_exhausted)
             search_budget_exhausted_.fetch_add(1, std::memory_order_relaxed);
+        if (out.partial)
+            search_partial_.fetch_add(1, std::memory_order_relaxed);
+
+        if (has_filter && req.search_mode == SearchMode::Quality && filtered_missing)
+        {
+            out.status = SearchStatus::InsufficientResults;
+            out.error = "filtered search insufficient results after adaptive expansion";
+            out.stats.quality_failure = true;
+            out.items.clear();
+            out.partial = false;
+            out.stats.partial = false;
+        }
         float lat = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
         brain_.observe_latency(lat);
 

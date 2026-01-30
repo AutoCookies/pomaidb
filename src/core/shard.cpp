@@ -452,10 +452,9 @@ namespace pomai
         final_topk.FillSorted(resp.items);
         SortAndDedupeResults(resp.items, topk);
         resp.stats.filtered_candidates = candidates.Size();
+        resp.stats.filtered_visits = visit_count;
         const bool filtered_partial = has_filter && candidates.Size() < candidate_k;
         const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit) && filtered_partial;
-        if (budget_exhausted && req.search_mode == SearchMode::Quality)
-            throw std::runtime_error("filtered grain search budget exhausted");
         if (filtered_partial)
             resp.stats.filtered_partial = true;
         resp.stats.filtered_time_budget_hit = time_budget_hit;
@@ -499,6 +498,8 @@ namespace pomai
             out.stats.filtered_time_budget_hit = out.stats.filtered_time_budget_hit || r.stats.filtered_time_budget_hit;
             out.stats.filtered_visit_budget_hit = out.stats.filtered_visit_budget_hit || r.stats.filtered_visit_budget_hit;
             out.stats.filtered_budget_exhausted = out.stats.filtered_budget_exhausted || r.stats.filtered_budget_exhausted;
+            out.stats.filtered_candidates += r.stats.filtered_candidates;
+            out.stats.filtered_visits += r.stats.filtered_visits;
         }
         SearchResponse lr;
         if (snapshot->live_snap && snapshot->live_grains)
@@ -512,6 +513,8 @@ namespace pomai
         out.stats.filtered_time_budget_hit = out.stats.filtered_time_budget_hit || lr.stats.filtered_time_budget_hit;
         out.stats.filtered_visit_budget_hit = out.stats.filtered_visit_budget_hit || lr.stats.filtered_visit_budget_hit;
         out.stats.filtered_budget_exhausted = out.stats.filtered_budget_exhausted || lr.stats.filtered_budget_exhausted;
+        out.stats.filtered_candidates += lr.stats.filtered_candidates;
+        out.stats.filtered_visits += lr.stats.filtered_visits;
         SortAndDedupeResults(out.items, req.topk);
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() > 40)
             const_cast<Shard *>(this)->RequestEmergencyFreeze();

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace pomai
@@ -24,6 +25,11 @@ namespace pomai
         Quality = 1
     };
 
+    enum class SearchStatus : std::uint8_t
+    {
+        Ok = 0,
+        InsufficientResults = 1
+    };
 
     enum class CentroidsLoadMode : std::uint8_t
     {
@@ -96,6 +102,19 @@ namespace pomai
         bool filtered_visit_budget_hit{false};
         bool filtered_budget_exhausted{false};
         std::size_t filtered_candidates{0};
+        std::size_t filtered_visits{0};
+        std::size_t filtered_missing_hits{0};
+        std::size_t filtered_retries{0};
+        std::size_t filtered_candidate_k{0};
+        std::uint32_t filtered_graph_ef{0};
+        std::size_t filtered_max_visits{0};
+        std::uint64_t filtered_time_budget_us{0};
+        bool filtered_candidate_cap_hit{false};
+        bool filtered_graph_ef_cap_hit{false};
+        bool filtered_visit_cap_hit{false};
+        bool filtered_time_cap_hit{false};
+        double filtered_selectivity{0.0};
+        bool quality_failure{false};
     };
 
     struct SearchResponse
@@ -103,6 +122,8 @@ namespace pomai
         std::vector<SearchResultItem> items;
         bool partial{false};
         SearchStats stats;
+        SearchStatus status{SearchStatus::Ok};
+        std::string error;
     };
 
     inline std::size_t NormalizeMaxRerankK(const SearchRequest &req)
