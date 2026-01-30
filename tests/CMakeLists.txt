@@ -7,6 +7,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Catch2)
 
+list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/contrib)
+
 add_executable(pomai_tests
     common/test_main.cpp
     common/test_utils.cpp
