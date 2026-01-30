@@ -7,7 +7,7 @@
 #include <thread>
 #include <vector>
 
-#include "shard.h"
+#include <pomai/core/shard.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

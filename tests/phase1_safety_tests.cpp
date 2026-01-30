@@ -6,10 +6,10 @@
 #include <string>
 #include <vector>
 
-#include "orbit_index.h"
-#include "seed.h"
-#include "shard.h"
-#include "wal.h"
+#include <pomai/index/orbit_index.h>
+#include <pomai/core/seed.h>
+#include <pomai/core/shard.h>
+#include <pomai/storage/wal.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

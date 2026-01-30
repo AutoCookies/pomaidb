@@ -1,8 +1,8 @@
-#include "seed.h"
-#include "search_utils.h"
-#include "cpu_kernels.h"
-#include "fixed_topk.h"
-#include "memory_manager.h"
+#include <pomai/core/seed.h>
+#include <pomai/util/search_utils.h>
+#include <pomai/util/cpu_kernels.h>
+#include <pomai/util/fixed_topk.h>
+#include <pomai/util/memory_manager.h>
 #include <immintrin.h>
 #include <algorithm>
 #include <array>

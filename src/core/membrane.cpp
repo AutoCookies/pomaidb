@@ -1,9 +1,9 @@
-#include "membrane.h"
-#include "search_utils.h"
-#include "spatial_router.h"
-#include "search_fanout.h"
-#include "memory_manager.h"
-#include "fixed_topk.h"
+#include <pomai/core/membrane.h>
+#include <pomai/util/search_utils.h>
+#include <pomai/core/spatial_router.h>
+#include <pomai/util/search_fanout.h>
+#include <pomai/util/memory_manager.h>
+#include <pomai/util/fixed_topk.h>
 
 #include <stdexcept>
 #include <algorithm>
@@ -166,7 +166,7 @@ namespace pomai
     }
 
     MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
-                                   pomai::server::WhisperConfig w_cfg,
+                                   pomai::WhisperConfig w_cfg,
                                    std::size_t dim,
                                    std::size_t search_pool_workers,
                                    std::size_t search_timeout_ms,

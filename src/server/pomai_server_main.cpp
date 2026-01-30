@@ -1,6 +1,6 @@
-#include "server/server.h"
-#include "server/config.h"
-#include "server/logger.h"
+#include <pomai/server/server.h>
+#include <pomai/server/config.h>
+#include <pomai/server/logger.h>
 
 #include <atomic>
 #include <csignal>

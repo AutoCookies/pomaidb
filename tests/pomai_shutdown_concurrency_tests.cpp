@@ -8,7 +8,7 @@
 #include <thread>
 #include <vector>
 
-#include "pomai_db.h"
+#include <pomai/api/pomai_db.h>
 
 using namespace pomai;
 namespace fs = std::filesystem;

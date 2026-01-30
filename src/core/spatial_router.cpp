@@ -1,4 +1,4 @@
-#include "spatial_router.h"
+#include <pomai/core/spatial_router.h>
 #include <cmath>
 #include <numeric>
 #include <algorithm>
