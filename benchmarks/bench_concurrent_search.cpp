@@ -60,7 +60,7 @@ int main()
     IndexBuildPool pool(2);
     pool.Start();
 
-    Shard shard("bench-shard", dim, 4096, wal_dir);
+    Shard shard("bench-shard", dim, 4096, wal_dir, CompactionConfig{});
     shard.SetIndexBuildPool(&pool);
     shard.Start();
 
