@@ -26,6 +26,7 @@ namespace pomai
 
         // Constructor: optional logger for diagnostics.
         explicit PomaiDB(DbOptions opt, Logger *logger = nullptr);
+        ~PomaiDB() { Stop(); } // Ensure Stop is called
 
         Status Start();
         Status Stop();
@@ -40,10 +41,6 @@ namespace pomai
         void SetProbeCount(std::size_t p);
         std::string GetStats() const;
 
-        // Trigger recompute of routing centroids across shards.
-        // - k: desired number of centroids (e.g., shards * 8)
-        // - total_samples: total vectors to sample across all shards (e.g., shards * 1024)
-        // Returns a future that resolves to true on success.
         std::future<Result<bool>> RecomputeCentroids(std::size_t k, std::size_t total_samples = 4096);
 
     private:
@@ -52,11 +49,15 @@ namespace pomai
     private:
         DbOptions opt_;
 
-        std::unique_ptr<IndexBuildPool> build_pool_;
+        // Critical: membrane_ must be declared BEFORE build_pool_
+        // so that build_pool_ is destroyed FIRST (reverse declaration order).
+        // This prevents Shards (owned by membrane) from being destroyed while
+        // build_pool_ workers are still running jobs that access them.
         std::unique_ptr<MembraneRouter> membrane_;
+        std::unique_ptr<IndexBuildPool> build_pool_;
+
         bool started_{false};
 
-        // optional logger (forwarded into Shards)
         Logger *logger_{nullptr};
 
         Metrics metrics_{};

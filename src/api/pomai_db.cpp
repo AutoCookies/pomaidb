@@ -83,20 +83,8 @@ namespace pomai
         filter_cfg.max_tags_per_vector = opt_.max_tags_per_vector;
         filter_cfg.max_filter_tags = opt_.max_filter_tags;
 
-        membrane_ = std::make_unique<MembraneRouter>(std::move(shards),
-                                                     opt_.whisper,
-                                                     opt_.dim,
-                                                     opt_.metric,
-                                                     opt_.search_pool_workers,
-                                                     opt_.search_timeout_ms,
-                                                     opt_.scan_batch_cap,
-                                                     opt_.scan_id_order_max_rows,
-                                                     filter_cfg,
-                                                     [this]()
-                                                     {
-                                                         metrics_.rejected_upsert_batches_total.fetch_add(1, std::memory_order_relaxed);
-                                                     },
-                                                     logger_);
+        membrane_ = std::make_unique<MembraneRouter>(std::move(shards), opt_.whisper, opt_.dim, opt_.metric, opt_.search_pool_workers, opt_.search_timeout_ms, opt_.scan_batch_cap, opt_.scan_id_order_max_rows, filter_cfg, [this]()
+                                                     { metrics_.rejected_upsert_batches_total.fetch_add(1, std::memory_order_relaxed); }, logger_);
 
         membrane_->SetCentroidsFilePath(opt_.centroids_path);
         membrane_->SetCentroidsLoadMode(opt_.centroids_load_mode);
@@ -148,12 +136,25 @@ namespace pomai
 
     Status PomaiDB::Stop()
     {
-        if (!started_)
-            return Status::Ok();
-        started_ = false;
-        auto st = membrane_->Stop();
+        Status st = Status::Ok();
+
+        // 1. Nếu đang chạy, dừng Membrane trước (để flush dữ liệu vào pool)
+        if (started_)
+        {
+            started_ = false;
+            st = membrane_->Stop();
+        }
+
+        // 2. BẮT BUỘC: Ngắt kết nối Pool khỏi Shard.
+        // Phải chạy VÔ ĐIỀU KIỆN (kể cả khi !started_), vì Destructor sẽ chạy sau này.
+        // Nếu không làm bước này, ~Shard() sẽ truy cập vào con trỏ build_pool_ đã chết.
+        if (membrane_)
+            membrane_->DetachBuildPool();
+
+        // 3. Dừng và dọn dẹp Pool
         if (build_pool_)
             build_pool_->Stop();
+
         return st;
     }
 

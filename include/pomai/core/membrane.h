@@ -114,6 +114,7 @@ namespace pomai
         void SetCentroidsLoadMode(CentroidsLoadMode mode);
         bool HasCentroids() const;
         bool ScheduleCompletion(std::function<void()> fn, std::chrono::steady_clock::duration delay = {});
+        void DetachBuildPool();
 
     private:
         // Legacy id-based pick (used as fallback)

@@ -176,17 +176,18 @@ namespace pomai
         return {};
     }
 
-    MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
-                                   pomai::server::WhisperConfig w_cfg,
-                                   std::size_t dim,
-                                   pomai::Metric metric,
-                                   std::size_t shards_count,
-                                   std::size_t shard_queue_capacity,
-                                   std::size_t search_pool_workers,
-                                   std::size_t search_timeout_ms,
-                                   FilterConfig filter_config,
-                                   std::function<void()> on_rejected_upsert,
-                                   pomai::Logger *logger)
+    MembraneRouter::MembraneRouter(
+        std::vector<std::unique_ptr<Shard>> shards,
+        pomai::WhisperConfig w_cfg,
+        std::size_t dim,
+        pomai::Metric metric,
+        std::size_t search_pool_workers,
+        std::size_t search_timeout_ms,
+        std::size_t scan_batch_cap,
+        std::size_t scan_id_order_max_rows,
+        FilterConfig filter_config,
+        std::function<void()> on_rejected_upsert,
+        pomai::Logger *logger)
         : shards_(std::move(shards)),
           brain_(w_cfg),
           router_(),
@@ -195,20 +196,24 @@ namespace pomai
           centroids_path_(),
           centroids_load_mode_(CentroidsLoadMode::Auto),
           dim_(dim),
+          metric_(metric),
+          db_dir_(),
           search_timeout_ms_(search_timeout_ms),
-          // Fix lỗi -Wreorder: Sắp xếp theo đúng thứ tự khai báo trong .h
+          filter_config_(std::move(filter_config)),
           search_pool_(ChooseSearchPoolWorkers(search_pool_workers, shards_.size())),
+          completion_(),
           on_rejected_upsert_(std::move(on_rejected_upsert)),
-          log_(logger)
+          logger_(logger)
     {
-        // Tránh cảnh báo unused cho các tham số tạm thời
-        (void)metric;
-        (void)shards_count;
-        (void)shard_queue_capacity;
-        (void)filter_config;
-
+        // Initialise scanning parameters from constructor arguments.
+        scan_batch_cap_ = scan_batch_cap;
+        scan_id_order_max_rows_ = scan_id_order_max_rows;
+        // Keep the deprecated log_ pointer in sync with logger_.
+        log_ = logger;
         if (shards_.empty())
+        {
             throw std::runtime_error("must have at least 1 shard");
+        }
     }
 
     Status MembraneRouter::Start()
@@ -724,6 +729,14 @@ namespace pomai
         }
 
         return Result<SearchResponse>(std::move(out));
+    }
+
+    void MembraneRouter::DetachBuildPool()
+    {
+        for (auto &s : shards_)
+        {
+            s->SetIndexBuildPool(nullptr);
+        }
     }
 
     std::shared_ptr<const MembraneRouter::ScanView> MembraneRouter::FindView(std::uint64_t epoch) const
