@@ -66,6 +66,7 @@ namespace pomai
     WalReplayStats ReplayToSeed(class Seed &seed, Lsn min_lsn);
 
     Lsn WrittenLsn() const;
+    Lsn DurableLsn() const;
 
     void TruncateToZero();
 

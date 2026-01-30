@@ -537,6 +537,12 @@ namespace pomai
         return written_lsn_;
     }
 
+    Lsn Wal::DurableLsn() const
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        return durable_lsn_;
+    }
+
     void Wal::TruncateToZero()
     {
         std::lock_guard<std::mutex> lk(mu_);

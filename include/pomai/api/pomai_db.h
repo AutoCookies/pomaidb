@@ -8,6 +8,7 @@
 
 #include <pomai/api/options.h>
 #include <pomai/api/search.h>
+#include <pomai/api/scan.h>
 #include <pomai/core/membrane.h>
 #include <pomai/util/index_build_pool.h>
 
@@ -35,6 +36,7 @@ namespace pomai
         std::future<Lsn> UpsertBatch(std::vector<UpsertRequest> batch, bool wait_durable = true);
 
         SearchResponse Search(const SearchRequest &req) const;
+        ScanResponse Scan(const ScanRequest &req) const;
         std::size_t TotalApproxCountUnsafe() const;
         std::future<bool> RequestCheckpoint();
         void SetProbeCount(std::size_t p);

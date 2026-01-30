@@ -13,6 +13,8 @@
 #include <random>
 #include <limits>
 #include <cmath>
+#include <unordered_set>
+#include <unordered_map>
 #include <pomai/util/fixed_topk.h>
 #include <pomai/util/search_utils.h>
 #include <pomai/util/cpu_kernels.h>
@@ -75,8 +77,22 @@ namespace pomai
 
     }
 
-    Shard::Shard(std::string name, std::size_t dim, std::size_t queue_cap, std::string wal_dir, LogFn info, LogFn error)
-        : name_(std::move(name)), wal_dir_(std::move(wal_dir)), wal_(name_, wal_dir_, dim), seed_(dim), ingest_q_(queue_cap), build_pool_(nullptr), log_info_(std::move(info)), log_error_(std::move(error))
+    Shard::Shard(std::string name,
+                 std::size_t dim,
+                 std::size_t queue_cap,
+                 std::string wal_dir,
+                 CompactionConfig compaction,
+                 LogFn info,
+                 LogFn error)
+        : name_(std::move(name)),
+          wal_dir_(std::move(wal_dir)),
+          wal_(name_, wal_dir_, dim),
+          seed_(dim),
+          ingest_q_(queue_cap),
+          build_pool_(nullptr),
+          log_info_(std::move(info)),
+          log_error_(std::move(error)),
+          compaction_(compaction)
     {
         auto live_snap = seed_.MakeSnapshot();
         auto next = std::make_shared<ShardState>();
@@ -115,6 +131,8 @@ namespace pomai
         }
         wal_.Start();
         owner_ = std::thread(&Shard::RunLoop, this);
+        compactor_running_.store(true, std::memory_order_release);
+        compactor_ = std::thread(&Shard::RunCompactionLoop, this);
     }
 
     void Shard::Stop()
@@ -122,12 +140,40 @@ namespace pomai
         ingest_q_.Close();
         if (owner_.joinable())
             owner_.join();
+        compactor_running_.store(false, std::memory_order_release);
+        if (compactor_.joinable())
+            compactor_.join();
         wal_.Stop();
     }
 
     std::size_t Shard::ApproxCountUnsafe() const
     {
         return seed_.Count();
+    }
+
+    std::shared_ptr<const ShardState> Shard::SnapshotState() const
+    {
+        return state_.load(std::memory_order_acquire);
+    }
+
+    std::size_t Shard::CompactionBacklog() const
+    {
+        return compaction_backlog_.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t Shard::LastCompactionDurationMs() const
+    {
+        return last_compaction_ms_.load(std::memory_order_relaxed);
+    }
+
+    Lsn Shard::DurableLsn() const
+    {
+        return wal_.DurableLsn();
+    }
+
+    Lsn Shard::WrittenLsn() const
+    {
+        return wal_.WrittenLsn();
     }
 
     std::future<Lsn> Shard::EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable)
@@ -580,18 +626,18 @@ namespace pomai
         if (!snap || snap->ids.empty())
             return;
         auto current = state_.load(std::memory_order_acquire);
-        if (current && current->segments.size() >= kMaxSegments)
-        {
-            if (log_error_)
-                log_error_("[" + name_ + "] segment cap reached, skipping freeze to bound segment count");
-            return;
-        }
+            if (current && current->segments.size() >= kMaxSegments)
+            {
+                if (log_error_)
+                    log_error_("[" + name_ + "] segment cap reached, skipping freeze to bound segment count");
+                return;
+            }
         std::size_t pos;
         {
             std::lock_guard<std::mutex> lk(writer_mu_);
             auto prev = state_.load(std::memory_order_acquire);
             auto next = std::make_shared<ShardState>(prev ? *prev : ShardState{});
-            next->segments.push_back({snap, nullptr, nullptr});
+            next->segments.push_back({snap, nullptr, nullptr, 0, segment_epoch_.fetch_add(1, std::memory_order_relaxed)});
             pos = next->segments.size() - 1;
             PublishState(std::move(next));
         }
@@ -724,12 +770,181 @@ namespace pomai
         for (const auto &seg : state.segments)
         {
             auto snap = Seed::SnapshotFromState(seg);
-            next->segments.push_back({snap, nullptr, nullptr});
+            next->segments.push_back({snap, nullptr, nullptr, 0, segment_epoch_.fetch_add(1, std::memory_order_relaxed)});
         }
         next->live_snap = seed_.MakeSnapshot();
         next->live_grains.reset();
         PublishState(std::move(next));
         checkpoint_lsn_ = checkpoint_lsn;
         recovered_ = true;
+    }
+
+    std::size_t Shard::ComputeCompactionBacklog(const std::shared_ptr<const ShardState> &state) const
+    {
+        if (!state)
+            return 0;
+        const std::size_t merge_count = std::max<std::size_t>({1, compaction_.compaction_trigger_threshold, compaction_.level_fanout});
+        std::unordered_map<std::uint32_t, std::size_t> counts;
+        for (const auto &seg : state->segments)
+            counts[seg.level]++;
+        std::size_t backlog = 0;
+        for (const auto &kv : counts)
+        {
+            if (kv.second >= merge_count)
+                backlog += kv.second;
+        }
+        return backlog;
+    }
+
+    void Shard::RunCompactionLoop()
+    {
+        while (compactor_running_.load(std::memory_order_acquire))
+        {
+            MaybeScheduleCompaction();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    void Shard::MaybeScheduleCompaction()
+    {
+        auto snapshot = state_.load(std::memory_order_acquire);
+        compaction_backlog_.store(ComputeCompactionBacklog(snapshot), std::memory_order_relaxed);
+        if (!snapshot)
+            return;
+        if (compaction_.max_concurrent_compactions == 0)
+            return;
+        const std::size_t merge_count = std::max<std::size_t>({1, compaction_.compaction_trigger_threshold, compaction_.level_fanout});
+        if (active_compactions_.load(std::memory_order_relaxed) >= compaction_.max_concurrent_compactions)
+            return;
+        std::unordered_map<std::uint32_t, std::size_t> counts;
+        for (const auto &seg : snapshot->segments)
+            counts[seg.level]++;
+        for (const auto &kv : counts)
+        {
+            if (kv.second >= merge_count)
+            {
+                if (active_compactions_.fetch_add(1, std::memory_order_acq_rel) >= compaction_.max_concurrent_compactions)
+                {
+                    active_compactions_.fetch_sub(1, std::memory_order_acq_rel);
+                    return;
+                }
+                bool ok = CompactLevel(kv.first);
+                active_compactions_.fetch_sub(1, std::memory_order_acq_rel);
+                if (!ok)
+                    return;
+            }
+        }
+    }
+
+    Seed Shard::MergeSnapshots(const std::vector<Seed::Snapshot> &snaps) const
+    {
+        Seed merged(seed_.Dim());
+        std::vector<float> buf(seed_.Dim());
+        std::vector<UpsertRequest> batch;
+        batch.reserve(1024);
+        for (const auto &snap : snaps)
+        {
+            if (!snap)
+                continue;
+            for (std::size_t row = 0; row < snap->ids.size(); ++row)
+            {
+                Seed::DequantizeRow(snap, row, buf.data());
+                Metadata meta{};
+                if (row < snap->namespace_ids.size())
+                    meta.namespace_id = snap->namespace_ids[row];
+                std::uint32_t start = (row < snap->tag_offsets.size()) ? snap->tag_offsets[row] : 0;
+                std::uint32_t end = (row + 1 < snap->tag_offsets.size()) ? snap->tag_offsets[row + 1] : start;
+                if (start <= end && end <= snap->tag_ids.size())
+                    meta.tag_ids.assign(snap->tag_ids.begin() + start, snap->tag_ids.begin() + end);
+                UpsertRequest req;
+                req.id = snap->ids[row];
+                req.vec.data = buf;
+                req.metadata = std::move(meta);
+                batch.push_back(std::move(req));
+                if (batch.size() >= 1024)
+                {
+                    merged.ApplyUpserts(batch);
+                    batch.clear();
+                }
+            }
+        }
+        if (!batch.empty())
+            merged.ApplyUpserts(batch);
+        return merged;
+    }
+
+    bool Shard::CompactLevel(std::uint32_t level)
+    {
+        auto start = std::chrono::steady_clock::now();
+        auto snapshot = state_.load(std::memory_order_acquire);
+        if (!snapshot)
+            return false;
+        const std::size_t merge_count = std::max<std::size_t>({1, compaction_.compaction_trigger_threshold, compaction_.level_fanout});
+        std::vector<std::size_t> positions;
+        std::vector<Seed::Snapshot> snaps;
+        for (std::size_t i = 0; i < snapshot->segments.size(); ++i)
+        {
+            const auto &seg = snapshot->segments[i];
+            if (seg.level == level && seg.snap)
+            {
+                positions.push_back(i);
+                snaps.push_back(seg.snap);
+                if (positions.size() >= merge_count)
+                    break;
+            }
+        }
+        if (positions.size() < merge_count)
+            return false;
+        Seed merged = MergeSnapshots(snaps);
+        auto merged_snap = merged.MakeSnapshot();
+        auto grains = BuildGrainIndex(merged_snap);
+        std::shared_ptr<pomai::core::OrbitIndex> index;
+        if (merged_snap && !merged_snap->ids.empty())
+        {
+            auto flat = Seed::DequantizeSnapshot(merged_snap);
+            index = std::make_shared<pomai::core::OrbitIndex>(merged_snap->dim);
+            index->Build(flat, merged_snap->ids);
+        }
+        {
+            std::lock_guard<std::mutex> lk(writer_mu_);
+            auto current = state_.load(std::memory_order_acquire);
+            if (!current)
+                return false;
+            bool still_present = true;
+            for (std::size_t idx : positions)
+            {
+                if (idx >= current->segments.size() || current->segments[idx].snap != snapshot->segments[idx].snap)
+                {
+                    still_present = false;
+                    break;
+                }
+            }
+            if (!still_present)
+                return false;
+            auto next = std::make_shared<ShardState>(*current);
+            std::vector<IndexedSegment> compacted;
+            compacted.reserve(next->segments.size() - positions.size() + 1);
+            std::unordered_set<std::size_t> remove;
+            remove.reserve(positions.size());
+            for (std::size_t idx : positions)
+                remove.insert(idx);
+            for (std::size_t i = 0; i < next->segments.size(); ++i)
+            {
+                if (remove.count(i) == 0)
+                    compacted.push_back(next->segments[i]);
+            }
+            IndexedSegment merged_seg;
+            merged_seg.snap = merged_snap;
+            merged_seg.grains = std::move(grains);
+            merged_seg.index = std::move(index);
+            merged_seg.level = level + 1;
+            merged_seg.created_at = segment_epoch_.fetch_add(1, std::memory_order_relaxed);
+            compacted.push_back(std::move(merged_seg));
+            next->segments = std::move(compacted);
+            PublishState(std::move(next));
+        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+        last_compaction_ms_.store(static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
+        return true;
     }
 }
