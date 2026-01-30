@@ -24,6 +24,7 @@ namespace pomai::server
 
         std::string log_path{"/var/log/pomai/pomai.log"};
         std::string log_level{"info"};
+        bool dev_mode{false};
 
         WhisperConfig whisper;
         bool allow_sync_on_append{true};

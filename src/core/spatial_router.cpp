@@ -6,31 +6,32 @@
 
 namespace pomai
 {
-    namespace
+    std::size_t SpatialRouter::SelectBestIndex(const Vector *centroids,
+                                               const std::size_t *indices,
+                                               std::size_t count,
+                                               const float *query,
+                                               std::size_t dim)
     {
-        std::size_t SelectBestIndex(const Vector *centroids,
-                                    const std::size_t *indices,
-                                    std::size_t count,
-                                    const float *query,
-                                    std::size_t dim)
+        alignas(32) float distances[256];
+        float best_d = std::numeric_limits<float>::infinity();
+        std::size_t best = 0;
+
+        std::size_t offset = 0;
+        while (offset < count)
         {
-            alignas(32) float distances[256];
-            std::size_t safe_count = std::min<std::size_t>(count, 256);
-
-            kernels::L2Sqr8CentroidsAVX2(centroids, indices, safe_count, query, dim, distances);
-
-            float best_d = std::numeric_limits<float>::infinity();
-            std::size_t best = 0;
-            for (std::size_t i = 0; i < safe_count; ++i)
+            std::size_t batch = std::min<std::size_t>(count - offset, 256);
+            kernels::L2Sqr8CentroidsAVX2(centroids, indices + offset, batch, query, dim, distances);
+            for (std::size_t i = 0; i < batch; ++i)
             {
                 if (distances[i] < best_d)
                 {
                     best_d = distances[i];
-                    best = i;
+                    best = offset + i;
                 }
             }
-            return best;
+            offset += batch;
         }
+        return best;
     }
 
     std::size_t SpatialRouter::PickShardForInsert(const Vector &vec) const

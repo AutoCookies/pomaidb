@@ -43,6 +43,13 @@ namespace pomai
         static std::vector<Vector> BuildKMeans(const std::vector<Vector> &data, std::size_t k, int iterations = 10);
 
     private:
+        friend struct SpatialRouterTestAccess;
+        static std::size_t SelectBestIndex(const Vector *centroids,
+                                           const std::size_t *indices,
+                                           std::size_t count,
+                                           const float *query,
+                                           std::size_t dim);
+
         mutable std::shared_mutex mu_;
         std::vector<Vector> centroids_;
         std::vector<Vector> master_centroids_;

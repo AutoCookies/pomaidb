@@ -13,3 +13,4 @@ default_metric: cosine
 
 log_path: ./pomai.log
 log_level: info
+# dev_mode: false

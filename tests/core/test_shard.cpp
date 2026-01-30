@@ -15,8 +15,8 @@ TEST_CASE("Shard upsert/search round-trip", "[core][shard]")
 {
     TempDir dir;
     CompactionConfig compaction{};
-    Shard shard("shard-0", 8, 128, dir.str(), compaction);
-    shard.Start();
+    Shard shard("shard-0", 0, 8, 128, dir.str(), compaction);
+    REQUIRE(shard.Start().ok());
 
     auto batch = MakeBatch(25, 8, 0.1f);
     auto fut = shard.EnqueueUpserts(batch, true);

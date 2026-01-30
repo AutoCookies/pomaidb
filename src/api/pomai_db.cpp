@@ -59,6 +59,7 @@ namespace pomai
             compaction_cfg.compaction_trigger_threshold = opt_.compaction_trigger_threshold;
             auto sh = std::make_unique<Shard>(
                 ss.str(),
+                static_cast<std::uint32_t>(i),
                 opt_.dim,
                 opt_.shard_queue_capacity,
                 paths.wal_dir,

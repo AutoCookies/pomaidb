@@ -14,6 +14,7 @@ add_executable(pomai_tests
     common/test_utils.cpp
     core/test_seed.cpp
     core/test_shard.cpp
+    core/test_spatial_router.cpp
     core/test_membrane.cpp
     core/test_orbit_index.cpp
     core/test_filtering.cpp

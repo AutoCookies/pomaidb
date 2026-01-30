@@ -79,12 +79,14 @@ namespace pomai
     }
 
     Shard::Shard(std::string name,
+                 std::uint32_t shard_id,
                  std::size_t dim,
                  std::size_t queue_cap,
                  std::string wal_dir,
                  CompactionConfig compaction,
                  Logger *logger)
         : name_(std::move(name)),
+          shard_id_(shard_id),
           wal_dir_(std::move(wal_dir)),
           wal_(name_, wal_dir_, dim),
           seed_(dim),
@@ -106,7 +108,7 @@ namespace pomai
         Stop();
     }
 
-    void Shard::Start()
+    Status Shard::Start()
     {
         try
         {
@@ -118,11 +120,13 @@ namespace pomai
         {
             if (logger_)
                 logger_->Error("shard.wal.replay", "[" + name_ + "] WAL Replay failed: " + std::string(e.what()));
+            return Status::Corrupt("WAL replay failed: " + std::string(e.what()));
         }
         catch (...)
         {
             if (logger_)
                 logger_->Error("shard.wal.replay", "[" + name_ + "] WAL Replay failed: unknown exception");
+            return Status::Corrupt("WAL replay failed: unknown exception");
         }
         if (!recovered_)
         {
@@ -139,6 +143,7 @@ namespace pomai
         owner_ = std::thread(&Shard::RunLoop, this);
         compactor_running_.store(true, std::memory_order_release);
         compactor_ = std::thread(&Shard::RunCompactionLoop, this);
+        return Status::Ok();
     }
 
     void Shard::Stop()
@@ -575,7 +580,7 @@ namespace pomai
                 {
                     wal_.WaitDurable(wal_.WrittenLsn());
                     ShardCheckpointState state;
-                    state.shard_id = 0;
+                    state.shard_id = shard_id_;
                     state.durable_lsn = wal_.WrittenLsn();
                     auto snapshot = state_.load(std::memory_order_acquire);
                     if (snapshot)
