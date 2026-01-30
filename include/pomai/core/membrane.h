@@ -7,7 +7,6 @@
 #include <functional>
 #include <atomic>
 #include <mutex>
-#include <unordered_map>
 #include <cstdint>
 #include <chrono>
 #include <pomai/core/shard.h>
@@ -33,6 +32,8 @@ namespace pomai
             std::size_t tag_dictionary_max_size{100000};
             std::size_t max_tags_per_vector{32};
             std::size_t max_filter_tags{64};
+
+            static FilterConfig Default();
         };
 
         // Added 'search_pool_workers' parameter so callers can tune the bounded search pool.
@@ -40,10 +41,10 @@ namespace pomai
         explicit MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                 pomai::WhisperConfig w_cfg,
                                 std::size_t dim,
-                                std::size_t search_pool_workers = 0,
-                                std::size_t search_timeout_ms = 500,
-                                FilterConfig filter_config = FilterConfig{},
-                                std::function<void()> on_rejected_upsert = {});
+                                std::size_t search_pool_workers,
+                                std::size_t search_timeout_ms,
+                                FilterConfig filter_config,
+                                std::function<void()> on_rejected_upsert);
 
         void Start();
         void Stop();
@@ -96,15 +97,6 @@ namespace pomai
         // Smart pick: prefer vector-based routing if vec_opt provided and router configured
         std::size_t PickShard(Id id, const Vector *vec_opt = nullptr) const;
 
-        struct DictionarySnapshot
-        {
-            std::unordered_map<std::string, std::uint32_t> namespaces;
-            std::unordered_map<std::string, TagId> tags;
-        };
-
-        std::shared_ptr<const DictionarySnapshot> SnapshotDictionary() const;
-        std::shared_ptr<const DictionarySnapshot> ExtendDictionary(const std::vector<std::string> &namespaces,
-                                                                   const std::vector<std::string> &tags);
         Metadata NormalizeMetadata(const Metadata &meta);
         std::shared_ptr<const Filter> NormalizeFilter(const SearchRequest &req) const;
 
@@ -125,9 +117,6 @@ namespace pomai
         std::size_t dim_{0};
         std::size_t search_timeout_ms_{500};
         FilterConfig filter_config_{};
-
-        mutable std::mutex dict_mu_;
-        std::atomic<std::shared_ptr<const DictionarySnapshot>> dict_{nullptr};
 
         // Thread-pool for bounded parallel search fanout. Mutable so Search() can be const.
         mutable SearchThreadPool search_pool_;

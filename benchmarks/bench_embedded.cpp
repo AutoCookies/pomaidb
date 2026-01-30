@@ -58,12 +58,9 @@ static bool MatchesFilter(std::size_t id, const Filter &filter)
     if (filter.match_none)
         return false;
     std::uint32_t ns = static_cast<std::uint32_t>(id % 10);
-    std::uint64_t user_id = static_cast<std::uint64_t>(id % 1000);
     TagId t1 = static_cast<TagId>(id % 7);
     TagId t2 = static_cast<TagId>(id % 11);
     if (filter.namespace_id && ns != *filter.namespace_id)
-        return false;
-    if (filter.user_id && user_id != *filter.user_id)
         return false;
     if (!filter.exclude_tags.empty())
     {
@@ -198,7 +195,6 @@ int main(int argc, char **argv)
         batch[0].id = i;
         batch[0].vec.data.resize(dim);
         batch[0].metadata.namespace_id = static_cast<std::uint32_t>(i % 10);
-        batch[0].metadata.user_id = static_cast<std::uint64_t>(i % 1000);
         batch[0].metadata.tag_ids = {static_cast<TagId>(i % 7), static_cast<TagId>(i % 11)};
         std::sort(batch[0].metadata.tag_ids.begin(), batch[0].metadata.tag_ids.end());
         for (size_t d = 0; d < dim; ++d)
@@ -225,7 +221,6 @@ int main(int argc, char **argv)
             batch[i].id = idx;
             batch[i].vec.data.resize(dim);
             batch[i].metadata.namespace_id = static_cast<std::uint32_t>(idx % 10);
-            batch[i].metadata.user_id = static_cast<std::uint64_t>(idx % 1000);
             batch[i].metadata.tag_ids = {static_cast<TagId>(idx % 7), static_cast<TagId>(idx % 11)};
             std::sort(batch[i].metadata.tag_ids.begin(), batch[i].metadata.tag_ids.end());
             for (size_t d = 0; d < dim; ++d)
@@ -320,10 +315,6 @@ int main(int argc, char **argv)
     Filter ns_only;
     ns_only.namespace_id = 3;
     cases.push_back({"namespace_only", ns_only});
-    Filter ns_user;
-    ns_user.namespace_id = 4;
-    ns_user.user_id = 128;
-    cases.push_back({"namespace_user", ns_user});
     Filter tags_any;
     tags_any.require_any_tags = {1, 5};
     std::sort(tags_any.require_any_tags.begin(), tags_any.require_any_tags.end());

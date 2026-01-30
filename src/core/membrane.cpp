@@ -165,6 +165,11 @@ namespace pomai
         }
     }
 
+    MembraneRouter::FilterConfig MembraneRouter::FilterConfig::Default()
+    {
+        return {};
+    }
+
     MembraneRouter::MembraneRouter(std::vector<std::unique_ptr<Shard>> shards,
                                    pomai::WhisperConfig w_cfg,
                                    std::size_t dim,
@@ -183,8 +188,6 @@ namespace pomai
     {
         if (shards_.empty())
             throw std::runtime_error("must have at least 1 shard");
-        auto snap = std::make_shared<DictionarySnapshot>();
-        dict_.store(snap, std::memory_order_release);
     }
 
     void MembraneRouter::Start()
@@ -240,91 +243,15 @@ namespace pomai
         return PickShardById(id);
     }
 
-    std::shared_ptr<const MembraneRouter::DictionarySnapshot> MembraneRouter::SnapshotDictionary() const
-    {
-        return dict_.load(std::memory_order_acquire);
-    }
-
-    std::shared_ptr<const MembraneRouter::DictionarySnapshot> MembraneRouter::ExtendDictionary(const std::vector<std::string> &namespaces,
-                                                                                               const std::vector<std::string> &tags)
-    {
-        if (namespaces.empty() && tags.empty())
-            return SnapshotDictionary();
-
-        std::lock_guard<std::mutex> lk(dict_mu_);
-        auto current = dict_.load(std::memory_order_acquire);
-        auto next = std::make_shared<DictionarySnapshot>(*current);
-        bool changed = false;
-
-        for (const auto &name : namespaces)
-        {
-            if (name.empty())
-                continue;
-            if (next->namespaces.find(name) == next->namespaces.end())
-            {
-                std::uint32_t id = static_cast<std::uint32_t>(next->namespaces.size() + 1);
-                next->namespaces.emplace(name, id);
-                changed = true;
-            }
-        }
-
-        for (const auto &tag : tags)
-        {
-            if (tag.empty())
-                continue;
-            if (next->tags.find(tag) == next->tags.end())
-            {
-                if (next->tags.size() >= filter_config_.tag_dictionary_max_size)
-                    throw std::runtime_error("tag dictionary max size exceeded");
-                TagId id = static_cast<TagId>(next->tags.size());
-                next->tags.emplace(tag, id);
-                changed = true;
-            }
-        }
-
-        if (changed)
-            dict_.store(next, std::memory_order_release);
-        return dict_.load(std::memory_order_acquire);
-    }
-
     Metadata MembraneRouter::NormalizeMetadata(const Metadata &meta)
     {
         Metadata out = meta;
-        std::vector<std::string> ns_names;
-        std::vector<std::string> tag_names;
-        if (!meta.namespace_name.empty())
-            ns_names.push_back(meta.namespace_name);
-        if (!meta.tags.empty())
-            tag_names = meta.tags;
-
-        auto snap = ExtendDictionary(ns_names, tag_names);
-        if (!meta.namespace_name.empty())
-        {
-            auto it = snap->namespaces.find(meta.namespace_name);
-            if (it != snap->namespaces.end())
-                out.namespace_id = it->second;
-            else
-                out.namespace_id = 0;
-        }
-
         std::vector<TagId> tag_ids = meta.tag_ids;
-        if (!meta.tags.empty())
-        {
-            tag_ids.reserve(tag_ids.size() + meta.tags.size());
-            for (const auto &tag : meta.tags)
-            {
-                auto it = snap->tags.find(tag);
-                if (it != snap->tags.end())
-                    tag_ids.push_back(it->second);
-            }
-        }
         std::sort(tag_ids.begin(), tag_ids.end());
         tag_ids.erase(std::unique(tag_ids.begin(), tag_ids.end()), tag_ids.end());
         if (tag_ids.size() > filter_config_.max_tags_per_vector)
             throw std::runtime_error("max_tags_per_vector exceeded");
         out.tag_ids = std::move(tag_ids);
-        out.tags.clear();
-        out.namespace_name.clear();
         return out;
     }
 
@@ -333,44 +260,6 @@ namespace pomai
         if (!req.filter)
             return nullptr;
         Filter f = *req.filter;
-        auto snap = SnapshotDictionary();
-        if (!f.namespace_name.empty())
-        {
-            auto it = snap->namespaces.find(f.namespace_name);
-            if (it == snap->namespaces.end())
-            {
-                f.match_none = true;
-            }
-            else
-            {
-                f.namespace_id = it->second;
-            }
-        }
-
-        auto append_tags = [&](const std::vector<std::string> &names, std::vector<TagId> &out, bool require_all, bool require_any)
-        {
-            if (names.empty() || f.match_none)
-                return;
-            std::size_t found = 0;
-            for (const auto &name : names)
-            {
-                auto it = snap->tags.find(name);
-                if (it != snap->tags.end())
-                {
-                    out.push_back(it->second);
-                    ++found;
-                }
-            }
-            if (require_all && found != names.size())
-                f.match_none = true;
-            if (require_any && found == 0)
-                f.match_none = true;
-        };
-
-        append_tags(f.require_all_tag_names, f.require_all_tags, true, false);
-        append_tags(f.require_any_tag_names, f.require_any_tags, false, true);
-        append_tags(f.exclude_tag_names, f.exclude_tags, false, false);
-
         auto normalize_vec = [](std::vector<TagId> &tags)
         {
             std::sort(tags.begin(), tags.end());
@@ -382,10 +271,6 @@ namespace pomai
         const std::size_t total_tags = f.require_all_tags.size() + f.require_any_tags.size() + f.exclude_tags.size();
         if (total_tags > filter_config_.max_filter_tags)
             throw std::runtime_error("max_filter_tags exceeded");
-        f.require_all_tag_names.clear();
-        f.require_any_tag_names.clear();
-        f.exclude_tag_names.clear();
-        f.namespace_name.clear();
         return std::make_shared<Filter>(std::move(f));
     }
 

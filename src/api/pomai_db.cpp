@@ -59,7 +59,7 @@ namespace pomai
             shards.push_back(std::move(sh));
         }
 
-        MembraneRouter::FilterConfig filter_cfg;
+        MembraneRouter::FilterConfig filter_cfg = MembraneRouter::FilterConfig::Default();
         filter_cfg.filtered_candidate_k = opt_.filtered_candidate_k;
         filter_cfg.filter_expand_factor = opt_.filter_expand_factor;
         filter_cfg.filter_max_visits = opt_.filter_max_visits;

@@ -60,8 +60,6 @@ static std::vector<Id> BruteForceFiltered(const std::vector<std::vector<float>> 
         const auto &m = meta[i];
         if (filter.namespace_id && *filter.namespace_id != m.namespace_id)
             continue;
-        if (filter.user_id && *filter.user_id != m.user_id)
-            continue;
         bool match = true;
         if (!filter.exclude_tags.empty())
         {
@@ -137,14 +135,14 @@ int main()
             UpsertRequest req;
             req.id = i;
             req.vec.data = {static_cast<float>(i), 0.0f, 0.0f, 0.0f};
-            req.metadata.namespace_name = (i < 2) ? "ns-a" : "ns-b";
-            req.metadata.user_id = (i == 0) ? 42 : 7;
+            req.metadata.namespace_id = (i < 2) ? 1 : 2;
             if (i == 0)
-                req.metadata.tags = {"red", "round"};
+                req.metadata.tag_ids = {1, 2};
             else if (i == 1)
-                req.metadata.tags = {"blue"};
+                req.metadata.tag_ids = {3};
             else
-                req.metadata.tags = {"red"};
+                req.metadata.tag_ids = {1};
+            std::sort(req.metadata.tag_ids.begin(), req.metadata.tag_ids.end());
             batch.push_back(std::move(req));
         }
         db.UpsertBatch(std::move(batch), true).get();
@@ -156,7 +154,7 @@ int main()
         req.candidate_k = 0;
 
         auto filter = std::make_shared<Filter>();
-        filter->namespace_name = "ns-a";
+        filter->namespace_id = 1;
         req.filter = filter;
         auto resp = db.Search(req);
         for (const auto &item : resp.items)
@@ -170,7 +168,8 @@ int main()
         }
 
         auto tag_filter = std::make_shared<Filter>();
-        tag_filter->require_all_tag_names = {"red", "round"};
+        tag_filter->require_all_tags = {1, 2};
+        std::sort(tag_filter->require_all_tags.begin(), tag_filter->require_all_tags.end());
         req.filter = tag_filter;
         auto resp2 = db.Search(req);
         if (resp2.items.empty() || resp2.items.front().id != 0)
@@ -180,8 +179,10 @@ int main()
         }
 
         auto any_filter = std::make_shared<Filter>();
-        any_filter->require_any_tag_names = {"blue", "red"};
-        any_filter->exclude_tag_names = {"round"};
+        any_filter->require_any_tags = {1, 3};
+        any_filter->exclude_tags = {2};
+        std::sort(any_filter->require_any_tags.begin(), any_filter->require_any_tags.end());
+        std::sort(any_filter->exclude_tags.begin(), any_filter->exclude_tags.end());
         req.filter = any_filter;
         auto resp3 = db.Search(req);
         for (const auto &item : resp3.items)
@@ -218,7 +219,6 @@ int main()
             for (std::size_t d = 0; d < dim; ++d)
                 vectors[i][d] = dist(rng);
             meta[i].namespace_id = static_cast<std::uint32_t>(i % 3);
-            meta[i].user_id = static_cast<std::uint64_t>(i % 5);
             meta[i].tag_ids = {static_cast<TagId>(i % 7), static_cast<TagId>(i % 11)};
             std::sort(meta[i].tag_ids.begin(), meta[i].tag_ids.end());
         }
@@ -267,6 +267,82 @@ int main()
                 }
             }
         }
+
+        SearchRequest rerank_req = req;
+        rerank_req.filter = nullptr;
+        rerank_req.topk = n;
+        rerank_req.candidate_k = n;
+        rerank_req.max_rerank_k = n;
+        auto rerank_resp = Seed::SearchSnapshot(snap, rerank_req);
+        std::vector<Id> rerank_filtered;
+        rerank_filtered.reserve(topk);
+        for (const auto &item : rerank_resp.items)
+        {
+            const auto &m = meta.at(static_cast<std::size_t>(item.id));
+            if (filter->namespace_id && m.namespace_id != *filter->namespace_id)
+                continue;
+            bool match = true;
+            if (!filter->exclude_tags.empty())
+            {
+                for (TagId t : m.tag_ids)
+                {
+                    if (std::binary_search(filter->exclude_tags.begin(), filter->exclude_tags.end(), t))
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+            }
+            if (!match)
+                continue;
+            if (!filter->require_all_tags.empty())
+            {
+                for (TagId t : filter->require_all_tags)
+                {
+                    if (!std::binary_search(m.tag_ids.begin(), m.tag_ids.end(), t))
+                    {
+                        match = false;
+                        break;
+                    }
+                }
+            }
+            if (!match)
+                continue;
+            if (!filter->require_any_tags.empty())
+            {
+                bool any = false;
+                for (TagId t : filter->require_any_tags)
+                {
+                    if (std::binary_search(m.tag_ids.begin(), m.tag_ids.end(), t))
+                    {
+                        any = true;
+                        break;
+                    }
+                }
+                if (!any)
+                    continue;
+            }
+            rerank_filtered.push_back(item.id);
+            if (rerank_filtered.size() >= topk)
+                break;
+        }
+        if (resp.items.size() != rerank_filtered.size())
+        {
+            std::cerr << "Filtered rerank recall test size mismatch\n";
+            failures++;
+        }
+        else
+        {
+            for (std::size_t i = 0; i < rerank_filtered.size(); ++i)
+            {
+                if (resp.items[i].id != rerank_filtered[i])
+                {
+                    std::cerr << "Filtered rerank recall mismatch at " << i << "\n";
+                    failures++;
+                    break;
+                }
+            }
+        }
     }
     catch (const std::exception &e)
     {
@@ -305,9 +381,9 @@ int main()
                                        req.vec.data.resize(opt.dim);
                                        for (std::size_t d = 0; d < opt.dim; ++d)
                                            req.vec.data[d] = dist(rng);
-                                       req.metadata.namespace_name = (req.id % 2 == 0) ? "ns-a" : "ns-b";
-                                       req.metadata.user_id = req.id % 5;
-                                       req.metadata.tags = {"tag-" + std::to_string(req.id % 7)};
+                                       req.metadata.namespace_id = (req.id % 2 == 0) ? 1 : 2;
+                                       req.metadata.tag_ids = {static_cast<TagId>(req.id % 7)};
+                                       std::sort(req.metadata.tag_ids.begin(), req.metadata.tag_ids.end());
                                        batch.push_back(std::move(req));
                                    }
                                    try
@@ -330,8 +406,9 @@ int main()
                                  req.metric = Metric::L2;
                                  req.query.data.resize(opt.dim);
                                  auto filter = std::make_shared<Filter>();
-                                 filter->namespace_name = "ns-a";
-                                 filter->require_any_tag_names = {"tag-1", "tag-2"};
+                                 filter->namespace_id = 1;
+                                 filter->require_any_tags = {1, 2};
+                                 std::sort(filter->require_any_tags.begin(), filter->require_any_tags.end());
                                  req.filter = filter;
                                  while (!stop.load())
                                  {

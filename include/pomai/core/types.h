@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <string>
-#include <utility>
 #include <vector>
 
 namespace pomai
@@ -37,31 +35,21 @@ namespace pomai
     struct Metadata
     {
         std::uint32_t namespace_id{0};
-        std::string namespace_name{};
         std::vector<TagId> tag_ids;
-        std::vector<std::string> tags;
     };
 
     struct Filter
     {
         std::optional<std::uint32_t> namespace_id;
-        std::string namespace_name{};
         std::vector<TagId> require_all_tags;
         std::vector<TagId> require_any_tags;
         std::vector<TagId> exclude_tags;
-        std::vector<std::string> require_all_tag_names;
-        std::vector<std::string> require_any_tag_names;
-        std::vector<std::string> exclude_tag_names;
-        std::vector<std::pair<std::string, std::string>> kv_equals;
         bool match_none{false};
 
         bool empty() const
         {
             return !match_none && !namespace_id &&
-                   namespace_name.empty() &&
-                   require_all_tags.empty() && require_any_tags.empty() && exclude_tags.empty() &&
-                   require_all_tag_names.empty() && require_any_tag_names.empty() && exclude_tag_names.empty() &&
-                   kv_equals.empty();
+                   require_all_tags.empty() && require_any_tags.empty() && exclude_tags.empty();
         }
     };
 
