@@ -101,6 +101,9 @@ namespace pomai
         bool filtered_time_budget_hit{false};
         bool filtered_visit_budget_hit{false};
         bool filtered_budget_exhausted{false};
+        std::size_t filtered_candidates_generated{0};
+        std::size_t filtered_candidates_passed_filter{0};
+        std::size_t filtered_reranked{0};
         std::size_t filtered_candidates{0};
         std::size_t filtered_visits{0};
         std::size_t filtered_missing_hits{0};

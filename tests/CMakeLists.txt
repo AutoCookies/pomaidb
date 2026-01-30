@@ -17,6 +17,7 @@ add_executable(pomai_tests
     core/test_membrane.cpp
     core/test_orbit_index.cpp
     core/test_filtering.cpp
+    core/test_filtering_correctness.cpp
     core/test_quality_filter_contract.cpp
     core/test_search.cpp
     core/test_scan.cpp

@@ -858,18 +858,47 @@ namespace pomai
         if (dequant.size() < dim)
             dequant.resize(dim);
         const auto *candidates = candidate_topk.Data();
+        bool invalid_mapping = false;
+        auto valid_row = [&](std::size_t row)
+        {
+            if (row >= snap->ids.size())
+                return false;
+            if (row >= snap->namespace_ids.size())
+                return false;
+            if (row + 1 >= snap->tag_offsets.size())
+                return false;
+            if (row * dim + dim > snap->qdata.size())
+                return false;
+            if (has_filter && req.filter && req.filter->namespace_id &&
+                snap->namespace_ids[row] != *req.filter->namespace_id)
+                return false;
+            return true;
+        };
         for (std::size_t i = 0; i < candidate_topk.Size(); ++i)
         {
             std::size_t cand_row = static_cast<std::size_t>(candidates[i].id);
+            if (!valid_row(cand_row))
+            {
+                invalid_mapping = true;
+                continue;
+            }
             DequantizeRow(snap, cand_row, dequant.data());
             final_topk.Push(-kernels::L2Sqr(dequant.data(), req.query.data.data(), dim), snap->ids[cand_row]);
         }
         final_topk.FillSorted(resp.items);
         SortAndDedupeResults(resp.items, req.topk);
+        if (invalid_mapping)
+        {
+            resp.partial = true;
+            resp.stats.partial = true;
+        }
+        resp.stats.filtered_candidates_generated = visit_count;
+        resp.stats.filtered_candidates_passed_filter = candidate_topk.Size();
+        resp.stats.filtered_reranked = candidate_topk.Size();
         resp.stats.filtered_candidates = candidate_topk.Size();
         resp.stats.filtered_visits = visit_count;
-        const bool filtered_partial = has_filter && candidate_topk.Size() < candidate_k;
-        const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit) && filtered_partial;
+        const bool filtered_partial = has_filter && resp.items.size() < req.topk;
+        const bool budget_exhausted = has_filter && (time_budget_hit || visit_budget_hit);
         resp.stats.filtered_partial = filtered_partial;
         resp.stats.filtered_time_budget_hit = time_budget_hit;
         resp.stats.filtered_visit_budget_hit = visit_budget_hit;

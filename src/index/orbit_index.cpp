@@ -585,7 +585,7 @@ namespace pomai::core
             }
         }
 
-        if (expansions >= visit_limit && best.size() < target)
+        if (expansions >= visit_limit)
             visit_budget_hit = true;
 
         if (best.size() < target)
@@ -709,8 +709,28 @@ namespace pomai::core
 
         std::vector<std::pair<float, std::uint32_t>> scored;
         scored.reserve(cand.size());
+        bool invalid_mapping = false;
+        auto valid_row = [&](std::uint32_t row)
+        {
+            if (row >= ids_.size())
+                return false;
+            if (row >= meta.ids.size())
+                return false;
+            if (row >= meta.namespace_ids.size())
+                return false;
+            if (row + 1 >= meta.tag_offsets.size())
+                return false;
+            if (filter.namespace_id && meta.namespace_ids[row] != *filter.namespace_id)
+                return false;
+            return true;
+        };
         for (auto idx : cand)
         {
+            if (!valid_row(idx))
+            {
+                invalid_mapping = true;
+                continue;
+            }
             const float *v = data_.data() + (std::size_t)idx * dim_;
             float d = pomai::kernels::L2Sqr(v, q, dim_);
             scored.push_back({d, idx});
@@ -734,12 +754,20 @@ namespace pomai::core
         }
 
         SortAndDedupeResults(resp.items, req.topk);
+        if (invalid_mapping)
+        {
+            resp.partial = true;
+            resp.stats.partial = true;
+        }
+        resp.stats.filtered_candidates_generated = visits;
+        resp.stats.filtered_candidates_passed_filter = scored.size();
+        resp.stats.filtered_reranked = scored.size();
         resp.stats.filtered_candidates = scored.size();
         resp.stats.filtered_visits = visits;
-        resp.stats.filtered_partial = partial;
+        resp.stats.filtered_partial = partial || resp.items.size() < req.topk;
         resp.stats.filtered_time_budget_hit = time_budget_hit;
         resp.stats.filtered_visit_budget_hit = visit_budget_hit;
-        resp.stats.filtered_budget_exhausted = (time_budget_hit || visit_budget_hit) && partial;
+        resp.stats.filtered_budget_exhausted = time_budget_hit || visit_budget_hit;
         resp.partial = resp.partial || partial;
         resp.stats.partial = resp.partial;
 
