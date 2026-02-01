@@ -1,163 +1,222 @@
-cmake_minimum_required(VERSION 3.10)
-project(pomai VERSION 1.0.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.20)
 
-# --- 1. CẤU HÌNH TIÊU CHUẨN C++ ---
+# ---- Project ----
+project(pomai
+  VERSION 0.1.0
+  DESCRIPTION "Pomai: embedded, multithreaded vector database (share-nothing shards)"
+  LANGUAGES CXX
+)
+
+# ---- Options (bigtech style toggles) ----
+option(POMAI_BUILD_EXAMPLES "Build examples" OFF)
+option(POMAI_BUILD_TESTS "Build tests (CTest)" OFF)
+option(POMAI_BUILD_BENCHMARKS "Build benchmarks" ON)
+
+option(POMAI_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option(POMAI_ENABLE_LTO "Enable Link-Time Optimization (Release/RelWithDebInfo)" ON)
+
+option(POMAI_ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(POMAI_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+option(POMAI_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+
+option(POMAI_ENABLE_CLANG_TIDY "Enable clang-tidy if available" OFF)
+
+# ---- Global C++ standard ----
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# --- 2. TÌM KIẾM PHỤ THUỘC (DEPENDENCIES) ---
-find_package(Threads REQUIRED)
+# ---- Output directories ----
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# --- 3. CẤU HÌNH COMPILER FLAGS (TARGET-BASED) ---
-add_library(pomai_compiler_flags INTERFACE)
-target_compile_features(pomai_compiler_flags INTERFACE cxx_std_20)
-
-option(POMAI_WERROR "Treat warnings as errors" OFF)
-option(POMAI_BUILD_TESTS "Build the test suite" ON)
-option(POMAI_ASAN "Enable AddressSanitizer" OFF)
-option(POMAI_TSAN "Enable ThreadSanitizer" OFF)
-option(POMAI_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
-set(POMAI_SANITIZE "" CACHE STRING "Sanitizer to enable (ASAN, UBSAN, TSAN)")
-set_property(CACHE POMAI_SANITIZE PROPERTY STRINGS "" ASAN UBSAN TSAN)
-if(POMAI_SANITIZE STREQUAL "ASAN")
-    set(POMAI_ASAN ON)
-elseif(POMAI_SANITIZE STREQUAL "UBSAN")
-    set(POMAI_UBSAN ON)
-elseif(POMAI_SANITIZE STREQUAL "TSAN")
-    set(POMAI_TSAN ON)
+# ---- Default build type ----
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-if(MSVC)
-    target_compile_options(pomai_compiler_flags INTERFACE /W4)
-    if(POMAI_WERROR)
-        target_compile_options(pomai_compiler_flags INTERFACE /WX)
+# ---- Helpers ----
+include(CheckIPOSupported)
+
+function(pomai_enable_warnings TARGET_NAME)
+  if(MSVC)
+    target_compile_options(${TARGET_NAME} PRIVATE /W4)
+    if(POMAI_WARNINGS_AS_ERRORS)
+      target_compile_options(${TARGET_NAME} PRIVATE /WX)
     endif()
-else()
-    target_compile_options(pomai_compiler_flags INTERFACE -Wall -Wextra -Wpedantic -mavx2 -mfma)
-    if(POMAI_WERROR)
-        target_compile_options(pomai_compiler_flags INTERFACE -Werror)
+  else()
+    target_compile_options(${TARGET_NAME} PRIVATE
+      -Wall -Wextra -Wpedantic
+      -Wshadow
+      -Wconversion
+      -Wsign-conversion
+      -Wold-style-cast
+      -Woverloaded-virtual
+      -Wnon-virtual-dtor
+      -Wformat=2
+      -Wnull-dereference
+      -Wduplicated-cond
+      -Wduplicated-branches
+      -Wlogical-op
+      -Wuseless-cast
+    )
+    if(POMAI_WARNINGS_AS_ERRORS)
+      target_compile_options(${TARGET_NAME} PRIVATE -Werror)
     endif()
-    if(CMAKE_BUILD_TYPE MATCHES Release)
-        target_compile_options(pomai_compiler_flags INTERFACE -O3 -march=native -ffast-math -funroll-loops)
-        include(CheckIPOSupported)
-        check_ipo_supported(RESULT ipo_supported OUTPUT error)
-        if(ipo_supported)
-            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-        endif()
-    elseif(CMAKE_BUILD_TYPE MATCHES RelWithDebInfo)
-        target_compile_options(pomai_compiler_flags INTERFACE -O2 -g3 -fno-omit-frame-pointer)
-    else()
-        target_compile_options(pomai_compiler_flags INTERFACE -O1 -g3 -fno-omit-frame-pointer)
-    endif()
-    target_link_options(pomai_compiler_flags INTERFACE -rdynamic)
-endif()
-
-set(pomai_sanitize_flags "")
-if(POMAI_ASAN)
-    list(APPEND pomai_sanitize_flags address)
-endif()
-if(POMAI_UBSAN)
-    list(APPEND pomai_sanitize_flags undefined)
-endif()
-if(POMAI_TSAN)
-    list(APPEND pomai_sanitize_flags thread)
-endif()
-if(pomai_sanitize_flags)
-    list(JOIN pomai_sanitize_flags "," pomai_sanitize_flags_joined)
-    target_compile_options(pomai_compiler_flags INTERFACE -fsanitize=${pomai_sanitize_flags_joined} -fno-omit-frame-pointer)
-    target_link_options(pomai_compiler_flags INTERFACE -fsanitize=${pomai_sanitize_flags_joined} -fno-omit-frame-pointer)
-endif()
-
-set(POMAI_PUBLIC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-# --- 4. MODULE LIBRARIES ---
-set(CONCURRENCY_SOURCES
-    src/concurrency/memory_manager.cpp
-    src/util/logger.cpp
-)
-add_library(pomai_concurrency STATIC ${CONCURRENCY_SOURCES})
-target_include_directories(pomai_concurrency PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_concurrency PUBLIC pomai_compiler_flags)
-
-set(STORAGE_SOURCES
-    src/storage/file_util.cpp
-    src/storage/manifest.cpp
-    src/storage/snapshot.cpp
-    src/storage/verify.cpp
-    src/storage/wal.cpp
-    src/storage/wal_uring.cpp
-    src/storage/crc64.c
-)
-add_library(pomai_storage STATIC ${STORAGE_SOURCES})
-target_include_directories(pomai_storage PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_storage PUBLIC pomai_concurrency Threads::Threads pomai_compiler_flags)
-
-set(INDEX_SOURCES
-    src/index/orbit_index.cpp
-    src/index/whispergrain.cpp
-)
-add_library(pomai_index STATIC ${INDEX_SOURCES})
-target_include_directories(pomai_index PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_index PUBLIC pomai_concurrency pomai_compiler_flags)
-
-set(CORE_SOURCES
-    src/core/membrane.cpp
-    src/core/seed.cpp
-    src/core/shard.cpp
-    src/core/spatial_router.cpp
-    src/core/wal_seed.cpp
-)
-add_library(pomai_core STATIC ${CORE_SOURCES})
-target_include_directories(pomai_core PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_core PUBLIC pomai_concurrency pomai_storage pomai_index Threads::Threads pomai_compiler_flags)
-
-set(API_SOURCES
-    src/api/pomai_db.cpp
-)
-add_library(pomai_api STATIC ${API_SOURCES})
-target_include_directories(pomai_api PUBLIC $<BUILD_INTERFACE:${POMAI_PUBLIC_INCLUDE_DIR}>)
-target_link_libraries(pomai_api PUBLIC pomai_core pomai_compiler_flags)
-
-# --- 5. SERVER DAEMON (pomai-server) ---
-set(SERVER_SOURCES
-    src/server/server.cpp
-    src/server/protocol.cpp
-    src/server/pomai_server_main.cpp
-    src/server/config.cpp
-)
-
-add_executable(pomai-server ${SERVER_SOURCES})
-target_link_libraries(pomai-server PRIVATE pomai_api)
-
-# --- 6. EMBEDDED BENCHMARKS ---
-function(add_pomai_benchmark name src lib)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${src}")
-        add_executable(${name} ${src})
-        target_link_libraries(${name} PRIVATE ${lib})
-    endif()
+  endif()
 endfunction()
 
-add_pomai_benchmark(bench_embedded benchmarks/bench_embedded.cpp pomai_api)
-add_pomai_benchmark(bench_concurrent_search benchmarks/bench_concurrent_search.cpp pomai_core)
-add_pomai_benchmark(bench_wal benchmarks/bench_wal.cpp pomai_storage)
+function(pomai_enable_sanitizers TARGET_NAME)
+  if(MSVC)
+    message(STATUS "Sanitizers are not configured for MSVC in this template.")
+    return()
+  endif()
 
-# --- 7. AUTOMATED TESTS ---
-if(POMAI_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-    enable_testing()
-    add_subdirectory(tests)
+  # TSAN must not be combined with ASAN.
+  if(POMAI_ENABLE_TSAN)
+    target_compile_options(${TARGET_NAME} PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+    target_link_options(${TARGET_NAME} PRIVATE -fsanitize=thread)
+  else()
+    if(POMAI_ENABLE_ASAN)
+      target_compile_options(${TARGET_NAME} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+      target_link_options(${TARGET_NAME} PRIVATE -fsanitize=address)
+    endif()
+    if(POMAI_ENABLE_UBSAN)
+      target_compile_options(${TARGET_NAME} PRIVATE -fsanitize=undefined -fno-omit-frame-pointer)
+      target_link_options(${TARGET_NAME} PRIVATE -fsanitize=undefined)
+    endif()
+  endif()
+endfunction()
+
+function(pomai_enable_lto TARGET_NAME)
+  if(NOT POMAI_ENABLE_LTO)
+    return()
+  endif()
+  check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+  if(ipo_supported)
+    set_property(TARGET ${TARGET_NAME} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+  else()
+    message(STATUS "IPO/LTO not supported: ${ipo_error}")
+  endif()
+endfunction()
+
+# ---- clang-tidy (optional) ----
+if(POMAI_ENABLE_CLANG_TIDY)
+  find_program(CLANG_TIDY_EXE NAMES clang-tidy)
+  if(CLANG_TIDY_EXE)
+    message(STATUS "clang-tidy enabled: ${CLANG_TIDY_EXE}")
+    set(CMAKE_CXX_CLANG_TIDY ${CLANG_TIDY_EXE})
+  else()
+    message(STATUS "clang-tidy requested but not found")
+  endif()
 endif()
 
-# --- 8. TOOLS ---
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/repro_segfault.cpp")
-    add_executable(repro_segfault src/tools/repro_segfault.cpp)
-    target_link_libraries(repro_segfault PRIVATE pomai_api)
+# ---- Threads ----
+find_package(Threads REQUIRED)
+
+# =============================================================================
+# Library: pomai (embedded core)
+# =============================================================================
+
+add_library(pomai STATIC
+  src/pomai.cpp
+  src/router.cpp
+  src/shard.cpp
+  src/wal.cpp
+  src/util/crc32c.cpp
+)
+
+target_include_directories(pomai
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(pomai
+  PUBLIC
+    Threads::Threads
+)
+
+# CPU opts (keep it sane; user can opt into -march=native outside)
+if(NOT MSVC)
+  target_compile_options(pomai PRIVATE
+    $<$<CONFIG:Release>:-O3>
+    $<$<CONFIG:RelWithDebInfo>:-O2>
+  )
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/pomai_verify.cpp")
-    add_executable(pomai_verify src/tools/pomai_verify.cpp)
-    target_link_libraries(pomai_verify PRIVATE pomai_api)
+
+pomai_enable_warnings(pomai)
+pomai_enable_sanitizers(pomai)
+pomai_enable_lto(pomai)
+
+# =============================================================================
+# Benchmarks
+# =============================================================================
+
+if(POMAI_BUILD_BENCHMARKS)
+  add_executable(bench_embedded_upsert benchmarks/bench_embedded_upsert.cpp)
+  target_link_libraries(bench_embedded_upsert PRIVATE pomai)
+  pomai_enable_warnings(bench_embedded_upsert)
+  pomai_enable_sanitizers(bench_embedded_upsert)
+  pomai_enable_lto(bench_embedded_upsert)
 endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/pomai_dump.cpp")
-    add_executable(pomai_dump src/tools/pomai_dump.cpp)
-    target_link_libraries(pomai_dump PRIVATE pomai_api)
+
+# =============================================================================
+# Examples
+# =============================================================================
+
+if(POMAI_BUILD_EXAMPLES)
+  add_executable(basic examples/basic.cpp)
+  target_link_libraries(basic PRIVATE pomai)
+  pomai_enable_warnings(basic)
+  pomai_enable_sanitizers(basic)
 endif()
+
+# =============================================================================
+# Tests (placeholder)
+# =============================================================================
+
+if(POMAI_BUILD_TESTS)
+  enable_testing()
+  message(STATUS "POMAI_BUILD_TESTS=ON but no tests are defined yet.")
+endif()
+
+# =============================================================================
+# Install (optional)
+# =============================================================================
+
+include(GNUInstallDirs)
+
+install(TARGETS pomai
+  EXPORT pomaiTargets
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT pomaiTargets
+  FILE pomaiTargets.cmake
+  NAMESPACE pomai::
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/pomai
+)
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+message(STATUS "")
+message(STATUS "Pomai build configuration:")
+message(STATUS "  Build type:           ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Build benchmarks:     ${POMAI_BUILD_BENCHMARKS}")
+message(STATUS "  Build examples:       ${POMAI_BUILD_EXAMPLES}")
+message(STATUS "  Build tests:          ${POMAI_BUILD_TESTS}")
+message(STATUS "  Warnings as errors:   ${POMAI_WARNINGS_AS_ERRORS}")
+message(STATUS "  LTO enabled:          ${POMAI_ENABLE_LTO}")
+message(STATUS "  ASAN:                 ${POMAI_ENABLE_ASAN}")
+message(STATUS "  UBSAN:                ${POMAI_ENABLE_UBSAN}")
+message(STATUS "  TSAN:                 ${POMAI_ENABLE_TSAN}")
+message(STATUS "  clang-tidy:           ${POMAI_ENABLE_CLANG_TIDY}")
+message(STATUS "")

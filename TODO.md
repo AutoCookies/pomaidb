@@ -1,105 +1,260 @@
-Short verdict (strict):
-- The RobustHarmony design is promising and directionally correct — multi-probe routing, parallel bucket scans, AVX2 batch distance, overfetch + exact re-rank are exactly the right levers to improve recall and latency.  
-- However the proposal as written is high-level and optimistic about latency/recall numbers; there are important missing details, failure modes and engineering work required before those claims can be realized reliably in Pomai. Implementable, yes — but not “drop-in” — and you must fix several structural risks first.
+Ok. “Bigtech standard” thì câu trả lời là: **checkpoint vẫn cần**, nhưng **không được phép** là “full dump chặn hot path” như hiện tại. Production-way phải có 3 thứ: **(1) WAL đúng semantics**, **(2) snapshot/checkpoint incremental + atomic publish**, **(3) background scheduling có throttle + backpressure**.
 
-Concrete strengths
-- Uses proven ideas: centroids → probe top-P → overfetch → exact re-rank (IVF+multi-probe + PQ/HNSW style). That addresses recall vs cost tradeoff.
-- AVX2 batch L2 for bucket scanning is the correct low-level optimization for per-shard work (you already have kernels::L2Sqr).
-- Dynamic nprobe via WhisperGrain budget is a sound adaptive control mechanism.
-- Overfetch (e.g., k*4) then re-rank reduces false negatives and increases recall.
-- Parallelization (per-probe/per-shard) will increase throughput and hide per-shard latencies.
+Dưới đây là blueprint chuẩn production (đúng kiểu RocksDB/Lucene-ish, nhưng tối giản cho embedded vector DB).
 
-Critical gaps & risks (must address before trusting claims)
-1. Threading model
-   - Your sketch uses std::async for parallel probe. That spawns unbounded threads and will kill performance. Need a bounded thread-pool (fixed workers) and task queues. Implement a request-scoped fanout using a thread-pool or work-stealing executor.
+---
 
-2. Bucket representation & scan cost
-   - You assume “scan bucket” is feasible (low latency). With large buckets (hundreds of thousands) linear scan even with AVX2 is expensive. You MUST ensure average bucket size is small (autoscaler) or add per-centroid local index (IVF/PQ/HNSW).
-   - Also scanning across many segments across shards multiplies cost. Prefer scanning only indexes (OrbitIndex) per segment when present.
+## 0) Mục tiêu chuẩn production
 
-3. Memory & data locality
-   - Batch AVX2 needs contiguous memory. Your segments/snapshots layout must guarantee contiguous float arrays; building temporary flattened arrays per query is unacceptable. Use existing flat storage (Seed::Snapshot.data) or indexes’ data_ directly.
+PomaiDB (embedded) phải đảm bảo:
 
-4. Re-rank cost & vector access
-   - Re-ranking top-100 requires accessing original vectors; if they live in disk-backed snapshots or have been freed, you need a path to load them or keep a small candidate store in memory. This affects memory design.
+1. **Durability contract rõ**: ack Upsert nghĩa là gì (fsync hay chỉ append vào OS cache).
+2. **Crash recovery bounded**: restart không replay WAL vô hạn.
+3. **Không phá tail latency**: checkpoint không được làm ingest/search “đứng hình”.
+4. **Atomicity**: checkpoint publish phải atomic (không có state nửa vời).
+5. **Tunable**: user chỉnh được cost/latency/durability.
 
-5. Overfetch factor and nprobe tuning
-   - Your formulae (base_nprobe = log2(N)/4 etc.) are heuristics. They must be tuned per dataset and index type. Provide safe bounds and hysteresis to avoid oscillation.
+---
 
-6. Correctness of IDs in reservoir / mapping
-   - Must ensure returned candidate ids are global and comparable to ground-truth (you fixed the bench earlier). Important for online validation.
+## 1) Tách rõ “Data plane” vs “Maintenance plane”
 
-7. Hotspots and skew
-   - Hot centroids (skew) will blow up per-probe cost. Need split/replicate policies and load-aware mapping. Without that P99 spikes badly.
+### Data plane (hot path)
 
-8. Failure & fallback policies
-   - How to act if index build or centroid index missing? You need clear fallback (broadcast or degrade gracefully).
+* Shard worker threads: xử lý Upsert/Delete/Search.
+* WAL append (nhanh).
+* Update in-memory index.
 
-9. AVX2 micro-optimizations
-   - Use well-tested kernels (you already have kernels::L2Sqr). Ensure alignment, handle tail, avoid branching in inner loop. Precompute query broadcast and maintain small working set to fit L1/L2 cache.
+### Maintenance plane (background)
 
-10. Resource accounting & safety
-   - Throttle per-query memory used, cap concurrent probes, cap candidate buffer sizes.
+* **MaintenanceScheduler**: 1 thread (hoặc threadpool size=1).
+* Làm:
 
-Concrete implementation checklist (prioritized)
-1. Replace std::async fanout with a request-scoped submission to a fixed thread-pool (IndexBuildPool already exists — add SearchThreadPool).
-2. Implement centroid routing index (tiny OrbitIndex/HNSW) when K > 512 so CandidateCentroidsForQuery is fast.
-3. Implement per-bucket scanning function:
-   - scan_bucket_avx2(query, bucket_ref, candidate_limit)
-   - Accept pointer to contiguous floats + start index + count; produce fixed-size small top-k (heap) with no heap allocations (stack- or arena-backed).
-4. Implement a fixed-cap TopK structure (no allocations) for merging across probes.
-5. Implement overfetch and exact re-rank pipeline:
-   - Probe → local scan (k*overfetch) → collect candidates → exact re-rank top-R (R=100) → final top-k.
-6. Add dynamic nprobe decision:
-   - compute budget factor = clamp(WhisperGrain score), nprobe = clamp(base * factor, min, max).
-   - Add caps (min=1 max=shards*Kcap).
-7. Add metrics & sampling-based online recall estimator:
-   - Keep small query validation set and compare routed results to broadcast baseline periodically to auto-adjust nprobe.
-8. Hotspot handling:
-   - Track per-centroid hit counts; on heavy skew, replicate centroid to multiple shards or split centroid (increase local C_s).
-9. Tests:
-   - Unit tests for scan_bucket_avx2 correctness vs scalar.
-   - Microbenchmark: per-bucket scan throughput and latency.
-   - End-to-end recall/latency tests vs broadcast baseline on representative dataset.
+  * checkpoint/snapshot incremental
+  * WAL recycling (truncate / switch file)
+  * index persistence (nếu bật)
+  * compaction segments (nếu blob store dùng segments)
 
-Concrete parameter recommendations to start with
-- overfetch = 4 (candidate_fetch = topk * 4)
-- re_rank_candidates = min(100, total_candidates)
-- base_nprobe = clamp( max(2, (uint32_t)std::round(std::log2(total_vectors)/6)), 1, 16 )
-- nprobe bounds: [1, 32] initially
-- thread pool size: min(16, hardware_concurrency())
-- batch AVX width: process 8 or 16 floats at a time depending on kernel
+> Bigtech standard: **hot path không được gọi trực tiếp “CreateCheckpoint() full”**.
 
-Testing plan (strict)
-- Microbench: run scan_bucket_avx2 on buckets sized [1k, 10k, 100k] and measure p50/p99 lat per bucket.
-- System bench: compare:
-  - broadcast baseline latency & recall
-  - current router (P=2) performance
-  - RobustHarmony with varying nprobe & overfetch
-  - measure recall@1/10, p50/p95/p99 latency, CPU usage, memory
-- Safety: force skewed dataset (one hot centroid) and observe P99 behavior; ensure replication/split logic protects P99.
+---
 
-Concrete code helpers you should ask me to produce next (I can implement)
-- A bounded SearchThreadPool and request fanout helper (safe replacement for std::async).
-- scan_bucket_avx2 implementation using kernels::L2Sqr over contiguous arrays and a fixed-size heap.
-- FixedTopK class (template) with push/merge/extract APIs, no dynamic allocations.
-- Candidate merging + re-rank harness to integrate into MembraneRouter::Search pipeline.
+## 2) WAL semantics chuẩn (phải chốt trước)
 
-Reality check on performance claims
-- P50 <100us and P99 <200us are achievable on well-engineered systems for small candidate sizes and modest K, but on low-RAM devices with large buckets and heavy I/O those numbers may not hold. Don’t promise them before you:
-  - ensure small average bucket size (autoscaler),
-  - use per-centroid local indexes where buckets are large,
-  - implement thread-pool and memory safety.
+Bạn define 3 durability levels (giống RocksDB):
 
-Final recommendation (strict next actions)
-1. Implement thread-pool fanout.
-2. Build scan_bucket_avx2 + FixedTopK and unit test.
-3. Plug into MembraneRouter::Search: CandidateCentroidsForQuery → submit bucket scans to thread-pool → merge → re-rank top-R → return top-k.
-4. Add metrics and a canary test harness (small dataset & skewed dataset).
-5. Tune nprobe/overfetch and add online adjuster via WhisperGrain feedback.
+* **Durability::kNone**: ack sau khi enqueue (chỉ dùng test).
+* **Durability::kWAL**: ack sau khi WAL append + flush (fdatasync optional).
+* **Durability::kFsync**: ack sau khi WAL fdatasync (đắt, nhưng mạnh).
 
-If you want, I’ll generate the first two concrete patches now:
-A) SearchThreadPool (bounded worker pool) + small fanout helper, and  
-B) FixedTopK + scan_bucket_avx2 implementation using your existing kernels::L2Sqr.
+**Contract**:
 
-Which one should I generate first?
+* Nếu ack OK ở kWAL/kFsync, record *phải* tồn tại sau crash theo đúng level.
+
+Thực thi:
+
+* Mỗi shard có WAL riêng ✅
+* WAL là append-only, record framing + checksum ✅
+
+---
+
+## 3) Checkpoint production ≠ “save everything”
+
+Checkpoint production phải **incremental** và **bounded cost**.
+
+### 3.1. Storage layout chuẩn
+
+Mỗi shard có thư mục riêng:
+
+```
+db/
+  shard_0/
+    wal/
+      000001.log
+      000002.log
+    segments/        # blob store data (append-only)
+      seg_00010.dat
+      seg_00011.dat
+    manifest/        # metadata nhỏ, atomic
+      MANIFEST
+    checkpoints/
+      cp_000123/     # optional, or just a metadata file
+```
+
+### 3.2. “Checkpoint” thực ra là **publish a consistent view**
+
+Cái cần durable là:
+
+* mapping `VectorId -> (segment_id, offset, len)` hoặc tương đương
+* “sequence number / epoch” đã apply
+* (optional) index persistence artifact
+
+**KHÔNG** cần dump “arena pages” toàn bộ mỗi lần.
+
+#### Atomic publish chuẩn
+
+* Ghi metadata mới ra file temp
+* fsync temp
+* rename temp -> MANIFEST (atomic on POSIX)
+* fsync directory (để rename durable)
+
+---
+
+## 4) Snapshot isolation (để checkpoint chạy song song hot path)
+
+Bigtech-standard approach:
+
+### 4.1. MVCC-lite bằng “epoch”
+
+* Mỗi shard có `atomic<uint64_t> applied_seq`.
+* Mọi mutation tăng seq.
+* Search đọc snapshot = seq tại thời điểm bắt đầu.
+
+### 4.2. BlobStore append-only + immutable segments
+
+* Upsert ghi payload vào segment mới (append).
+* Mapping id->location update ở memtable (có thể copy-on-write nhỏ, hoặc sharded map).
+
+### 4.3. Checkpoint chỉ cần “freeze a view”
+
+* Freeze “manifest view” tại seq X:
+
+  * segment list + id->location snapshot (hoặc delta logs)
+* Không động vào hot index, không dump data cũ.
+
+**Quan trọng**: nếu bạn vẫn muốn “arena_->Ids() copy toàn bộ” thì đó là anti-production. Snapshot phải là **handle** (shared_ptr) chứ không phải copy O(n).
+
+---
+
+## 5) Index persistence: 2 mode chuẩn
+
+HNSW save/load rất đắt. Bigtech làm 1 trong 2:
+
+### Mode A (đề xuất mặc định): **Index rebuild on startup**
+
+* Checkpoint chỉ giữ vectors/payload mapping.
+* On restart: load vectors rồi rebuild HNSW.
+* Ưu: code đơn giản, checkpoint rẻ.
+* Nhược: restart lâu (nhưng predictable).
+
+### Mode B: **Index persistence async**
+
+* Background thread thỉnh thoảng snapshot index (rất ít, manual hoặc daily).
+* Hot path không block.
+* Khi có file index mới nhất: startup load nhanh.
+
+**Production default thường là A**, và cho enterprise user bật B nếu họ cần fast restart.
+
+---
+
+## 6) Scheduling checkpoint kiểu bigtech (throttle + budgets)
+
+Checkpoint trigger theo 3 điều kiện:
+
+* `wal_bytes > threshold` (vd 256MB)
+* `time_since_last > interval` (vd 10–30 phút)
+* `ops_since_last > N` (vd 1–5 triệu)
+
+Nhưng chạy checkpoint phải có **budget**:
+
+### CPU/IO throttling (bắt buộc)
+
+* Background thread `nice +5`
+* IO throttling: giới hạn `MB/s` và `fsync frequency`
+* “Stop if tail latency tăng”: nếu shard queue depth tăng > ngưỡng → pause maintenance.
+
+### Backpressure safety
+
+* Nếu WAL vượt hard limit (vd 8GB):
+
+  * hoặc block writes (return `Status::Busy` / `TryAgain`)
+  * hoặc force checkpoint (nhưng vẫn budgeted, không stop-the-world)
+
+Bigtech standard là **predictable behavior** chứ không “random lag spike”.
+
+---
+
+## 7) API surface chuẩn production
+
+Bạn cần các API/options này (tối thiểu):
+
+### DbOptions
+
+* `num_shards`
+* `durability_level`
+* `checkpoint.enable` (default true)
+* `checkpoint.wal_bytes_threshold` (default 256MB)
+* `checkpoint.min_interval_ms` (default 10min)
+* `checkpoint.max_interval_ms` (default 60min)
+* `checkpoint.max_bytes_per_sec` (IO throttle)
+* `checkpoint.mode = {kManifestOnly, kWithIndex}`
+
+### Runtime API
+
+* `Flush(FlushOptions)` – block cho tới khi WAL durable + mapping durable
+* `Checkpoint(CheckpointOptions)` – block hoặc async
+* `GetStats()` – expose queue depth, wal bytes, last checkpoint time
+* `BeginBulkLoad()/EndBulkLoad()` – tắt maintenance + giảm fsync, cuối bulk thì checkpoint 1 phát
+
+Bulk load là tiêu chuẩn production (Lucene/RocksDB đều có concept tương tự).
+
+---
+
+## 8) “Bạn đang làm sai ở đâu” so với production
+
+Trong code hiện tại của bạn, “checkpoint” đang là:
+
+* full snapshot arena pages
+* full index save
+* truncate WAL
+* chạy inline theo interval nhỏ (50k)
+
+=> Đây là **anti-pattern** vì:
+
+* cost checkpoint ~ O(dataset)
+* frequency cao → throughput collapse
+* chạy trên hot path → tail latency spike
+
+Production checkpoint phải:
+
+* cost ~ O(delta) hoặc O(metadata)
+* frequency theo WAL size/time
+* chạy background + throttle
+* publish atomic + recoverable
+
+---
+
+## 9) Migration plan: làm đúng production mà ít rewrite nhất
+
+Nếu muốn “most production” nhưng không phá codebase quá mạnh, làm theo thứ tự:
+
+### Step 1 — Immediate stop-the-bleeding (1 ngày)
+
+* Disable auto checkpoint trong ingest benchmark.
+* Remove `MaybePublishSnapshot()` kiểu copy ids (thay bằng pointer/version).
+* Search trả id+score, payload lazy hoặc load sau merge.
+
+### Step 2 — Manifest-based checkpoint (2–4 ngày)
+
+* Biến checkpoint thành “publish manifest + rotate WAL”
+* BlobStore chuyển sang segments append-only (nếu chưa)
+* Recovery: load manifest + replay WAL files mới hơn manifest seq.
+
+### Step 3 — Maintenance thread + budgets (2–3 ngày)
+
+* Thêm `MaintenanceScheduler` single thread.
+* Checkpoint trigger theo wal_bytes/time + throttle.
+
+### Step 4 — Optional index persistence (sau)
+
+* Cho phép save/load HNSW async, không block ingest.
+
+Cách này sẽ đưa Pomai lên đúng chuẩn “production embedded DB” mà vẫn giữ triết lý shard WAL.
+
+---
+
+## Chốt câu theo kiểu bigtech
+
+**PomaiDB production vẫn cần checkpoint**, nhưng checkpoint **không được phép** là “snapshot full dataset mỗi 50k ops”.
+Checkpoint production là **manifest + wal recycling + optional index persistence**, chạy background có throttle, có backpressure, và publish atomic.
+
+Nếu bạn muốn mình “đóng vai lead engineer” và ra luôn **spec chuẩn + danh sách thay đổi vào đúng các file bạn đưa** (wal.*, shard.*, router.*, blob_store.*), mình làm ngay theo plan ở trên — ưu tiên thay đổi ít nhưng đúng chuẩn.

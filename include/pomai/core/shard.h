@@ -1,160 +1,168 @@
 #pragma once
-#include <string>
+#include <filesystem>
 #include <vector>
-#include <memory>
-#include <future>
-#include <thread>
-#include <mutex>
-#include <functional>
-#include <optional>
 #include <atomic>
+#include <memory>
+#include <cstring>
+#include <shared_mutex>
 
-#include <pomai/core/types.h>
-#include <pomai/core/status.h>
-#include <pomai/storage/wal.h>
-#include <pomai/core/seed.h>
-#include <pomai/index/orbit_index.h>
-#include <pomai/concurrency/bounded_queue.h>
-#include <pomai/index/whispergrain.h>
-#include <pomai/concurrency/index_build_pool.h>
-#include <pomai/util/logger.h>
+#include "pomai/core/command.h"
+#include "pomai/core/wal.h"
+#include "pomai/core/stats.h"
+#include "pomai/concurrency/bounded_mpsc_queue.h"
+#include "pomai/index/hnsw_wrapper.h"
+#include "pomai/core/blob_store.h"
 
-namespace pomai
+namespace pomai::core
 {
-    struct ShardCheckpointState
+
+    struct ShardOptions
     {
-        std::uint32_t shard_id{0};
-        Seed::PersistedState live;
-        std::vector<Seed::PersistedState> segments;
-        Lsn durable_lsn{0};
+        std::filesystem::path wal_path;
+        FsyncPolicy fsync_policy{FsyncPolicy::Never};
+        std::uint32_t vector_dim{0};
     };
 
-    struct UpsertTask
+    struct ReadSnapshot
     {
-        std::vector<UpsertRequest> batch;
-        bool wait_durable{true};
-        std::promise<Result<Lsn>> done;
-        bool is_checkpoint{false};
-        bool is_checkpoint_state{false};
-        std::optional<std::promise<Result<bool>>> checkpoint_done;
-        std::optional<std::promise<Result<ShardCheckpointState>>> checkpoint_state_done;
-        bool is_emergency_freeze{false};
+        std::vector<pomai::VectorId> ids;
     };
 
-    struct GrainIndex
-    {
-        std::size_t dim;
-        std::vector<Vector> centroids;
-        std::vector<std::size_t> offsets;
-        std::vector<std::uint32_t> postings;
-        std::vector<std::size_t> namespace_offsets;
-        std::vector<std::uint32_t> namespace_ids;
-    };
-
-    struct IndexedSegment
-    {
-        Seed::Snapshot snap;
-        std::shared_ptr<const GrainIndex> grains;
-        std::shared_ptr<const pomai::core::OrbitIndex> index;
-        std::uint32_t level{0};
-        std::uint64_t created_at{0};
-    };
-
-    struct ShardState
-    {
-        std::vector<IndexedSegment> segments;
-        Seed::Snapshot live_snap;
-        std::shared_ptr<const GrainIndex> live_grains;
-    };
-
-    struct CompactionConfig
-    {
-        std::size_t level_fanout{4};
-        std::size_t max_concurrent_compactions{1};
-        std::size_t compaction_trigger_threshold{4};
-    };
-
-
-    class Shard
+    class PagedVectorArena
     {
     public:
-        Shard(std::string name,
-              std::uint32_t shard_id,
-              std::size_t dim,
-              std::size_t queue_cap,
-              std::string wal_dir,
-              CompactionConfig compaction,
-              Logger *logger = nullptr);
-        ~Shard();
+        static constexpr std::size_t kPageSizeBytes = 2 * 1024 * 1024;
 
-        Status Start();
+        explicit PagedVectorArena(std::uint32_t dim) : dim_(dim)
+        {
+            std::size_t vec_size = dim_ * sizeof(float);
+            vectors_per_page_ = kPageSizeBytes / vec_size;
+            if (vectors_per_page_ < 1)
+                vectors_per_page_ = 1;
+            ids_.reserve(100000);
+        }
+
+        std::uint32_t Add(VectorId id, const std::vector<float> &vec)
+        {
+            std::uint32_t idx = static_cast<std::uint32_t>(ids_.size());
+            std::uint32_t page_idx = idx / vectors_per_page_;
+            std::uint32_t offset_in_page = idx % vectors_per_page_;
+
+            if (page_idx >= pages_.size())
+            {
+                float *new_page = new float[vectors_per_page_ * dim_];
+                pages_.push_back(std::unique_ptr<float[]>(new_page));
+            }
+
+            float *page_ptr = pages_[page_idx].get();
+            float *dest = page_ptr + (static_cast<std::size_t>(offset_in_page) * dim_);
+            std::memcpy(dest, vec.data(), dim_ * sizeof(float));
+
+            ids_.push_back(id);
+            return idx;
+        }
+
+        const float *GetVector(std::uint32_t idx) const
+        {
+            std::uint32_t page_idx = idx / vectors_per_page_;
+            std::uint32_t offset_in_page = idx % vectors_per_page_;
+            return pages_[page_idx].get() + (static_cast<std::size_t>(offset_in_page) * dim_);
+        }
+
+        const float *GetPage(std::uint32_t page_idx) const
+        {
+            if (page_idx >= pages_.size())
+                return nullptr;
+            return pages_[page_idx].get();
+        }
+
+        void SetIds(std::vector<VectorId> &&ids) { ids_ = std::move(ids); }
+
+        void AllocatePages(std::size_t n_pages)
+        {
+            while (pages_.size() < n_pages)
+            {
+                float *new_page = new float[vectors_per_page_ * dim_];
+                pages_.push_back(std::unique_ptr<float[]>(new_page));
+            }
+        }
+
+        float *GetMutablePage(std::uint32_t page_idx)
+        {
+            if (page_idx >= pages_.size())
+                return nullptr;
+            return pages_[page_idx].get();
+        }
+
+        std::size_t Size() const { return ids_.size(); }
+        std::uint32_t Dim() const { return dim_; }
+        std::size_t VectorsPerPage() const { return vectors_per_page_; }
+        std::size_t NumPages() const { return pages_.size(); }
+
+        const std::vector<VectorId> &Ids() const { return ids_; }
+        void Reserve(std::size_t n) { ids_.reserve(n); }
+
+    private:
+        std::uint32_t dim_;
+        std::size_t vectors_per_page_;
+        std::vector<VectorId> ids_;
+        std::vector<std::unique_ptr<float[]>> pages_;
+    };
+
+    class Shard final
+    {
+    public:
+        explicit Shard(std::uint32_t shard_id, ShardOptions opt);
+
+        Shard(const Shard &) = delete;
+        Shard &operator=(const Shard &) = delete;
+
+        pomai::Status Start();
+        pomai::Status ApplyUpsert(std::vector<pomai::UpsertItem> &&items);
+        SearchReply ExecuteSearch(const SearchRequest &req);
+        pomai::Status Flush();
         void Stop();
 
-        std::future<Result<Lsn>> EnqueueUpserts(std::vector<UpsertRequest> batch, bool wait_durable);
-        std::future<Result<bool>> RequestCheckpoint();
-        std::future<Result<ShardCheckpointState>> RequestCheckpointState();
-        void RequestEmergencyFreeze();
+        pomai::Status CreateCheckpoint();
 
-        SearchResponse Search(const SearchRequest &req, const pomai::ai::Budget &budget) const;
-        std::size_t ApproxCountUnsafe() const;
-        std::shared_ptr<const ShardState> SnapshotState() const;
-        std::size_t CompactionBacklog() const;
-        std::uint64_t LastCompactionDurationMs() const;
-        Lsn DurableLsn() const;
-        Lsn WrittenLsn() const;
-        std::vector<Vector> SampleVectors(std::size_t max_samples) const;
-        void LoadFromCheckpoint(const ShardCheckpointState &state, Lsn checkpoint_lsn);
+        void MaybePublishSnapshot();
+        std::shared_ptr<const ReadSnapshot> GetSnapshot() const;
+
+        std::uint32_t ShardId() const { return shard_id_; }
+        std::uint64_t UpsertCount() const { return upsert_count_.load(std::memory_order_relaxed); }
+        std::uint64_t SearchCount() const { return search_count_.load(std::memory_order_relaxed); }
+
+        const LatencyWindow &UpsertLatencyWindow() const { return upsert_lat_us_; }
+        const LatencyWindow &SearchLatencyWindow() const { return search_lat_us_; }
+        const WalWriter &Wal() const { return wal_; }
 
     private:
-        void RunLoop();
-        void MaybeFreezeSegment();
-        void PublishState(std::shared_ptr<const ShardState> next);
-        void ScheduleLiveGrainBuild(const Seed::Snapshot &snap);
+        pomai::Status Recover();
+        pomai::Status ReplayPayload(const std::vector<std::byte> &payload);
 
-        void AttachIndex(std::size_t segment_pos,
-                         Seed::Snapshot snap,
-                         std::shared_ptr<pomai::core::OrbitIndex> idx,
-                         std::shared_ptr<GrainIndex> grains = nullptr);
-        void AttachLiveGrains(Seed::Snapshot snap, std::shared_ptr<GrainIndex> grains);
+        pomai::Status SaveSnapshot(const std::filesystem::path &path);
+        pomai::Status LoadSnapshot(const std::filesystem::path &path);
 
-        static void MergeTopK(SearchResponse &out, const SearchResponse &in, std::size_t k);
-        std::shared_ptr<GrainIndex> BuildGrainIndex(const Seed::Snapshot &snap) const;
-        SearchResponse SearchGrains(const Seed::Snapshot &snap, const GrainIndex &grains, const SearchRequest &req, const pomai::ai::Budget &budget) const;
-        void RunCompactionLoop();
-        void MaybeScheduleCompaction();
-        bool CompactLevel(std::uint32_t level);
-        std::size_t ComputeCompactionBacklog(const std::shared_ptr<const ShardState> &state) const;
-        Seed MergeSnapshots(const std::vector<Seed::Snapshot> &snaps) const;
+        std::unique_ptr<pomai::index::HnswIndex> index_;
+        std::unique_ptr<BlobStore> blob_store_;
 
-    private:
-        std::string name_;
-        std::uint32_t shard_id_{0};
-        std::string wal_dir_;
-        Wal wal_;
-        Seed seed_;
-        BoundedQueue<UpsertTask> ingest_q_;
-        IndexBuildPool *build_pool_{nullptr};
-        Logger *logger_{nullptr};
-        mutable std::mutex writer_mu_;
-        std::atomic<std::shared_ptr<const ShardState>> state_{nullptr};
-        std::thread owner_;
-        std::thread compactor_;
-        static constexpr std::size_t kFreezeEveryVectors = 50000;
-        std::size_t since_freeze_{0};
-        static constexpr std::size_t kMaxSegments = 64;
-        static constexpr std::size_t kPublishLiveEveryVectors = 10000;
-        std::size_t since_live_publish_{0};
-        std::atomic<bool> emergency_freeze_pending_{false};
-        std::optional<Lsn> checkpoint_lsn_;
-        bool recovered_{false};
-        CompactionConfig compaction_;
-        std::atomic<bool> compactor_running_{false};
-        std::atomic<std::size_t> active_compactions_{0};
-        std::atomic<std::uint64_t> last_compaction_ms_{0};
-        std::atomic<std::size_t> compaction_backlog_{0};
-        std::atomic<std::uint64_t> segment_epoch_{0};
+        float Score(const float *a, const float *b, std::uint32_t dim) const;
 
-    public:
-        void SetIndexBuildPool(IndexBuildPool *pool) { build_pool_ = pool; }
+        const std::uint32_t shard_id_;
+        const ShardOptions opt_;
+
+        WalWriter wal_;
+        std::unique_ptr<PagedVectorArena> arena_;
+
+        std::atomic<std::shared_ptr<const ReadSnapshot>> published_;
+        std::uint64_t ops_since_publish_{0};
+
+        std::size_t ops_since_checkpoint_{0};
+
+        std::atomic<std::uint64_t> upsert_count_{0};
+        std::atomic<std::uint64_t> search_count_{0};
+        LatencyWindow upsert_lat_us_{4096};
+        LatencyWindow search_lat_us_{4096};
     };
-}
+
+} // namespace pomai::core
