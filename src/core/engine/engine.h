@@ -1,10 +1,10 @@
 #pragma once
-
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <string>
 #include <vector>
 
-#include "core/shard/shard.h"
 #include "pomai/options.h"
 #include "pomai/search.h"
 #include "pomai/status.h"
@@ -13,26 +13,35 @@
 namespace pomai::core
 {
 
+    class Shard;
+
     class Engine
     {
     public:
         explicit Engine(pomai::DBOptions opt);
+        ~Engine();
 
-        pomai::Status Open();
-        pomai::Status Close();
+        Engine(const Engine &) = delete;
+        Engine &operator=(const Engine &) = delete;
 
-        pomai::Status Put(VectorId id, std::span<const float> vec);
-        pomai::Status Delete(VectorId id);
-        pomai::Status Flush();
+        Status Open();
+        Status Close();
 
-        pomai::Status Search(std::span<const float> query,
-                             std::uint32_t topk,
-                             std::vector<pomai::SearchHit> *out);
+        Status Put(VectorId id, std::span<const float> vec);
+        Status Delete(VectorId id);
+        Status Flush();
+
+        Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
+
+        const pomai::DBOptions &options() const { return opt_; }
 
     private:
-        std::uint32_t ShardOf(VectorId id) const noexcept;
+        Status OpenLocked();
+        static std::uint32_t ShardOf(VectorId id, std::uint32_t shard_count);
 
         pomai::DBOptions opt_;
+        bool opened_ = false;
+
         std::vector<std::unique_ptr<Shard>> shards_;
     };
 

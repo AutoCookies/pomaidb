@@ -16,6 +16,7 @@ add_library(pomai STATIC
   src/storage/wal/wal.cc
   src/storage/manifest/manifest.cc
   src/table/memtable.cc
+  src/core/membrane/manager.cc
 
   # Gate #1/#2 utilities (must be linked into libpomai)
   src/util/posix_file.cc

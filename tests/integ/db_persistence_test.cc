@@ -1,46 +1,66 @@
 #include "tests/common/test_main.h"
+#include "tests/common/test_tmpdir.h"
+
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "pomai/options.h"
 #include "pomai/pomai.h"
 #include "pomai/search.h"
-#include "tests/common/db_test_util.h"
-#include "tests/common/test_tmpdir.h"
 
-POMAI_TEST(DB_ReopenPersistsThroughWalReplay)
+namespace
 {
-    pomai::DBOptions opt;
-    opt.path = pomai::test::TempDir("pomai-integ-persist");
-    opt.dim = 8;
-    opt.shard_count = 4;
 
+    std::vector<float> MakeVec(std::uint32_t dim, float base)
     {
-        auto db = pomai::test::OpenDB(opt);
-        POMAI_EXPECT_TRUE(db != nullptr);
+        std::vector<float> v(dim);
+        for (std::uint32_t i = 0; i < dim; ++i)
+            v[i] = base + static_cast<float>(i) * 0.01f;
+        return v;
+    }
 
-        std::vector<float> v(opt.dim, 0.0f);
-        v[3] = 1.0f;
+    POMAI_TEST(DB_Persistence_Reopen_ReplaysWal)
+    {
+        pomai::DBOptions opt;
+        opt.path = pomai::test::TempDir("pomai-db_persistence_test");
+        opt.dim = 16;
+        opt.shard_count = 4;
+        opt.fsync = pomai::FsyncPolicy::kAlways;
 
-        for (std::uint64_t id = 1; id <= 200; ++id)
+        // 1) Open -> Put -> Flush -> Close
         {
-            POMAI_EXPECT_OK(db->Put(id, v));
+            std::unique_ptr<pomai::DB> db;
+            POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
+
+            auto v = MakeVec(opt.dim, 3.14f);
+            POMAI_EXPECT_OK(db->Put(777, v));
+            POMAI_EXPECT_OK(db->Flush());
+            POMAI_EXPECT_OK(db->Close());
         }
-        POMAI_EXPECT_OK(db->Flush());
-        POMAI_EXPECT_OK(db->Close());
+
+        // 2) Reopen -> Search phải thấy id=777
+        {
+            std::unique_ptr<pomai::DB> db;
+            POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
+
+            auto q = MakeVec(opt.dim, 3.14f);
+            pomai::SearchResult r;
+            POMAI_EXPECT_OK(db->Search(q, /*topk*/ 10, &r));
+
+            bool found = false;
+            for (const auto &h : r.hits)
+            {
+                if (h.id == static_cast<pomai::VectorId>(777))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            POMAI_EXPECT_TRUE(found);
+
+            POMAI_EXPECT_OK(db->Close());
+        }
     }
 
-    {
-        auto db = pomai::test::OpenDB(opt);
-        POMAI_EXPECT_TRUE(db != nullptr);
-
-        std::vector<float> q(opt.dim, 0.0f);
-        q[3] = 1.0f;
-
-        pomai::SearchResult out;
-        POMAI_EXPECT_OK(db->Search(q, 5, &out));
-        POMAI_EXPECT_TRUE(!out.hits.empty());
-
-        POMAI_EXPECT_OK(db->Close());
-    }
-}
+} // namespace

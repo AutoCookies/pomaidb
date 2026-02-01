@@ -2,63 +2,91 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <thread>
+#include <utility>
 
 #include "core/shard/runtime.h"
-
-#include "storage/manifest/manifest.h"
+#include "core/shard/shard.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 
-namespace fs = std::filesystem;
-
 namespace pomai::core
 {
+    namespace
+    {
+        constexpr std::size_t kMailboxCap = 4096;
+        constexpr std::size_t kArenaBlockBytes = 1u << 20;  // 1 MiB
+        constexpr std::size_t kWalSegmentBytes = 64u << 20; // 64 MiB
+
+        static void MergeTopK(std::vector<pomai::SearchHit> *all, std::uint32_t k)
+        {
+            if (!all)
+                return;
+            if (all->size() <= k)
+            {
+                std::sort(all->begin(), all->end(),
+                          [](const auto &a, const auto &b)
+                          { return a.score > b.score; });
+                return;
+            }
+
+            std::nth_element(all->begin(), all->begin() + static_cast<std::ptrdiff_t>(k), all->end(),
+                             [](const auto &a, const auto &b)
+                             { return a.score > b.score; });
+            all->resize(k);
+
+            std::sort(all->begin(), all->end(),
+                      [](const auto &a, const auto &b)
+                      { return a.score > b.score; });
+        }
+    } // namespace
 
     Engine::Engine(pomai::DBOptions opt) : opt_(std::move(opt)) {}
+    Engine::~Engine() = default;
 
-    std::uint32_t Engine::ShardOf(VectorId id) const noexcept
+    std::uint32_t Engine::ShardOf(VectorId id, std::uint32_t shard_count)
     {
-        return static_cast<std::uint32_t>(id % opt_.shard_count);
+        return shard_count == 0 ? 0u : static_cast<std::uint32_t>(id % shard_count);
     }
 
-    pomai::Status Engine::Open()
+    Status Engine::Open()
     {
-        if (opt_.path.empty())
-            return pomai::Status::InvalidArgument("path empty");
+        if (opened_)
+            return Status::Ok();
+        return OpenLocked();
+    }
+
+    Status Engine::OpenLocked()
+    {
         if (opt_.dim == 0)
-            return pomai::Status::InvalidArgument("dim=0");
+            return Status::InvalidArgument("dim must be > 0");
         if (opt_.shard_count == 0)
-            return pomai::Status::InvalidArgument("shard_count=0");
+            return Status::InvalidArgument("shard_count must be > 0");
 
-        fs::create_directories(opt_.path);
+        std::error_code ec;
+        std::filesystem::create_directories(opt_.path, ec);
+        if (ec)
+            return Status::IOError("create_directories failed");
 
-        auto st = pomai::storage::Manifest::EnsureInitialized(
-            opt_.path, opt_.shard_count, opt_.dim);
-        if (!st.ok())
-            return st;
-
+        shards_.clear();
         shards_.reserve(opt_.shard_count);
 
-        for (std::uint32_t sid = 0; sid < opt_.shard_count; ++sid)
+        for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
         {
-            auto wal = std::make_unique<pomai::storage::Wal>(
-                opt_.path, sid, opt_.wal_segment_bytes, opt_.fsync);
-            st = wal->Open();
+            auto wal = std::make_unique<storage::Wal>(opt_.path, i, kWalSegmentBytes, opt_.fsync);
+            auto st = wal->Open();
             if (!st.ok())
                 return st;
 
-            auto mem = std::make_unique<pomai::table::MemTable>(
-                opt_.dim, opt_.arena_block_bytes);
+            auto mem = std::make_unique<table::MemTable>(opt_.dim, kArenaBlockBytes);
 
             st = wal->ReplayInto(*mem);
             if (!st.ok())
                 return st;
 
-            // 🔥 ShardRuntime complete type is known here
-            auto rt = std::make_unique<ShardRuntime>(
-                sid, opt_.dim, std::move(wal), std::move(mem), 1u << 16);
-
+            auto rt = std::make_unique<ShardRuntime>(i, opt_.dim, std::move(wal), std::move(mem), kMailboxCap);
             auto shard = std::make_unique<Shard>(std::move(rt));
+
             st = shard->Start();
             if (!st.ok())
                 return st;
@@ -66,77 +94,82 @@ namespace pomai::core
             shards_.push_back(std::move(shard));
         }
 
-        return pomai::Status::Ok();
+        opened_ = true;
+        return Status::Ok();
     }
 
-    pomai::Status Engine::Close()
+    Status Engine::Close()
     {
-        shards_.clear(); // RAII -> Shard -> ShardRuntime stop clean
-        return pomai::Status::Ok();
+        if (!opened_)
+            return Status::Ok();
+        shards_.clear();
+        opened_ = false;
+        return Status::Ok();
     }
 
-    pomai::Status Engine::Put(VectorId id, std::span<const float> vec)
+    Status Engine::Put(VectorId id, std::span<const float> vec)
     {
-        if (vec.size() != opt_.dim)
-            return pomai::Status::InvalidArgument("dim mismatch");
-        return shards_[ShardOf(id)]->Put(id, vec);
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        if (static_cast<std::uint32_t>(vec.size()) != opt_.dim)
+            return Status::InvalidArgument("dim mismatch");
+        const auto sid = ShardOf(id, opt_.shard_count);
+        return shards_[sid]->Put(id, vec);
     }
 
-    pomai::Status Engine::Delete(VectorId id)
+    Status Engine::Delete(VectorId id)
     {
-        return shards_[ShardOf(id)]->Delete(id);
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        const auto sid = ShardOf(id, opt_.shard_count);
+        return shards_[sid]->Delete(id);
     }
 
-    pomai::Status Engine::Flush()
+    Status Engine::Flush()
     {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
         for (auto &s : shards_)
         {
             auto st = s->Flush();
             if (!st.ok())
                 return st;
         }
-        return pomai::Status::Ok();
+        return Status::Ok();
     }
 
-    pomai::Status Engine::Search(std::span<const float> query,
-                                 std::uint32_t topk,
-                                 std::vector<pomai::SearchHit> *out)
+    Status Engine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out)
     {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
         if (!out)
-            return pomai::Status::InvalidArgument("out null");
-        if (query.size() != opt_.dim)
-            return pomai::Status::InvalidArgument("dim mismatch");
+            return Status::InvalidArgument("out=null");
 
-        out->clear();
+        out->Clear();
+        if (static_cast<std::uint32_t>(query.size()) != opt_.dim)
+            return Status::InvalidArgument("dim mismatch");
         if (topk == 0)
-            return pomai::Status::Ok();
+            return Status::Ok();
+
+        std::vector<std::vector<pomai::SearchHit>> per(opt_.shard_count);
+        std::vector<std::thread> ts;
+        ts.reserve(opt_.shard_count);
+
+        for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
+        {
+            ts.emplace_back([&, i]
+                            { (void)shards_[i]->SearchLocal(query, topk, &per[i]); });
+        }
+        for (auto &t : ts)
+            t.join();
 
         std::vector<pomai::SearchHit> merged;
-        merged.reserve(topk * shards_.size());
+        for (auto &v : per)
+            merged.insert(merged.end(), v.begin(), v.end());
 
-        for (auto &shard : shards_)
-        {
-            std::vector<pomai::SearchHit> local;
-            auto st = shard->Search(query, topk, &local);
-            if (!st.ok())
-                return st;
-
-            merged.insert(merged.end(),
-                          std::make_move_iterator(local.begin()),
-                          std::make_move_iterator(local.end()));
-        }
-
-        std::sort(merged.begin(), merged.end(),
-                  [](const auto &a, const auto &b)
-                  {
-                      return a.score > b.score;
-                  });
-
-        if (merged.size() > topk)
-            merged.resize(topk);
-
-        *out = std::move(merged);
-        return pomai::Status::Ok();
+        MergeTopK(&merged, topk);
+        out->hits = std::move(merged);
+        return Status::Ok();
     }
 
 } // namespace pomai::core

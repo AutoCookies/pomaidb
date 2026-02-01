@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <span>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -24,7 +25,6 @@ namespace pomai::table
 
 namespace pomai::core
 {
-
     struct PutCmd
     {
         VectorId id{};
@@ -81,7 +81,11 @@ namespace pomai::core
         pomai::Status Start();
         pomai::Status Enqueue(Command &&cmd);
 
-        // Gate #3-safe synchronous RPC
+        // sync wrappers (Shard can use these or push Command directly)
+        pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status Delete(pomai::VectorId id);
+        pomai::Status Flush();
+
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
                              std::vector<pomai::SearchHit> *out);

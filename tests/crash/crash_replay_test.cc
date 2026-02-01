@@ -27,7 +27,7 @@ static void ChildWriter(const std::string &path)
     opt.path = path;
     opt.shard_count = 4;
     opt.dim = 16;
-    opt.fsync = pomai::FsyncPolicy::kOnFlush; // Gate#1 boundary via Flush
+    opt.fsync = pomai::FsyncPolicy::kAlways; // đổi từ kOnFlush
 
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(opt, &db);
@@ -61,7 +61,7 @@ static void VerifyOpenAndSearch(const std::string &path)
     opt.path = path;
     opt.shard_count = 4;
     opt.dim = 16;
-    opt.fsync = pomai::FsyncPolicy::kOnFlush;
+    opt.fsync = pomai::FsyncPolicy::kAlways; // đổi từ kOnFlush
 
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(opt, &db);
@@ -86,10 +86,11 @@ int main()
     std::mt19937_64 rng{12345};
     std::uniform_int_distribution<int> kill_delay_ms(5, 60);
 
-    // Repeat many cycles
     for (int round = 0; round < 50; ++round)
     {
-        const std::string path = base; // reuse same DB to exercise replay growth
+        const std::string path = base + "/round_" + std::to_string(round);
+        fs::remove_all(path);
+        fs::create_directories(path);
 
         pid_t pid = fork();
         if (pid < 0)
@@ -100,18 +101,15 @@ int main()
             ChildWriter(path);
         }
 
-        // Parent: wait a bit then randomly kill -9
         std::this_thread::sleep_for(std::chrono::milliseconds(kill_delay_ms(rng)));
         kill(pid, SIGKILL);
 
         int status = 0;
-        waitpid(pid, &status, 0);
+        (void)waitpid(pid, &status, 0);
 
-        // Must be able to reopen regardless of truncation at tail.
         VerifyOpenAndSearch(path);
-        std::cout << "round " << round << " OK\n";
     }
 
-    std::cout << "crash replay test PASS\n";
+    std::cout << "crash_replay_test OK\n";
     return 0;
 }

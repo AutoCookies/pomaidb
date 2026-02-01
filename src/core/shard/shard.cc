@@ -1,56 +1,32 @@
 #include "core/shard/shard.h"
-#include "core/shard/runtime.h"
+
+#include <utility>
 
 namespace pomai::core
 {
-
-    Shard::Shard(std::unique_ptr<ShardRuntime> rt)
-        : rt_(std::move(rt)) {}
-
+    Shard::Shard(std::unique_ptr<ShardRuntime> rt) : rt_(std::move(rt)) {}
     Shard::~Shard() = default;
 
-    pomai::Status Shard::Start()
+    pomai::Status Shard::Start() { return rt_->Start(); }
+
+    pomai::Status Shard::Put(pomai::VectorId id, std::span<const float> vec)
     {
-        return rt_->Start();
+        return rt_->Put(id, vec);
     }
 
-    pomai::Status Shard::Put(VectorId id, std::span<const float> vec)
+    pomai::Status Shard::Delete(pomai::VectorId id)
     {
-        PutCmd c;
-        c.id = id;
-        c.vec = vec.data();
-        c.dim = static_cast<std::uint32_t>(vec.size());
-        auto fut = c.done.get_future();
-        auto st = rt_->Enqueue(Command{std::move(c)});
-        if (!st.ok())
-            return st;
-        return fut.get();
-    }
-
-    pomai::Status Shard::Delete(VectorId id)
-    {
-        DelCmd c;
-        c.id = id;
-        auto fut = c.done.get_future();
-        auto st = rt_->Enqueue(Command{std::move(c)});
-        if (!st.ok())
-            return st;
-        return fut.get();
+        return rt_->Delete(id);
     }
 
     pomai::Status Shard::Flush()
     {
-        FlushCmd c;
-        auto fut = c.done.get_future();
-        auto st = rt_->Enqueue(Command{std::move(c)});
-        if (!st.ok())
-            return st;
-        return fut.get();
+        return rt_->Flush();
     }
 
-    pomai::Status Shard::Search(std::span<const float> query,
-                                std::uint32_t topk,
-                                std::vector<pomai::SearchHit> *out)
+    pomai::Status Shard::SearchLocal(std::span<const float> query,
+                                     std::uint32_t topk,
+                                     std::vector<pomai::SearchHit> *out) const
     {
         return rt_->Search(query, topk, out);
     }

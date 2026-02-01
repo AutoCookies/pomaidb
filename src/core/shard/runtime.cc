@@ -2,13 +2,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
+#include <utility>
 
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 
 namespace pomai::core
 {
-
     static float Dot(std::span<const float> a, std::span<const float> b)
     {
         float s = 0.0f;
@@ -26,7 +27,9 @@ namespace pomai::core
           dim_(dim),
           wal_(std::move(wal)),
           mem_(std::move(mem)),
-          mailbox_(mailbox_cap) {}
+          mailbox_(mailbox_cap)
+    {
+    }
 
     ShardRuntime::~ShardRuntime()
     {
@@ -42,7 +45,8 @@ namespace pomai::core
     pomai::Status ShardRuntime::Start()
     {
         if (started_.exchange(true))
-            return pomai::Status::Busy("shard already started");
+            return pomai::Status::Busy("already started");
+
         worker_ = std::jthread([this]
                                { RunLoop(); });
         return pomai::Status::Ok();
@@ -51,10 +55,51 @@ namespace pomai::core
     pomai::Status ShardRuntime::Enqueue(Command &&cmd)
     {
         if (!started_.load(std::memory_order_relaxed))
-            return pomai::Status::Aborted("shard not started");
+            return pomai::Status::Aborted("not started");
+
         if (!mailbox_.PushBlocking(std::move(cmd)))
             return pomai::Status::Aborted("mailbox closed");
         return pomai::Status::Ok();
+    }
+
+    pomai::Status ShardRuntime::Put(pomai::VectorId id, std::span<const float> vec)
+    {
+        if (vec.size() != dim_)
+            return pomai::Status::InvalidArgument("dim mismatch");
+
+        PutCmd c;
+        c.id = id;
+        c.vec = vec.data();
+        c.dim = static_cast<std::uint32_t>(vec.size());
+        auto fut = c.done.get_future();
+
+        auto st = Enqueue(Command{std::move(c)});
+        if (!st.ok())
+            return st;
+        return fut.get();
+    }
+
+    pomai::Status ShardRuntime::Delete(pomai::VectorId id)
+    {
+        DelCmd c;
+        c.id = id;
+        auto fut = c.done.get_future();
+
+        auto st = Enqueue(Command{std::move(c)});
+        if (!st.ok())
+            return st;
+        return fut.get();
+    }
+
+    pomai::Status ShardRuntime::Flush()
+    {
+        FlushCmd c;
+        auto fut = c.done.get_future();
+
+        auto st = Enqueue(Command{std::move(c)});
+        if (!st.ok())
+            return st;
+        return fut.get();
     }
 
     pomai::Status ShardRuntime::Search(std::span<const float> query,
@@ -62,7 +107,7 @@ namespace pomai::core
                                        std::vector<pomai::SearchHit> *out)
     {
         if (!out)
-            return pomai::Status::InvalidArgument("out null");
+            return pomai::Status::InvalidArgument("out=null");
         if (query.size() != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
         if (topk == 0)
@@ -130,6 +175,7 @@ namespace pomai::core
     {
         if (c.dim != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
+
         auto st = wal_->AppendPut(c.id, {c.vec, c.dim});
         if (!st.ok())
             return st;
@@ -152,41 +198,40 @@ namespace pomai::core
     SearchReply ShardRuntime::HandleSearch(SearchCmd &c)
     {
         SearchReply r;
-        r.st = SearchLocalInternal(
-            {c.query.data(), c.query.size()},
-            c.topk,
-            &r.hits);
+        r.st = SearchLocalInternal({c.query.data(), c.query.size()}, c.topk, &r.hits);
         return r;
     }
 
-    pomai::Status ShardRuntime::SearchLocalInternal(
-        std::span<const float> query,
-        std::uint32_t topk,
-        std::vector<pomai::SearchHit> *out)
+    pomai::Status ShardRuntime::SearchLocalInternal(std::span<const float> query,
+                                                    std::uint32_t topk,
+                                                    std::vector<pomai::SearchHit> *out)
     {
         out->clear();
         out->reserve(topk);
 
         mem_->ForEach([&](VectorId id, std::span<const float> vec)
                       {
-    float score = Dot(query, vec);
+            float score = Dot(query, vec);
 
-    if (out->size() < topk) {
-      out->push_back({id, score});
-      if (out->size() == topk) {
-        std::make_heap(out->begin(), out->end(),
-          [](auto& a, auto& b) { return a.score > b.score; });
-      }
-      return;
-    }
+            if (out->size() < topk)
+            {
+                out->push_back({id, score});
+                if (out->size() == topk)
+                {
+                    std::make_heap(out->begin(), out->end(),
+                                   [](auto &a, auto &b) { return a.score > b.score; });
+                }
+                return;
+            }
 
-    if (score <= (*out)[0].score) return;
+            if (score <= (*out)[0].score)
+                return;
 
-    std::pop_heap(out->begin(), out->end(),
-      [](auto& a, auto& b) { return a.score > b.score; });
-    (*out)[topk - 1] = {id, score};
-    std::push_heap(out->begin(), out->end(),
-      [](auto& a, auto& b) { return a.score > b.score; }); });
+            std::pop_heap(out->begin(), out->end(),
+                          [](auto &a, auto &b) { return a.score > b.score; });
+            (*out)[topk - 1] = {id, score};
+            std::push_heap(out->begin(), out->end(),
+                           [](auto &a, auto &b) { return a.score > b.score; }); });
 
         std::sort(out->begin(), out->end(),
                   [](auto &a, auto &b)

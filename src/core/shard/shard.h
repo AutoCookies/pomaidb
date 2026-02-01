@@ -1,36 +1,35 @@
 #pragma once
-
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <vector>
 
+#include "core/shard/runtime.h" // make ShardRuntime complete here
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
 
 namespace pomai::core
 {
-
-    class ShardRuntime;
-
     class Shard
     {
     public:
         explicit Shard(std::unique_ptr<ShardRuntime> rt);
         ~Shard();
 
-        pomai::Status Start();
+        Shard(const Shard &) = delete;
+        Shard &operator=(const Shard &) = delete;
 
-        pomai::Status Put(VectorId id, std::span<const float> vec);
-        pomai::Status Delete(VectorId id);
-        pomai::Status Flush();
+        Status Start();
 
-        pomai::Status Search(std::span<const float> query,
-                             std::uint32_t topk,
-                             std::vector<pomai::SearchHit> *out);
+        Status Put(VectorId id, std::span<const float> vec);
+        Status Delete(VectorId id);
+        Status Flush();
+
+        Status SearchLocal(std::span<const float> q, std::uint32_t k,
+                           std::vector<pomai::SearchHit> *out) const;
 
     private:
         std::unique_ptr<ShardRuntime> rt_;
     };
-
 } // namespace pomai::core
