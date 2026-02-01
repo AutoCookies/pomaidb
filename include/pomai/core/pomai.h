@@ -24,6 +24,8 @@ namespace pomai
         std::uint32_t vector_dim{0}; // 0 = allow any
         std::size_t shard_inbox_capacity{4096};
         core::FsyncPolicy fsync_policy{core::FsyncPolicy::Never};
+        // 0 = disable automatic checkpointing (recommended for bulk ingest benchmarks)
+        std::size_t checkpoint_interval{0};
     };
 
     class PomaiDB final
@@ -36,7 +38,10 @@ namespace pomai
         void Stop();
 
         Status Upsert(VectorId id, VectorData vec);
+        // Fast path: returns {id, score} with empty payload strings.
         Result<std::vector<SearchHit>> Search(VectorData query, std::uint32_t topk);
+        // Convenience: fetch payloads for the final top-k hits (extra IO).
+        Result<std::vector<SearchHit>> SearchWithPayload(VectorData query, std::uint32_t topk);
 
         Status Flush();
         Result<std::vector<core::ShardStatsSnapshot>> Stats();

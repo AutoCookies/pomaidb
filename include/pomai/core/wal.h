@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -9,31 +10,34 @@
 
 namespace pomai::core
 {
-
     enum class FsyncPolicy : std::uint8_t
     {
         Never = 0,       // OS tự lo (nhanh nhất, rủi ro cao nhất)
         EveryWrite = 1,  // Fsync sau mỗi lần append (chậm, an toàn tuyệt đối)
-        GroupCommit = 2, // (Chưa implement) Gom nhiều write rồi fsync 1 lần
+        GroupCommit = 2, // reserved (chưa implement)
     };
+
+    // Helpers for manifest-based WAL rotation.
+    // WAL directory contains files: wal_<id>.log where <id> is uint64.
+    std::filesystem::path WalFilePath(const std::filesystem::path &wal_dir, std::uint64_t wal_id);
+    pomai::Status ListWalFileIds(const std::filesystem::path &wal_dir, std::vector<std::uint64_t> &out_ids);
 
     class WalWriter final
     {
     public:
         WalWriter() = default;
 
-        // Không cho phép copy để tránh tranh chấp file descriptor
         WalWriter(const WalWriter &) = delete;
         WalWriter &operator=(const WalWriter &) = delete;
 
         pomai::Status Open(const std::filesystem::path &path, FsyncPolicy policy);
 
-        // Zero-copy interface: Nhận pointer raw và size
         pomai::Status Append(const void *data, std::size_t size);
 
         pomai::Status Flush();
         void Close();
 
+        std::uint64_t BytesWritten() const { return bytes_written_.load(std::memory_order_acquire); }
         const LatencyWindow &FsyncLatencyWindow() const { return fsync_lat_us_; }
 
     private:
@@ -41,6 +45,7 @@ namespace pomai::core
         FsyncPolicy policy_{FsyncPolicy::Never};
         int fd_{-1};
 
+        std::atomic<std::uint64_t> bytes_written_{0};
         LatencyWindow fsync_lat_us_{2048};
     };
 
@@ -50,13 +55,9 @@ namespace pomai::core
         explicit WalReader(std::filesystem::path path);
         ~WalReader();
 
-        // Mở file để đọc
         pomai::Status Open();
 
-        // Đọc record tiếp theo.
-        // - Trả về OK: Đọc thành công, data nằm trong `out`.
-        // - Trả về OUT_OF_RANGE: Hết file (EOF clean).
-        // - Trả về DATA_LOSS: Checksum sai hoặc file bị cắt cụt bất thường.
+        // Trả OK khi đọc được record; NotFound("eof") khi EOF clean.
         pomai::Status ReadNext(std::vector<std::byte> &out);
 
     private:

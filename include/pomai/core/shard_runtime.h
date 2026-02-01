@@ -3,7 +3,6 @@
 #include <memory>
 #include <thread>
 #include <utility>
-#include <variant>
 
 #include "pomai/concurrency/bounded_mpsc_queue.h"
 #include "pomai/core/command.h"
@@ -12,19 +11,20 @@
 
 namespace pomai::core
 {
-
     struct ShardRuntimeOptions
     {
         std::size_t inbox_capacity{4096};
     };
 
-    class ShardRuntime final
+    class ShardRuntime final : public std::enable_shared_from_this<ShardRuntime>
     {
     public:
         ShardRuntime(std::uint32_t id,
                      std::unique_ptr<Shard> shard,
                      ShardRuntimeOptions opt)
-            : id_(id), shard_(std::move(shard)), inbox_(opt.inbox_capacity) {}
+            : id_(id), shard_(std::move(shard)), inbox_(opt.inbox_capacity)
+        {
+        }
 
         ~ShardRuntime() { Stop(); }
 
@@ -40,7 +40,6 @@ namespace pomai::core
             running_.store(true, std::memory_order_release);
             th_ = std::thread([this]
                               { Run(); });
-
             return pomai::Status::OK();
         }
 
@@ -63,16 +62,32 @@ namespace pomai::core
             return inbox_.TryPush(std::move(cmd));
         }
 
+        // Step3: request checkpoint (non-blocking)
+        void RequestCheckpoint()
+        {
+            Command c;
+            CmdCheckpoint cp;
+            cp.has_promise = false;
+            c.payload = std::move(cp);
+            (void)TryEnqueue(std::move(c));
+        }
+
         ShardStatsSnapshot SnapshotStats() const
         {
             ShardStatsSnapshot s;
             s.shard_id = id_;
             s.queue_depth = inbox_.Size();
+
             s.upsert_count = shard_->UpsertCount();
             s.search_count = shard_->SearchCount();
+
+            s.wal_bytes = shard_->WalBytes();
+            s.ms_since_last_checkpoint = shard_->MsSinceLastCheckpoint();
+
             s.upsert_latency_us = shard_->UpsertLatencyWindow().GetP50P99();
             s.search_latency_us = shard_->SearchLatencyWindow().GetP50P99();
             s.wal_fsync_us = shard_->Wal().FsyncLatencyWindow().GetP50P99();
+
             return s;
         }
 
@@ -105,6 +120,17 @@ namespace pomai::core
                 {
                     auto st = shard_->Flush();
                     f->prom.set_value(std::move(st));
+                }
+                else if (auto *g = std::get_if<CmdGetPayloadBatch>(&cmd.payload))
+                {
+                    auto rep = shard_->GetPayloadBatch(g->ids);
+                    g->prom.set_value(std::move(rep));
+                }
+                else if (auto *cp = std::get_if<CmdCheckpoint>(&cmd.payload))
+                {
+                    auto st = shard_->CreateCheckpoint();
+                    if (cp->has_promise)
+                        cp->prom.set_value(std::move(st));
                 }
             }
         }

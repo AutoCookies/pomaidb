@@ -7,10 +7,7 @@
 
 namespace pomai::core
 {
-
     // Rolling window of latency samples (microseconds), thread-safe.
-    // Writers: shard thread only (single writer in our design) but we still protect for safety.
-    // Readers: /stats endpoint.
     class LatencyWindow final
     {
     public:
@@ -28,7 +25,6 @@ namespace pomai::core
             }
             else
             {
-                // circular overwrite
                 buf_[idx_] = us;
                 idx_ = (idx_ + 1) % cap_;
                 filled_ = true;
@@ -49,6 +45,7 @@ namespace pomai::core
                 std::lock_guard<std::mutex> lk(mu_);
                 tmp = buf_;
             }
+
             Percentiles out;
             out.n = tmp.size();
             if (tmp.empty())
@@ -80,10 +77,15 @@ namespace pomai::core
     struct ShardStatsSnapshot
     {
         std::uint32_t shard_id{0};
+
         std::uint64_t upsert_count{0};
         std::uint64_t search_count{0};
 
         std::size_t queue_depth{0};
+
+        // Step3 scheduling signals
+        std::uint64_t wal_bytes{0};
+        std::uint64_t ms_since_last_checkpoint{0};
 
         LatencyWindow::Percentiles upsert_latency_us{};
         LatencyWindow::Percentiles search_latency_us{};

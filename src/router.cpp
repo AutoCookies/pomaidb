@@ -92,13 +92,17 @@ namespace pomai::core
 
     SearchReply Router::Search(const SearchRequest &req)
     {
+        // Phase 1: search all shards without touching payload storage.
+        SearchRequest req_no_payload = req;
+        req_no_payload.include_payload = false;
+
         std::vector<std::future<SearchReply>> futs;
         futs.reserve(shards_.size());
 
         for (auto &s : shards_)
         {
             CmdSearch cmd;
-            cmd.req = req;
+            cmd.req = req_no_payload;
             futs.push_back(cmd.prom.get_future());
 
             if (!s->TryEnqueue(Command{std::move(cmd)}))
@@ -119,6 +123,63 @@ namespace pomai::core
             if (!rep.status.ok() && out.status.ok())
                 out.status = rep.status;
             MergeTopK(merged, std::move(rep.hits), req.topk);
+        }
+
+        // Phase 2 (optional): fetch payloads only for the final top-k hits.
+        if (req.include_payload && !merged.empty())
+        {
+            std::vector<std::vector<pomai::VectorId>> ids_by_shard(shards_.size());
+            std::vector<std::vector<std::size_t>> pos_by_shard(shards_.size());
+
+            for (std::size_t i = 0; i < merged.size(); ++i)
+            {
+                const auto id = merged[i].id;
+                const std::uint32_t sid = PickShard(id);
+                ids_by_shard[sid].push_back(id);
+                pos_by_shard[sid].push_back(i);
+            }
+
+            // Issue batched payload requests.
+            std::vector<std::future<PayloadBatchReply>> pfuts(shards_.size());
+            std::vector<bool> has_req(shards_.size(), false);
+
+            for (std::size_t sid = 0; sid < shards_.size(); ++sid)
+            {
+                if (ids_by_shard[sid].empty())
+                    continue;
+
+                CmdGetPayloadBatch cmd;
+                cmd.ids = std::move(ids_by_shard[sid]);
+                pfuts[sid] = cmd.prom.get_future();
+                has_req[sid] = true;
+
+                if (!shards_[sid]->TryEnqueue(Command{std::move(cmd)}))
+                {
+                    if (out.status.ok())
+                        out.status = pomai::Status::Busy("shard queue full (payload fetch)");
+                    continue;
+                }
+            }
+
+            // Fill payloads back into merged results.
+            for (std::size_t sid = 0; sid < shards_.size(); ++sid)
+            {
+                if (!has_req[sid])
+                    continue;
+
+                auto prep = pfuts[sid].get();
+                if (!prep.status.ok() && out.status.ok())
+                    out.status = prep.status;
+
+                const auto &payloads = prep.payloads;
+                const auto &positions = pos_by_shard[sid];
+
+                const std::size_t n = std::min(payloads.size(), positions.size());
+                for (std::size_t j = 0; j < n; ++j)
+                {
+                    merged[positions[j]].payload = payloads[j];
+                }
+            }
         }
 
         out.hits = std::move(merged);

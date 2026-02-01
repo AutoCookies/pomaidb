@@ -25,6 +25,7 @@ namespace pomai
             so.wal_path = opt_.dir / ("shard_" + std::to_string(i) + ".wal");
             so.fsync_policy = opt_.fsync_policy;
             so.vector_dim = opt_.vector_dim;
+            so.checkpoint_interval_ops = opt_.checkpoint_interval;
 
             auto shard = std::make_unique<core::Shard>(i, so);
 
@@ -72,6 +73,20 @@ namespace pomai
         core::SearchRequest req;
         req.query = std::move(query);
         req.topk = topk;
+        req.include_payload = false;
+
+        auto rep = router_->Search(req);
+        if (!rep.status.ok())
+            return Result<std::vector<SearchHit>>::Err(rep.status);
+        return Result<std::vector<SearchHit>>::Ok(std::move(rep.hits));
+    }
+
+    Result<std::vector<SearchHit>> PomaiDB::SearchWithPayload(VectorData query, std::uint32_t topk)
+    {
+        core::SearchRequest req;
+        req.query = std::move(query);
+        req.topk = topk;
+        req.include_payload = true;
 
         auto rep = router_->Search(req);
         if (!rep.status.ok())

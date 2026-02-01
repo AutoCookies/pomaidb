@@ -124,6 +124,8 @@ add_library(pomai STATIC
   src/router.cpp
   src/shard.cpp
   src/wal.cpp
+  src/maintenance.cpp
+  src/manifest.cpp
   src/util/crc32c.cpp
 )
 
@@ -150,17 +152,6 @@ pomai_enable_warnings(pomai)
 pomai_enable_sanitizers(pomai)
 pomai_enable_lto(pomai)
 
-# =============================================================================
-# Benchmarks
-# =============================================================================
-
-if(POMAI_BUILD_BENCHMARKS)
-  add_executable(bench_embedded_upsert benchmarks/bench_embedded_upsert.cpp)
-  target_link_libraries(bench_embedded_upsert PRIVATE pomai)
-  pomai_enable_warnings(bench_embedded_upsert)
-  pomai_enable_sanitizers(bench_embedded_upsert)
-  pomai_enable_lto(bench_embedded_upsert)
-endif()
 
 # =============================================================================
 # Examples
