@@ -1,30 +1,28 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
-#include <vector>
-#include <string> // <--- Bắt buộc phải có để dùng std::string
+#include <span>
+#include <string_view>
 
 namespace pomai
 {
+
     using VectorId = std::uint64_t;
 
-    // Đổi tên từ 'Vector' thành 'VectorData' để khớp với UpsertItem bên dưới
-    struct VectorData
+    struct Slice
     {
-        std::vector<float> values;
+        const std::byte *data = nullptr;
+        std::size_t size = 0;
+
+        constexpr bool empty() const noexcept { return size == 0; }
     };
 
-    struct UpsertItem
+    struct FloatSpan
     {
-        VectorId id;
-        VectorData vec; // Bây giờ trình biên dịch đã hiểu VectorData là gì
-        std::string payload;
-    };
+        const float *data = nullptr;
+        std::uint32_t dim = 0;
 
-    struct SearchHit
-    {
-        VectorId id;
-        float score;
-        std::string payload;
+        constexpr std::span<const float> span() const noexcept { return {data, dim}; }
     };
 
 } // namespace pomai

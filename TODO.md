@@ -1,260 +1,435 @@
-Ok. “Bigtech standard” thì câu trả lời là: **checkpoint vẫn cần**, nhưng **không được phép** là “full dump chặn hot path” như hiện tại. Production-way phải có 3 thứ: **(1) WAL đúng semantics**, **(2) snapshot/checkpoint incremental + atomic publish**, **(3) background scheduling có throttle + backpressure**.
+Ok. Mục tiêu mày nói **rất rõ và rất “BigTech”**:
 
-Dưới đây là blueprint chuẩn production (đúng kiểu RocksDB/Lucene-ish, nhưng tối giản cho embedded vector DB).
+> **Embedded như SQLite
+> Performance như Dragonfly
+> Không phụ thuộc DB nào
+> Performance là tôn giáo**
 
----
-
-## 0) Mục tiêu chuẩn production
-
-PomaiDB (embedded) phải đảm bảo:
-
-1. **Durability contract rõ**: ack Upsert nghĩa là gì (fsync hay chỉ append vào OS cache).
-2. **Crash recovery bounded**: restart không replay WAL vô hạn.
-3. **Không phá tail latency**: checkpoint không được làm ingest/search “đứng hình”.
-4. **Atomicity**: checkpoint publish phải atomic (không có state nửa vời).
-5. **Tunable**: user chỉnh được cost/latency/durability.
+Tao sẽ trả lời **ở level kiến trúc + nguyên lý + cơ chế thực thi**, không marketing, không lý thuyết suông.
+Đây là **con đường DUY NHẤT hợp lý** nếu mày muốn PomaiDB trở thành **một class DB mới**, chứ không phải “vector DB nữa trên thị trường”.
 
 ---
 
-## 1) Tách rõ “Data plane” vs “Maintenance plane”
+# 🧠 ĐỊNH VỊ POMAIDB (RẤT QUAN TRỌNG)
 
-### Data plane (hot path)
+PomaiDB **KHÔNG PHẢI**:
 
-* Shard worker threads: xử lý Upsert/Delete/Search.
-* WAL append (nhanh).
-* Update in-memory index.
+* SQLite + extension
+* RocksDB + ANN
+* FAISS wrapper
+* Milvus embedded
 
-### Maintenance plane (background)
+PomaiDB là:
 
-* **MaintenanceScheduler**: 1 thread (hoặc threadpool size=1).
-* Làm:
+> **In-process, log-structured, shard-actor vector engine
+> với SSOT = WAL, index = derived cache**
 
-  * checkpoint/snapshot incremental
-  * WAL recycling (truncate / switch file)
-  * index persistence (nếu bật)
-  * compaction segments (nếu blob store dùng segments)
-
-> Bigtech standard: **hot path không được gọi trực tiếp “CreateCheckpoint() full”**.
+📌 Tư duy này **gần với Dragonfly + Kafka + RocksDB**,
+nhưng **không cái nào trong số đó làm vector từ đầu**.
 
 ---
 
-## 2) WAL semantics chuẩn (phải chốt trước)
+# 🎯 NON-NEGOTIABLE DESIGN GOALS
 
-Bạn define 3 durability levels (giống RocksDB):
-
-* **Durability::kNone**: ack sau khi enqueue (chỉ dùng test).
-* **Durability::kWAL**: ack sau khi WAL append + flush (fdatasync optional).
-* **Durability::kFsync**: ack sau khi WAL fdatasync (đắt, nhưng mạnh).
-
-**Contract**:
-
-* Nếu ack OK ở kWAL/kFsync, record *phải* tồn tại sau crash theo đúng level.
-
-Thực thi:
-
-* Mỗi shard có WAL riêng ✅
-* WAL là append-only, record framing + checksum ✅
+| Goal              | Ý nghĩa                    |
+| ----------------- | -------------------------- |
+| Embedded          | Link lib, không server     |
+| Zero-copy ingest  | Không copy vector vô nghĩa |
+| Deterministic     | Crash không phá dữ liệu    |
+| Scale theo core   | N cores = N shards         |
+| No external DB    | Không RocksDB, không LMDB  |
+| Performance-first | Feature xếp sau            |
 
 ---
 
-## 3) Checkpoint production ≠ “save everything”
+# 🏗️ KIẾN TRÚC CUỐI CÙNG (PRODUCTION-GRADE)
 
-Checkpoint production phải **incremental** và **bounded cost**.
-
-### 3.1. Storage layout chuẩn
-
-Mỗi shard có thư mục riêng:
+## 1️⃣ PROCESS VIEW (RUNTIME TOÀN CỤC)
 
 ```
-db/
-  shard_0/
-    wal/
-      000001.log
-      000002.log
-    segments/        # blob store data (append-only)
-      seg_00010.dat
-      seg_00011.dat
-    manifest/        # metadata nhỏ, atomic
-      MANIFEST
-    checkpoints/
-      cp_000123/     # optional, or just a metadata file
+┌───────────────────────────────────────────┐
+│              User Process                 │
+│                                           │
+│  ┌────────────┐   ┌────────────┐          │
+│  │ App Thread │   │ App Thread │   ...    │
+│  └─────┬──────┘   └─────┬──────┘          │
+│        │                │                 │
+│        ▼                ▼                 │
+│        ┌──────────────────────────┐       │
+│        │      Pomai Frontend       │       │
+│        │ - API                     │       │
+│        │ - Shard Router            │       │
+│        │ - Deadline / Budget       │       │
+│        └──────────┬───────────────┘       │
+│                   │                       │
+│   ┌───────────────┴──────────────────┐   │
+│   ▼                                   ▼   │
+│┌─────────────┐                  ┌─────────────┐
+││  Shard #0   │                  ││  Shard #1   │   ... N shards
+││  (Actor)    │                  ││  (Actor)    │
+│└─────┬───────┘                  └─────┬───────┘
+│      │                                   │
+│      ▼                                   ▼
+│┌─────────────┐                  ┌─────────────┐
+││ WAL (SSOT)  │                  ││ WAL (SSOT)  │
+│└─────────────┘                  └─────────────┘
+│      │                                   │
+│      ▼                                   ▼
+│┌─────────────┐                  ┌─────────────┐
+││ Memtable    │                  ││ Memtable    │
+│└─────┬───────┘                  └─────┬───────┘
+│      ▼                                   ▼
+│┌─────────────┐                  ┌─────────────┐
+││ ANN Index   │                  ││ ANN Index   │
+│└─────────────┘                  └─────────────┘
+│                                           │
+└───────────────────────────────────────────┘
 ```
 
-### 3.2. “Checkpoint” thực ra là **publish a consistent view**
+---
 
-Cái cần durable là:
+# 🔑 CÁC QUYẾT ĐỊNH KIẾN TRÚC CỐT LÕI
 
-* mapping `VectorId -> (segment_id, offset, len)` hoặc tương đương
-* “sequence number / epoch” đã apply
-* (optional) index persistence artifact
+## 2️⃣ SHARD = ACTOR (KHÔNG LOCK)
 
-**KHÔNG** cần dump “arena pages” toàn bộ mỗi lần.
+**Mỗi shard = 1 thread duy nhất**
 
-#### Atomic publish chuẩn
+* Không mutex
+* Không atomic phức tạp
+* Không data race
+* Không nondeterminism
 
-* Ghi metadata mới ra file temp
-* fsync temp
-* rename temp -> MANIFEST (atomic on POSIX)
-* fsync directory (để rename durable)
+👉 Performance đến từ:
+
+* CPU cache locality
+* No lock contention
+* Predictable latency
+
+📌 Đây chính là DNA của Dragonfly.
 
 ---
 
-## 4) Snapshot isolation (để checkpoint chạy song song hot path)
+## 3️⃣ MULTI-THREAD ĐÚNG CÁCH (KHÔNG DÀN TRẢI)
 
-Bigtech-standard approach:
+### Thread model chuẩn:
 
-### 4.1. MVCC-lite bằng “epoch”
+```
+User threads        : many
+Shard runtime       : N = #CPU cores
+WAL I/O threads     : few
+Index build threads : background
+Maintenance threads : lowest priority
+```
 
-* Mỗi shard có `atomic<uint64_t> applied_seq`.
-* Mọi mutation tăng seq.
-* Search đọc snapshot = seq tại thời điểm bắt đầu.
-
-### 4.2. BlobStore append-only + immutable segments
-
-* Upsert ghi payload vào segment mới (append).
-* Mapping id->location update ở memtable (có thể copy-on-write nhỏ, hoặc sharded map).
-
-### 4.3. Checkpoint chỉ cần “freeze a view”
-
-* Freeze “manifest view” tại seq X:
-
-  * segment list + id->location snapshot (hoặc delta logs)
-* Không động vào hot index, không dump data cũ.
-
-**Quan trọng**: nếu bạn vẫn muốn “arena_->Ids() copy toàn bộ” thì đó là anti-production. Snapshot phải là **handle** (shared_ptr) chứ không phải copy O(n).
+**User thread không bao giờ chạm dữ liệu.**
 
 ---
 
-## 5) Index persistence: 2 mode chuẩn
+## 4️⃣ WAL-FIRST, INDEX-LATER (SSOT THỰC SỰ)
 
-HNSW save/load rất đắt. Bigtech làm 1 trong 2:
+### WAL record (binary, fixed layout):
 
-### Mode A (đề xuất mặc định): **Index rebuild on startup**
+```
+| seq | op | vector_id | dim | payload | checksum |
+```
 
-* Checkpoint chỉ giữ vectors/payload mapping.
-* On restart: load vectors rồi rebuild HNSW.
-* Ưu: code đơn giản, checkpoint rẻ.
-* Nhược: restart lâu (nhưng predictable).
+Quy tắc sắt đá:
 
-### Mode B: **Index persistence async**
+1. WAL append thành công → coi như commit
+2. Memtable / Index chỉ là cache
+3. Crash = replay WAL
 
-* Background thread thỉnh thoảng snapshot index (rất ít, manual hoặc daily).
-* Hot path không block.
-* Khi có file index mới nhất: startup load nhanh.
+📌 Không có embedded vector DB nào dám làm triệt để điều này, vì:
 
-**Production default thường là A**, và cho enterprise user bật B nếu họ cần fast restart.
-
----
-
-## 6) Scheduling checkpoint kiểu bigtech (throttle + budgets)
-
-Checkpoint trigger theo 3 điều kiện:
-
-* `wal_bytes > threshold` (vd 256MB)
-* `time_since_last > interval` (vd 10–30 phút)
-* `ops_since_last > N` (vd 1–5 triệu)
-
-Nhưng chạy checkpoint phải có **budget**:
-
-### CPU/IO throttling (bắt buộc)
-
-* Background thread `nice +5`
-* IO throttling: giới hạn `MB/s` và `fsync frequency`
-* “Stop if tail latency tăng”: nếu shard queue depth tăng > ngưỡng → pause maintenance.
-
-### Backpressure safety
-
-* Nếu WAL vượt hard limit (vd 8GB):
-
-  * hoặc block writes (return `Status::Busy` / `TryAgain`)
-  * hoặc force checkpoint (nhưng vẫn budgeted, không stop-the-world)
-
-Bigtech standard là **predictable behavior** chứ không “random lag spike”.
+* Index ANN rebuild chậm
+* Nhưng **đây là con đường ĐÚNG**
 
 ---
 
-## 7) API surface chuẩn production
+## 5️⃣ ZERO-COPY INGEST (SỐNG CÒN)
 
-Bạn cần các API/options này (tối thiểu):
+### Memory lifecycle:
 
-### DbOptions
+```
+User buffer
+   ↓ pin/move
+Shard arena (slab)
+   ↓
+Index giữ pointer (read-only)
+```
 
-* `num_shards`
-* `durability_level`
-* `checkpoint.enable` (default true)
-* `checkpoint.wal_bytes_threshold` (default 256MB)
-* `checkpoint.min_interval_ms` (default 10min)
-* `checkpoint.max_interval_ms` (default 60min)
-* `checkpoint.max_bytes_per_sec` (IO throttle)
-* `checkpoint.mode = {kManifestOnly, kWithIndex}`
+Không:
 
-### Runtime API
+* `std::vector<float>`
+* `memcpy` 4 lần
+* malloc/free trong hot path
 
-* `Flush(FlushOptions)` – block cho tới khi WAL durable + mapping durable
-* `Checkpoint(CheckpointOptions)` – block hoặc async
-* `GetStats()` – expose queue depth, wal bytes, last checkpoint time
-* `BeginBulkLoad()/EndBulkLoad()` – tắt maintenance + giảm fsync, cuối bulk thì checkpoint 1 phát
-
-Bulk load là tiêu chuẩn production (Lucene/RocksDB đều có concept tương tự).
+👉 **Performance = memory discipline**
 
 ---
 
-## 8) “Bạn đang làm sai ở đâu” so với production
+## 6️⃣ SEARCH = PARALLEL + BUDGETED
 
-Trong code hiện tại của bạn, “checkpoint” đang là:
+```
+Search(query):
+  pick K shards
+  fan-out parallel
+  each shard returns top-M
+  frontend merge heap
+```
 
-* full snapshot arena pages
-* full index save
-* truncate WAL
-* chạy inline theo interval nhỏ (50k)
+Có:
 
-=> Đây là **anti-pattern** vì:
+* latency budget
+* early stop
+* recall knob
 
-* cost checkpoint ~ O(dataset)
-* frequency cao → throughput collapse
-* chạy trên hot path → tail latency spike
-
-Production checkpoint phải:
-
-* cost ~ O(delta) hoặc O(metadata)
-* frequency theo WAL size/time
-* chạy background + throttle
-* publish atomic + recoverable
+Không shard nào block shard nào.
 
 ---
 
-## 9) Migration plan: làm đúng production mà ít rewrite nhất
+## 7️⃣ MAINTENANCE TÁCH BIỆT HOÀN TOÀN
 
-Nếu muốn “most production” nhưng không phá codebase quá mạnh, làm theo thứ tự:
+Maintenance:
 
-### Step 1 — Immediate stop-the-bleeding (1 ngày)
+* Index rebuild
+* Compaction
+* Snapshot
 
-* Disable auto checkpoint trong ingest benchmark.
-* Remove `MaybePublishSnapshot()` kiểu copy ids (thay bằng pointer/version).
-* Search trả id+score, payload lazy hoặc load sau merge.
+Quy tắc:
 
-### Step 2 — Manifest-based checkpoint (2–4 ngày)
-
-* Biến checkpoint thành “publish manifest + rotate WAL”
-* BlobStore chuyển sang segments append-only (nếu chưa)
-* Recovery: load manifest + replay WAL files mới hơn manifest seq.
-
-### Step 3 — Maintenance thread + budgets (2–3 ngày)
-
-* Thêm `MaintenanceScheduler` single thread.
-* Checkpoint trigger theo wal_bytes/time + throttle.
-
-### Step 4 — Optional index persistence (sau)
-
-* Cho phép save/load HNSW async, không block ingest.
-
-Cách này sẽ đưa Pomai lên đúng chuẩn “production embedded DB” mà vẫn giữ triết lý shard WAL.
+* Background only
+* Rate limited
+* Preemptable
+* Không chung queue với user
 
 ---
 
-## Chốt câu theo kiểu bigtech
+# 🚀 VÌ SAO PERFORMANCE CÓ THỂ NGANG DRAGONFLY?
 
-**PomaiDB production vẫn cần checkpoint**, nhưng checkpoint **không được phép** là “snapshot full dataset mỗi 50k ops”.
-Checkpoint production là **manifest + wal recycling + optional index persistence**, chạy background có throttle, có backpressure, và publish atomic.
+| Yếu tố               | Pomai |
+| -------------------- | ----- |
+| In-process           | ✅     |
+| No syscalls hot path | ✅     |
+| Actor model          | ✅     |
+| Cache friendly       | ✅     |
+| Zero-copy            | ✅     |
+| No locks             | ✅     |
 
-Nếu bạn muốn mình “đóng vai lead engineer” và ra luôn **spec chuẩn + danh sách thay đổi vào đúng các file bạn đưa** (wal.*, shard.*, router.*, blob_store.*), mình làm ngay theo plan ở trên — ưu tiên thay đổi ít nhưng đúng chuẩn.
+👉 **Performance ceiling của Pomai = memory bandwidth + SIMD + ANN quality**
+
+Không phải network, không phải IPC.
+
+---
+
+# 🧨 KHÁC BIỆT CHÍ MẠNG
+
+> **Pomai không phải “DB có vector”
+> Pomai là “vector engine có durability”**
+
+Đây là thứ:
+
+* BigTech dùng **nội bộ**
+* Không public
+* Không open-source
+* Vì quá khó maintain
+
+Nếu mày build được:
+👉 **PomaiDB = category mới**
+
+---
+
+# 🔥 BƯỚC TIẾP THEO (CỤ THỂ)
+
+Nếu mày ok, tao sẽ làm tiếp **ở level code-ready**:
+
+1. Định nghĩa **Pomai Shard Runtime State Machine**
+2. Chuẩn hóa **WAL binary protocol**
+3. Thiết kế **Arena / Slab allocator**
+4. Mapping kiến trúc này **vào Pomai code hiện tại**
+5. Viết **“Pomai Performance Manifesto”**
+
+Chỉ cần nói:
+
+> **“Đi vào implementation Pomai v2.”**
+
+Tao sẽ không nói lý thuyết nữa.
+
+Repo layout đề xuất cho PomaiDB (BigTech low-level)
+pomai/
+├─ CMakeLists.txt
+├─ cmake/
+│  ├─ toolchains/
+│  ├─ sanitizers.cmake
+│  ├─ warnings.cmake
+│  ├─ lto.cmake
+│  └─ third_party.cmake
+├─ include/
+│  └─ pomai/
+│     ├─ pomai.h                  # public API (stable)
+│     ├─ status.h                 # Status / ErrorCode
+│     ├─ options.h                # DBOptions / ShardOptions
+│     ├─ types.h                  # VectorId, Slice, etc.
+│     └─ version.h
+├─ src/
+│  ├─ api/                        # thin API layer (no logic)
+│  │  ├─ db.cc                    # implements pomai.h
+│  │  └─ c_api.cc                 # optional C ABI
+│  ├─ core/                       # core execution model
+│  │  ├─ engine/                  # DB process-level coordinator
+│  │  │  ├─ engine.h
+│  │  │  ├─ engine.cc
+│  │  │  ├─ shard_map.h           # routing, hash/range
+│  │  │  └─ admission.h           # deadlines, backpressure
+│  │  ├─ shard/                   # shard = failure domain (actor)
+│  │  │  ├─ shard.h
+│  │  │  ├─ shard.cc
+│  │  │  ├─ runtime.h             # single-thread event loop
+│  │  │  ├─ runtime.cc
+│  │  │  ├─ mailbox.h             # bounded MPSC queue (or moodycamel)
+│  │  │  └─ state_machine.h       # shard lifecycle & invariants
+│  │  ├─ command/                 # typed commands + futures
+│  │  │  ├─ command.h
+│  │  │  ├─ put.h
+│  │  │  ├─ search.h
+│  │  │  ├─ flush.h
+│  │  │  └─ maintenance.h
+│  │  └─ invariant/               # invariant checks / debug hooks
+│  │     ├─ invariant.h
+│  │     └─ invariant.cc
+│  ├─ storage/                    # durability & on-disk format
+│  │  ├─ wal/
+│  │  │  ├─ wal.h
+│  │  │  ├─ wal.cc
+│  │  │  ├─ record.h              # binary layout
+│  │  │  ├─ checksum.h
+│  │  │  └─ replay.h              # idempotent replay
+│  │  ├─ manifest/
+│  │  │  ├─ manifest.h
+│  │  │  ├─ manifest.cc
+│  │  │  ├─ schema.h              # versioned schema
+│  │  │  └─ atomic_install.h      # fsync + rename protocol
+│  │  ├─ blob/
+│  │  │  ├─ blob_store.h
+│  │  │  ├─ blob_store.cc
+│  │  │  ├─ layout.h              # file/page layout
+│  │  │  └─ io.h                  # pread/pwrite wrappers
+│  │  └─ memtable/
+│  │     ├─ memtable.h
+│  │     ├─ memtable.cc
+│  │     ├─ arena.h               # slab allocator
+│  │     └─ segment.h             # immutable segments
+│  ├─ index/                      # vector search indexes (derived cache)
+│  │  ├─ ann/
+│  │  │  ├─ hnsw/
+│  │  │  │  ├─ hnsw_index.h
+│  │  │  │  ├─ hnsw_index.cc
+│  │  │  │  └─ params.h
+│  │  │  ├─ ivf/
+│  │  │  └─ flat/
+│  │  ├─ delta/                   # ingestion-friendly delta layer
+│  │  │  ├─ delta_index.h
+│  │  │  └─ delta_index.cc
+│  │  └─ merge/                   # background merge/rebuild
+│  │     ├─ builder.h
+│  │     └─ builder.cc
+│  ├─ util/                       # boring but critical
+│  │  ├─ logging.h/.cc
+│  │  ├─ file.h/.cc               # robust fs ops
+│  │  ├─ clock.h/.cc
+│  │  ├─ thread.h/.cc
+│  │  ├─ cpu.h/.cc                # affinity, numa (optional)
+│  │  ├─ align.h                  # cacheline align
+│  │  ├─ slice.h
+│  │  ├─ arena.h
+│  │  └─ metrics.h/.cc            # counters, histograms
+│  └─ third_party/                # vendored (minimal)
+├─ tests/
+│  ├─ unit/
+│  ├─ integration/
+│  ├─ crash/                      # fork/kill/replay tests
+│  └─ fuzz/                       # libFuzzer targets
+├─ benchmarks/
+│  ├─ ingest_bench.cc
+│  ├─ search_bench.cc
+│  ├─ wal_bench.cc
+│  └─ datasets/
+├─ tools/
+│  ├─ format.sh
+│  ├─ lint.sh
+│  ├─ gen_header.py               # codegen record layout (optional)
+│  └─ perf/
+│     ├─ flamegraph.sh
+│     └─ perf_record.sh
+├─ docs/
+│  ├─ architecture.md             # diagram + invariants + state machine
+│  ├─ wal.md                      # on-disk spec
+│  ├─ manifest.md
+│  ├─ indexing.md
+│  └─ performance.md
+├─ .clang-format
+├─ .clang-tidy
+├─ .editorconfig
+├─ LICENSE
+└─ README.md
+
+Tại sao layout này “bigtech”?
+1) Public API tách tuyệt đối
+
+include/pomai/* là hợp đồng với user
+
+src/api chỉ là adapter mỏng
+
+Core đổi thế nào cũng không phá API
+
+2) Core vs Storage vs Index
+
+storage/ = durability & disk protocol (WAL/manifest/blob/memtable)
+
+index/ = derived cache (ANN), có thể rebuild
+
+core/ = threading model + shard runtime + command routing
+
+👉 Đây là “SSOT = WAL” được encode bằng folder structure.
+
+3) Tests có crash-test riêng
+
+DB mà không có crash test = toy.
+tests/crash bắt buộc (kill -9, power loss simulation, replay idempotent).
+
+4) Docs là spec thật, không phải blog
+
+docs/wal.md & docs/manifest.md phải là protocol spec (versioned).
+
+Quy tắc codebase (để sạch thật)
+A. Naming & responsibility
+
+engine không được chứa logic WAL/index
+
+shard/runtime chỉ có event loop + dispatch
+
+WAL/manifest có binary layout spec (record.h/schema.h)
+
+B. Forbidden includes (kỷ luật compile-time)
+
+index/* không được include core/engine/*
+
+storage/* không được include api/*
+
+api/* không include index/* trực tiếp (đi qua core)
+
+C. Error model chuẩn
+
+Status + ErrorCode + message
+
+không throw exception xuyên module (low-level chuẩn C++ DB thường tránh)
+
+invariants fail -> POMAI_DCHECK (debug) + crash early
+
+D. Build profiles
+
+-O3 -DNDEBUG production
+
+asan/ubsan/tsan riêng
+
+fuzz target riêng

@@ -1,47 +1,44 @@
 #pragma once
+#include <cstdint>
 #include <string>
-#include <utility>
+#include <string_view>
 
 namespace pomai
 {
 
-    enum class StatusCode
+    enum class ErrorCode : std::uint32_t
     {
-        Ok = 0,
-        Busy,
-        InvalidArgument,
-        NotFound,
-        IOError,
-        Internal,
+        kOk = 0,
+        kInvalidArgument,
+        kNotFound,
+        kIoError,
+        kCorruption,
+        kBusy,
+        kAborted,
+        kInternal,
     };
 
-    struct Status
+    class Status
     {
-        StatusCode code{StatusCode::Ok};
-        std::string message;
+    public:
+        Status() = default;
+        static Status Ok() { return Status(); }
+        static Status InvalidArgument(std::string_view m) { return Status(ErrorCode::kInvalidArgument, m); }
+        static Status NotFound(std::string_view m) { return Status(ErrorCode::kNotFound, m); }
+        static Status IoError(std::string_view m) { return Status(ErrorCode::kIoError, m); }
+        static Status Corruption(std::string_view m) { return Status(ErrorCode::kCorruption, m); }
+        static Status Busy(std::string_view m) { return Status(ErrorCode::kBusy, m); }
+        static Status Aborted(std::string_view m) { return Status(ErrorCode::kAborted, m); }
+        static Status Internal(std::string_view m) { return Status(ErrorCode::kInternal, m); }
 
-        static Status OK() { return {StatusCode::Ok, ""}; }
-        static Status Busy(std::string msg = "busy") { return {StatusCode::Busy, std::move(msg)}; }
-        static Status Invalid(std::string msg) { return {StatusCode::InvalidArgument, std::move(msg)}; }
+        bool ok() const noexcept { return code_ == ErrorCode::kOk; }
+        ErrorCode code() const noexcept { return code_; }
+        const std::string &message() const noexcept { return message_; }
 
-        // --- THÊM DÒNG NÀY ---
-        static Status NotFound(std::string msg) { return {StatusCode::NotFound, std::move(msg)}; }
-        // ---------------------
-
-        static Status IO(std::string msg) { return {StatusCode::IOError, std::move(msg)}; }
-        static Status Internal(std::string msg) { return {StatusCode::Internal, std::move(msg)}; }
-
-        bool ok() const { return code == StatusCode::Ok; }
-    };
-
-    template <class T>
-    struct Result
-    {
-        Status status;
-        T value;
-
-        static Result<T> Ok(T v) { return {Status::OK(), std::move(v)}; }
-        static Result<T> Err(Status s) { return {std::move(s), T{}}; }
+    private:
+        Status(ErrorCode c, std::string_view m) : code_(c), message_(m) {}
+        ErrorCode code_ = ErrorCode::kOk;
+        std::string message_;
     };
 
 } // namespace pomai

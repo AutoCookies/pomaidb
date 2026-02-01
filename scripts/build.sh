@@ -1,142 +1,114 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================================
-# Pomai build helper
-#
-# Usage:
-#   ./scripts/build.sh                 # build (default Release)
-#   ./scripts/build.sh clean           # remove build dir
-#   ./scripts/build.sh test            # build + ctest
-#   ./scripts/build.sh bench           # build + run bench_pomai (if exists)
-#   ./scripts/build.sh run             # build + run pomai-server (if exists)
-#   ./scripts/build.sh install         # build + install
-#
-# Presets:
-#   ./scripts/build.sh asan            # RelWithDebInfo + ASAN+UBSAN
-#   ./scripts/build.sh tsan            # Debug + TSAN
-#
-# Env overrides:
-#   BUILD_TYPE=Release|Debug|RelWithDebInfo|MinSizeRel   (default Release)
-#   BUILD_DIR=build                                      (default <repo>/build)
-#   NATIVE=1                                             (Release only, adds -march=native)
-#   PREFIX=/usr/local                                    (install prefix)
-#   RUN_BIN=...                                          (override binary for action=run)
-#   RUN_ARGS="..."                                       (args for action=run)
-#   BENCH_BIN=...                                        (override benchmark binary)
-#   BENCH_ARGS="..."                                     (args for action=bench)
-# ==============================================================================
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BUILD_TYPE="release"
+COMPILER=""
+GENERATOR=""
+JOBS="$(nproc)"
 
-ACTION="${1:-build}"
+usage() {
+  echo "Usage: $0 [release|debug|asan|tsan] [--clang|--gcc]"
+  echo
+  echo "Examples:"
+  echo "  ./scripts/build.sh"
+  echo "  ./scripts/build.sh debug"
+  echo "  ./scripts/build.sh asan --clang"
+  echo "  ./scripts/build.sh tsan --clang"
+  exit 1
+}
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# -------- parse args --------
+for arg in "$@"; do
+  case "$arg" in
+    release|debug|asan|tsan)
+      BUILD_TYPE="$arg"
+      ;;
+    --clang)
+      COMPILER="clang"
+      ;;
+    --gcc)
+      COMPILER="gcc"
+      ;;
+    -h|--help)
+      usage
+      ;;
+    *)
+      echo "Unknown arg: $arg"
+      usage
+      ;;
+  esac
+done
 
-BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build}"
-BUILD_TYPE="${BUILD_TYPE:-Release}"
-NATIVE="${NATIVE:-0}"
-PREFIX="${PREFIX:-/usr/local}"
+# -------- generator --------
+if command -v ninja >/dev/null 2>&1; then
+  GENERATOR="Ninja"
+else
+  GENERATOR="Unix Makefiles"
+fi
 
-RUN_ARGS="${RUN_ARGS:-}"
-BENCH_ARGS="${BENCH_ARGS:-}"
+# -------- compiler --------
+CMAKE_COMPILER_ARGS=()
+if [[ "$COMPILER" == "clang" ]]; then
+  CMAKE_COMPILER_ARGS+=(
+    -DCMAKE_CXX_COMPILER=clang++
+    -DCMAKE_C_COMPILER=clang
+  )
+elif [[ "$COMPILER" == "gcc" ]]; then
+  CMAKE_COMPILER_ARGS+=(
+    -DCMAKE_CXX_COMPILER=g++
+    -DCMAKE_C_COMPILER=gcc
+  )
+fi
 
-# Default binary names (override via env if your target differs)
-RUN_BIN="${RUN_BIN:-${BUILD_DIR}/bin/pomai-server}"
-BENCH_BIN="${BENCH_BIN:-${BUILD_DIR}/bin/bench_pomai}"
+# -------- build config --------
+CMAKE_BUILD_TYPE="Release"
+CMAKE_EXTRA_FLAGS=()
 
-GREEN='\033[1;32m'
-BLUE='\033[1;34m'
-RED='\033[1;31m'
-NC='\033[0m'
-
-log()  { echo -e "${GREEN}[pomai]${NC} $*"; }
-info() { echo -e "${BLUE}[info]${NC} $*"; }
-err()  { echo -e "${RED}[error]${NC} $*"; }
-
-POMAI_CMAKE_OPTS=()
-
-case "${ACTION}" in
-  clean)
-    log "Cleaning build directory: ${BUILD_DIR}"
-    rm -rf "${BUILD_DIR}"
-    log "Clean complete."
-    exit 0
+case "$BUILD_TYPE" in
+  release)
+    CMAKE_BUILD_TYPE="Release"
+    ;;
+  debug)
+    CMAKE_BUILD_TYPE="Debug"
     ;;
   asan)
-    ACTION="build"
-    BUILD_TYPE="RelWithDebInfo"
-    POMAI_CMAKE_OPTS+=(-DPOMAI_ENABLE_ASAN=ON -DPOMAI_ENABLE_UBSAN=ON)
+    CMAKE_BUILD_TYPE="RelWithDebInfo"
+    CMAKE_EXTRA_FLAGS+=(
+      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+    )
     ;;
   tsan)
-    ACTION="build"
-    BUILD_TYPE="Debug"
-    POMAI_CMAKE_OPTS+=(-DPOMAI_ENABLE_TSAN=ON)
+    CMAKE_BUILD_TYPE="RelWithDebInfo"
+    CMAKE_EXTRA_FLAGS+=(
+      -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+    )
+    ;;
+  *)
+    usage
     ;;
 esac
 
-# Prefer Ninja if available
-GENERATOR=()
-if command -v ninja >/dev/null 2>&1; then
-  GENERATOR=(-G Ninja)
-fi
+BUILD_DIR="${ROOT_DIR}/build/${BUILD_TYPE}"
 
-log "Build Environment:"
-info "  Repo root:  ${REPO_ROOT}"
-info "  Build dir:  ${BUILD_DIR}"
-info "  Build type: ${BUILD_TYPE}"
-info "  Native:     ${NATIVE}"
-if ((${#POMAI_CMAKE_OPTS[@]})); then
-  info "  CMake opts: ${POMAI_CMAKE_OPTS[*]}"
-fi
+echo "== Pomai build =="
+echo "  type      : ${BUILD_TYPE}"
+echo "  generator : ${GENERATOR}"
+echo "  compiler  : ${COMPILER:-default}"
+echo "  build dir : ${BUILD_DIR}"
+echo
 
 mkdir -p "${BUILD_DIR}"
 
-log "Configuring CMake..."
-CXX_FLAGS_RELEASE=()
-if [[ "${BUILD_TYPE}" == "Release" && "${NATIVE}" == "1" ]]; then
-  # NOTE: -march=native makes binaries non-portable.
-  CXX_FLAGS_RELEASE=(-DCMAKE_CXX_FLAGS_RELEASE=-O3\ -march=native)
-fi
+cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
+  -G "${GENERATOR}" \
+  -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+  "${CMAKE_COMPILER_ARGS[@]}" \
+  "${CMAKE_EXTRA_FLAGS[@]}"
 
-cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" \
-  "${GENERATOR[@]}" \
-  -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
-  -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
-  "${CXX_FLAGS_RELEASE[@]}" \
-  "${POMAI_CMAKE_OPTS[@]}" \
-  -Wno-dev
+cmake --build "${BUILD_DIR}" -j"${JOBS}"
 
-log "Compiling..."
-cmake --build "${BUILD_DIR}" -j"$(nproc)"
-
-case "${ACTION}" in
-  test)
-    log "Running tests (ctest)..."
-    (cd "${BUILD_DIR}" && ctest --output-on-failure)
-    ;;
-  install)
-    log "Installing to prefix: ${PREFIX}"
-    cmake --install "${BUILD_DIR}"
-    ;;
-  run)
-    if [[ ! -x "${RUN_BIN}" ]]; then
-      err "Run binary not found: ${RUN_BIN}"
-      err "Set RUN_BIN=/path/to/your/binary or ensure you have a server target."
-      exit 1
-    fi
-    log "Running: ${RUN_BIN} ${RUN_ARGS}"
-    exec "${RUN_BIN}" ${RUN_ARGS}
-    ;;
-  bench)
-    if [[ ! -x "${BENCH_BIN}" ]]; then
-      err "Benchmark binary not found: ${BENCH_BIN}"
-      err "Tip: ensure your root CMake builds bench_pomai, or run scripts/build_bench.sh."
-      exit 1
-    fi
-    log "Running: ${BENCH_BIN} ${BENCH_ARGS}"
-    exec "${BENCH_BIN}" ${BENCH_ARGS}
-    ;;
-  build|*)
-    log "Done."
-    ;;
-esac
+echo
+echo "Build OK → ${BUILD_DIR}"
