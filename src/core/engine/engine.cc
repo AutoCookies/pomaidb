@@ -84,7 +84,14 @@ namespace pomai::core
             if (!st.ok())
                 return st;
 
-            auto rt = std::make_unique<ShardRuntime>(i, opt_.dim, std::move(wal), std::move(mem), kMailboxCap);
+            auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
+            // Ensure dir exists (Wal creates it? Engine creates it?) 
+            // Engine created opt_.path. Wal creates shard dir?
+            // Wal::Open uses EnsureDir logic.
+            // Let's rely on Wal or create it.
+            // Wal uses "shards" subdirectory.
+            // Let's pass it.
+            auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem), kMailboxCap);
             auto shard = std::make_unique<Shard>(std::move(rt));
 
             st = shard->Start();
@@ -115,6 +122,26 @@ namespace pomai::core
             return Status::InvalidArgument("dim mismatch");
         const auto sid = ShardOf(id, opt_.shard_count);
         return shards_[sid]->Put(id, vec);
+    }
+
+    Status Engine::Get(VectorId id, std::vector<float> *out)
+    {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        if (!out)
+            return Status::InvalidArgument("out=null");
+        const auto sid = ShardOf(id, opt_.shard_count);
+        return shards_[sid]->Get(id, out);
+    }
+
+    Status Engine::Exists(VectorId id, bool *exists)
+    {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        if (!exists)
+            return Status::InvalidArgument("exists=null");
+        const auto sid = ShardOf(id, opt_.shard_count);
+        return shards_[sid]->Exists(id, exists);
     }
 
     Status Engine::Delete(VectorId id)

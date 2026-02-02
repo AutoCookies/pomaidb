@@ -37,6 +37,8 @@ namespace pomai::core
         Status ListMembranes(std::vector<std::string> *out) const;
 
         Status Put(std::string_view membrane, VectorId id, std::span<const float> vec);
+        Status Get(std::string_view membrane, VectorId id, std::vector<float> *out);
+        Status Exists(std::string_view membrane, VectorId id, bool *exists);
         Status Delete(std::string_view membrane, VectorId id);
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
 

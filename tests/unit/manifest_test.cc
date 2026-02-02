@@ -8,6 +8,7 @@
 #include "pomai/status.h"
 #include "storage/manifest/manifest.h"
 #include "tests/common/test_tmpdir.h"
+#include "util/crc32c.h"
 
 namespace
 {
@@ -43,7 +44,8 @@ namespace
         POMAI_EXPECT_TRUE(fs::exists(root_manifest));
 
         const std::string content = ReadAllOrDie(root_manifest);
-        POMAI_EXPECT_TRUE(content.rfind("pomai.manifest.v2\n", 0) == 0);
+        // Expect v3 header
+        POMAI_EXPECT_TRUE(content.rfind("pomai.manifest.v3\n", 0) == 0);
 
         // Idempotent.
         POMAI_EXPECT_OK(pomai::storage::Manifest::EnsureInitialized(root));
@@ -57,11 +59,14 @@ namespace
         a.name = "alpha";
         a.shard_count = 3;
         a.dim = 8;
+        a.metric = pomai::MetricType::kInnerProduct;
 
         pomai::MembraneSpec b;
         b.name = "beta";
         b.shard_count = 4;
         b.dim = 16;
+        b.metric = pomai::MetricType::kCosine;
+        b.index_params.num_lists = 99;
 
         POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, a));
         POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, b));
@@ -77,6 +82,8 @@ namespace
         POMAI_EXPECT_EQ(got.name, std::string("beta"));
         POMAI_EXPECT_EQ(got.shard_count, static_cast<std::uint32_t>(4));
         POMAI_EXPECT_EQ(got.dim, static_cast<std::uint32_t>(16));
+        POMAI_EXPECT_TRUE(got.metric == pomai::MetricType::kCosine);
+        POMAI_EXPECT_EQ(got.index_params.num_lists, static_cast<std::uint32_t>(99));
 
         // Create again => AlreadyExists.
         auto st = pomai::storage::Manifest::CreateMembrane(root, a);
@@ -87,7 +94,8 @@ namespace
         const auto b_manifest = (fs::path(root) / "membranes" / "beta" / "MANIFEST").string();
         POMAI_EXPECT_TRUE(fs::exists(b_manifest));
         const std::string mcontent = ReadAllOrDie(b_manifest);
-        POMAI_EXPECT_TRUE(mcontent.rfind("pomai.membrane.v1\n", 0) == 0);
+        // Expect v2 header
+        POMAI_EXPECT_TRUE(mcontent.rfind("pomai.membrane.v2\n", 0) == 0);
 
         POMAI_EXPECT_OK(pomai::storage::Manifest::DropMembrane(root, "alpha"));
 
@@ -102,7 +110,8 @@ namespace
     POMAI_TEST(Manifest_Validation)
     {
         const std::string root = pomai::test::TempDir("pomai-manifest-validate");
-
+        POMAI_EXPECT_OK(pomai::storage::Manifest::EnsureInitialized(root));
+        
         pomai::MembraneSpec bad;
         bad.name = "../oops";
         bad.dim = 8;
@@ -138,14 +147,48 @@ namespace
 
         fs::create_directories(root);
 
+        // Manually write bad header without CRC logic (or even with)
         {
             std::ofstream out(fs::path(root) / "MANIFEST", std::ios::binary | std::ios::trunc);
-            out << "not-a-real-header\n";
+            std::string content = "not-a-real-header\n";
+            // If we just write content, it will fail CRC check if > 4 bytes, or be too short.
+            // Let's write dummy CRC to pass size check if needed, but here we want header check failure.
+            // Actually, if we use AtomicWriteFile it appends CRC.
+            // But we are simulating existing corruption.
+            
+            // Write content + valid CRC but bad header
+            out.write(content.data(), content.size());
+            uint32_t crc = pomai::util::Crc32c(content.data(), content.size());
+            out.write(reinterpret_cast<const char*>(&crc), 4);
         }
 
         std::vector<std::string> names;
         auto st = pomai::storage::Manifest::ListMembranes(root, &names);
         POMAI_EXPECT_TRUE(!st.ok());
+        // Could be Corruption due to header
+        POMAI_EXPECT_EQ(st.code(), pomai::ErrorCode::kAborted);
+    }
+    
+    POMAI_TEST(Manifest_Corruption_BadCRC)
+    {
+        namespace fs = std::filesystem;
+        const std::string root = pomai::test::TempDir("pomai-manifest-badcrc");
+
+        // Initialize correctly first
+        POMAI_EXPECT_OK(pomai::storage::Manifest::EnsureInitialized(root));
+        
+        // Corrupt the file content
+        {
+             std::string path = (fs::path(root) / "MANIFEST").string();
+             std::fstream out(path, std::ios::in | std::ios::out | std::ios::binary);
+             out.seekp(0);
+             out.put('X'); // Corrupt first byte
+        }
+        
+        std::vector<std::string> names;
+        auto st = pomai::storage::Manifest::ListMembranes(root, &names);
+        POMAI_EXPECT_TRUE(!st.ok());
+        // Should be CRC mismatch
         POMAI_EXPECT_EQ(st.code(), pomai::ErrorCode::kAborted);
     }
 

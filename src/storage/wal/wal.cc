@@ -38,6 +38,7 @@ namespace pomai::storage
     public:
         pomai::util::PosixFile file;
         std::string path;
+        std::vector<std::uint8_t> scratch; // Reusable buffer for encoding frames
     };
 
     Wal::Wal(std::string db_path,
@@ -120,9 +121,12 @@ namespace pomai::storage
 
         const std::size_t payload_bytes = vec.size_bytes();
 
-        // Frame = [len][RecordPrefix][payload][crc32c]
-        std::vector<std::uint8_t> frame;
-        frame.reserve(sizeof(FrameHeader) + sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
+        // reuse scratch buffer
+        auto &frame = impl_->scratch;
+        frame.clear();
+        // heuristic reserve
+        if (frame.capacity() < 128 + payload_bytes)
+             frame.reserve(128 + payload_bytes);
 
         FrameHeader fh{};
         fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
@@ -157,8 +161,8 @@ namespace pomai::storage
         rp.id = id;
         rp.dim = 0;
 
-        std::vector<std::uint8_t> frame;
-        frame.reserve(sizeof(FrameHeader) + sizeof(RecordPrefix) + sizeof(std::uint32_t));
+        auto &frame = impl_->scratch;
+        frame.clear();
 
         FrameHeader fh{};
         fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + sizeof(std::uint32_t));
@@ -282,5 +286,4 @@ namespace pomai::storage
         }
         return pomai::Status::Ok();
     }
-
 } // namespace pomai::storage

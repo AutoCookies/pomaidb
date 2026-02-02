@@ -57,8 +57,6 @@ namespace pomai::index
         std::uint32_t AssignCentroid(std::span<const float> vec) const;
         void SeedOrUpdateCentroid(std::uint32_t cid, std::span<const float> vec);
 
-        static float Dot(std::span<const float> a, std::span<const float> b);
-
         std::uint32_t dim_;
         Options opt_;
 
@@ -74,6 +72,13 @@ namespace pomai::index
 
         std::uint32_t seeded_ = 0;
         std::uint64_t live_count_ = 0;
+
+        struct ScoredCentroid
+        {
+            std::uint32_t id;
+            float score;
+        };
+        mutable std::vector<ScoredCentroid> scratch_scored_;
     };
 
 } // namespace pomai::index

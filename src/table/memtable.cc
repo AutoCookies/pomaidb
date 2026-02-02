@@ -43,11 +43,21 @@ namespace pomai::table
 
     pomai::Status MemTable::Delete(pomai::VectorId id)
     {
-        auto it = map_.find(id);
-        if (it == map_.end())
-            return pomai::Status::Ok();
-        it->second = nullptr;
+        map_[id] = nullptr;
         return pomai::Status::Ok();
     }
+
+    pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec) const {
+        if (!out_vec) return Status::InvalidArgument("out_vec is null");
+        auto it = map_.find(id);
+        if (it == map_.end() || it->second == nullptr) {
+            *out_vec = nullptr;
+            return Status::NotFound("vector not found");
+        }
+        *out_vec = it->second;
+        return Status::Ok();
+    }
+
+
 
 } // namespace pomai::table

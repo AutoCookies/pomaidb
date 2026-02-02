@@ -130,6 +130,26 @@ namespace pomai::core
         return e->Put(id, vec);
     }
 
+    Status MembraneManager::Get(std::string_view membrane, VectorId id, std::vector<float> *out)
+    {
+        if (!out)
+            return Status::InvalidArgument("out is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e)
+            return Status::NotFound("membrane not found");
+        return e->Get(id, out);
+    }
+
+    Status MembraneManager::Exists(std::string_view membrane, VectorId id, bool *exists)
+    {
+        if (!exists)
+            return Status::InvalidArgument("exists is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e)
+            return Status::NotFound("membrane not found");
+        return e->Exists(id, exists);
+    }
+
     Status MembraneManager::Delete(std::string_view membrane, VectorId id)
     {
         auto *e = GetEngineOrNull(membrane);

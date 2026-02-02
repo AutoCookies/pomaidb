@@ -24,7 +24,10 @@ add_library(pomai STATIC
   src/table/memtable.cc
   src/storage/wal/wal.cc
   src/storage/manifest/manifest.cc
+  src/table/segment.cc
+
   src/core/index/ivf_coarse.cc
+  src/core/distance.cc
 
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
@@ -107,6 +110,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(mailbox_test)
   pomai_add_labeled_test(mailbox_test "unit")
 
+  add_executable(segment_test tests/unit/segment_test.cc)
+  pomai_setup_test(segment_test)
+  pomai_add_labeled_test(segment_test "unit")
+
   # ---- Integration (embedded DB API) ----
   add_executable(db_basic_test tests/integ/db_basic_test.cc)
   pomai_setup_test(db_basic_test)
@@ -115,6 +122,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(db_persistence_test tests/integ/db_persistence_test.cc)
   pomai_setup_test(db_persistence_test)
   pomai_add_labeled_test(db_persistence_test "integ")
+
+  add_executable(db_segment_test tests/integ/db_segment_test.cc)
+  pomai_setup_test(db_segment_test)
+  pomai_add_labeled_test(db_segment_test "integ")
 
   add_executable(manifest_test tests/unit/manifest_test.cc)
   pomai_setup_test(manifest_test)
@@ -127,7 +138,24 @@ if (POMAI_BUILD_TESTS)
   # ---- Crash (Gate #2) ----
   if (POMAI_ENABLE_CRASH_TESTS)
     add_executable(pomai_crash_test tests/crash/crash_replay_test.cc)
-    pomai_setup_test(pomai_crash_test)
+    
+    # Manual setup loosely based on pomai_setup_test but without test_runner.cc
+    target_link_libraries(pomai_crash_test PRIVATE pomai)
+    if (MSVC)
+      target_compile_options(pomai_crash_test PRIVATE /W4 /permissive-)
+    else()
+      target_compile_options(pomai_crash_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    target_include_directories(pomai_crash_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    if (POMAI_IS_TSAN)
+      target_compile_options(pomai_crash_test PRIVATE -fno-pie)
+      target_link_options(pomai_crash_test PRIVATE -no-pie)
+    endif()
+
     add_test(NAME pomai_crash_replay COMMAND pomai_crash_test)
     set_tests_properties(pomai_crash_replay PROPERTIES LABELS "crash")
   endif()

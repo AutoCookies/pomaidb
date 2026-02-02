@@ -14,6 +14,16 @@ namespace pomai::core
         return rt_->Put(id, vec);
     }
 
+    pomai::Status Shard::Get(pomai::VectorId id, std::vector<float> *out)
+    {
+        return rt_->Get(id, out);
+    }
+
+    pomai::Status Shard::Exists(pomai::VectorId id, bool *exists)
+    {
+        return rt_->Exists(id, exists);
+    }
+
     pomai::Status Shard::Delete(pomai::VectorId id)
     {
         return rt_->Delete(id);

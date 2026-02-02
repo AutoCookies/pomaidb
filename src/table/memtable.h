@@ -15,6 +15,7 @@ namespace pomai::table
         MemTable(std::uint32_t dim, std::size_t arena_block_bytes);
 
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status Get(pomai::VectorId id, const float** out_vec) const;
         pomai::Status Delete(pomai::VectorId id);
 
         const float *GetPtr(pomai::VectorId id) const

@@ -62,9 +62,32 @@ namespace
         {
             POMAI_EXPECT_TRUE(h.id != static_cast<pomai::VectorId>(100));
         }
+        {
+        // Test Get/Exists
+        pomai::Status st;
+        std::vector<float> vec_out;
+        st = db->Get("default", 200, &vec_out); 
+        POMAI_EXPECT_OK(st);
+        POMAI_EXPECT_EQ(vec_out.size(), opt.dim);
+        if (!vec_out.empty()) {
+            POMAI_EXPECT_EQ(vec_out[0], v2[0]);
+        }
+
+        bool exists = false;
+        st = db->Exists("default", 200, &exists); 
+        POMAI_EXPECT_OK(st);
+        POMAI_EXPECT_TRUE(exists);
+
+        st = db->Exists("default", 100, &exists); 
+        POMAI_EXPECT_OK(st);
+        POMAI_EXPECT_TRUE(!exists);
+
+        st = db->Exists("default", 999, &exists); 
+        POMAI_EXPECT_OK(st);
+        POMAI_EXPECT_TRUE(!exists);
 
         POMAI_EXPECT_OK(db->CloseMembrane("default"));
         POMAI_EXPECT_OK(db->Close());
     }
-
+}
 } // namespace

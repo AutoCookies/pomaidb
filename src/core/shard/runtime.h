@@ -21,6 +21,7 @@ namespace pomai::storage
 namespace pomai::table
 {
     class MemTable;
+    class SegmentReader;
 }
 
 // Forward declare IVF (avoid heavy include in header).
@@ -70,17 +71,36 @@ namespace pomai::core
         std::promise<void> done;
     };
 
-    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd>;
+    struct GetReply
+    {
+        pomai::Status st;
+        std::vector<float> vec;
+    };
+
+    struct GetCmd
+    {
+        VectorId id{};
+        std::promise<GetReply> done;
+    };
+
+    struct ExistsCmd
+    {
+        VectorId id{};
+        std::promise<std::pair<pomai::Status, bool>> done;
+    };
+
+    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd>;
 
     class ShardRuntime
     {
     public:
         ShardRuntime(std::uint32_t shard_id,
+                     std::string shard_dir,
                      std::uint32_t dim,
                      std::unique_ptr<storage::Wal> wal,
                      std::unique_ptr<table::MemTable> mem,
                      std::size_t mailbox_cap);
-
+                     
         ~ShardRuntime();
 
         ShardRuntime(const ShardRuntime &) = delete;
@@ -90,6 +110,8 @@ namespace pomai::core
         pomai::Status Enqueue(Command &&cmd);
 
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status Get(pomai::VectorId id, std::vector<float> *out);
+        pomai::Status Exists(pomai::VectorId id, bool *exists);
         pomai::Status Delete(pomai::VectorId id);
         pomai::Status Flush();
 
@@ -97,10 +119,18 @@ namespace pomai::core
                              std::uint32_t topk,
                              std::vector<pomai::SearchHit> *out);
 
+        // Non-blocking enqueue. Returns ResourceExhausted if full.
+        pomai::Status TryEnqueue(Command &&cmd);
+
+        std::size_t GetQueueDepth() const { return mailbox_.Size(); }
+        std::uint64_t GetOpsProcessed() const { return ops_processed_.load(std::memory_order_relaxed); }
+
     private:
         void RunLoop();
 
         pomai::Status HandlePut(PutCmd &c);
+        GetReply HandleGet(GetCmd &c);
+        std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c);
         pomai::Status HandleDel(DelCmd &c);
         pomai::Status HandleFlush(FlushCmd &c);
 
@@ -108,17 +138,24 @@ namespace pomai::core
         pomai::Status SearchLocalInternal(std::span<const float> query,
                                           std::uint32_t topk,
                                           std::vector<pomai::SearchHit> *out);
+                                          
+        // Helper to load segments
+        void LoadSegments();
 
         const std::uint32_t shard_id_;
+        const std::string shard_dir_;
         const std::uint32_t dim_;
 
         std::unique_ptr<storage::Wal> wal_;
         std::unique_ptr<table::MemTable> mem_;
+        std::vector<std::shared_ptr<table::SegmentReader>> segments_;
 
         // IVF coarse index for candidate selection (centroid routing).
         std::unique_ptr<pomai::index::IvfCoarse> ivf_;
+        std::vector<pomai::VectorId> candidates_scratch_;
 
         BoundedMpscQueue<Command> mailbox_;
+        std::atomic<std::uint64_t> ops_processed_{0};
 
         std::jthread worker_;
         std::atomic<bool> started_{false};

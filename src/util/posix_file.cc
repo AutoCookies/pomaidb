@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 namespace pomai::util
 {
@@ -108,6 +109,7 @@ namespace pomai::util
         return pomai::Status::Ok();
     }
 
+
     pomai::Status PosixFile::SyncAll()
     {
         if (::fsync(fd_) != 0)
@@ -115,8 +117,47 @@ namespace pomai::util
         return pomai::Status::Ok();
     }
 
+    pomai::Status PosixFile::Map(const void** out_data, std::size_t* out_size)
+    {
+         if (fd_ < 0) return pomai::Status::InvalidArgument("file not open");
+         if (map_addr_) {
+             // Already mapped
+             *out_data = map_addr_;
+             *out_size = map_size_;
+             return pomai::Status::Ok(); 
+         }
+
+         struct stat st;
+         if (fstat(fd_, &st) != 0) return Err("fstat");
+         std::size_t size = static_cast<std::size_t>(st.st_size);
+         
+         if (size == 0) {
+             // Empty file, mapping might fail or return nothing
+             map_addr_ = nullptr;
+             map_size_ = 0;
+             *out_data = nullptr;
+             *out_size = 0;
+             return pomai::Status::Ok();
+         }
+
+         void* addr = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd_, 0);
+         if (addr == MAP_FAILED) return Err("mmap");
+         
+         map_addr_ = addr;
+         map_size_ = size;
+         *out_data = addr;
+         *out_size = size;
+         return pomai::Status::Ok();
+    }
+
     pomai::Status PosixFile::Close()
     {
+        if (map_addr_) {
+            ::munmap(map_addr_, map_size_);
+            map_addr_ = nullptr;
+            map_size_ = 0;
+        }
+
         if (fd_ >= 0)
         {
             int r;

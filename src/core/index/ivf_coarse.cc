@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <limits>
 
+#include "core/distance.h"
+
 namespace pomai::index
 {
 
@@ -24,14 +26,6 @@ namespace pomai::index
         id2list_.reserve(1u << 20);
     }
 
-    float IvfCoarse::Dot(std::span<const float> a, std::span<const float> b)
-    {
-        float s = 0.0f;
-        for (std::size_t i = 0; i < a.size(); ++i)
-            s += a[i] * b[i];
-        return s;
-    }
-
     std::uint32_t IvfCoarse::AssignCentroid(std::span<const float> vec) const
     {
         // Choose centroid by maximum dot product (consistent with scoring).
@@ -41,7 +35,7 @@ namespace pomai::index
         for (std::uint32_t c = 0; c < opt_.nlist; ++c)
         {
             const float *p = &centroids_[static_cast<std::size_t>(c) * dim_];
-            float s = Dot(vec, std::span<const float>(p, dim_));
+            float s = pomai::core::Dot(vec, std::span<const float>(p, dim_));
             if (s > best)
             {
                 best = s;
@@ -152,29 +146,28 @@ namespace pomai::index
             return pomai::Status::Ok();
 
         // Score centroids by dot(query, centroid), pick top nprobe.
-        struct CS
-        {
-            std::uint32_t id;
-            float score;
-        };
-
-        std::vector<CS> scored;
+        auto &scored = scratch_scored_;
+        scored.clear();
         scored.reserve(opt_.nlist);
 
         for (std::uint32_t c = 0; c < opt_.nlist; ++c)
         {
             const float *p = &centroids_[static_cast<std::size_t>(c) * dim_];
-            float s = Dot(query, std::span<const float>(p, dim_));
-            scored.push_back(CS{c, s});
+            float s = pomai::core::Dot(query, std::span<const float>(p, dim_));
+            scored.push_back({c, s});
         }
 
         const std::uint32_t p = opt_.nprobe;
-        std::nth_element(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(p), scored.end(),
-                         [](const CS &a, const CS &b)
-                         { return a.score > b.score; });
-        scored.resize(p);
+        if (scored.size() > p)
+        {
+             std::nth_element(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(p), scored.end(),
+                              [](const ScoredCentroid &a, const ScoredCentroid &b)
+                              { return a.score > b.score; });
+             scored.resize(p);
+        }
+
         std::sort(scored.begin(), scored.end(),
-                  [](const CS &a, const CS &b)
+                  [](const ScoredCentroid &a, const ScoredCentroid &b)
                   { return a.score > b.score; });
 
         // Gather candidates from selected lists.
