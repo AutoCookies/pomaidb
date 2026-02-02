@@ -1,28 +1,34 @@
 cmake_minimum_required(VERSION 3.20)
 project(pomai LANGUAGES CXX)
 
+# =========================
+# Global build settings
+# =========================
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(POMAI_BUILD_TESTS "Build tests" OFF)
 option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
 
+# =========================
+# Library: pomai
+# =========================
 add_library(pomai STATIC
   src/api/db.cc
   src/core/engine/engine.cc
   src/core/shard/shard.cc
   src/core/shard/runtime.cc
+  src/core/membrane/manager.cc
+  src/table/memtable.cc
   src/storage/wal/wal.cc
   src/storage/manifest/manifest.cc
-  src/table/memtable.cc
-  src/core/membrane/manager.cc
 
-  # Gate #1/#2 utilities (must be linked into libpomai)
+  # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
   src/util/crc32c.cc
 )
-
 
 target_include_directories(pomai
   PUBLIC
@@ -31,9 +37,12 @@ target_include_directories(pomai
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# =========================
-# Tests
-# =========================
+if (MSVC)
+  target_compile_options(pomai PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(pomai PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
 # =========================
 # Tests
 # =========================
@@ -52,12 +61,18 @@ if (POMAI_BUILD_TESTS)
   endif()
 
   function(pomai_setup_test target)
+    # Link against main library
     target_link_libraries(${target} PRIVATE pomai)
 
-    # One main per test binary.
+    # One main per test binary (your harness)
     target_sources(${target} PRIVATE tests/common/test_runner.cc)
 
-    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    # Warnings
+    if (MSVC)
+      target_compile_options(${target} PRIVATE /W4 /permissive-)
+    else()
+      target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
 
     # Allow tests to include both public and internal headers.
     target_include_directories(${target} PRIVATE
@@ -100,6 +115,14 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(db_persistence_test)
   pomai_add_labeled_test(db_persistence_test "integ")
 
+  add_executable(manifest_test tests/unit/manifest_test.cc)
+  pomai_setup_test(manifest_test)
+  pomai_add_labeled_test(manifest_test "unit")
+
+  add_executable(membrane_test tests/integ/membrane_test.cc)
+  pomai_setup_test(membrane_test)
+  pomai_add_labeled_test(membrane_test "integ")
+
   # ---- Crash (Gate #2) ----
   if (POMAI_ENABLE_CRASH_TESTS)
     add_executable(pomai_crash_test tests/crash/crash_replay_test.cc)
@@ -118,8 +141,13 @@ if (POMAI_BUILD_TESTS)
   pomai_add_labeled_test(shard_runtime_tsan_test "tsan")
 endif()
 
-if (MSVC)
-  target_compile_options(pomai PRIVATE /W4 /permissive-)
-else()
-  target_compile_options(pomai PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+# =========================
+# Benchmarks
+# =========================
+if (POMAI_BUILD_BENCH)
+  # Add benchmarks here later, use a similar helper to tests (but WITHOUT test_runner.cc)
+  # Example:
+  # add_executable(my_bench benchmarks/my_bench.cc)
+  # target_link_libraries(my_bench PRIVATE pomai)
+  # target_include_directories(my_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()

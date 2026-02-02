@@ -387,3 +387,8 @@ cmake -S . -B build/tsan \
 cmake --build build/tsan -j
 ctest --test-dir build/tsan -V
 ```
+
+Check Test failed
+```
+ctest --rerun-failed --output-on-failure
+```
