@@ -1,401 +1,234 @@
 # PomaiDB
 
-<p align="center">
-  <img src="assets/logo.png" alt="PomaiDB Logo" width="200">
-  <br>
-  <i><b>The vector database for humans, not just machines.</b></i>
-</p>
+PomaiDB is a local-first, single-machine, single-user vector database focused on deterministic recovery, immutable read views, and explicit search contracts for quality vs. latency. It is an embedded C++20 library with optional server mode and tools for verification and export.
 
----
+## Table of Contents
+- [What is Pomai in 30 seconds](#what-is-pomai-in-30-seconds)
+- [Database contracts (non-negotiable)](#database-contracts-non-negotiable)
+- [Architecture overview](#architecture-overview)
+- [Math](#math)
+- [On-disk layout](#on-disk-layout)
+- [Build & Run](#build--run)
+- [Benchmarking](#benchmarking)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
+- [Roadmap](#roadmap)
+- [Security & Safety](#security--safety)
+- [Not implemented](#not-implemented)
 
-AI should not require expensive machines.  
-**PomaiDB** makes vector search possible on hardware everyone already owns:  
-old laptops, edge boxes, offline workstations, and humble VMs.
+## What is Pomai in 30 seconds
+PomaiDB stores vectors on disk with WAL + checkpointing, serves lock-free read snapshots, and exposes a single explicit search contract: you must choose `SearchMode::Latency` or `SearchMode::Quality`. It is a **local-first** library; the optional server speaks a small binary protocol for PING/CREATE/UPSERT/SEARCH only. It is **not** a multi-tenant cloud service and **not** an ML framework.
 
----
+## Database contracts (non-negotiable)
+- **Local-first.** Data lives on the machine. No background “phone home,” no cloud dependency.
+- **Durability & recovery invariants.** WAL + atomic checkpoints are authoritative. Recovery loads the latest checkpoint and replays WAL to a consistent state. A manifest describes the checkpoint, dictionary, and index artifacts.
+- **Immutability (grain/membrane).**
+  - **Grain**: an immutable segment built from a frozen memtable.
+  - **Membrane**: a published, immutable view composed of grains and the current live snapshot.
+- **No locks on hot read path.** Reads load immutable `ShardState` snapshots via atomic/shared_ptr swaps; no global mutex on search.
+- **Quality vs. latency modes.** Search requests must declare `SearchMode::Quality` or `SearchMode::Latency`. Quality mode refuses to pretend success when filtered results are insufficient and returns `SearchStatus::InsufficientResults` with explicit flags.
 
-## Why PomaiDB Exists
+## Architecture overview
 
-Modern AI infrastructure assumes expensive hardware and abundant resources.
+### Data flow (ASCII)
+```
+             +---------------------+
+             |  PomaiDB (API)      |
+             +----------+----------+
+                        |
+                        v
+             +----------+----------+
+             | MembraneRouter      |  <-- query contract + budgets
+             +----+----------+-----+
+                  |          |
+                  |          +--------------------------+
+                  v                                     v
+           +------+-----+                        +------+-----+
+           |  Shard 0   | ...                    |  Shard N   |
+           +------+-----+                        +------+-----+
+                  |                                     |
+                  v                                     v
+     +------------+----------+              +-----------+-----------+
+     | Immutable segments    |              | Immutable segments     |
+     | + live snapshot       |              | + live snapshot        |
+     +------------+----------+              +-----------+-----------+
+                  |
+                  v
+            WAL + Checkpoint
+```
 
-**PomaiDB challenges that assumption.**
+### Membrane publish (ASCII)
+```
+  Seed (memtable) --> freeze --> Grain (immutable)
+       |                               |
+       +---- live snapshot ------------+
+                     |
+              atomic ShardState swap
+                     |
+               Membrane view
+```
 
-**We believe:**
-- AI should run on machines in real life, not just in datacenters.
-- Infrastructure should adapt to resource limits, not crash.
-- Systems must degrade gracefully, never fail catastrophically.
-- Everyone—not just big tech—should have access to fast, usable vector search.
+### Module map
+- `include/pomai/api/*` – public API types and entrypoints.
+- `include/pomai/core/*` – membrane, shard, seed (immutable grains), spatial router.
+- `include/pomai/index/*` – `OrbitIndex` graph index.
+- `include/pomai/storage/*` – WAL, snapshot, manifest, verification.
+- `include/pomai/concurrency/*` – bounded queues, thread pools, memory manager.
+- `include/pomai/util/*` – utility helpers (CPU kernels, search utils, fixed-topk).
+- `src/*` mirrors the same structure, plus `src/tools` for CLI utilities.
 
----
+## Math
 
-## Overview
+### L2 distance
+For vectors \(x, y \in \mathbb{R}^d\):
+\[
+\mathrm{L2}(x, y) = \sum_{i=1}^{d} (x_i - y_i)^2
+\]
+PomaiDB stores scores as **negative L2** for top-k ranking.
 
-PomaiDB exists because **most modern AI infrastructure assumes abundance**—RAM, CPU, connectivity.  
-We know that **data lives everywhere**, including the edge, developing markets, offline offices, and underpowered laptops.
+### SQ8 quantization (encode/decode)
+For each dimension \(i\):
+\[
+q_i = \mathrm{clamp}_{[0,255]}\left(\mathrm{round}\left(\frac{x_i - \min_i}{\mathrm{scale}_i}\right)\right)
+\]
+\[
+\hat{x}_i = \min_i + q_i \cdot \mathrm{scale}_i
+\]
+Where \(\mathrm{scale}_i = (\max_i - \min_i) / 255\). PomaiDB stores SQ8 values per grain and dequantizes during exact rerank.
 
-PomaiDB is a **high-performance, embedded-ready vector database** written in modern C++20.  
-It is designed for **low-latency similarity search on commodity hardware**, using a custom "Pomegranate" architecture that combines multi-schema support, lock-free indexing, WAL, and SIMD-accelerated quantization—all with **zero external dependencies**.
+### Rerank: candidates vs. exact
+Search is two-stage:
+1. **Candidate generation** from quantized data / graph traversal (fast, approximate).
+2. **Exact rerank** on dequantized vectors for the final top-k.
+The search budget controls how far candidate generation can expand.
 
-> **PomaiDB treats the OS as a collaborator, not an enemy:** > It leverages the page cache, mmap, and atomic file semantics, refusing to "fight" Linux.
+### Filter selectivity & candidate amplification
+Filtered search adapts `filtered_candidate_k` and `graph_ef` based on selectivity. If the filter passes only \(s\) of candidates, expected amplification to reach `topk` is roughly \(1 / s\). PomaiDB expands candidates up to configured caps and surfaces budget hits explicitly.
 
-## Who PomaiDB Is For
+## On-disk layout
+```
+<db_dir>/
+  MANIFEST
+  centroids.bin                (optional)
+  checkpoints/
+    chk_<epoch>_<lsn>.pomai
+  wal/
+    shard-<n>.wal
+  meta/
+    dict_<epoch>_<lsn>.bin
+  indexes/
+    idx_<epoch>_<lsn>_<kind>.bin
+```
 
-PomaiDB is built for:
-- Developers running AI on old laptops or small VMs
-- Teams deploying vector search on edge or offline systems
-- Engineers who care about stability more than benchmarks
-- Anyone who believes AI infrastructure should be humane
+### Atomic commit protocol (checkpoint)
+1. Write snapshot to `checkpoints/<file>.tmp`.
+2. `fdatasync` the snapshot file.
+3. Atomic rename to `checkpoints/<file>`.
+4. `fsync` the checkpoints directory.
+5. Write dictionary and index artifacts (`meta/`, `indexes/`) using the same temp + rename + `fsync` protocol.
+6. Write manifest to `MANIFEST.tmp`, `fdatasync`, then atomic rename to `MANIFEST` and `fsync` the db root.
 
-## What Makes PomaiDB Different
+### Checksum verification rules
+- Snapshot and dictionary files are CRC64-checked on read.
+- `pomai_verify` validates the manifest, snapshot, dictionary, and index CRCs.
 
-PomaiDB does not aim to win raw benchmarks.
-It aims to survive.
+## Build & Run
 
-- If resources drop, PomaiDB degrades gracefully.
-- If load spikes, PomaiDB protects the system.
-- If hardware is weak, PomaiDB adapts — not crashes.
+### Prerequisites
+- C++20 compiler (GCC 10+ or Clang 11+)
+- CMake 3.10+
+- Linux (WSL acceptable)
 
-## Core Architecture and Algorithms
-
-### 1. **Multi-Membrance Storage**
-Not just multi-index, but **multi-membrance**: PomaiDB divides vectorspaces into fully isolated logical areas ("membrances"). Each membrance can have its own dimensionality, RAM limits, and persistence.
-
-Why?  
-**To support real concurrent workloads, multi-tenancy, and test/dev isolation—without "locking the world” for every schema change.**
-
----
-
-### 2. **Pomegranate Indexing (IVF + Adaptive Routing)**
-Instead of dogmatic HNSW/IVF, PomaiDB fuses strong ideas:
-
-- **Centroid Initialization:** via K-Means++ for consistent clustering.
-- **Dynamic Bucketing:** Vectors packed by closest centroid, stored via lock-free allocators.
-- **Routing Graph:** Centroids are connected similar to HNSW, allowing fast search without brute-forcing all clusters.
-
-Why?  
-**To combine the practical strengths of both "global cluster first" and "navigate like a human"—without copying untuned academic code.**
-
----
-
-### 3. **SynapseCodec (4-bit Compression, Delta Quantization)**
-Not all vectors merit 32-bit floats in RAM.  
-PomaiDB quantizes deltas between a vector and its centroid using **4-bit nibbles** (~8x RAM savings).  
-Distance is approximated using SIMD LUTs; exact refinement is possible on-demand.
-
-Why?  
-**Because the trade-off between RAM, speed, and recall must be tunable—especially on small machines.**
-
----
-
-### 4. **SimHash Prefiltering**
-Before running L2/Dot-Product on candidates, PomaiDB computes 512-bit SimHash fingerprints.  
-Candidates with a high Hamming distance to the query are _immediately_ discarded using POPCNT.
-
-Why?  
-**Because sometimes approximate recall is enough, and your CPU cycles are precious.**
-
----
-
-### 5. **ShardArena Allocator**
-Custom bump-pointer allocator with...
-
-- **mmap, Huge Pages:** for large object allocation and minimal fragmentation.
-- **Zero-Copy Persistence:** “Freezing” a bucket to disk is just a remapping—no serialization ceremony.
-- **Atomic Offsets, Lock-Free Readers:** Massive throughput, even under light contention.
-
-**Design Philosophy:** PomaiDB relies on the OS, trusting page cache and atomic renames, not reinventing "mini-filesystems" inside a user process.
-
----
-
-### 6. **Write-Ahead Log (WAL) and Crash Recovery**
-Not “just for show.” WAL is implemented with:
-
-- **Async group commit via io_uring with fdatasync durability.**
-- **Simple, CRC32-checksummed logs.** - **Atomic file operations** (rename patterns).
-- **Crash resilience:** DB is consistent after power loss (we replay the WAL until successful).
-
-Why?  
-**Because reliability is not optional, even on the edge.**
-
----
-
-### 7. **Centroid Persistence (centroids.bin)**
-PomaiDB can persist routing centroids to disk and load them synchronously on startup so routing is
-available immediately without recomputing k-means each restart. The file is saved atomically and
-fsynced for durability.
-
-**Defaults & configuration:**
-- Default path: `<wal_dir>/centroids.bin` (override with `DbOptions::centroids_path`).
-- Load behavior: `DbOptions::centroids_load_mode` (`Auto`, `Sync`, `Async`, `None`).
-- After a successful recompute, centroids are written to disk automatically.
-
-Why?  
-**To avoid expensive recomputation and speed up cold starts with reliable, durable routing data.**
-
----
-
-### 7. **WhisperGrain: Energy Operating System**
-
-PomaiDB is not another “dumb” search engine hard-coded to eat RAM.  
-The **WhisperGrain** controller transforms PomaiDB into a living system:
-
-- Every search and vector op is translated to "ops" (operation units).
-- A dynamic budget—based on real-time latency, CPU, and system health—decides how hard to try, when to degrade, when to do exact refine.
-- The result?  
-  - **PomaiDB simply does not crash under load:** Quality and recall are traded _gracefully_ for health.
-  - **No wild tail-latency spikes:** Your device is safe, no matter what abuse you give it.
-
-Why?  
-**Because AI should fade gracefully on bad days, not ruin your system.**
-
----
-
-### 8. **Dataset Engine & Split Strategies (New in V3)**
-PomaiDB is now a full-fledged **AI Data Engine**, capable of understanding your data's semantics to prepare training sets automatically. It supports 4 powerful splitting strategies:
-
-- **Random Split:** Standard shuffle for general purpose data.
-- **Stratified Split:** Balances class distribution (e.g., maintain 80/20 ratio for rare classes).
-- **Cluster Split (Spatial):** Splits data by geometric clusters (e.g., Train on Day/Night, Test on Rain) to test model generalization.
-- **Temporal Split:** Splits data by time (e.g., Train on Jan-Oct, Test on Nov-Dec) to prevent data leakage in time-series tasks.
-
-Why?
-**Because a Vector DB should help you build better models, not just store numbers.**
-
----
-
-### 9. **AI Contract & Streaming (New in V3)**
-- **AI Contract:** `GET MEMBRANCE INFO` now returns a semantic contract (dimension, metric, split sizes) so ML frameworks (PyTorch/TensorFlow) can auto-configure without manual hard-coding.
-- **Binary Streaming:** The `ITERATE` command pumps training data directly from disk to GPU via a high-performance binary protocol, bypassing slow Python loops.
-
-Why?
-**Because MLOps should be automated and standardized.**
-
----
-
-## Performance Benchmarks
-
-Tested on Dell Latitude E5440 (2 Cores, 8GB RAM):
-
-- **Dataset:** 1,000,000 vectors (512-dim)
-- **Search Latency (P50):** ~0.46ms
-- **P99.9:** < 0.60ms
-
-> **Note:** These figures are averages under controlled load, with recall and nprobe adaptively traded for latency. See WhisperGrain for details.
-
-
-## Building from Source
-
-**Prerequisites:** - GCC/Clang with C++20
-- Linux/macOS (Windows via WSL)
-- CMake ≥ 3.10, Make
-
+### Build (Release/Debug)
 ```bash
-chmod +x ./build.sh
-./build.sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug -j
 ```
 
-Binaries:
-
-* `pomai_server` — main server
-* `pomai_cli` — SQL client
----
-
-## Running the Server
-
+### Embedded benchmark
 ```bash
-chmod +x ./run.sh
-./run.sh
+./build/bench_embedded --queries=100 --topk=10 --rerank_k=0 --graph_ef=0
 ```
 
-**Env vars:**
-
-* `POMAI_DB_DIR` = data root (`./data/pomai_db` default)
-* `POMAI_PORT`   = override listen port (default: 7777)
-
----
-
-## Using the CLI
-
+### WAL benchmark
 ```bash
-./pomai_cli -h 127.0.0.1 -p 7777
+./build/bench_wal --threads 4 --batch 64 --dim 128 --duration 5 --wait-durable
 ```
 
----
+### Server (optional)
+The server is a lightweight binary protocol (PING/CREATE_COLLECTION/UPSERT_BATCH/SEARCH). It is **not** a SQL or HTTP server.
+```bash
+./build/pomai-server --config config/pomai.yaml
+# or
+./build/pomai-server config/pomai.yaml
+```
+Note: configuration file parsing is currently a stub; defaults from `pomai_server_main.cpp` are used when the file is missing or unparsed.
 
-## PomaiSQL Protocol
+### Debug logging
+- Embedded: set `DbOptions::debug_logging = true`.
+- Server: set `log_level: debug` in the config.
 
-Custom, SQL-inspired. Commands end with `;`.
-
-**Create Schema:**
-
-```sql
-CREATE MEMBRANCE name DIM N RAM MB;
-SHOW MEMBRANCES;
+### Tools
+```bash
+./build/pomai_verify <db_dir>
+./build/pomai_dump <db_dir> <output.tsv>
 ```
 
-**Insert/Select Context:**
-
-```sql
-USE myspace;
-INSERT VALUES (photo_001, [0.12, 0.45, ...]);
--- Batch Insert with Tags
-INSERT INTO myspace VALUES (p1, [...]), (p2, [...]) TAGS (class:dog, date:2024-01-01);
-SEARCH QUERY ([0.12, 0.45, ...]) TOP 5;
+## Benchmarking
+Recommended commands:
+```bash
+./build/bench_embedded --queries=200 --topk=10
+./build/bench_concurrent_search
+./build/bench_wal --threads 4 --batch 64 --duration 5
 ```
 
-**Retrieve or Delete:**
+Metrics:
+- **recall@10**: fraction of true top-10 neighbors found.
+- **p50/p95/p99**: latency percentiles (lower is better).
+- **ingest ops/s**: vectors written per second.
+- **filtered search**: read `filtered_budget_exhausted`, `filtered_missing_hits`, and retry counters to judge selectivity impact.
 
-```sql
-GET LABEL photo_001;
-DELETE LABEL photo_001;
+## Testing
+```bash
+cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
-**Dataset Management (New):**
-
-```sql
--- View AI Contract
-GET MEMBRANCE INFO myspace; 
-
--- Split Dataset
-EXEC SPLIT myspace 0.8 0.1 0.1;               -- Random
-EXEC SPLIT myspace 0.8 0.1 0.1 STRATIFIED class; -- Balanced by class
-EXEC SPLIT myspace 0.8 0.1 0.1 TEMPORAL date;    -- Time-ordered
+Sanitizers:
+```bash
+cmake -S . -B build-asan -DPOMAI_SANITIZE=ASAN
+cmake --build build-asan -j
+ctest --test-dir build-asan --output-on-failure
 ```
 
-**Bulk Ingest:**
-
-```sql
-LOAD BINARY '/path/vectors.bin' INTO myspace;
+Convenience test runner:
+```bash
+./tests/test.sh
 ```
 
-## Why Use PomaiDB?
+## Troubleshooting
+- **OOM during benchmarks**: the embedded benchmark keeps a full copy of vectors for ground truth. Use fewer vectors or sampled ground truth; disable exact rerank if the budget is tight.
+- **p99 spikes**: reduce `SearchMode::Quality` usage, tighten `filtered_candidate_k`/`graph_ef`, and ensure WAL/checkpoint I/O isn’t throttled.
+- **Build failures**: confirm a C++20 compiler and CMake 3.10+; remove old build directories after toolchain changes.
 
-* Because your data is *not* always in the cloud.
-* Because not everyone has a 128GB server.
-* Because crash-only design is unacceptable for real users.
-* Because you want a database that fights for you—not the other way around.
+## Roadmap
+- Cosine metric search support (currently only L2 is implemented).
+- Structured server config parsing.
+- Compaction telemetry and backpressure knobs.
 
-## Benchmarks
+## Security & Safety
+- Local-first data handling: PomaiDB does not exfiltrate data or require network access.
+- Crash safety is explicit: WAL + checkpointing plus checksum verification are mandatory for recovery.
+- The server exposes **no authentication**; run it on trusted hosts only.
 
-We run this benchmarks on Github Codespace, with 4 cores CPU, and 16Gb RAM. By inserting, searching, filtering, delete 512 dimensions vectors.
-
-<p align="center">
-<img src="assets/baseline_cdf_last.png" alt="PomaiDB Logo" width="600">
-
-
-
-
-
-</p>
-
-<p align="center">
-<img src="assets/latency_percentiles_vs_N.png" alt="PomaiDB Logo" width="600">
-
-
-
-
-
-</p>
-
-<p align="center">
-<img src="assets/recall_vs_latency.png" alt="PomaiDB Logo" width="600">
-
-
-
-
-
-</p>
-
-<p align="center">
-<img src="assets/throughput_vs_N.png" alt="PomaiDB Logo" width="600">
-
-
-
-
-
-</p>
-
-<p align="center">
-<img src="assets/sys_mem_time.png" alt="PomaiDB Memory through time" width="600">
-
-
-
-
-
-</p>
-
-<p align="center">
-<img src="assets/sys_cpu_time.png" alt="PomaiDB Memory through time" width="600">
-
-
-
-
-
-</p>
-
-## License
-
-PomaiDB is released under the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
-
-See `LICENSE` for details.
-
-> We deeply encourage both academic and practical use,
-> but ask you to **credit the original author (Quan Van)** and **contribute improvements** for the benefit of the community.
-
----
-
-## Citation
-
-If you use PomaiDB in academic or research projects:
-
-```
-@misc{pomai,
-  author={Quan Van},
-  title={PomaiDB: Vector Search for Every Machine},
-  url={[https://github.com/AutoCookies/pomai](https://github.com/AutoCookies/pomai)},
-  year={2026}
-}
-
-```
-
-## A Final Word
-
-**PomaiDB is not just code.** It is a manifesto:
-
-* That *state-of-the-art* belongs to everyone.
-* That *robustness* is possible, even on weak hardware.
-* That a database can be proud of what it doesn’t demand.
-
-Welcome to the new edge of AI.
-
-
-## How to run sync policy test
-Run this block at a time
-```
-# 1) confirm binary exists
-ls -l build/pomai_db_writer || ls -l build/pomai_db_writer*
-
-# 2) prepare tmp dir and run writer (5 batches x 10 vectors)
-rm -rf /tmp/pomai_dbg
-mkdir -p /tmp/pomai_dbg
-./build/pomai_db_writer /tmp/pomai_dbg 1 5 10 8 | tee /tmp/pomai_dbg/writer.stdout
-
-# 3) show captured outputs and files
-echo "---- writer.stdout ----"
-sed -n '1,200p' /tmp/pomai_dbg/writer.stdout || true
-
-echo "---- writer.status ----"
-ls -l /tmp/pomai_dbg/writer.status || true
-cat /tmp/pomai_dbg/writer.status || true
-
-echo "---- ls -la /tmp/pomai_dbg ----"
-ls -la /tmp/pomai_dbg || true
-
-echo "---- hexdump shard-0.wal (first 128 bytes) ----"
-hexdump -C -n 128 /tmp/pomai_dbg/shard-0.wal || true
-
-echo "---- replay inspect ----"
-/bin/true && ./build/wal_replay_inspect /tmp/pomai_dbg 8 || true
-```
-
-Then run ```./test/test_sync_policy.sh```
+## Not implemented
+These items are **not** in the current codebase and should not be assumed:
+- SQL or CLI interface.
+- Multi-tenant cloud service.
+- Dataset splitting, ML training pipelines, or streaming training data.
+- SimHash or 4-bit compression.
+- Cosine distance search (configuration exists, execution is L2-only today).

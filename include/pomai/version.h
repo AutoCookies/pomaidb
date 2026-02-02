@@ -1,0 +1,4 @@
+#pragma once
+#define POMAI_VERSION_MAJOR 0
+#define POMAI_VERSION_MINOR 1
+#define POMAI_VERSION_PATCH 0
