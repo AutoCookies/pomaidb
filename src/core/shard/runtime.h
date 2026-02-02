@@ -23,8 +23,15 @@ namespace pomai::table
     class MemTable;
 }
 
+// Forward declare IVF (avoid heavy include in header).
+namespace pomai::index
+{
+    class IvfCoarse;
+}
+
 namespace pomai::core
 {
+
     struct PutCmd
     {
         VectorId id{};
@@ -44,6 +51,7 @@ namespace pomai::core
         std::promise<pomai::Status> done;
     };
 
+    // MUST be complete before being used in std::promise<SearchReply>.
     struct SearchReply
     {
         pomai::Status st;
@@ -81,7 +89,6 @@ namespace pomai::core
         pomai::Status Start();
         pomai::Status Enqueue(Command &&cmd);
 
-        // sync wrappers (Shard can use these or push Command directly)
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
         pomai::Status Delete(pomai::VectorId id);
         pomai::Status Flush();
@@ -108,7 +115,11 @@ namespace pomai::core
         std::unique_ptr<storage::Wal> wal_;
         std::unique_ptr<table::MemTable> mem_;
 
+        // IVF coarse index for candidate selection (centroid routing).
+        std::unique_ptr<pomai::index::IvfCoarse> ivf_;
+
         BoundedMpscQueue<Command> mailbox_;
+
         std::jthread worker_;
         std::atomic<bool> started_{false};
     };

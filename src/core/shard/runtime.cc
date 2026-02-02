@@ -2,14 +2,15 @@
 
 #include <algorithm>
 #include <cmath>
-#include <optional>
-#include <utility>
+#include <limits>
 
+#include "core/index/ivf_coarse.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 
 namespace pomai::core
 {
+
     static float Dot(std::span<const float> a, std::span<const float> b)
     {
         float s = 0.0f;
@@ -29,6 +30,12 @@ namespace pomai::core
           mem_(std::move(mem)),
           mailbox_(mailbox_cap)
     {
+        pomai::index::IvfCoarse::Options opt;
+        opt.nlist = 64;
+        opt.nprobe = 4;
+        opt.warmup = 256;
+        opt.ema = 0.05f;
+        ivf_ = std::make_unique<pomai::index::IvfCoarse>(dim_, opt);
     }
 
     ShardRuntime::~ShardRuntime()
@@ -45,8 +52,7 @@ namespace pomai::core
     pomai::Status ShardRuntime::Start()
     {
         if (started_.exchange(true))
-            return pomai::Status::Busy("already started");
-
+            return pomai::Status::Busy("shard already started");
         worker_ = std::jthread([this]
                                { RunLoop(); });
         return pomai::Status::Ok();
@@ -55,12 +61,15 @@ namespace pomai::core
     pomai::Status ShardRuntime::Enqueue(Command &&cmd)
     {
         if (!started_.load(std::memory_order_relaxed))
-            return pomai::Status::Aborted("not started");
-
+            return pomai::Status::Aborted("shard not started");
         if (!mailbox_.PushBlocking(std::move(cmd)))
             return pomai::Status::Aborted("mailbox closed");
         return pomai::Status::Ok();
     }
+
+    // -------------------------
+    // Sync wrappers
+    // -------------------------
 
     pomai::Status ShardRuntime::Put(pomai::VectorId id, std::span<const float> vec)
     {
@@ -71,8 +80,8 @@ namespace pomai::core
         c.id = id;
         c.vec = vec.data();
         c.dim = static_cast<std::uint32_t>(vec.size());
-        auto fut = c.done.get_future();
 
+        auto fut = c.done.get_future();
         auto st = Enqueue(Command{std::move(c)});
         if (!st.ok())
             return st;
@@ -107,7 +116,7 @@ namespace pomai::core
                                        std::vector<pomai::SearchHit> *out)
     {
         if (!out)
-            return pomai::Status::InvalidArgument("out=null");
+            return pomai::Status::InvalidArgument("out null");
         if (query.size() != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
         if (topk == 0)
@@ -131,6 +140,10 @@ namespace pomai::core
         *out = std::move(r.hits);
         return pomai::Status::Ok();
     }
+
+    // -------------------------
+    // Actor loop
+    // -------------------------
 
     void ShardRuntime::RunLoop()
     {
@@ -171,6 +184,10 @@ namespace pomai::core
         }
     }
 
+    // -------------------------
+    // Handlers
+    // -------------------------
+
     pomai::Status ShardRuntime::HandlePut(PutCmd &c)
     {
         if (c.dim != dim_)
@@ -179,7 +196,14 @@ namespace pomai::core
         auto st = wal_->AppendPut(c.id, {c.vec, c.dim});
         if (!st.ok())
             return st;
-        return mem_->Put(c.id, {c.vec, c.dim});
+
+        st = mem_->Put(c.id, {c.vec, c.dim});
+        if (!st.ok())
+            return st;
+
+        // Update IVF AFTER mem is updated (so candidates rerank pointer exists).
+        (void)ivf_->Put(c.id, {c.vec, c.dim});
+        return pomai::Status::Ok();
     }
 
     pomai::Status ShardRuntime::HandleDel(DelCmd &c)
@@ -187,7 +211,13 @@ namespace pomai::core
         auto st = wal_->AppendDelete(c.id);
         if (!st.ok())
             return st;
-        return mem_->Delete(c.id);
+
+        st = mem_->Delete(c.id);
+        if (!st.ok())
+            return st;
+
+        (void)ivf_->Delete(c.id);
+        return pomai::Status::Ok();
     }
 
     pomai::Status ShardRuntime::HandleFlush(FlushCmd &)
@@ -202,6 +232,10 @@ namespace pomai::core
         return r;
     }
 
+    // -------------------------
+    // SearchLocalInternal: IVF-coarse
+    // -------------------------
+
     pomai::Status ShardRuntime::SearchLocalInternal(std::span<const float> query,
                                                     std::uint32_t topk,
                                                     std::vector<pomai::SearchHit> *out)
@@ -209,17 +243,22 @@ namespace pomai::core
         out->clear();
         out->reserve(topk);
 
-        mem_->ForEach([&](VectorId id, std::span<const float> vec)
-                      {
-            float score = Dot(query, vec);
+        // Try IVF candidate selection.
+        std::vector<pomai::VectorId> candidates;
+        auto st = ivf_->SelectCandidates(query, &candidates);
+        if (!st.ok())
+            return st;
 
+        auto push_topk = [&](pomai::VectorId id, float score)
+        {
             if (out->size() < topk)
             {
                 out->push_back({id, score});
                 if (out->size() == topk)
                 {
                     std::make_heap(out->begin(), out->end(),
-                                   [](auto &a, auto &b) { return a.score > b.score; });
+                                   [](const auto &a, const auto &b)
+                                   { return a.score > b.score; }); // min-heap by score
                 }
                 return;
             }
@@ -228,13 +267,37 @@ namespace pomai::core
                 return;
 
             std::pop_heap(out->begin(), out->end(),
-                          [](auto &a, auto &b) { return a.score > b.score; });
+                          [](const auto &a, const auto &b)
+                          { return a.score > b.score; });
             (*out)[topk - 1] = {id, score};
             std::push_heap(out->begin(), out->end(),
-                           [](auto &a, auto &b) { return a.score > b.score; }); });
+                           [](const auto &a, const auto &b)
+                           { return a.score > b.score; });
+        };
+
+        if (!candidates.empty())
+        {
+            // IVF path: rerank candidates only.
+            for (pomai::VectorId id : candidates)
+            {
+                const float *ptr = mem_->GetPtr(id);
+                if (!ptr)
+                    continue;
+                float score = Dot(query, std::span<const float>(ptr, dim_));
+                push_topk(id, score);
+            }
+        }
+        else
+        {
+            // Fallback brute-force: scan whole memtable (current behavior).
+            mem_->ForEach([&](VectorId id, std::span<const float> vec)
+                          {
+                          float score = Dot(query, vec);
+                          push_topk(id, score); });
+        }
 
         std::sort(out->begin(), out->end(),
-                  [](auto &a, auto &b)
+                  [](const auto &a, const auto &b)
                   { return a.score > b.score; });
 
         return pomai::Status::Ok();

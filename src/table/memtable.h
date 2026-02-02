@@ -17,6 +17,14 @@ namespace pomai::table
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
         pomai::Status Delete(pomai::VectorId id);
 
+        const float *GetPtr(pomai::VectorId id) const
+        {
+            auto it = map_.find(id);
+            if (it == map_.end())
+                return nullptr;
+            return it->second;
+        }
+
         template <class Fn>
         void ForEach(Fn &&fn) const
         {

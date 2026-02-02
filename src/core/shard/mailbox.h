@@ -66,4 +66,8 @@ namespace pomai::core
         bool closed_ = false;
     };
 
+    // Backward-compatible name used across the codebase.
+    template <class T>
+    using Mailbox = BoundedMpscQueue<T>;
+
 } // namespace pomai::core
