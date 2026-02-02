@@ -207,7 +207,7 @@ namespace pomai::storage
             std::error_code ec;
             const std::uint64_t file_size = static_cast<std::uint64_t>(fs::file_size(SegmentPath(g), ec));
             if (ec)
-                return pomai::Status::IoError("wal file_size failed");
+                return pomai::Status::IoError("WAL replay: failed to get file size for segment " + std::to_string(g));
 
             std::uint64_t off = 0;
             while (off + sizeof(FrameHeader) <= file_size)
@@ -234,7 +234,7 @@ namespace pomai::storage
 
                 if (fh.len < sizeof(RecordPrefix) + sizeof(std::uint32_t))
                 {
-                    return pomai::Status::Corruption("wal frame too small");
+                    return pomai::Status::Corruption("WAL corruption: frame too small in segment " + std::to_string(g) + " at offset " + std::to_string(off));
                 }
 
                 const std::uint32_t stored_crc = *reinterpret_cast<const std::uint32_t *>(
@@ -243,7 +243,7 @@ namespace pomai::storage
                 if (stored_crc != calc_crc)
                 {
                     // corruption inside full frame: this is real corruption, not tail truncation
-                    return pomai::Status::Corruption("wal crc mismatch");
+                    return pomai::Status::Corruption("WAL corruption: CRC mismatch in segment " + std::to_string(g) + " at offset " + std::to_string(off));
                 }
 
                 const auto *rp = reinterpret_cast<const RecordPrefix *>(body.data());
@@ -253,7 +253,7 @@ namespace pomai::storage
                     const std::size_t vec_bytes = static_cast<std::size_t>(dim) * sizeof(float);
                     const std::size_t expect = sizeof(RecordPrefix) + vec_bytes + sizeof(std::uint32_t);
                     if (expect != fh.len)
-                        return pomai::Status::Corruption("wal put length mismatch");
+                        return pomai::Status::Corruption("WAL corruption: PUT record length mismatch in segment " + std::to_string(g));
 
                     const float *vec = reinterpret_cast<const float *>(body.data() + sizeof(RecordPrefix));
                     st = mem.Put(rp->id, std::span<const float>{vec, dim});
@@ -263,14 +263,14 @@ namespace pomai::storage
                 else if (rp->op == static_cast<std::uint8_t>(Op::kDel))
                 {
                     if (fh.len != sizeof(RecordPrefix) + sizeof(std::uint32_t))
-                        return pomai::Status::Corruption("wal del length mismatch");
+                        return pomai::Status::Corruption("WAL corruption: DELETE record length mismatch in segment " + std::to_string(g));
                     st = mem.Delete(rp->id);
                     if (!st.ok())
                         return st;
                 }
                 else
                 {
-                    return pomai::Status::Corruption("wal unknown op");
+                    return pomai::Status::Corruption("WAL corruption: unknown operation code " + std::to_string(rp->op) + " in segment " + std::to_string(g));
                 }
 
                 if (rp->seq > seq_)

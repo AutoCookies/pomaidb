@@ -19,6 +19,11 @@ namespace pomai::core
         return rt_->Delete(id);
     }
 
+    pomai::Status Shard::WriteBatch(const std::vector<pomai::WriteBatch::Op> &ops)
+    {
+        return rt_->WriteBatch(ops);
+    }
+
     pomai::Status Shard::Flush()
     {
         return rt_->Flush();

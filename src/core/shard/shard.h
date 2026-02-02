@@ -24,6 +24,7 @@ namespace pomai::core
 
         Status Put(VectorId id, std::span<const float> vec);
         Status Delete(VectorId id);
+        Status WriteBatch(const std::vector<pomai::WriteBatch::Op> &ops);
         Status Flush();
 
         Status SearchLocal(std::span<const float> q, std::uint32_t k,

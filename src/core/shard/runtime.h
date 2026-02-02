@@ -13,6 +13,7 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/write_batch.h"
 
 namespace pomai::storage
 {
@@ -46,6 +47,12 @@ namespace pomai::core
         std::promise<pomai::Status> done;
     };
 
+    struct WriteBatchCmd
+    {
+        std::vector<pomai::WriteBatch::Op> ops;
+        std::promise<pomai::Status> done;
+    };
+
     struct FlushCmd
     {
         std::promise<pomai::Status> done;
@@ -70,7 +77,7 @@ namespace pomai::core
         std::promise<void> done;
     };
 
-    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd>;
+    using Command = std::variant<PutCmd, DelCmd, WriteBatchCmd, FlushCmd, SearchCmd, StopCmd>;
 
     class ShardRuntime
     {
@@ -91,6 +98,7 @@ namespace pomai::core
 
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
         pomai::Status Delete(pomai::VectorId id);
+        pomai::Status WriteBatch(const std::vector<pomai::WriteBatch::Op> &ops);
         pomai::Status Flush();
 
         pomai::Status Search(std::span<const float> query,
@@ -102,6 +110,7 @@ namespace pomai::core
 
         pomai::Status HandlePut(PutCmd &c);
         pomai::Status HandleDel(DelCmd &c);
+        pomai::Status HandleWriteBatch(WriteBatchCmd &c);
         pomai::Status HandleFlush(FlushCmd &c);
 
         SearchReply HandleSearch(SearchCmd &c);

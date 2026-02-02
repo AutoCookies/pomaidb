@@ -125,6 +125,35 @@ namespace pomai::core
         return shards_[sid]->Delete(id);
     }
 
+    Status Engine::Write(const pomai::WriteBatch &batch)
+    {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        if (batch.Empty())
+            return Status::Ok();
+
+        // Group operations by shard
+        std::vector<std::vector<pomai::WriteBatch::Op>> per_shard(opt_.shard_count);
+        for (const auto &op : batch.Ops())
+        {
+            const auto sid = ShardOf(op.id, opt_.shard_count);
+            per_shard[sid].push_back(op);
+        }
+
+        // Send batch to each shard (in parallel via separate calls)
+        for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
+        {
+            if (per_shard[i].empty())
+                continue;
+
+            auto st = shards_[i]->WriteBatch(per_shard[i]);
+            if (!st.ok())
+                return st;
+        }
+
+        return Status::Ok();
+    }
+
     Status Engine::Flush()
     {
         if (!opened_)

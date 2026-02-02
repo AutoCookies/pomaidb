@@ -8,6 +8,7 @@
 #include "pomai/options.h"
 #include "pomai/search.h"
 #include "pomai/status.h"
+#include "pomai/write_batch.h"
 
 namespace pomai::core
 {
@@ -38,6 +39,7 @@ namespace pomai::core
 
         Status Put(std::string_view membrane, VectorId id, std::span<const float> vec);
         Status Delete(std::string_view membrane, VectorId id);
+        Status Write(std::string_view membrane, const pomai::WriteBatch &batch);
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
 
         // Default membrane convenience: use name "__default__"

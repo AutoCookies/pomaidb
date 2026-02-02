@@ -40,6 +40,11 @@ namespace pomai
             return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, out);
         }
 
+        Status Write(const WriteBatch &batch) override
+        {
+            return mgr_.Write(core::MembraneManager::kDefaultMembrane, batch);
+        }
+
         // ---- Membrane API ----
         Status CreateMembrane(const MembraneSpec &spec) override
         {
@@ -81,6 +86,11 @@ namespace pomai
                       uint32_t topk, SearchResult *out) override
         {
             return mgr_.Search(membrane, query, topk, out);
+        }
+
+        Status Write(std::string_view membrane, const WriteBatch &batch) override
+        {
+            return mgr_.Write(membrane, batch);
         }
 
     private:

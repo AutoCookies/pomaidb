@@ -95,6 +95,10 @@ if (POMAI_BUILD_TESTS)
   endfunction()
 
   # ---- Unit ----
+  add_executable(status_test tests/unit/status_test.cc)
+  pomai_setup_test(status_test)
+  pomai_add_labeled_test(status_test "unit")
+
   add_executable(crc32c_test tests/unit/crc32c_test.cc)
   pomai_setup_test(crc32c_test)
   pomai_add_labeled_test(crc32c_test "unit")
@@ -106,6 +110,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(mailbox_test tests/unit/mailbox_test.cc)
   pomai_setup_test(mailbox_test)
   pomai_add_labeled_test(mailbox_test "unit")
+
+  add_executable(write_batch_test tests/unit/write_batch_test.cc)
+  pomai_setup_test(write_batch_test)
+  pomai_add_labeled_test(write_batch_test "unit")
 
   # ---- Integration (embedded DB API) ----
   add_executable(db_basic_test tests/integ/db_basic_test.cc)
@@ -123,6 +131,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(membrane_test tests/integ/membrane_test.cc)
   pomai_setup_test(membrane_test)
   pomai_add_labeled_test(membrane_test "integ")
+
+  add_executable(db_write_batch_test tests/integ/db_write_batch_test.cc)
+  pomai_setup_test(db_write_batch_test)
+  pomai_add_labeled_test(db_write_batch_test "integ")
 
   # ---- Crash (Gate #2) ----
   if (POMAI_ENABLE_CRASH_TESTS)

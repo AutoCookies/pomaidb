@@ -9,6 +9,7 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/write_batch.h"
 
 namespace pomai::core
 {
@@ -29,6 +30,7 @@ namespace pomai::core
 
         Status Put(VectorId id, std::span<const float> vec);
         Status Delete(VectorId id);
+        Status Write(const pomai::WriteBatch &batch);
         Status Flush();
 
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);

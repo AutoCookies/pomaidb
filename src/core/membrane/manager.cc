@@ -138,6 +138,14 @@ namespace pomai::core
         return e->Delete(id);
     }
 
+    Status MembraneManager::Write(std::string_view membrane, const pomai::WriteBatch &batch)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e)
+            return Status::NotFound("membrane not found");
+        return e->Write(batch);
+    }
+
     Status MembraneManager::Search(std::string_view membrane, std::span<const float> query,
                                    std::uint32_t topk, pomai::SearchResult *out)
     {

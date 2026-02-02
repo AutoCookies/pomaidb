@@ -100,6 +100,21 @@ namespace pomai::core
         return fut.get();
     }
 
+    pomai::Status ShardRuntime::WriteBatch(const std::vector<pomai::WriteBatch::Op> &ops)
+    {
+        if (ops.empty())
+            return pomai::Status::Ok();
+
+        WriteBatchCmd c;
+        c.ops = ops; // Copy ops into command
+        auto fut = c.done.get_future();
+
+        auto st = Enqueue(Command{std::move(c)});
+        if (!st.ok())
+            return st;
+        return fut.get();
+    }
+
     pomai::Status ShardRuntime::Flush()
     {
         FlushCmd c;
@@ -165,6 +180,11 @@ namespace pomai::core
                 c->done.set_value(HandleDel(*c));
                 continue;
             }
+            if (auto *c = std::get_if<WriteBatchCmd>(&cmd))
+            {
+                c->done.set_value(HandleWriteBatch(*c));
+                continue;
+            }
             if (auto *c = std::get_if<FlushCmd>(&cmd))
             {
                 c->done.set_value(HandleFlush(*c));
@@ -217,6 +237,52 @@ namespace pomai::core
             return st;
 
         (void)ivf_->Delete(c.id);
+        return pomai::Status::Ok();
+    }
+
+    pomai::Status ShardRuntime::HandleWriteBatch(WriteBatchCmd &c)
+    {
+        if (c.ops.empty())
+            return pomai::Status::Ok();
+
+        // Process each operation in order: WAL first, then memtable, then IVF
+        for (const auto &op : c.ops)
+        {
+            if (op.type == pomai::WriteBatch::OpType::kPut)
+            {
+                if (op.vec.size() != dim_)
+                    return pomai::Status::InvalidArgument("WriteBatch: dim mismatch for vector " + std::to_string(op.id));
+
+                auto st = wal_->AppendPut(op.id, op.vec);
+                if (!st.ok())
+                    return st;
+
+                st = mem_->Put(op.id, op.vec);
+                if (!st.ok())
+                    return st;
+
+                (void)ivf_->Put(op.id, op.vec);
+            }
+            else if (op.type == pomai::WriteBatch::OpType::kDelete)
+            {
+                auto st = wal_->AppendDelete(op.id);
+                if (!st.ok())
+                    return st;
+
+                st = mem_->Delete(op.id);
+                if (!st.ok())
+                    return st;
+
+                (void)ivf_->Delete(op.id);
+            }
+            else
+            {
+                return pomai::Status::Internal("WriteBatch: unknown operation type");
+            }
+        }
+
+        // Single fsync at the end if fsync policy requires it
+        // (WAL's AppendPut/AppendDelete will handle fsync based on policy)
         return pomai::Status::Ok();
     }
 

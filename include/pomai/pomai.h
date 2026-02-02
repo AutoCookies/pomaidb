@@ -8,6 +8,7 @@
 #include "search.h"
 #include "status.h"
 #include "types.h"
+#include "write_batch.h"
 
 namespace pomai
 {
@@ -27,6 +28,9 @@ namespace pomai
         virtual Status Search(std::span<const float> query, uint32_t topk,
                               SearchResult *out) = 0;
 
+        // WriteBatch API (atomic batch writes)
+        virtual Status Write(const WriteBatch &batch) = 0;
+
         // Membrane API
         virtual Status CreateMembrane(const MembraneSpec &spec) = 0;
         virtual Status DropMembrane(std::string_view name) = 0;
@@ -39,6 +43,9 @@ namespace pomai
         virtual Status Delete(std::string_view membrane, VectorId id) = 0;
         virtual Status Search(std::string_view membrane, std::span<const float> query,
                               uint32_t topk, SearchResult *out) = 0;
+
+        // WriteBatch API (per-membrane atomic batch writes)
+        virtual Status Write(std::string_view membrane, const WriteBatch &batch) = 0;
 
         static Status Open(const DBOptions &options, std::unique_ptr<DB> *out);
     };

@@ -50,7 +50,7 @@ namespace pomai::storage
         {
             std::ifstream in(path, std::ios::binary);
             if (!in.is_open())
-                return pomai::Status::IOError("read failed: open");
+                return pomai::Status::IOError("Manifest: failed to open file for reading: " + path);
 
             in.seekg(0, std::ios::end);
             std::streamoff n = in.tellg();
@@ -62,7 +62,7 @@ namespace pomai::storage
                 in.read(buf.data(), n);
 
             if (!in.good() && n > 0)
-                return pomai::Status::IOError("read failed");
+                return pomai::Status::IOError("Manifest: failed to read file: " + path);
 
             *out = std::move(buf);
             return pomai::Status::Ok();
@@ -74,16 +74,16 @@ namespace pomai::storage
             {
                 std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
                 if (!out.is_open())
-                    return pomai::Status::IOError("write failed: open tmp");
+                    return pomai::Status::IOError("Manifest: failed to open tmp file for writing: " + tmp);
                 out.write(content.data(), static_cast<std::streamsize>(content.size()));
                 if (!out.good())
-                    return pomai::Status::IOError("write failed");
+                    return pomai::Status::IOError("Manifest: failed to write to tmp file: " + tmp);
             }
 
             std::error_code ec;
             fs::rename(tmp, final_path, ec);
             if (ec)
-                return pomai::Status::IOError("rename failed");
+                return pomai::Status::IOError("Manifest: failed to rename " + tmp + " to " + final_path + ": " + ec.message());
             return pomai::Status::Ok();
         }
 
@@ -147,7 +147,7 @@ namespace pomai::storage
             std::size_t p = sv.find('\n');
             std::string_view header = (p == std::string_view::npos) ? sv : sv.substr(0, p);
             if (header != "pomai.manifest.v2")
-                return pomai::Status::Corruption("bad manifest header");
+                return pomai::Status::Corruption("Manifest: invalid header, expected 'pomai.manifest.v2', got: " + std::string(header));
             sv = (p == std::string_view::npos) ? std::string_view{} : sv.substr(p + 1);
 
             while (!sv.empty())
@@ -161,15 +161,15 @@ namespace pomai::storage
 
                 auto toks = SplitWs(line);
                 if (toks.size() != 6)
-                    return pomai::Status::Corruption("bad manifest line");
+                    return pomai::Status::Corruption("Manifest: invalid line format, expected 6 tokens, got " + std::to_string(toks.size()));
 
                 if (toks[0] != "membrane" || toks[2] != "shards" || toks[4] != "dim")
-                    return pomai::Status::Corruption("bad manifest line");
+                    return pomai::Status::Corruption("Manifest: invalid line format, expected 'membrane {name} shards {N} dim {D}'");
 
                 RootEntry e;
                 e.name = std::string(toks[1]);
                 if (!IsValidName(e.name))
-                    return pomai::Status::Corruption("invalid membrane name");
+                    return pomai::Status::Corruption("Manifest: invalid membrane name: " + e.name);
 
                 st = ParseU32(toks[3], &e.shard_count);
                 if (!st.ok())
@@ -218,11 +218,11 @@ namespace pomai::storage
         std::error_code ec;
         fs::create_directories(std::string(root_path), ec);
         if (ec)
-            return pomai::Status::IOError("create_directories root failed");
+            return pomai::Status::IOError("Manifest: failed to create root directory: " + std::string(root_path) + ": " + ec.message());
 
         fs::create_directories(fs::path(std::string(root_path)) / "membranes", ec);
         if (ec)
-            return pomai::Status::IOError("create_directories membranes failed");
+            return pomai::Status::IOError("Manifest: failed to create membranes directory: " + ec.message());
 
         const auto mp = RootManifestPath(root_path);
         if (fs::exists(mp, ec))
@@ -258,7 +258,7 @@ namespace pomai::storage
         std::error_code ec;
         fs::create_directories(MembraneDir(root_path, spec.name), ec);
         if (ec)
-            return pomai::Status::IOError("create_directories membrane failed");
+            return pomai::Status::IOError("Manifest: failed to create membrane directory for '" + spec.name + "': " + ec.message());
 
         st = WriteMembraneManifest(root_path, spec);
         if (!st.ok())
