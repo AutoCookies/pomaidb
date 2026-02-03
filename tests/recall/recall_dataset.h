@@ -22,10 +22,10 @@ struct Dataset {
 };
 
 struct DatasetOptions {
-    std::uint32_t dim = 32;
-    std::size_t num_vectors = 10000;
-    std::size_t num_queries = 100;
-    std::size_t num_clusters = 10;
+    std::uint32_t dim = 512;
+    std::size_t num_vectors = 5000000;
+    std::size_t num_queries = 10000;
+    std::size_t num_clusters = 10000;
     
     // Cluster params
     float cluster_spread = 0.1f; // std-dev of gaussian blob

@@ -1,23 +1,65 @@
-# Glossary (canonical terms)
+# Glossary
 
-> This glossary is the single source of truth for terminology used across the docs.
+This document serves as the single source of truth for terminology in PomaiDB.
 
-- **Active MemTable**: The mutable in-memory table that receives new writes on a shard. It is **not** included in snapshots and is therefore invisible to reads until it is rotated to frozen. (Source: `pomai::core::ShardRuntime::HandlePut`, `RotateMemTable`.)
-- **Frozen MemTable**: An immutable MemTable created by rotating the active MemTable. Frozen tables are included in snapshots and visible to reads. (Source: `pomai::core::ShardRuntime::RotateMemTable`, `ShardSnapshot`.)
-- **Freeze (soft)**: Rotation of the active MemTable into the frozen set, followed by snapshot publication. Triggered automatically when the active MemTable reaches 5000 entries per shard. (Source: `pomai::core::ShardRuntime::HandlePut`.)
-- **Freeze (hard / API)**: The `Freeze` API flushes all frozen tables to segments, updates shard manifest, resets WAL, and publishes a new snapshot. (Source: `pomai::core::ShardRuntime::HandleFreeze`.)
-- **Flush**: WAL durability boundary via `fdatasync` when enabled; does not change visibility. (Source: `pomai::core::ShardRuntime::HandleFlush`, `pomai::storage::Wal::Flush`.)
-- **Checkpoint**: Not a distinct concept in current code. The closest behavior is `Freeze`, which writes segments and resets WAL. (Assumption based on code structure.)
-- **Mailbox / Actor**: The bounded MPSC queue and single writer thread that serializes write commands per shard. (Source: `pomai::core::ShardRuntime`, `BoundedMpscQueue`.)
-- **Shard**: A partition of the key space; each shard has a single writer thread and its own WAL and segment set. (Source: `pomai::core::Engine::ShardOf`, `pomai::core::ShardRuntime`.)
-- **Shard Snapshot (`ShardSnapshot`)**: Immutable view of a shard’s frozen tables and segments; readers use a shared_ptr to access it lock-free. (Source: `pomai::core::ShardSnapshot`, `ShardRuntime::PublishSnapshot`.)
-- **Snapshot publication**: Atomic replace of `current_snapshot_` with a new `ShardSnapshot`. (Source: `pomai::core::ShardRuntime::PublishSnapshot`.)
-- **WAL (Write-Ahead Log)**: Append-only log per shard used for crash recovery. Frames include a prefix with sequence, op type, id, and optional vector payload. (Source: `pomai::storage::Wal`.)
-- **WAL prefix consistency**: Snapshots represent a prefix of the WAL history; writes become visible only after snapshot publication. (Source: `core/shard/invariants.h`.)
-- **Segment**: Immutable on-disk file storing vectors and tombstones in sorted order. (Source: `pomai::table::SegmentBuilder`, `SegmentReader`.)
-- **Shard manifest**: `manifest.current` in each shard directory listing active segment files. Updated by atomic rename and directory fsync. (Source: `pomai::core::ShardManifest`.)
-- **Membrane**: Logical namespace/collection configured by `MembraneSpec`. Currently managed in-memory by `MembraneManager` and not persisted by default. (Source: `pomai::core::MembraneManager`.)
-- **Membrane manifest**: `MANIFEST` under `membranes/<name>` storing persistent membrane specs; present in code but not wired into `DB::Open`. (Source: `pomai::storage::Manifest`.)
-- **RYW (Read-Your-Writes)**: The property that a thread can read its own write without waiting; **not supported** until a soft/hard freeze publishes a snapshot. (Source: `core/shard/invariants.h` + snapshot visibility.)
-- **SI (Snapshot Isolation)**: Readers operate on a snapshot that is not affected by concurrent writes. (Source: `ShardRuntime::Get`, `Search`, snapshot publication.)
-- **SOT (Source of Truth)**: The codebase defines the system behavior; docs point to exact symbols/files for each guarantee. (Policy.)
+## Core Concepts
+
+### Shard
+A horizontal partition of the database.
+- **Role**: Unit of write serialization (single writer thread) and consistency.
+- **Persistence**: Has its own WAL and directory of segments.
+- **Isolation**: No cross-shard ordering or atomicity.
+
+### Membrane
+A logical namespace or collection of vectors (analogous to a "Table" or "Collection" in other DBs).
+- **Default Membrane**: The membrane used when no name is specified (internally `__default__`).
+- **Isolation**: Membranes are physically separated on disk (separate subdirectories).
+- **Status**: Currently, named membranes are **ephemeral** in the API (lost on restart) due to implementation gaps.
+
+### VectorId
+A 64-bit unsigned integer uniquely identifying a vector within a membrane.
+- **Constraint**: Must be unique per membrane. Resubmitting an existing ID is an overwrite (Upsert).
+
+## Persistence & Storage
+
+### WAL (Write-Ahead Log)
+Append-only log file receiving all writes before they are applied to memory.
+- **Rotation**: Rotated to a new file when it exceeds a size threshold (default 64MB) or on Freeze.
+- **Durability**: Configured via `FsyncPolicy`.
+
+### Segment
+Immutable on-disk file containing a sorted run of vector data.
+- **Creation**: Created only during `Freeze`.
+- **Format**: `pomai.seg.v1` (version 2 payload). contains header, data, and CRC.
+
+### Manifest
+File tracking the structural state of the database.
+- **Global Manifest**: `MANIFEST` at root. Tracks membranes (currently unwired).
+- **Shard Manifest**: `manifest.current` in shard dir. Tracks active segments.
+
+## Visibility & Consistency
+
+### Snapshot
+A consistent view of the database at a point in time.
+- **Composition**: A set of immutable segments + a frozen MemTable (if any).
+- **Acquisition**: Readers acquire a snapshot at the start of an operation (`Search`, `Get`).
+- **Ordering**: Monotonically increasing versions.
+
+### Freeze
+An operation that:
+1. Rotates the active MemTable to valid frozen state.
+2. Flushes frozen state to a new Segment.
+3. Updates Manifest.
+4. Resets WAL.
+- **Semantics**: Provides durability (persisted to segment) and visibility (published to new snapshot).
+
+### Soft Freeze
+An automatic, in-memory rotation of the MemTable when it fills up (default 5000 items).
+- **Semantics**: Makes recent writes visible to new snapshots, but does *not* persist to Segment.
+
+### FsyncPolicy
+Configuration controlling when `fsync` is called on WAL.
+- `kNever`: Relies on OS page cache. Fast, unsafe.
+- `kOnFlush`: `fsync` only on explicit `Flush()` call.
+- `kAlways`: `fsync` on every `Put`/`Delete`. Slow, safe.
+

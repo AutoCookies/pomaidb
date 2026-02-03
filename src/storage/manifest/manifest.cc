@@ -1,5 +1,6 @@
 #include "storage/manifest/manifest.h"
 #include "util/crc32c.h"
+#include "util/posix_file.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -95,39 +96,45 @@ namespace pomai::storage
         static pomai::Status AtomicWriteFile(const std::string &final_path, std::string_view content)
         {
             const std::string tmp = final_path + ".tmp";
-            {
-                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-                if (!out.is_open())
-                    return pomai::Status::IOError("write failed: open tmp");
-                
-                // Write content
-                out.write(content.data(), static_cast<std::streamsize>(content.size()));
-                
-                // Calculate and write CRC
-                uint32_t crc = pomai::util::Crc32c(content.data(), content.size());
-                char crc_buf[4];
-                crc_buf[0] = crc & 0xFF;
-                crc_buf[1] = (crc >> 8) & 0xFF;
-                crc_buf[2] = (crc >> 16) & 0xFF;
-                crc_buf[3] = (crc >> 24) & 0xFF;
-                
-                out.write(crc_buf, 4);
+            
+            // Use PosixFile for explicit sync control
+            pomai::util::PosixFile pf;
+            auto st = pomai::util::PosixFile::CreateTrunc(tmp, &pf);
+            if (!st.ok()) return st;
 
-                if (!out.good())
-                    return pomai::Status::IOError("write failed");
-                
-                out.flush();
-                // fsync equivalent in C++ streams is not standard, but closing usually handles it mostly. 
-                // For stricter durability, we'd need platform specific fsync on the file descriptor.
-                // Assuming close is enough for this stage, or we can reopen and fsync if needed. 
-                // Ideally this project seems to have posix_file utils, but we are using fstream here.
-            }
+            // Write content
+            st = pf.PWrite(0, content.data(), content.size());
+            if (!st.ok()) return st;
+            
+            // Calculate and write CRC
+            uint32_t crc = pomai::util::Crc32c(content.data(), content.size());
+            char crc_buf[4];
+            crc_buf[0] = crc & 0xFF;
+            crc_buf[1] = (crc >> 8) & 0xFF;
+            crc_buf[2] = (crc >> 16) & 0xFF;
+            crc_buf[3] = (crc >> 24) & 0xFF;
+
+            st = pf.PWrite(content.size(), crc_buf, 4);
+            if (!st.ok()) return st;
+
+            // Critical: Fsync data to disk before rename
+            st = pf.SyncData();
+            if (!st.ok()) return st;
+
+            st = pf.Close();
+            if (!st.ok()) return st;
 
             std::error_code ec;
             fs::rename(tmp, final_path, ec);
             if (ec)
                 return pomai::Status::IOError("rename failed");
-            return pomai::Status::Ok();
+            
+            // Directory fsync for rename durability?
+            // The caller (Manifest logic) should probably handle dir fsync or we do it here.
+            // ShardManifest::Commit does dir fsync. Global manifest should too.
+            // Getting parent dir:
+            fs::path p(final_path);
+            return pomai::util::FsyncDir(p.parent_path().string());
         }
 
         struct RootEntry

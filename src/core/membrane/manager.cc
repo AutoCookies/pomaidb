@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <utility>
+#include <vector>
 
 #include "core/engine/engine.h"
+#include "storage/manifest/manifest.h"
+
 
 namespace pomai::core
 {
@@ -25,7 +28,46 @@ namespace pomai::core
         if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists)
             return st;
 
-        return OpenMembrane(kDefaultMembrane);
+        st = OpenMembrane(kDefaultMembrane);
+        if (!st.ok()) return st;
+
+        // Restore other membranes from manifest
+        std::vector<std::string> membranes;
+        st = storage::Manifest::ListMembranes(base_.path, &membranes);
+        if (!st.ok()) 
+        {
+             // If manifest corrupted or missing, we might want to fail hard?
+             // Since we just created default membrane, EnsureInitialized must have run.
+             return st;
+        }
+
+        for (const auto& name : membranes)
+        {
+            if (name == kDefaultMembrane) continue;
+            
+            // "Create" in memory without checking manifest (already checked via ListMembranes)
+            // But we can use the existing CreateMembrane logic which re-loads manifest?
+            // Actually, CreateMembrane checks if manifest exists.
+            // Let's use GetMembrane to get spec, then create in-memory engine, then open.
+            
+            pomai::MembraneSpec mspec;
+            st = storage::Manifest::GetMembrane(base_.path, name, &mspec);
+            if (!st.ok()) return st;
+
+            // Register engine in manager (in-memory)
+            if (engines_.find(name) == engines_.end()) {
+                pomai::DBOptions opt = base_;
+                opt.dim = mspec.dim;
+                opt.shard_count = mspec.shard_count;
+                opt.path = base_.path + "/membranes/" + name;
+                engines_.emplace(name, std::make_unique<Engine>(opt));
+            }
+
+            st = OpenMembrane(name);
+            if (!st.ok()) return st;
+        }
+
+        return Status::Ok();
     }
 
     Status MembraneManager::Close()

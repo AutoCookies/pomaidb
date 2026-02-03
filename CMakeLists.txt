@@ -202,3 +202,13 @@ endif()
 add_executable(bench_baseline tests/bench_baseline.cc)
 target_link_libraries(bench_baseline PRIVATE pomai)
 target_include_directories(bench_baseline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# =========================
+# Tools
+# =========================
+add_executable(pomai_inspect src/tools/pomai_inspect.cc)
+target_link_libraries(pomai_inspect PRIVATE pomai)
+target_include_directories(pomai_inspect PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)

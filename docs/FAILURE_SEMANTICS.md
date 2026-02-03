@@ -42,6 +42,10 @@
 - **Outcome**: The segment file exists but is not referenced by `manifest.current`, so it is ignored on restart. (Source: `ShardManifest::Load` reads `manifest.current`.)
 - **Data loss**: Writes flushed into that segment are lost from the visible state until a subsequent Freeze recreates them. (Assumption based on manifest being the only reference.)
 
+### 6) Crash and restart with named membranes
+- **Outcome**: `DB::Open` (via `MembraneManager::Open`) only restores the default membrane. Any named membranes created via `CreateMembrane` are **lost to the API** on restart, even if their data exists on disk. (Source: `MembraneManager::Open` logic only opens `__default__`.)
+- **Resolution**: Implementation required to scan `membranes/` directory or `MANIFEST` and restore them.
+
 ### 6) Crash after manifest update, before dir fsync
 - **Outcome**: The manifest rename may or may not be durable, depending on filesystem behavior. (Assumption; see `ShardManifest::Commit`.)
 - **Visibility**: If manifest rename is lost, the segment may be ignored; if rename is durable, the segment is loaded. (Source: `ShardManifest::Commit`, `ShardRuntime::LoadSegments`.)
