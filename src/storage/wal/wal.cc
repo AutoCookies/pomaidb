@@ -286,4 +286,42 @@ namespace pomai::storage
         }
         return pomai::Status::Ok();
     }
+    pomai::Status Wal::Reset()
+    {
+        if (impl_) {
+            impl_->file.Close();
+            delete impl_;
+            impl_ = nullptr;
+        }
+
+        // Delete all wal files
+        for (std::uint64_t g = 0; ; ++g) {
+            std::string p = SegmentPath(g);
+            std::error_code ec;
+            if (!fs::exists(p, ec)) break;
+            fs::remove(p, ec);
+        }
+        
+        // Reset state
+        gen_ = 0;
+        seq_ = 0; // Safe to reset seq if MemTable is empty/flushed.
+        file_off_ = 0;
+        bytes_in_seg_ = 0;
+
+        // Re-open (creates new wal_0.log)
+        impl_ = new Impl();
+        impl_->path = SegmentPath(gen_);
+        
+        // Create directory just in case (Open does it? No, Open calls create_directories).
+        // Let's call Open logic or just do minimal.
+        // Replicating Open logic:
+        // Open() assumes closed.
+        // But here we set impl_ already?
+        // Let's reuse Open() logic but Open() scans for gen_.
+        // We deleted everything. So Open() will find no files, set gen_=0.
+        // So:
+        delete impl_; impl_ = nullptr; // Reset impl again
+        return Open();
+    }
+
 } // namespace pomai::storage

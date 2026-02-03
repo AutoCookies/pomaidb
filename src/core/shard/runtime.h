@@ -89,7 +89,17 @@ namespace pomai::core
         std::promise<std::pair<pomai::Status, bool>> done;
     };
 
-    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd>;
+    struct FreezeCmd
+    {
+        std::promise<pomai::Status> done;
+    };
+
+    struct CompactCmd
+    {
+        std::promise<pomai::Status> done;
+    };
+
+    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd, FreezeCmd, CompactCmd>;
 
     class ShardRuntime
     {
@@ -113,7 +123,10 @@ namespace pomai::core
         pomai::Status Get(pomai::VectorId id, std::vector<float> *out);
         pomai::Status Exists(pomai::VectorId id, bool *exists);
         pomai::Status Delete(pomai::VectorId id);
-        pomai::Status Flush();
+
+        pomai::Status Flush(); // WAL Flush
+        pomai::Status Freeze(); // MemTable -> Segment
+        pomai::Status Compact(); // Compact Segments
 
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
@@ -133,6 +146,8 @@ namespace pomai::core
         std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c);
         pomai::Status HandleDel(DelCmd &c);
         pomai::Status HandleFlush(FlushCmd &c);
+        pomai::Status HandleFreeze(FreezeCmd &c);
+        pomai::Status HandleCompact(CompactCmd &c);
 
         SearchReply HandleSearch(SearchCmd &c);
         pomai::Status SearchLocalInternal(std::span<const float> query,
@@ -140,7 +155,7 @@ namespace pomai::core
                                           std::vector<pomai::SearchHit> *out);
                                           
         // Helper to load segments
-        void LoadSegments();
+        pomai::Status LoadSegments();
 
         const std::uint32_t shard_id_;
         const std::string shard_dir_;

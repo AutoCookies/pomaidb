@@ -103,6 +103,16 @@ namespace pomai
             return mgr_.Search(membrane, query, topk, out);
         }
 
+        Status Freeze(std::string_view membrane) override
+        {
+            return mgr_.Freeze(membrane);
+        }
+
+        Status Compact(std::string_view membrane) override
+        {
+            return mgr_.Compact(membrane);
+        }
+
     private:
         core::MembraneManager mgr_;
     };

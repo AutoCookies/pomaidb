@@ -58,6 +58,12 @@ namespace pomai::table
         return Status::Ok();
     }
 
+    void MemTable::Clear()
+    {
+        map_.clear();
+        arena_.Clear();
+    }
+
 
 
 } // namespace pomai::table

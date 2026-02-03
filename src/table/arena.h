@@ -13,6 +13,7 @@ namespace pomai::table
         explicit Arena(std::size_t block_bytes) : block_bytes_(block_bytes) {}
 
         void *Allocate(std::size_t n, std::size_t align);
+        void Clear() { blocks_.clear(); }
 
     private:
         struct Block

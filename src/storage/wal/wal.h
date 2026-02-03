@@ -31,6 +31,10 @@ namespace pomai::storage
 
         pomai::Status Flush();
         pomai::Status ReplayInto(pomai::table::MemTable &mem);
+        
+        // Closes current log, deletes all WAL files, and resets state.
+        // Used after successful MemTable flush to segments.
+        pomai::Status Reset();
 
     private:
         std::string SegmentPath(std::uint64_t gen) const;

@@ -32,6 +32,8 @@ namespace pomai::core
         Status Exists(VectorId id, bool *exists);
         Status Delete(VectorId id);
         Status Flush();
+        Status Freeze();
+        Status Compact();
 
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
 

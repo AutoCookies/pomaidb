@@ -49,6 +49,19 @@ static void ChildWriter(const std::string &path)
             if (!st.ok())
                 Die(st.message().c_str());
         }
+        
+        // Gate #2 Requirement: Test Freeze/Compact survivability
+        if ((i % 1000) == 0)
+        {
+             st = db->Freeze("default"); // Trigger segment creation
+             if (!st.ok()) Die(st.message().c_str());
+        }
+        
+        if ((i % 5000) == 0) // Less frequent
+        {
+             st = db->Compact("default");
+             if (!st.ok()) Die(st.message().c_str());
+        }
     }
 
     db->Close();

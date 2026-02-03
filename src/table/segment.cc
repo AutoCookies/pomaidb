@@ -22,14 +22,23 @@ namespace pomai::table
     {
     }
 
-    pomai::Status SegmentBuilder::Add(pomai::VectorId id, std::span<const float> vec)
+    pomai::Status SegmentBuilder::Add(pomai::VectorId id, std::span<const float> vec, bool is_deleted)
     {
-        if (vec.size() != dim_)
-            return pomai::Status::InvalidArgument("dimension mismatch");
-        
         Entry e;
         e.id = id;
-        e.vec.assign(vec.begin(), vec.end());
+        e.is_deleted = is_deleted;
+
+        if (is_deleted)
+        {
+            // Tombstone: store zeros (or uninit, but zeros compresses better and is deterministic)
+            e.vec.resize(dim_, 0.0f);
+        }
+        else
+        {
+            if (vec.size() != dim_)
+                return pomai::Status::InvalidArgument("dimension mismatch");
+            e.vec.assign(vec.begin(), vec.end());
+        }
         entries_.push_back(std::move(e));
         return pomai::Status::Ok();
     }
@@ -44,20 +53,16 @@ namespace pomai::table
         SegmentHeader h{};
         std::memset(&h, 0, sizeof(h));
         std::memcpy(h.magic, kMagic, sizeof(h.magic));
-        h.version = 1;
+        h.version = 2; // V2
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
 
         // Write to tmp file
         std::string tmp_path = path_ + ".tmp";
         
-        // We use C++ fstream or PosixFile? PosixFile is better for consistency but it is append-only/pwrite?
-        // Let's use std::ofstream for sequential writing for builder, simpler.
-        // Actually, we need to calculate CRC.
-        
         std::vector<uint8_t> buffer;
-        // Estimate size: Header + N * (8 + 4*dim) + 4
-        size_t entry_size = sizeof(uint64_t) + dim_ * sizeof(float);
+        // Entry: ID(8) + Flags(1) + Pad(3) + Vec(dim*4)
+        size_t entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(float);
         size_t total_size = sizeof(SegmentHeader) + entries_.size() * entry_size + 4;
         
         try {
@@ -72,9 +77,19 @@ namespace pomai::table
 
         // Entries
         for (const auto& e : entries_) {
+             // ID
              const uint8_t* p_id = reinterpret_cast<const uint8_t*>(&e.id);
              buffer.insert(buffer.end(), p_id, p_id + sizeof(e.id));
              
+             // Flags + Padding
+             uint8_t flags = e.is_deleted ? kFlagTombstone : kFlagNone;
+             buffer.push_back(flags);
+             // Pad 3 bytes (zeros)
+             buffer.push_back(0);
+             buffer.push_back(0);
+             buffer.push_back(0);
+
+             // Vector
              const uint8_t* p_vec = reinterpret_cast<const uint8_t*>(e.vec.data());
              buffer.insert(buffer.end(), p_vec, p_vec + (dim_ * sizeof(float)));
         }
@@ -134,11 +149,11 @@ namespace pomai::table
         const SegmentHeader* h = static_cast<const SegmentHeader*>(data);
 
         if (strncmp(h->magic, kMagic, 12) != 0) return pomai::Status::Corruption("bad magic");
-        if (h->version != 1) return pomai::Status::Corruption("unsupported version");
+        if (h->version != 2) return pomai::Status::Corruption("unsupported version");
         
         reader->count_ = h->count;
         reader->dim_ = h->dim;
-        reader->entry_size_ = sizeof(uint64_t) + h->dim * sizeof(float);
+        reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float); // ID + Flags/Pad + Vec
         
         reader->base_addr_ = static_cast<const uint8_t*>(data);
         reader->file_size_ = size;
@@ -153,9 +168,16 @@ namespace pomai::table
 
     pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec) const
     {
-        if (count_ == 0) return pomai::Status::NotFound("empty segment");
+         auto res = Find(id, out_vec);
+         if (res == FindResult::kFound) return pomai::Status::Ok();
+         if (res == FindResult::kFoundTombstone) return pomai::Status::NotFound("tombstone");
+         return pomai::Status::NotFound("id not found in segment");
+    }
 
-        // Binary Search
+    SegmentReader::FindResult SegmentReader::Find(pomai::VectorId id, std::span<const float> *out_vec) const
+    {
+        if (count_ == 0) return FindResult::kNotFound;
+
         int64_t left = 0;
         int64_t right = count_ - 1;
         
@@ -164,22 +186,24 @@ namespace pomai::table
         while (left <= right) {
             int64_t mid = left + (right - left) / 2;
             
-            // Offset = Header + mid * entry_size
             const uint8_t* p = entries_start + mid * entry_size_;
             
-            // Read ID (unaligned access safe on x86, but use memcpy for safety/portability or assuming packed/aligned enough)
-            // ID is 8 bytes. Header is 12+4+4+4+32 = 56 bytes? 
-            // struct Header { char magic[12]; u32 version; u32 count; u32 dim; u32 reserved[8]; }
-            // 12 + 4 + 4 + 4 + 32 = 56. 
-            // 56 is divisible by 8. So IDs are 8-byte aligned if file is.
-            // float vectors follows 8-byte ID, so they are 4-byte aligned. Safe.
-            
-            uint64_t read_id = *reinterpret_cast<const uint64_t*>(p);
+            // Safe unaligned read for ID (memcpy)
+            uint64_t read_id;
+            std::memcpy(&read_id, p, sizeof(uint64_t));
 
             if (read_id == id) {
-                const float* vec_ptr = reinterpret_cast<const float*>(p + sizeof(uint64_t));
-                *out_vec = std::span<const float>(vec_ptr, dim_);
-                return pomai::Status::Ok();
+                // Found
+                uint8_t flags = *(p + 8);
+                if (flags & kFlagTombstone) {
+                    if(out_vec) *out_vec = {}; // Deleted
+                    return FindResult::kFoundTombstone;
+                }
+                
+                // Vector starts at offset 8 (ID) + 4 (Flags+Pad) = 12
+                const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
+                if (out_vec) *out_vec = std::span<const float>(vec_ptr, dim_);
+                return FindResult::kFound;
             }
 
             if (read_id < id) {
@@ -188,8 +212,32 @@ namespace pomai::table
                 right = mid - 1;
             }
         }
+        return FindResult::kNotFound;
+    }
 
-        return pomai::Status::NotFound("id not found in segment");
+    pomai::Status SegmentReader::ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const
+    {
+        if (index >= count_) return pomai::Status::InvalidArgument("index out of range");
+
+        const uint8_t* p = base_addr_ + sizeof(SegmentHeader) + index * entry_size_;
+        
+        if (out_id) {
+             std::memcpy(out_id, p, sizeof(uint64_t));
+        }
+        
+        uint8_t flags = *(p + 8);
+        bool is_deleted = (flags & kFlagTombstone);
+        if (out_deleted) *out_deleted = is_deleted;
+
+        if (out_vec) {
+             if (is_deleted) {
+                 *out_vec = {};
+             } else {
+                 const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
+                 *out_vec = std::span<const float>(vec_ptr, dim_);
+             }
+        }
+        return pomai::Status::Ok();
     }
 
 } // namespace pomai::table

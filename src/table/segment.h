@@ -14,21 +14,26 @@
 namespace pomai::table
 {
 
-    // On-disk format:
+    // On-disk format V2:
     // [Header]
-    // [Entry 0: ID (8 bytes) | Vector (dim * 4 bytes)]
+    // [Entry 0: ID (8 bytes) | Flags (1 byte) | Vector (dim * 4 bytes)] (Packed/Unaligned potentially, but we'll manually serialize)
     // ...
     // [Entry N-1]
-    // [CRC32C (4 bytes) - covers Header + All Entries]
+    // [CRC32C (4 bytes)]
 
     struct SegmentHeader
     {
-        char magic[12]; // "pomai.seg.v1" (padded/null terminated)
-        uint32_t version;
+        char magic[12]; // "pomai.seg.v1" (v1 reader compatibility check? No we bump version)
+                        // Let's keep magic same but check version.
+        uint32_t version; // 2
         uint32_t count;
         uint32_t dim;
         uint32_t reserved[8];
     };
+
+    // Flags
+    constexpr uint8_t kFlagNone = 0;
+    constexpr uint8_t kFlagTombstone = 1 << 0;
 
     class SegmentReader
     {
@@ -37,13 +42,34 @@ namespace pomai::table
 
         ~SegmentReader();
 
-        // Looks up a vector by ID. Returns NotFound if not present.
-        // On success, *out_vec points to internal memory (valid until SegmentReader closed).
+        // Looks up a vector by ID. 
+        // If ID is found but is a Tombstone, returns NotFound("tombstone").
+        // (Or should we return specific status? For Get, it's effectively NotFound).
         pomai::Status Get(pomai::VectorId id, std::span<const float> *out_vec) const;
 
+        // Check if ID exists (handling tombstones).
+        // Returns Ok + true if present and alive.
+        // Returns Ok + false if present but tombstone (explicit delete).
+        // Returns Ok + false if not present at all?
+        // Wait, Exists needs to distinguish "Known Deleted" vs "Unknown".
+        // Upper layers (ShardRuntime) iterate segments Newest -> Oldest.
+        // If Newest has Tombstone -> STOP, return Deleted.
+        // If Newest has Alive -> STOP, return Exists.
+        // If Not Found -> Continue.
+        // So we need a way to return "FoundTombstone".
+        enum class FindResult {
+            kFound,
+            kFoundTombstone,
+            kNotFound
+        };
+        FindResult Find(pomai::VectorId id, std::span<const float> *out_vec) const;
+        
+        // Read entry at index [0, Count()-1]
+        // Returns ID, Vector (if not deleted), and Deleted Status.
+        pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const;
+
         // Iteration
-        // Retuns Ok unless callback stops (not implemented yet) or error.
-        // Takes a callback: void(pomai::VectorId, std::span<const float>)
+        // Callback: void(VectorId, span<float>, bool is_deleted)
         template <typename F>
         void ForEach(F &&func) const
         {
@@ -51,10 +77,13 @@ namespace pomai::table
             const uint8_t* p = base_addr_ + sizeof(SegmentHeader);
             for (uint32_t i = 0; i < count_; ++i) {
                  uint64_t id = *reinterpret_cast<const uint64_t*>(p);
-                 const float* vec_ptr = reinterpret_cast<const float*>(p + sizeof(uint64_t));
-                 std::span<const float> vec(vec_ptr, dim_);
+                 uint8_t flags = *(p + 8);
+                 const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
                  
-                 func(static_cast<pomai::VectorId>(id), vec);
+                 std::span<const float> vec(vec_ptr, dim_);
+                 bool is_deleted = (flags & kFlagTombstone);
+                 
+                 func(static_cast<pomai::VectorId>(id), vec, is_deleted);
                  
                  p += entry_size_;
             }
@@ -75,28 +104,6 @@ namespace pomai::table
         
         const uint8_t* base_addr_ = nullptr;
         std::size_t file_size_ = 0;
-        
-        // Mapped memory or buffer could be used.
-        // For V1, let's use simple pread or mmap if PosixFile supports it.
-        // The existing PosixFile seems basic (PRead/PWrite). 
-        // For efficient search we might want mmap later, but for now we might load all or seek.
-        // Given typically these are small-ish or we want low latency, let's assume we might need to cache.
-        // But for "Get", PRead is fine.
-        
-        // Cache metadata for binary search? 
-        // To do binary search on disk without loading everything:
-        // We need to read the ID at distinct offsets.
-        
-        // Ideally we map the file. 
-        // Since PosixFile wrapper doesn't show Map support in previous view, we will implement
-        // a simple in-memory load for now if small, or just PRead for Get.
-        // Let's stick to PRead for O(logN) lookups to avoid huge memory usage for now,
-        // OR just load everything if we want speed for Search.
-        // 
-        // Optimization: Let's assume we map it or read-only map.
-        // The task says "Support loading segments".
-        // Let's add mmap support to PosixFile later if needed. 
-        // For now, let's implement Get using PRead (Binary Search on disk).
     };
 
     class SegmentBuilder
@@ -104,13 +111,10 @@ namespace pomai::table
     public:
         SegmentBuilder(std::string path, uint32_t dim);
         
-        // Add a vector. Must be added in any order, but Finish will sort them?
-        // Or we require caller (MemTable flush) to provide them sorted?
-        // MemTable is a map, so iteration is not sorted by ID? 
-        // Wait, std::unordered_map.
-        // So Builder should buffer and sort, or we pass a sorted iterator.
-        // Let's support Add() and we buffer/sort inside before writing to ensure on-disk is sorted.
-        pomai::Status Add(pomai::VectorId id, std::span<const float> vec);
+        // Add a vector. 
+        // If is_deleted is true, vec content is ignored (will be zeroed on disk).
+        // vec.size() must match dim unless is_deleted is true (then it can be empty).
+        pomai::Status Add(pomai::VectorId id, std::span<const float> vec, bool is_deleted);
 
         pomai::Status Finish();
         
@@ -119,7 +123,8 @@ namespace pomai::table
     private:
         struct Entry {
             pomai::VectorId id;
-            std::vector<float> vec;
+            std::vector<float> vec; // Empty if deleted
+            bool is_deleted;
         };
         
         std::string path_;

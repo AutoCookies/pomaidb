@@ -42,6 +42,9 @@ namespace pomai::core
         Status Delete(std::string_view membrane, VectorId id);
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
 
+        Status Freeze(std::string_view membrane);
+        Status Compact(std::string_view membrane);
+
         // Default membrane convenience: use name "__default__"
         static constexpr std::string_view kDefaultMembrane = "__default__";
 

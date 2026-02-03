@@ -25,9 +25,9 @@ namespace
         std::vector<float> v3 = {9.0, 10.0, 11.0, 12.0};
         
         // Add out of order to test sorting
-        POMAI_EXPECT_OK(builder.Add(20, std::span<const float>(v2)));
-        POMAI_EXPECT_OK(builder.Add(10, std::span<const float>(v1)));
-        POMAI_EXPECT_OK(builder.Add(30, std::span<const float>(v3)));
+        POMAI_EXPECT_OK(builder.Add(20, std::span<const float>(v2), /*is_deleted=*/false));
+        POMAI_EXPECT_OK(builder.Add(10, std::span<const float>(v1), /*is_deleted=*/false));
+        POMAI_EXPECT_OK(builder.Add(30, std::span<const float>(v3), /*is_deleted=*/true)); // Tombstone
         
         POMAI_EXPECT_OK(builder.Finish());
         
@@ -50,13 +50,35 @@ namespace
         POMAI_EXPECT_OK(reader->Get(20, &out));
         POMAI_EXPECT_EQ(out[0], 5.0f);
         
-        POMAI_EXPECT_OK(reader->Get(30, &out));
-        POMAI_EXPECT_EQ(out[0], 9.0f);
-        
-        // Get non-existing
-        auto st = reader->Get(15, &out);
+        // Get Tombstone
+        auto st = reader->Get(30, &out);
         POMAI_EXPECT_TRUE(!st.ok());
         POMAI_EXPECT_EQ(st.code(), pomai::ErrorCode::kNotFound);
+        POMAI_EXPECT_EQ(st.message(), std::string("tombstone"));
+        
+        // Find API
+        POMAI_EXPECT_TRUE(reader->Find(10, &out) == pomai::table::SegmentReader::FindResult::kFound);
+        POMAI_EXPECT_TRUE(reader->Find(20, &out) == pomai::table::SegmentReader::FindResult::kFound);
+        POMAI_EXPECT_TRUE(reader->Find(30, &out) == pomai::table::SegmentReader::FindResult::kFoundTombstone);
+        POMAI_EXPECT_TRUE(reader->Find(99, &out) == pomai::table::SegmentReader::FindResult::kNotFound);
+
+        // Get non-existing
+        st = reader->Get(15, &out);
+        POMAI_EXPECT_TRUE(!st.ok());
+        POMAI_EXPECT_EQ(st.code(), pomai::ErrorCode::kNotFound);
+        POMAI_EXPECT_EQ(st.message(), std::string("id not found in segment"));
+        
+        // ForEach
+        int count = 0;
+        int tombstones = 0;
+        reader->ForEach([&](pomai::VectorId id, std::span<const float> vec, bool is_deleted) {
+             count++;
+             if (is_deleted) tombstones++;
+             if (id == 30) POMAI_EXPECT_TRUE(is_deleted);
+             if (id == 10 || id == 20) POMAI_EXPECT_TRUE(!is_deleted);
+        });
+        POMAI_EXPECT_EQ(count, 3);
+        POMAI_EXPECT_EQ(tombstones, 1);
         
         st = reader->Get(5, &out); // Check before first
         POMAI_EXPECT_TRUE(!st.ok());

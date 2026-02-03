@@ -46,6 +46,9 @@ namespace pomai
         virtual Status Search(std::string_view membrane, std::span<const float> query,
                               uint32_t topk, SearchResult *out) = 0;
 
+        virtual Status Freeze(std::string_view membrane) = 0;
+        virtual Status Compact(std::string_view membrane) = 0;
+
         static Status Open(const DBOptions &options, std::unique_ptr<DB> *out);
     };
 

@@ -20,7 +20,6 @@ add_library(pomai STATIC
   src/core/engine/engine.cc
   src/core/shard/shard.cc
   src/core/shard/runtime.cc
-  src/core/shard/manifest.cc
   src/core/membrane/manager.cc
   src/table/memtable.cc
   src/storage/wal/wal.cc
@@ -114,18 +113,6 @@ if (POMAI_BUILD_TESTS)
   add_executable(segment_test tests/unit/segment_test.cc)
   pomai_setup_test(segment_test)
   pomai_add_labeled_test(segment_test "unit")
-  
-  add_executable(shard_manifest_test tests/unit/shard_manifest_test.cc)
-  pomai_setup_test(shard_manifest_test)
-  pomai_add_labeled_test(shard_manifest_test "unit")
-
-  add_executable(oracle_test tests/unit/oracle_test.cc tests/common/bruteforce_oracle.cc)
-  pomai_setup_test(oracle_test)
-  pomai_add_labeled_test(oracle_test "unit")
-
-  add_executable(recall_test tests/recall/recall_test.cc tests/recall/recall_dataset.cc tests/common/bruteforce_oracle.cc)
-  pomai_setup_test(recall_test)
-  pomai_add_labeled_test(recall_test "recall")
 
   # ---- Integration (embedded DB API) ----
   add_executable(db_basic_test tests/integ/db_basic_test.cc)

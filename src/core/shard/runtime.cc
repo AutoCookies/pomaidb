@@ -10,6 +10,8 @@
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 #include "table/segment.h" // Added
+#include "core/shard/manifest.h"
+#include <queue>
 
 namespace pomai::core
 {
@@ -53,60 +55,29 @@ namespace pomai::core
         if (started_.exchange(true))
             return pomai::Status::Busy("shard already started");
         
-        LoadSegments(); // Added
+        auto st = LoadSegments();
+        if (!st.ok()) return st;
 
         worker_ = std::jthread([this]
                                { RunLoop(); });
         return pomai::Status::Ok();
     }
 
-    void ShardRuntime::LoadSegments() // Added
+    pomai::Status ShardRuntime::LoadSegments()
     {
-        // Scan shard_dir for files "seg_*.dat"
-        // Since we don't have manifest tracking segments yet (A3 will add that),
-        // we assume files on disk are valid segments to load.
-        // A2 added "segments" line to membrane manifest? We didn't implement parsing it though?
-        // Wait, A2 implemented WriteMembraneManifest with shards/dim/metric.
-        // It did NOT add `segments` list to manifest yet.
-        // So we rely on directory scan.
+        std::vector<std::string> seg_names;
+        auto st = ShardManifest::Load(shard_dir_, &seg_names);
+        if (!st.ok()) return st;
         
-        if (!fs::exists(shard_dir_)) return;
-        
-        std::vector<std::string> seg_files;
-        for (const auto& entry : fs::directory_iterator(shard_dir_)) {
-             if (entry.is_regular_file()) {
-                 std::string name = entry.path().filename().string();
-                 if (name.rfind("seg_", 0) == 0 && name.ends_with(".dat")) {
-                     seg_files.push_back(entry.path().string());
-                 }
-             }
-        }
-        
-        // Sort files (e.g. seg_0.dat, seg_1.dat...)
-        // Simple string sort works if fixed width, otherwise need number parsing.
-        // Let's just sort strings for stability.
-        std::sort(seg_files.begin(), seg_files.end());
-        // Reverse order? Usually we search newest first.
-        // WAL rotation produces increasing sequences.
-        // Search: MemTable -> Newest Segment -> Oldest Segment.
-        // So we want reverse order in `segments_`.
-        // Sort ascending, then reverse? Or `blocks` are usually list of immutable components.
-        // Let's store newest first.
-        std::sort(seg_files.rbegin(), seg_files.rend());
-
-        for (const auto& path : seg_files) {
+        segments_.clear();
+        for (const auto& name : seg_names) {
+            std::string path = (fs::path(shard_dir_) / name).string();
             std::unique_ptr<table::SegmentReader> reader;
-            auto st = table::SegmentReader::Open(path, &reader);
-            if (st.ok()) {
-                segments_.push_back(std::move(reader));
-            } else {
-                // Log warning?
-                // For now ignore corrupt segments or fail?
-                // Fail loud is better for DB.
-                // But LoadSegments returns void.
-                // We should probably log.
-            }
+            st = table::SegmentReader::Open(path, &reader);
+            if (!st.ok()) return st;
+            segments_.push_back(std::move(reader));
         }
+        return pomai::Status::Ok();
     }
 
     pomai::Status ShardRuntime::Enqueue(Command &&cmd)
@@ -203,6 +174,24 @@ namespace pomai::core
         return fut.get();
     }
 
+    pomai::Status ShardRuntime::Freeze()
+    {
+        FreezeCmd c;
+        auto f = c.done.get_future();
+        auto st = Enqueue(Command{std::move(c)});
+        if (!st.ok()) return st;
+        return f.get();
+    }
+
+    pomai::Status ShardRuntime::Compact()
+    {
+        CompactCmd c;
+        auto f = c.done.get_future();
+        auto st = Enqueue(Command{std::move(c)});
+        if (!st.ok()) return st;
+        return f.get();
+    }
+
     pomai::Status ShardRuntime::Search(std::span<const float> query,
                                        std::uint32_t topk,
                                        std::vector<pomai::SearchHit> *out)
@@ -266,6 +255,14 @@ namespace pomai::core
                     {
                         arg.done.set_value(HandleFlush(arg));
                     }
+                    else if constexpr (std::is_same_v<T, FreezeCmd>)
+                    {
+                        arg.done.set_value(HandleFreeze(arg));
+                    }
+                    else if constexpr (std::is_same_v<T, CompactCmd>)
+                    {
+                        arg.done.set_value(HandleCompact(arg));
+                    }
                     else if constexpr (std::is_same_v<T, SearchCmd>)
                     {
                         arg.done.set_value(HandleSearch(arg));
@@ -326,10 +323,14 @@ namespace pomai::core
         // 2. Check Segments
         for (const auto& seg : segments_) {
             std::span<const float> svec;
-            st = seg->Get(c.id, &svec);
-            if (st.ok()) {
+            // Use Find (handles tombstones)
+            auto res = seg->Find(c.id, &svec);
+            if (res == table::SegmentReader::FindResult::kFound) {
                 reply.st = Status::Ok();
                 reply.vec.assign(svec.begin(), svec.end());
+                return reply;
+            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
+                reply.st = Status::NotFound("tombstone");
                 return reply;
             }
         }
@@ -346,8 +347,12 @@ namespace pomai::core
         
         for (const auto& seg : segments_) {
             std::span<const float> svec;
-            if (seg->Get(c.id, &svec).ok()) {
+            auto res = seg->Find(c.id, &svec);
+            if (res == table::SegmentReader::FindResult::kFound) {
                 return {Status::Ok(), true};
+            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
+                // If found tombstone in NEWER segment, it is deleted.
+                return {Status::Ok(), false};
             }
         }
         return {Status::Ok(), false};
@@ -370,6 +375,166 @@ namespace pomai::core
     pomai::Status ShardRuntime::HandleFlush(FlushCmd &)
     {
         return wal_->Flush();
+    }
+
+    pomai::Status ShardRuntime::HandleFreeze(FreezeCmd &)
+    {
+        if (mem_->GetCount() == 0) return pomai::Status::Ok();
+
+        // 1. Build Segment
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count(); // Monotonic enough for local?
+        // Use system clock for filename readability?
+        auto sys_now = std::chrono::system_clock::now().time_since_epoch().count();
+        std::string name = "seg_" + std::to_string(sys_now) + ".dat";
+        std::string path = (fs::path(shard_dir_) / name).string();
+
+        table::SegmentBuilder builder(path, dim_);
+        
+        // mem_->IterateWithStatus
+        mem_->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+             // We can ignore deleted if we are sure no older segments exist?
+             // But safely we should persist tombstones.
+             (void)builder.Add(id, vec, is_deleted);
+        });
+
+        auto st = builder.Finish();
+        if (!st.ok()) return st;
+
+        // 2. Update Manifest
+        std::vector<std::string> seg_names;
+        st = ShardManifest::Load(shard_dir_, &seg_names);
+        if (!st.ok()) return st; // Should return empty if new
+        
+        // Prepend (Assuming Newest First).
+        // Manifest order: Newest First?
+        // Let's decide: Manifest = [Newest, ..., Oldest]
+        seg_names.insert(seg_names.begin(), name);
+        
+        st = ShardManifest::Commit(shard_dir_, seg_names);
+        if (!st.ok()) return st;
+
+        // 3. Clear MemTable & Reset WAL
+        mem_->Clear();
+        st = wal_->Reset();
+        if (!st.ok()) return st; 
+        
+        // 4. Reload in-memory
+        std::unique_ptr<table::SegmentReader> reader;
+        st = table::SegmentReader::Open(path, &reader);
+        if (!st.ok()) return st;
+        segments_.insert(segments_.begin(), std::move(reader));
+
+        return pomai::Status::Ok();
+    }
+
+    pomai::Status ShardRuntime::HandleCompact(CompactCmd &)
+    {
+        if (segments_.empty()) return pomai::Status::Ok();
+
+        // 1. Prepare Output
+        auto sys_now = std::chrono::system_clock::now().time_since_epoch().count();
+        std::string name = "seg_" + std::to_string(sys_now) + "_compacted.dat";
+        std::string path = (fs::path(shard_dir_) / name).string();
+
+        table::SegmentBuilder builder(path, dim_);
+
+        // 2. K-way Merge
+        struct Cursor {
+            VectorId id;
+            uint32_t seg_idx;
+            uint32_t entry_idx;
+            bool is_deleted;
+            
+            // Priority Queue (Min-Heap): Smallest ID first, then Smallest SegIdx (Newest)
+            bool operator>(const Cursor& other) const {
+                if (id != other.id) return id > other.id;
+                return seg_idx > other.seg_idx;
+            }
+        };
+
+        std::priority_queue<Cursor, std::vector<Cursor>, std::greater<Cursor>> heap;
+
+        // Initialize cursors
+        for (uint32_t i = 0; i < segments_.size(); ++i) {
+            VectorId id;
+            bool del;
+            // Read first entry
+            if (segments_[i]->ReadAt(0, &id, nullptr, &del).ok()) {
+                heap.push({id, i, 0, del});
+            }
+        }
+
+        VectorId last_id = std::numeric_limits<VectorId>::max(); // Using max as sentinel for "none"?
+        bool is_first = true;
+
+        while (!heap.empty()) {
+            Cursor top = heap.top();
+            heap.pop();
+            
+            // Check if this ID is new
+            if (is_first || top.id != last_id) {
+                // This is the winning version (newest due to secondary sort order)
+                
+                // If it is NOT deleted, add it.
+                // If it IS deleted, we can drop it because we are compacting ALL segments (full compaction).
+                // So no older version exists that needs shadowing.
+                if (!top.is_deleted) {
+                    // Need to read vector data now
+                    std::span<const float> vec;
+                    // We need to read again from segments_[top.seg_idx] at top.entry_idx?
+                    // We didn't store vec in Cursor to save heap space/copy.
+                    // ReadAt again.
+                    if (segments_[top.seg_idx]->ReadAt(top.entry_idx, nullptr, &vec, nullptr).ok()) {
+                        builder.Add(top.id, vec, false);
+                    }
+                }
+                
+                last_id = top.id;
+                is_first = false;
+            }
+            // Else: this is an older version of same ID (shadowed). Ignore.
+
+            // Advance cursor
+            uint32_t next_idx = top.entry_idx + 1;
+            VectorId next_id;
+            bool next_del;
+            if (segments_[top.seg_idx]->ReadAt(next_idx, &next_id, nullptr, &next_del).ok()) {
+                heap.push({next_id, top.seg_idx, next_idx, next_del});
+            }
+        }
+
+        auto st = builder.Finish();
+        if (!st.ok()) return st;
+        
+        // 3. Update Manifest
+        std::vector<std::string> seg_names;
+        // The new list will contain ONLY the new segment.
+        seg_names.push_back(name);
+        
+        st = ShardManifest::Commit(shard_dir_, seg_names);
+        if (!st.ok()) return st;
+
+        // 4. Reload in-memory
+        // Clear old segments logic?
+        // Delete input files?
+        // We should delete old files AFTER commit.
+        // Copy old segments to delete them later?
+        std::vector<std::shared_ptr<table::SegmentReader>> old_segments = std::move(segments_);
+        segments_.clear();
+
+        // Load new
+        std::unique_ptr<table::SegmentReader> reader;
+        st = table::SegmentReader::Open(path, &reader);
+        if (!st.ok()) return st;
+        segments_.push_back(std::move(reader));
+        
+        // 5. Delete old files
+        for (const auto& old : old_segments) {
+             std::error_code ec;
+             fs::remove(old->Path(), ec);
+        }
+
+        return pomai::Status::Ok();
     }
 
     SearchReply ShardRuntime::HandleSearch(SearchCmd &c)
@@ -437,17 +602,17 @@ namespace pomai::core
                     continue;
                 }
                 
-                // If not in memtable, check segments?
-                // Single-point lookup for candidates is potentially slow if many candidates
-                // but IVF candidates usually < 1000.
-                // Segments are sorted, so O(logN). N segments.
-                // Better than scanning all.
+                // Check segments
                 for (const auto& seg : segments_) {
                     std::span<const float> svec;
-                    if (seg->Get(id, &svec).ok()) {
+                    auto res = seg->Find(id, &svec);
+                    if (res == table::SegmentReader::FindResult::kFound) {
                         float score = Dot(query, svec);
                         push_topk(id, score);
-                        break; // Found (assume unique ID)
+                        break; // Found
+                    }
+                    if (res == table::SegmentReader::FindResult::kFoundTombstone) {
+                        break; // Deleted
                     }
                 }
             }
@@ -462,7 +627,8 @@ namespace pomai::core
                               
             // Scan Segments
             for (const auto& seg : segments_) {
-                seg->ForEach([&](VectorId id, std::span<const float> vec) {
+                seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+                    if (is_deleted) return;
                     float score = pomai::core::Dot(query, vec);
                     push_topk(id, score);
                 });
@@ -477,3 +643,5 @@ namespace pomai::core
     }
 
 } // namespace pomai::core
+
+

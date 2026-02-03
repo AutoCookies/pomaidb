@@ -169,4 +169,18 @@ namespace pomai::core
         return e->Search(query, topk, out);
     }
 
+    Status MembraneManager::Freeze(std::string_view membrane)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->Freeze();
+    }
+
+    Status MembraneManager::Compact(std::string_view membrane)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->Compact();
+    }
+
 } // namespace pomai::core

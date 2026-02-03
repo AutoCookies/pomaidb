@@ -31,6 +31,9 @@ namespace pomai::core
         Status SearchLocal(std::span<const float> q, std::uint32_t k,
                            std::vector<pomai::SearchHit> *out) const;
 
+        Status Freeze();
+        Status Compact();
+
     private:
         std::unique_ptr<ShardRuntime> rt_;
     };

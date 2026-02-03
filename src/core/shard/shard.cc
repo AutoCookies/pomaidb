@@ -34,11 +34,13 @@ namespace pomai::core
         return rt_->Flush();
     }
 
-    pomai::Status Shard::SearchLocal(std::span<const float> query,
-                                     std::uint32_t topk,
-                                     std::vector<pomai::SearchHit> *out) const
+    pomai::Status Shard::SearchLocal(std::span<const float> q, std::uint32_t k,
+                              std::vector<pomai::SearchHit> *out) const
     {
-        return rt_->Search(query, topk, out);
+        return rt_->Search(q, k, out);
     }
+
+    Status Shard::Freeze() { return rt_->Freeze(); }
+    Status Shard::Compact() { return rt_->Compact(); }
 
 } // namespace pomai::core

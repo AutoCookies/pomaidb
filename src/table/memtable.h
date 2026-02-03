@@ -18,12 +18,31 @@ namespace pomai::table
         pomai::Status Get(pomai::VectorId id, const float** out_vec) const;
         pomai::Status Delete(pomai::VectorId id);
 
+        size_t GetCount() const { return map_.size(); }
+        void Clear();
+
         const float *GetPtr(pomai::VectorId id) const
         {
             auto it = map_.find(id);
             if (it == map_.end())
                 return nullptr;
             return it->second;
+        }
+
+
+        template <class Fn>
+        void IterateWithStatus(Fn &&fn) const
+        {
+            for (const auto &[id, ptr] : map_)
+            {
+                bool is_deleted = (ptr == nullptr);
+                // If deleted, vec is empty span.
+                std::span<const float> vec;
+                if (!is_deleted) {
+                    vec = std::span<const float>{ptr, dim_};
+                }
+                fn(id, vec, is_deleted);
+            }
         }
 
         template <class Fn>

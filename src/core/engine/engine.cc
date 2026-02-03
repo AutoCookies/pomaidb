@@ -165,6 +165,26 @@ namespace pomai::core
         return Status::Ok();
     }
 
+    Status Engine::Freeze()
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        for (auto &s : shards_) {
+            Status st = s->Freeze();
+            if (!st.ok()) return st;
+        }
+        return Status::Ok();
+    }
+
+    Status Engine::Compact()
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        for (auto &s : shards_) {
+            Status st = s->Compact();
+            if (!st.ok()) return st;
+        }
+        return Status::Ok();
+    }
+
     Status Engine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out)
     {
         if (!opened_)
