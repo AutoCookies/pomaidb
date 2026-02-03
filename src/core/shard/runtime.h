@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/shard/mailbox.h"
+#include "core/shard/snapshot.h"
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
@@ -141,21 +142,32 @@ namespace pomai::core
     private:
         void RunLoop();
 
+        // Internal helpers
         pomai::Status HandlePut(PutCmd &c);
-        GetReply HandleGet(GetCmd &c);
-        std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c);
         pomai::Status HandleDel(DelCmd &c);
         pomai::Status HandleFlush(FlushCmd &c);
         pomai::Status HandleFreeze(FreezeCmd &c);
         pomai::Status HandleCompact(CompactCmd &c);
-
         SearchReply HandleSearch(SearchCmd &c);
-        pomai::Status SearchLocalInternal(std::span<const float> query,
+        GetReply HandleGet(GetCmd &c);
+        std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c);
+
+        pomai::Status SearchLocalInternal(std::shared_ptr<ShardSnapshot> snap, 
+                                          std::span<const float> query,
                                           std::uint32_t topk,
                                           std::vector<pomai::SearchHit> *out);
                                           
         // Helper to load segments
         pomai::Status LoadSegments();
+
+        // Snapshot management
+        void PublishSnapshot();
+        std::shared_ptr<ShardSnapshot> GetSnapshot() {
+             return current_snapshot_.load(std::memory_order_acquire);
+        }
+        
+        // Soft Freeze: Move active memtable to frozen.
+        pomai::Status RotateMemTable();
 
         const std::uint32_t shard_id_;
         const std::string shard_dir_;
@@ -163,7 +175,13 @@ namespace pomai::core
 
         std::unique_ptr<storage::Wal> wal_;
         std::unique_ptr<table::MemTable> mem_;
+        // New: Frozen memtables (awaiting flush to disk)
+        std::vector<std::shared_ptr<table::MemTable>> frozen_mem_;
+        
         std::vector<std::shared_ptr<table::SegmentReader>> segments_;
+
+        // Snapshot
+        std::atomic<std::shared_ptr<ShardSnapshot>> current_snapshot_;
 
         // IVF coarse index for candidate selection (centroid routing).
         std::unique_ptr<pomai::index::IvfCoarse> ivf_;

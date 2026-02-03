@@ -193,3 +193,8 @@ if (POMAI_BUILD_BENCH)
   # target_link_libraries(my_bench PRIVATE pomai)
   # target_include_directories(my_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
+
+# Baseline Benchmark
+add_executable(bench_baseline tests/bench_baseline.cc)
+target_link_libraries(bench_baseline PRIVATE pomai)
+target_include_directories(bench_baseline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

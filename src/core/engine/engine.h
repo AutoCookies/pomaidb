@@ -9,6 +9,7 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "util/thread_pool.h"
 
 namespace pomai::core
 {
@@ -47,6 +48,7 @@ namespace pomai::core
         bool opened_ = false;
 
         std::vector<std::unique_ptr<Shard>> shards_;
+        std::unique_ptr<util::ThreadPool> search_pool_;
     };
 
 } // namespace pomai::core

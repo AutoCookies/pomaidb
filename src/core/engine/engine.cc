@@ -85,12 +85,9 @@ namespace pomai::core
                 return st;
 
             auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
-            // Ensure dir exists (Wal creates it? Engine creates it?) 
-            // Engine created opt_.path. Wal creates shard dir?
-            // Wal::Open uses EnsureDir logic.
-            // Let's rely on Wal or create it.
-            // Wal uses "shards" subdirectory.
-            // Let's pass it.
+            // Create shard dir if not exists (Wal might have created parent, but shards/i might be missing if new logic?)
+            std::filesystem::create_directories(shard_dir, ec);
+
             auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem), kMailboxCap);
             auto shard = std::make_unique<Shard>(std::move(rt));
 
@@ -100,6 +97,11 @@ namespace pomai::core
 
             shards_.push_back(std::move(shard));
         }
+        
+        // Init thread pool
+        size_t threads = std::thread::hardware_concurrency();
+        if (threads < 4) threads = 4;
+        search_pool_ = std::make_unique<util::ThreadPool>(threads);
 
         opened_ = true;
         return Status::Ok();
@@ -109,6 +111,7 @@ namespace pomai::core
     {
         if (!opened_)
             return Status::Ok();
+        search_pool_.reset(); // Stop pool first
         shards_.clear();
         opened_ = false;
         return Status::Ok();
@@ -199,16 +202,17 @@ namespace pomai::core
             return Status::Ok();
 
         std::vector<std::vector<pomai::SearchHit>> per(opt_.shard_count);
-        std::vector<std::thread> ts;
-        ts.reserve(opt_.shard_count);
+        std::vector<std::future<pomai::Status>> futures;
+        futures.reserve(opt_.shard_count);
 
         for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
         {
-            ts.emplace_back([&, i]
-                            { (void)shards_[i]->SearchLocal(query, topk, &per[i]); });
+            futures.push_back(search_pool_->Enqueue([&, i]
+                            { return shards_[i]->SearchLocal(query, topk, &per[i]); }));
         }
-        for (auto &t : ts)
-            t.join();
+        
+        for (auto &f : futures)
+            (void)f.get();
 
         std::vector<pomai::SearchHit> merged;
         for (auto &v : per)
