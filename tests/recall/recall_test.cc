@@ -74,16 +74,23 @@ POMAI_TEST(Recall_Clustered_Basic) {
     ShardRuntime rt(shard_id, path, dopt.dim, std::move(wal), std::move(mem), 1024);
     POMAI_EXPECT_OK(rt.Start());
     
+    // Keep a separate MemTable for Oracle that is NOT managed by ShardRuntime
+    auto oracle_mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);
+    
     // 3. Ingest
     std::cout << "[RecallTest] Ingesting " << dopt.num_vectors << " vectors..." << std::endl;
     for(size_t i=0; i<dopt.num_vectors; ++i) {
         pomai::VectorId id = ds.ids[i];
         std::span<const float> vec(&ds.data[i * dopt.dim], dopt.dim);
         
-        // Blockingly put (using internal HandlePut via future)
-        // Helper: rt.Put is sync.
         POMAI_EXPECT_OK(rt.Put(id, vec));
+        POMAI_EXPECT_OK(oracle_mem->Put(id, vec));
     }
+    // Must Freeze to make all data visible to Search
+    core::FreezeCmd fcmd;
+    auto fut = fcmd.done.get_future();
+    POMAI_EXPECT_OK(rt.Enqueue(core::Command{std::move(fcmd)}));
+    POMAI_EXPECT_OK(fut.get());
     
     // 4. Run Queries
     std::cout << "[RecallTest] Running " << dopt.num_queries << " queries..." << std::endl;
@@ -97,8 +104,8 @@ POMAI_TEST(Recall_Clustered_Basic) {
     for(size_t i=0; i<dopt.num_queries; ++i) {
         std::span<const float> query(&ds.queries[i * dopt.dim], dopt.dim);
         
-        // Oracle
-        auto gt = pomai::test::BruteForceSearch(query, k, mem_ptr, empty_segments);
+        // Oracle uses separate memtable
+        auto gt = pomai::test::BruteForceSearch(query, k, oracle_mem.get(), empty_segments);
         
         // System
         std::vector<SearchHit> res;
@@ -163,11 +170,20 @@ POMAI_TEST(Recall_Uniform_Hard) {
     ShardRuntime rt(shard_id, path, dopt.dim, std::move(wal), std::move(mem), 1024);
     POMAI_EXPECT_OK(rt.Start());
     
+    auto oracle_mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);
+
     // 3. Ingest
     std::cout << "[RecallTest] Ingesting..." << std::endl;
     for(size_t i=0; i<dopt.num_vectors; ++i) {
-        POMAI_EXPECT_OK(rt.Put(ds.ids[i], std::span<const float>(&ds.data[i * dopt.dim], dopt.dim)));
+        std::span<const float> vec(&ds.data[i * dopt.dim], dopt.dim);
+        POMAI_EXPECT_OK(rt.Put(ds.ids[i], vec));
+        POMAI_EXPECT_OK(oracle_mem->Put(ds.ids[i], vec));
     }
+    // Must Freeze
+    core::FreezeCmd fcmd;
+    auto fut = fcmd.done.get_future();
+    POMAI_EXPECT_OK(rt.Enqueue(core::Command{std::move(fcmd)}));
+    POMAI_EXPECT_OK(fut.get());
     
     // 4. Query
     std::vector<std::shared_ptr<SegmentReader>> empty_segments;
@@ -179,7 +195,7 @@ POMAI_TEST(Recall_Uniform_Hard) {
     std::cout << "[RecallTest] Querying..." << std::endl;
     for(size_t i=0; i<dopt.num_queries; ++i) {
         std::span<const float> query(&ds.queries[i * dopt.dim], dopt.dim);
-        auto gt = pomai::test::BruteForceSearch(query, k, mem_ptr, empty_segments);
+        auto gt = pomai::test::BruteForceSearch(query, k, oracle_mem.get(), empty_segments);
         
         auto t0 = std::chrono::steady_clock::now();
         std::vector<SearchHit> res;

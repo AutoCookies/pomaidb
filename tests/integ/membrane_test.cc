@@ -55,7 +55,10 @@ namespace
         // Same ID in different membranes must be isolated.
         POMAI_EXPECT_OK(db->Put("A", 100, vA));
         POMAI_EXPECT_OK(db->Put("B", 100, vB));
-        POMAI_EXPECT_OK(db->Flush());
+        
+        // Use Freeze for visibility
+        POMAI_EXPECT_OK(db->Freeze("A"));
+        POMAI_EXPECT_OK(db->Freeze("B"));
 
         {
             pomai::SearchResult r;
@@ -72,7 +75,8 @@ namespace
 
         // Delete in A must not affect B.
         POMAI_EXPECT_OK(db->Delete("A", 100));
-        POMAI_EXPECT_OK(db->Flush());
+        // Freeze to verify delete visibility
+        POMAI_EXPECT_OK(db->Freeze("A"));
 
         {
             pomai::SearchResult r;

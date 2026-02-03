@@ -1,6 +1,7 @@
 #include "core/shard/runtime.h"
 #include <filesystem>
 #include <cassert>
+#include <unordered_set>
 
 #include <algorithm>
 #include <cmath>
@@ -224,8 +225,9 @@ namespace pomai::core
         }
 
         // 2. Check Segments (Newest -> Oldest)
+        // segments_ is [Newest, ..., Oldest] (based on HandleFreeze insert(begin))
         
-        for (auto it = snap->segments.rbegin(); it != snap->segments.rend(); ++it) {
+        for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
             std::span<const float> svec;
             auto res = (*it)->Find(id, &svec);
             if (res == table::SegmentReader::FindResult::kFound) {
@@ -247,7 +249,7 @@ namespace pomai::core
         }
 
         // 2. Check Segments (Newest -> Oldest)
-        for (auto it = snap->segments.rbegin(); it != snap->segments.rend(); ++it) {
+        for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
             std::span<const float> svec;
             auto res = (*it)->Find(id, &svec);
              if (res == table::SegmentReader::FindResult::kFound) {
@@ -639,22 +641,29 @@ namespace pomai::core
         out->clear();
         out->reserve(topk);
 
-        // Try IVF candidate selection (Optional - skipping for now to focus on Snapshot logic)
-        // Note: IVF index is currently NOT in snapshot. It lives in ShardRuntime.
-        // Is IVF thread safe? IvfCoarse::SelectCandidates is usually read-only.
-        // If HandleDel modifies IVF... (Delete calls ivf_->Delete).
-        // If Writer modifies IVF while Reader reads it -> RACE.
-        // User request: "Optimized... IVF".
-        // Baseline: IVF is there.
-        // Correctness: I must protect IVF or put it in Snapshot.
-        // Putting IVF in Snapshot is hard (it's mutable).
-        // Simple Fix: Fallback to Brute Force for Phase 1/2?
-        // The prompt says "Reads may observe a slightly stale snapshot".
-        // If I skip IVF and do Brute Force on Snapshot, it's correct but slow.
-        // But the requirements say "Linear-ish scaling".
-        // If I use IVF, I need locking or COW.
-        // For now, I will use Brute Force on Snapshot to ensure SAFETY (TSAN clean).
-        // I will comment out IVF usage for Search and rely on Brute Force scan of snapshot items.
+        // Phase 1: Build tombstone set from all frozen memtables
+        // We need to track which IDs have been deleted so we can skip them
+        // when scanning older memtables and segments.
+        std::unordered_set<VectorId> tombstones;
+        std::unordered_set<VectorId> seen_ids;  // Track IDs we've already scored
+        
+        // Collect tombstones from all frozen memtables (newest to oldest)
+        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
+            (*it)->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+                if (is_deleted) {
+                    tombstones.insert(id);
+                }
+            });
+        }
+        
+        // Also collect tombstones from segments (Newest -> Oldest)
+        for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
+            (*it)->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+                if (is_deleted) {
+                    tombstones.insert(id);
+                }
+            });
+        }
         
         auto push_topk = [&](pomai::VectorId id, float score)
         {
@@ -682,18 +691,23 @@ namespace pomai::core
                            { return a.score > b.score; });
         };
 
-        // Scan Frozen MemTables
-        for (const auto& fmem : snap->frozen_memtables) {
-             fmem->ForEach([&](VectorId id, std::span<const float> vec) {
+        // Phase 2: Scan frozen memtables (newest to oldest)
+        // Skip tombstones and already-seen IDs
+        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
+             (*it)->ForEach([&](VectorId id, std::span<const float> vec) {
+                  if (tombstones.count(id) || seen_ids.count(id)) return;
+                  seen_ids.insert(id);
                   float score = pomai::core::Dot(query, vec);
                   push_topk(id, score);
              });
         }
 
-        // Scan Segments
-        for (const auto& seg : snap->segments) {
-            seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                if (is_deleted) return;
+        // Phase 3: Scan segments (newest to oldest)
+        // Skip tombstones and already-seen IDs
+        for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
+            (*it)->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+                if (is_deleted || tombstones.count(id) || seen_ids.count(id)) return;
+                seen_ids.insert(id);
                 float score = pomai::core::Dot(query, vec);
                 push_topk(id, score);
             });
