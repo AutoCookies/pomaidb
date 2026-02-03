@@ -148,6 +148,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(membrane_test)
   pomai_add_labeled_test(membrane_test "integ")
 
+  add_executable(manifest_corruption_test tests/crash/manifest_corruption_test.cc)
+  pomai_setup_test(manifest_corruption_test)
+  pomai_add_labeled_test(manifest_corruption_test "crash")
+
   # ---- Crash (Gate #2) ----
   if (POMAI_ENABLE_CRASH_TESTS)
     add_executable(pomai_crash_test tests/crash/crash_replay_test.cc)

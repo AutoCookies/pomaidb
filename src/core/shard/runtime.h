@@ -149,8 +149,12 @@ namespace pomai::core
         pomai::Status HandleFreeze(FreezeCmd &c);
         pomai::Status HandleCompact(CompactCmd &c);
         SearchReply HandleSearch(SearchCmd &c);
-        GetReply HandleGet(GetCmd &c);
-        std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c);
+        // GetReply HandleGet(GetCmd &c); // Deprecated
+        // std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c); // Deprecated
+
+        // Lock-free internal helpers
+        pomai::Status GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out);
+        std::pair<pomai::Status, bool> ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id);
 
         pomai::Status SearchLocalInternal(std::shared_ptr<ShardSnapshot> snap, 
                                           std::span<const float> query,
@@ -182,6 +186,7 @@ namespace pomai::core
 
         // Snapshot
         std::atomic<std::shared_ptr<ShardSnapshot>> current_snapshot_;
+        std::uint64_t next_snapshot_version_ = 1;
 
         // IVF coarse index for candidate selection (centroid routing).
         std::unique_ptr<pomai::index::IvfCoarse> ivf_;

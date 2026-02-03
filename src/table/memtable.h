@@ -29,6 +29,12 @@ namespace pomai::table
             return it->second;
         }
 
+        bool IsTombstone(pomai::VectorId id) const
+        {
+            auto it = map_.find(id);
+            return (it != map_.end()) && (it->second == nullptr);
+        }
+
 
         template <class Fn>
         void IterateWithStatus(Fn &&fn) const

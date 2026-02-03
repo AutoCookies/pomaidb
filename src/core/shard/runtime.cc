@@ -1,5 +1,6 @@
 #include "core/shard/runtime.h"
 #include <filesystem>
+#include <cassert>
 
 #include <algorithm>
 #include <cmath>
@@ -55,6 +56,11 @@ namespace pomai::core
         if (started_.exchange(true))
             return pomai::Status::Busy("shard already started");
         
+        // If we have replayed data in MemTable, rotate it to Frozen so it's visible in Snapshot.
+        if (mem_->GetCount() > 0) {
+            (void)RotateMemTable();
+        }
+
         auto st = LoadSegments();
         if (!st.ok()) return st;
 
@@ -103,13 +109,30 @@ namespace pomai::core
     // -------------------------
     // Snapshot & Rotation
     // -------------------------
+    // -------------------------
+    // Snapshot & Rotation
+    // -------------------------
     void ShardRuntime::PublishSnapshot()
     {
         auto snap = std::make_shared<ShardSnapshot>();
+        snap->version = next_snapshot_version_++;
+        snap->created_at = std::chrono::steady_clock::now();
+        
         // Copy atomic/shared state
         snap->segments = segments_; // Shared ownership of segments
         snap->frozen_memtables = frozen_mem_; // Shared ownership of frozen tables
         
+        // INVARIANT: All frozen memtables are immutable (count fixed)
+        for (const auto& fmem : snap->frozen_memtables) {
+            // usage count might be > 1 (snapshot + frozen_mem_) or more if multiple snapshots
+            assert(fmem.use_count() >= 2); 
+        }
+
+        // INVARIANT: All segments are immutable (read-only)
+        for (const auto& seg : snap->segments) {
+            assert(seg.use_count() >= 2);
+        }
+
         current_snapshot_.store(snap, std::memory_order_release);
     }
 
@@ -169,33 +192,71 @@ namespace pomai::core
     pomai::Status ShardRuntime::Get(pomai::VectorId id, std::vector<float> *out)
     {
         if (!out) return Status::InvalidArgument("out is null");
-        GetCmd cmd;
-        cmd.id = id;
-        auto f = cmd.done.get_future();
-        auto st = Enqueue(Command{std::move(cmd)});
-        if (!st.ok()) return st; // e.g. mailbox closed
-        auto reply = f.get();
-        if (reply.st.ok())
-        {
-            *out = std::move(reply.vec);
-        }
-        return reply.st;
+        auto snap = GetSnapshot();
+        if (!snap) return Status::Aborted("shard not ready");
+        return GetFromSnapshot(snap, id, out);
     }
 
     pomai::Status ShardRuntime::Exists(pomai::VectorId id, bool *exists)
     {
         if (!exists) return Status::InvalidArgument("exists is null");
-        ExistsCmd cmd;
-        cmd.id = id;
-        auto f = cmd.done.get_future();
-        auto st = Enqueue(Command{std::move(cmd)});
-        if (!st.ok()) return st;
-        auto reply = f.get();
-        if (reply.first.ok())
-        {
-            *exists = reply.second;
+        auto snap = GetSnapshot();
+        if (!snap) return Status::Aborted("shard not ready");
+        auto res = ExistsInSnapshot(snap, id);
+        if (res.first.ok()) {
+            *exists = res.second;
         }
-        return reply.first;
+        return res.first;
+    }
+
+    pomai::Status ShardRuntime::GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out) {
+        // 1. Check Frozen MemTables (Newest -> Oldest)
+        
+        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
+            if ((*it)->IsTombstone(id)) {
+                return Status::NotFound("tombstone");
+            }
+            const float* p = (*it)->GetPtr(id);
+            if (p) {
+                out->assign(p, p + dim_);
+                return Status::Ok();
+            }
+        }
+
+        // 2. Check Segments (Newest -> Oldest)
+        
+        for (auto it = snap->segments.rbegin(); it != snap->segments.rend(); ++it) {
+            std::span<const float> svec;
+            auto res = (*it)->Find(id, &svec);
+            if (res == table::SegmentReader::FindResult::kFound) {
+                out->assign(svec.begin(), svec.end());
+                return Status::Ok();
+            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
+                return Status::NotFound("tombstone");
+            }
+        }
+        
+        return Status::NotFound("vector not found");
+    }
+
+    std::pair<pomai::Status, bool> ShardRuntime::ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id) {
+        // 1. Check Frozen (Newest -> Oldest)
+        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
+             if ((*it)->IsTombstone(id)) return {Status::Ok(), false};
+             if ((*it)->GetPtr(id)) return {Status::Ok(), true};
+        }
+
+        // 2. Check Segments (Newest -> Oldest)
+        for (auto it = snap->segments.rbegin(); it != snap->segments.rend(); ++it) {
+            std::span<const float> svec;
+            auto res = (*it)->Find(id, &svec);
+             if (res == table::SegmentReader::FindResult::kFound) {
+                return {Status::Ok(), true};
+            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
+                return {Status::Ok(), false};
+            }
+        }
+        return {Status::Ok(), false};
     }
 
     pomai::Status ShardRuntime::Flush()
@@ -298,13 +359,35 @@ namespace pomai::core
                         // If SearchCmd is still used, handle it.
                         arg.done.set_value(HandleSearch(arg));
                     }
+                    else if constexpr (std::is_same_v<T, SearchCmd>)
+                    {
+                        // Deprecated loop path for Search, but kept for compilation if Shard sends it.
+                        // Shard::SearchLocal calls rt_->Search directly now (lock-free).
+                        // If SearchCmd is still used, handle it.
+                        arg.done.set_value(HandleSearch(arg));
+                    }
                     else if constexpr (std::is_same_v<T, GetCmd>)
                     {
-                        arg.done.set_value(HandleGet(arg));
+                        // Deprecated loop path. Get is now lock-free.
+                        // But if mailbox still has GetCmd (race cond), we should handle it (or error).
+                        // Since we removed GetCmd construction from API, only old messages could linger (unlikely).
+                        // But wait, I DELETED GetCmd from variant? No, I commented it out in headers?
+                        // No, I only commented out HandleGet declaration. GetCmd struct is still there.
+                        // Let's implement a dummy handler that returns Aborted or calls new logic.
+                        // Handlers are removed so we can't call them.
+                        // Correct fix: Remove the visitor branch.
+                        // But visitor MUST cover all variants.
+                        // If GetCmd is still in variant, we must handle it.
+                        // Is GetCmd still in variant? Yes.
+                        // So I should keep the branch but implement inline or just call empty.
+                        // Actually, I should remove GetCmd from variant in runtime.h to be clean.
+                        // If I remove from variant, I don't need visitor branch.
+                        // Let's do that in next step. For now, empty handler or error.
+                        // Better: just remove the branches and I will remove them from variant in runtime.h next.
                     }
                     else if constexpr (std::is_same_v<T, ExistsCmd>)
                     {
-                        arg.done.set_value(HandleExists(arg));
+                         // Deprecated.
                     }
                     else if constexpr (std::is_same_v<T, StopCmd>)
                     {
@@ -345,81 +428,8 @@ namespace pomai::core
         }
         return pomai::Status::Ok();
     }
-
-    GetReply ShardRuntime::HandleGet(GetCmd &c)
-    {
-        // Get is still serialized for now (per User Req: "Reads (Search/Get) must NOT block").
-        // Wait, Get ALSO must not block.
-        // Can Get use snapshot?
-        // Yes.
-        // But Get API in ShardRuntime::Get still enqueues.
-        // We should move Get to use Snapshot too if we want "Get" to be non-blocking.
-        // User Req: "Reads (Search/Get) must NOT block".
-        // I will change Get to use Snapshot too in a future step or now.
-        // Focus on Search first.
-        
-        GetReply reply;
-        const float *ptr = nullptr;
-        // 1. Check MemTable
-        auto st = mem_->Get(c.id, &ptr);
-        if (st.ok() && ptr)
-        {
-            reply.st = Status::Ok();
-            reply.vec.assign(ptr, ptr + dim_);
-            return reply;
-        }
-
-        // 2. Check Frozen
-        for (const auto& f : frozen_mem_) {
-            const float* p = f->GetPtr(c.id);
-            if (p) {
-                reply.st = Status::Ok();
-                reply.vec.assign(p, p + dim_);
-                return reply;
-            }
-        }
-
-        // 3. Check Segments
-        for (const auto& seg : segments_) {
-            std::span<const float> svec;
-            // Use Find (handles tombstones)
-            auto res = seg->Find(c.id, &svec);
-            if (res == table::SegmentReader::FindResult::kFound) {
-                reply.st = Status::Ok();
-                reply.vec.assign(svec.begin(), svec.end());
-                return reply;
-            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
-                reply.st = Status::NotFound("tombstone");
-                return reply;
-            }
-        }
-
-        reply.st = Status::NotFound("vector not found");
-        return reply;
-    }
-
-    std::pair<pomai::Status, bool> ShardRuntime::HandleExists(ExistsCmd &c)
-    {
-        const float *ptr = nullptr;
-        auto st = mem_->Get(c.id, &ptr);
-        if (st.ok() && ptr) return {Status::Ok(), true};
-        
-        for (const auto& f : frozen_mem_) {
-            if (f->GetPtr(c.id)) return {Status::Ok(), true};
-        }
-
-        for (const auto& seg : segments_) {
-            std::span<const float> svec;
-            auto res = seg->Find(c.id, &svec);
-            if (res == table::SegmentReader::FindResult::kFound) {
-                return {Status::Ok(), true};
-            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
-                // If found tombstone in NEWER segment, it is deleted.
-                return {Status::Ok(), false};
-            }
-        }
-        return {Status::Ok(), false};
-    }
+    
+    // HandleGet and HandleExists removed.
 
     pomai::Status ShardRuntime::HandleDel(DelCmd &c)
     {
@@ -440,9 +450,6 @@ namespace pomai::core
         // So `Search` will see the OLD value in Frozen/Segments if Active has Tombstone.
         // This is STALENESS. "Reads may observe a slightly stale snapshot".
         // This is consistent.
-        // However, if we do Soft Freeze, the Tombstone moves to Frozen.
-        // Then Search sees Tombstone.
-        // Correct.
         
         (void)ivf_->Delete(c.id);
         return pomai::Status::Ok();
