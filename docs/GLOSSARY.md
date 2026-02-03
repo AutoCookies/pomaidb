@@ -1,0 +1,23 @@
+# Glossary (canonical terms)
+
+> This glossary is the single source of truth for terminology used across the docs.
+
+- **Active MemTable**: The mutable in-memory table that receives new writes on a shard. It is **not** included in snapshots and is therefore invisible to reads until it is rotated to frozen. (Source: `pomai::core::ShardRuntime::HandlePut`, `RotateMemTable`.)
+- **Frozen MemTable**: An immutable MemTable created by rotating the active MemTable. Frozen tables are included in snapshots and visible to reads. (Source: `pomai::core::ShardRuntime::RotateMemTable`, `ShardSnapshot`.)
+- **Freeze (soft)**: Rotation of the active MemTable into the frozen set, followed by snapshot publication. Triggered automatically when the active MemTable reaches 5000 entries per shard. (Source: `pomai::core::ShardRuntime::HandlePut`.)
+- **Freeze (hard / API)**: The `Freeze` API flushes all frozen tables to segments, updates shard manifest, resets WAL, and publishes a new snapshot. (Source: `pomai::core::ShardRuntime::HandleFreeze`.)
+- **Flush**: WAL durability boundary via `fdatasync` when enabled; does not change visibility. (Source: `pomai::core::ShardRuntime::HandleFlush`, `pomai::storage::Wal::Flush`.)
+- **Checkpoint**: Not a distinct concept in current code. The closest behavior is `Freeze`, which writes segments and resets WAL. (Assumption based on code structure.)
+- **Mailbox / Actor**: The bounded MPSC queue and single writer thread that serializes write commands per shard. (Source: `pomai::core::ShardRuntime`, `BoundedMpscQueue`.)
+- **Shard**: A partition of the key space; each shard has a single writer thread and its own WAL and segment set. (Source: `pomai::core::Engine::ShardOf`, `pomai::core::ShardRuntime`.)
+- **Shard Snapshot (`ShardSnapshot`)**: Immutable view of a shard’s frozen tables and segments; readers use a shared_ptr to access it lock-free. (Source: `pomai::core::ShardSnapshot`, `ShardRuntime::PublishSnapshot`.)
+- **Snapshot publication**: Atomic replace of `current_snapshot_` with a new `ShardSnapshot`. (Source: `pomai::core::ShardRuntime::PublishSnapshot`.)
+- **WAL (Write-Ahead Log)**: Append-only log per shard used for crash recovery. Frames include a prefix with sequence, op type, id, and optional vector payload. (Source: `pomai::storage::Wal`.)
+- **WAL prefix consistency**: Snapshots represent a prefix of the WAL history; writes become visible only after snapshot publication. (Source: `core/shard/invariants.h`.)
+- **Segment**: Immutable on-disk file storing vectors and tombstones in sorted order. (Source: `pomai::table::SegmentBuilder`, `SegmentReader`.)
+- **Shard manifest**: `manifest.current` in each shard directory listing active segment files. Updated by atomic rename and directory fsync. (Source: `pomai::core::ShardManifest`.)
+- **Membrane**: Logical namespace/collection configured by `MembraneSpec`. Currently managed in-memory by `MembraneManager` and not persisted by default. (Source: `pomai::core::MembraneManager`.)
+- **Membrane manifest**: `MANIFEST` under `membranes/<name>` storing persistent membrane specs; present in code but not wired into `DB::Open`. (Source: `pomai::storage::Manifest`.)
+- **RYW (Read-Your-Writes)**: The property that a thread can read its own write without waiting; **not supported** until a soft/hard freeze publishes a snapshot. (Source: `core/shard/invariants.h` + snapshot visibility.)
+- **SI (Snapshot Isolation)**: Readers operate on a snapshot that is not affected by concurrent writes. (Source: `ShardRuntime::Get`, `Search`, snapshot publication.)
+- **SOT (Source of Truth)**: The codebase defines the system behavior; docs point to exact symbols/files for each guarantee. (Policy.)
