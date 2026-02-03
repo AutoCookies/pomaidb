@@ -1,68 +1,134 @@
 # PomaiDB
 
-PomaiDB is a local-first, single-machine, embedded vector database built in C++20. It implements a sharded, actor-model architecture with **lock-free snapshot isolation** for high-concurrency read workloads.
+## Executive summary (20–30 lines)
+PomaiDB is a single-process, embedded vector database implemented in C++20. 
+It targets applications that need local vector search without external services. 
+Data is partitioned into shards; each shard has a single writer thread. 
+Readers are lock-free and use immutable snapshots for concurrency safety. 
+Writes go through a write-ahead log (WAL) before mutating memory. 
+Reads observe a published snapshot, not the active mutable MemTable. 
+Snapshots are monotonically versioned and represent a prefix of WAL history. 
+Visibility is bounded by MemTable rotation (soft freeze) or explicit Freeze. 
+By default, soft freeze triggers after 5000 items per shard. 
+The database is crash-recoverable by replaying WAL into MemTables. 
+On startup, replayed data is rotated to frozen tables for immediate visibility. 
+Segments are immutable on-disk files written during Freeze. 
+Segment lists are persisted via shard manifests with atomic rename + dir fsync. 
+Durability depends on the configured fsync policy for WAL and segment files. 
+The default fsync policy is `kNever`, so durability is best-effort. 
+Search currently uses brute-force scanning over snapshot items for correctness. 
+IVF is present in code but bypassed in the read path today. 
+Metrics are not yet exposed; operators must instrument externally. 
+PomaiDB is not distributed and does not implement replication. 
+It is intended for embedded, single-tenant deployments only. 
+Membranes provide logical separation but are currently in-memory only. 
+On-disk membrane manifests exist but are not wired into DB::Open. 
+The API exposes explicit Freeze and Flush for visibility and durability control. 
+Documentation is written to match the current code on branch `pomai-embeded`. 
 
-> [!NOTE]
-> **Status**: Alpha (Hardening Phase).
-> **Consistency Model**: Snapshot Isolation with Bounded Staleness.
+## What it is
+- An embedded, single-process vector database with sharded, actor-style writers.
+- A lock-free snapshot reader model for Search/Get/Exists.
+- A WAL + immutable segment storage engine for crash recovery.
 
-## System Model & Guarantees
+## What it is not
+- Not distributed or replicated.
+- Not multi-tenant or cloud-managed.
+- Not a general-purpose SQL/OLAP database.
 
-### 1. Concurrency & Isolation
-PomaiDB separates Read and Write paths to ensure readers never block writers and vice-versa.
+## Quick links (authoritative docs)
+- Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Consistency model: [docs/CONSISTENCY_MODEL.md](docs/CONSISTENCY_MODEL.md)
+- Failure semantics: [docs/FAILURE_SEMANTICS.md](docs/FAILURE_SEMANTICS.md)
+- On-disk format: [docs/ON_DISK_FORMAT.md](docs/ON_DISK_FORMAT.md)
+- Operations: [docs/OPERATIONS.md](docs/OPERATIONS.md)
+- Performance: [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+- Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
+- Glossary: [docs/GLOSSARY.md](docs/GLOSSARY.md)
+- FAQ: [docs/FAQ.md](docs/FAQ.md)
 
-- **Writes (Put/Delete)**: Serialized per-shard via a bounded mailbox (Actor Model).
-- **Reads (Search/Get/Exists)**: **Lock-Free**. Reads access an atomic `ShardSnapshot`.
-- **Visibility (Bounded Staleness)**:
-    - Writes go to an **Active MemTable** (invisible to readers).
-    - Data becomes visible ONLY after a **Soft Freeze** (Snapshot update).
-    - Soft Freeze triggers automatically (default: 5000 items) or via manual `Freeze()`.
-    - **No Read-Your-Writes**: A thread writing data will not see it in `Get()` until the next freeze.
+## Hello World (embedded C++)
+```cpp
+#include <iostream>
+#include <memory>
+#include <vector>
 
-### 2. Storage Hierarchy
-Data flows through immutable states:
-$$ \text{Active (Mutable)} \xrightarrow{\text{Freeze}} \text{Frozen (Immutable)} \xrightarrow{\text{Flush}} \text{Segment (Disk)} $$
+#include "pomai/pomai.h"
 
-- **Active MemTable**: Mutable, write-only, invisible to readers.
-- **Frozen MemTables**: Immutable, visible to readers (in Snapshot).
-- **Segments**: Immutable on-disk files, visible to readers (in Snapshot).
-- **WAL**: Durability log (Prefix Consistency).
+int main() {
+    pomai::DBOptions opt;
+    opt.path = "./demo_db";
+    opt.dim = 4;
+    opt.shard_count = 2;
+    opt.fsync = pomai::FsyncPolicy::kAlways; // optional: durability boundary for WAL
 
-### 3. Snapshot Semantics
-A `ShardSnapshot` gives a consistent view of the database at a point in time.
-- **Immutability**: Snapshots reference only immutable data structures (Frozen MemTables + Segments).
-- **Ordering**: Snapshots represent a strictly monotonic prefix of the WAL history.
-- **Lifetime**: Memory is automatically reclaimed when the last reader releases the snapshot (`std::shared_ptr`).
+    std::unique_ptr<pomai::DB> db;
+    pomai::Status st = pomai::DB::Open(opt, &db);
+    if (!st.ok()) {
+        std::cerr << "Open failed: " << st.message() << "\n";
+        return 1;
+    }
 
-## Data Model
-- **Vectors**: Dense Float32 only. No quantization (yet).
-- **Distance**: Euclidean (L2).
-- **Search**: exact re-ranking of results.
-    - *Current Limitation*: Algorithm is brute-force scan over snapshot items (IVF bypass for correctness).
+    float v1[] = {1, 0, 0, 0};
+    float v2[] = {0, 1, 0, 0};
+    db->Put(42, v1);
+    db->Put(7, v2);
 
-## Persistence & Durability
-- **WAL**: All Puts/Deletes are appended to WAL before memory ack.
-- **Crash Recovery**: On restart, WAL is replayed into MemTable.
-- **Startup Visibility**: Replayed data is automatically rotated to Frozen on startup, making it immediately visible.
+    // Publish a snapshot so reads can see recent writes.
+    db->Freeze("__default__");
 
-## Build & Test
+    pomai::SearchResult out;
+    db->Search(std::span<const float>(v1, 4), 2, &out);
+    for (const auto &hit : out.hits) {
+        std::cout << "id=" << hit.id << " score=" << hit.score << "\n";
+    }
 
-### Dependencies
-- C++20 Compiler
-- CMake 3.20+
-
-### Commands
-```bash
-# Build
-cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
-cmake --build build -j
-
-# Run Tests
-ctest --test-dir build --output-on-failure
+    db->Close();
+    return 0;
+}
 ```
 
-## Known Limitations
-1. **Bounded Staleness**: Reads lag writes by ~5000 ops (configurable).
-2. **Directory Sync**: Segment creation relies on OS/Filesystem for directory entry sync (strict `fsync` on dir not fully guaranteed on all platforms).
-3. **IVF Bypass**: Search currently performs a linear scan of the snapshot for maximum correctness (TSAN clean), ignoring the IVF index.
-4. **Single Tenant**: Designed for embedded, single-app use.
+## API overview
+- **Create/Open**: `pomai::DB::Open(DBOptions, ...)`
+- **Upsert/Delete**: `Put`, `Delete` (per-membrane and default membrane overloads)
+- **Read**: `Get`, `Exists`, `Search`
+- **Freeze**: publish visibility + flush frozen tables to segments
+- **Flush**: WAL durability boundary (subject to fsync policy)
+- **Close**: `Close` closes all membranes and shards
+
+## Guarantee matrix
+| Operation | Durability | Visibility | Isolation | Ordering | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Upsert (Put/Delete) | WAL appended; durable if WAL `fsync=kAlways` or after `Flush` | Not visible until soft freeze or `Freeze` | Snapshot isolation per shard | Per-shard order via mailbox | Active MemTable is not in snapshot. |
+| Search | Reads a single immutable snapshot | Snapshot state only | Snapshot isolation | Per-shard snapshot ordering only | Brute-force scan over frozen + segments. |
+| Get/Exists | Reads a single immutable snapshot | Snapshot state only | Snapshot isolation | Per-shard snapshot ordering only | Active MemTable is not in snapshot. |
+| Freeze | Segment files + shard manifest updated; WAL reset | Publishes a new snapshot after segment update | Readers move to new snapshot atomically | Per-shard only | Segment rename + manifest fsync; no global barrier. |
+| Flush | WAL `fdatasync` if `fsync != kNever` | No visibility change | N/A | N/A | Flush is a durability boundary only. |
+| Recovery | WAL replay into MemTable + rotate to frozen | Replayed data visible after startup rotation | Snapshot isolation post-open | Per-shard only | Truncated WAL tail tolerated. |
+
+## Build, test, benchmark
+```bash
+# Build library + baseline benchmark
+cmake -S . -B build
+cmake --build build -j
+
+# Build and run tests
+cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+
+# Run baseline benchmark
+./build/bench_baseline
+```
+
+## Known limitations (current code)
+1. **Bounded staleness is fixed at 5000 items per shard** (not configurable yet).
+2. **No read-your-writes** until a soft freeze or explicit `Freeze` publishes a snapshot.
+3. **Search uses brute-force scan**; IVF is bypassed for correctness.
+4. **Metric selection is not wired into Search** (dot product is used for scoring).
+5. **No built-in metrics or logging**; operators must instrument externally.
+6. **Membrane manifests exist on disk but are not wired into DB::Open**.
+7. **Directory fsync behavior depends on OS/filesystem** for segment renames.
+
+## License
+Apache-2.0 (see [LICENSE](LICENSE)).
