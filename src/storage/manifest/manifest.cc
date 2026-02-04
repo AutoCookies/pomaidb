@@ -109,10 +109,10 @@ namespace pomai::storage
             // Calculate and write CRC
             uint32_t crc = pomai::util::Crc32c(content.data(), content.size());
             char crc_buf[4];
-            crc_buf[0] = crc & 0xFF;
-            crc_buf[1] = (crc >> 8) & 0xFF;
-            crc_buf[2] = (crc >> 16) & 0xFF;
-            crc_buf[3] = (crc >> 24) & 0xFF;
+            crc_buf[0] = static_cast<char>(crc & 0xFF);
+            crc_buf[1] = static_cast<char>((crc >> 8) & 0xFF);
+            crc_buf[2] = static_cast<char>((crc >> 16) & 0xFF);
+            crc_buf[3] = static_cast<char>((crc >> 24) & 0xFF);
 
             st = pf.PWrite(content.size(), crc_buf, 4);
             if (!st.ok()) return st;
@@ -260,9 +260,8 @@ namespace pomai::storage
             else if (spec.metric == pomai::MetricType::kCosine) mtype = "COS";
             out += "metric " + mtype + "\n";
 
-            out += "index_params " + std::to_string(spec.index_params.num_lists) + " " + 
-                   std::to_string(spec.index_params.ef_construction) + " " + 
-                   std::to_string(spec.index_params.ef_search) + "\n";
+            out += "index_params " + std::to_string(spec.index_params.nlist) + " " + 
+                   std::to_string(spec.index_params.nprobe) + "\n";
 
             return AtomicWriteFile(MembraneManifestPath(root_path, spec.name), out);
         }
@@ -310,10 +309,9 @@ namespace pomai::storage
                         else spec->metric = pomai::MetricType::kL2;
                     }
                 } else if (toks[0] == "index_params") {
-                    if (toks.size() > 3) {
-                         ParseU32(toks[1], &spec->index_params.num_lists);
-                         ParseU32(toks[2], &spec->index_params.ef_construction);
-                         ParseU32(toks[3], &spec->index_params.ef_search);
+                    if (toks.size() > 2) {
+                         ParseU32(toks[1], &spec->index_params.nlist);
+                         ParseU32(toks[2], &spec->index_params.nprobe);
                     }
                 }
             }

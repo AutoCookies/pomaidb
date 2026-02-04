@@ -26,8 +26,26 @@ namespace pomai::core
         spec.shard_count = base_.shard_count;
 
         auto st = CreateMembrane(spec);
-        if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists)
+        if (st.code() == pomai::ErrorCode::kAlreadyExists)
+        {
+            // Already in manifest. Load valid spec and instantiate engine so we can Open it.
+            pomai::MembraneSpec loaded_spec;
+            st = storage::Manifest::GetMembrane(base_.path, spec.name, &loaded_spec);
+            if (!st.ok()) return st;
+
+            pomai::DBOptions opt = base_;
+            opt.dim = loaded_spec.dim;
+            opt.shard_count = loaded_spec.shard_count;
+            opt.index_params = loaded_spec.index_params;
+            opt.path = base_.path + "/membranes/" + spec.name;
+
+            engines_.emplace(spec.name, std::make_unique<Engine>(opt));
+            st = Status::Ok(); // clear error
+        }
+        else if (!st.ok())
+        {
             return st;
+        }
 
         st = OpenMembrane(kDefaultMembrane);
         if (!st.ok()) return st;
@@ -37,8 +55,6 @@ namespace pomai::core
         st = storage::Manifest::ListMembranes(base_.path, &membranes);
         if (!st.ok()) 
         {
-             // If manifest corrupted or missing, we might want to fail hard?
-             // Since we just created default membrane, EnsureInitialized must have run.
              return st;
         }
 
@@ -46,20 +62,16 @@ namespace pomai::core
         {
             if (name == kDefaultMembrane) continue;
             
-            // "Create" in memory without checking manifest (already checked via ListMembranes)
-            // But we can use the existing CreateMembrane logic which re-loads manifest?
-            // Actually, CreateMembrane checks if manifest exists.
-            // Let's use GetMembrane to get spec, then create in-memory engine, then open.
-            
             pomai::MembraneSpec mspec;
             st = storage::Manifest::GetMembrane(base_.path, name, &mspec);
             if (!st.ok()) return st;
 
-            // Register engine in manager (in-memory)
+            // Register engine in manager
             if (engines_.find(name) == engines_.end()) {
                 pomai::DBOptions opt = base_;
                 opt.dim = mspec.dim;
                 opt.shard_count = mspec.shard_count;
+                opt.index_params = mspec.index_params;
                 opt.path = base_.path + "/membranes/" + name;
                 engines_.emplace(name, std::make_unique<Engine>(opt));
             }
@@ -116,6 +128,11 @@ namespace pomai::core
         if (engines_.find(spec.name) != engines_.end())
             return Status::AlreadyExists("membrane already exists");
 
+        // 1. Persist to Manifest
+        // We use base_.path as the root_path for the DB.
+        auto st = storage::Manifest::CreateMembrane(base_.path, spec);
+        if (!st.ok()) return st;
+
         pomai::DBOptions opt = base_;
         opt.dim = spec.dim;
         opt.shard_count = spec.shard_count;
@@ -133,6 +150,12 @@ namespace pomai::core
         auto it = engines_.find(std::string(name));
         if (it == engines_.end())
             return Status::NotFound("membrane not found");
+
+        // 1. Persist to Manifest
+        auto st = storage::Manifest::DropMembrane(base_.path, name);
+        if (!st.ok()) return st;
+
+        // 2. Remove from Memory
         (void)it->second->Close();
         engines_.erase(it);
         return Status::Ok();

@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <span>
 #include <unordered_map>
+#include <shared_mutex>
 #include "pomai/status.h"
 #include "pomai/types.h"
 #include "table/arena.h"
@@ -44,6 +45,7 @@ namespace pomai::table
         template <class Fn>
         void IterateWithStatus(Fn &&fn) const
         {
+            std::shared_lock lock(mutex_);
             for (const auto &[id, ptr] : map_)
             {
                 bool is_deleted = (ptr == nullptr);
@@ -59,6 +61,7 @@ namespace pomai::table
         template <class Fn>
         void ForEach(Fn &&fn) const
         {
+            std::shared_lock lock(mutex_);
             for (const auto &[id, ptr] : map_)
             {
                 if (ptr == nullptr)
@@ -71,6 +74,7 @@ namespace pomai::table
         std::uint32_t dim_;
         Arena arena_;
         std::unordered_map<pomai::VectorId, float *> map_;
+        mutable std::shared_mutex mutex_;
     };
 
 } // namespace pomai::table

@@ -113,6 +113,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(mailbox_test)
   pomai_add_labeled_test(mailbox_test "unit")
 
+  add_executable(wal_test tests/unit/wal_test.cc)
+  pomai_setup_test(wal_test)
+  pomai_add_labeled_test(wal_test "unit")
+
   add_executable(segment_test tests/unit/segment_test.cc)
   pomai_setup_test(segment_test)
   pomai_add_labeled_test(segment_test "unit")
@@ -145,6 +149,14 @@ if (POMAI_BUILD_TESTS)
   add_executable(db_segment_test tests/integ/db_segment_test.cc)
   pomai_setup_test(db_segment_test)
   pomai_add_labeled_test(db_segment_test "integ")
+
+  add_executable(db_open_test tests/integ/db_open_test.cc)
+  pomai_setup_test(db_open_test)
+  pomai_add_labeled_test(db_open_test "integ")
+  
+  add_executable(db_consistency_test tests/integ/db_consistency_test.cc)
+  pomai_setup_test(db_consistency_test)
+  pomai_add_labeled_test(db_consistency_test "integ")
 
   add_executable(manifest_test tests/unit/manifest_test.cc)
   pomai_setup_test(manifest_test)

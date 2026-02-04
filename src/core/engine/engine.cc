@@ -88,7 +88,7 @@ namespace pomai::core
             // Create shard dir if not exists (Wal might have created parent, but shards/i might be missing if new logic?)
             std::filesystem::create_directories(shard_dir, ec);
 
-            auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem), kMailboxCap, opt_.index_params, search_pool_.get());
+            auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem), kMailboxCap, opt_.index_params, search_pool_.get(), segment_pool_.get());
             auto shard = std::make_unique<Shard>(std::move(rt));
 
             st = shard->Start();
@@ -98,10 +98,16 @@ namespace pomai::core
             shards_.push_back(std::move(shard));
         }
         
-        // Init thread pool
+        // Init thread pools
         size_t threads = std::thread::hardware_concurrency();
         if (threads < 4) threads = 4;
+        
+        // Shard pool handles high-level shard requests
         search_pool_ = std::make_unique<util::ThreadPool>(threads);
+        
+        // Segment pool handles parallel segment scans (preventing deadlock)
+        // Can be same size or larger.
+        segment_pool_ = std::make_unique<util::ThreadPool>(threads);
 
         opened_ = true;
         return Status::Ok();

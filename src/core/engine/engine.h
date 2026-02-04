@@ -53,6 +53,7 @@ namespace pomai::core
 
         std::vector<std::unique_ptr<Shard>> shards_;
         std::unique_ptr<util::ThreadPool> search_pool_;
+        std::unique_ptr<util::ThreadPool> segment_pool_; // Added
     };
 
 } // namespace pomai::core

@@ -83,24 +83,6 @@ namespace pomai::core
         std::promise<void> done;
     };
 
-    struct GetReply
-    {
-        pomai::Status st;
-        std::vector<float> vec;
-    };
-
-    struct GetCmd
-    {
-        VectorId id{};
-        std::promise<GetReply> done;
-    };
-
-    struct ExistsCmd
-    {
-        VectorId id{};
-        std::promise<std::pair<pomai::Status, bool>> done;
-    };
-
     struct FreezeCmd
     {
         std::promise<pomai::Status> done;
@@ -122,7 +104,7 @@ namespace pomai::core
         std::promise<IteratorReply> done;
     };
 
-    using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd, FreezeCmd, CompactCmd, IteratorCmd>;
+    using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, StopCmd, FreezeCmd, CompactCmd, IteratorCmd>;
 
     class ShardRuntime
     {
@@ -134,7 +116,8 @@ namespace pomai::core
                      std::unique_ptr<table::MemTable> mem,
                      std::size_t mailbox_cap,
                      const pomai::IndexParams& index_params,
-                     pomai::util::ThreadPool* thread_pool = nullptr); // Optional for tests
+                     pomai::util::ThreadPool* thread_pool = nullptr,
+                     pomai::util::ThreadPool* segment_pool = nullptr); // Added
                      
         ~ShardRuntime();
 
@@ -232,6 +215,7 @@ namespace pomai::core
         std::atomic<bool> started_{false};
 
         pomai::util::ThreadPool* thread_pool_{nullptr};
+        pomai::util::ThreadPool* segment_pool_{nullptr}; // Added
         pomai::IndexParams index_params_;
     };
 

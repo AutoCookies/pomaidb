@@ -143,7 +143,7 @@ namespace pomai::core
             std::span<const float> vec;
             bool is_deleted;
             
-            auto st = seg->ReadAt(entry_idx_, &id, &vec, &is_deleted);
+            auto st = seg->ReadAt(static_cast<uint32_t>(entry_idx_), &id, &vec, &is_deleted);
             
             if (st.ok()) {
                 if (!is_deleted) {

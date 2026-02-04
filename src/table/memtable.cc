@@ -1,5 +1,6 @@
 #include "table/memtable.h"
 #include <cstring>
+#include <mutex>
 
 namespace pomai::table
 {
@@ -33,6 +34,7 @@ namespace pomai::table
 
     pomai::Status MemTable::Put(pomai::VectorId id, std::span<const float> vec)
     {
+        std::unique_lock lock(mutex_);
         if (vec.size() != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
         float *dst = static_cast<float *>(arena_.Allocate(vec.size_bytes(), alignof(float)));
@@ -44,6 +46,7 @@ namespace pomai::table
     pomai::Status MemTable::PutBatch(const std::vector<pomai::VectorId>& ids,
                                       const std::vector<std::span<const float>>& vectors)
     {
+        std::unique_lock lock(mutex_);
         // Validation
         if (ids.size() != vectors.size())
             return pomai::Status::InvalidArgument("ids and vectors size mismatch");
@@ -68,11 +71,13 @@ namespace pomai::table
 
     pomai::Status MemTable::Delete(pomai::VectorId id)
     {
+        std::unique_lock lock(mutex_);
         map_[id] = nullptr;
         return pomai::Status::Ok();
     }
 
     pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec) const {
+        std::shared_lock lock(mutex_);
         if (!out_vec) return Status::InvalidArgument("out_vec is null");
         auto it = map_.find(id);
         if (it == map_.end() || it->second == nullptr) {
@@ -85,6 +90,7 @@ namespace pomai::table
 
     void MemTable::Clear()
     {
+        std::unique_lock lock(mutex_);
         map_.clear();
         arena_.Clear();
     }

@@ -28,7 +28,8 @@ namespace pomai::core
                                std::unique_ptr<table::MemTable> mem,
                                std::size_t mailbox_cap,
                                const pomai::IndexParams& index_params,
-                               pomai::util::ThreadPool* thread_pool)
+                               pomai::util::ThreadPool* thread_pool,
+                               pomai::util::ThreadPool* segment_pool)
         : shard_id_(shard_id),
           shard_dir_(std::move(shard_dir)), // Added
           dim_(dim),
@@ -36,6 +37,7 @@ namespace pomai::core
           mem_(std::move(mem)),
           mailbox_(mailbox_cap),
           thread_pool_(thread_pool),
+          segment_pool_(segment_pool),
           index_params_(index_params)
     {
         pomai::index::IvfCoarse::Options opt;
@@ -385,6 +387,15 @@ namespace pomai::core
 
     void ShardRuntime::RunLoop()
     {
+        // Ensure cleanup on exit (exception or normal)
+        struct ScopeGuard {
+            ShardRuntime* rt;
+            ~ScopeGuard() {
+                rt->mailbox_.Close();
+                rt->started_.store(false);
+            }
+        } guard{this};
+
         bool stop_now = false;
         for (;;)
         {
@@ -430,44 +441,13 @@ namespace pomai::core
                     }
                     else if constexpr (std::is_same_v<T, SearchCmd>)
                     {
-                        // Deprecated loop path for Search, but kept for compilation if Shard sends it.
-                        // Shard::SearchLocal calls rt_->Search directly now (lock-free).
-                        // If SearchCmd is still used, handle it.
                         arg.done.set_value(HandleSearch(arg));
-                    }
-                    else if constexpr (std::is_same_v<T, SearchCmd>)
-                    {
-                        // Deprecated loop path for Search, but kept for compilation if Shard sends it.
-                        // Shard::SearchLocal calls rt_->Search directly now (lock-free).
-                        // If SearchCmd is still used, handle it.
-                        arg.done.set_value(HandleSearch(arg));
-                    }
-                    else if constexpr (std::is_same_v<T, GetCmd>)
-                    {
-                        // Deprecated loop path. Get is now lock-free.
-                        // But if mailbox still has GetCmd (race cond), we should handle it (or error).
-                        // Since we removed GetCmd construction from API, only old messages could linger (unlikely).
-                        // But wait, I DELETED GetCmd from variant? No, I commented it out in headers?
-                        // No, I only commented out HandleGet declaration. GetCmd struct is still there.
-                        // Let's implement a dummy handler that returns Aborted or calls new logic.
-                        // Handlers are removed so we can't call them.
-                        // Correct fix: Remove the visitor branch.
-                        // But visitor MUST cover all variants.
-                        // If GetCmd is still in variant, we must handle it.
-                        // Is GetCmd still in variant? Yes.
-                        // So I should keep the branch but implement inline or just call empty.
-                        // Actually, I should remove GetCmd from variant in runtime.h to be clean.
-                        // If I remove from variant, I don't need visitor branch.
-                        // Let's do that in next step. For now, empty handler or error.
-                        // Better: just remove the branches and I will remove them from variant in runtime.h next.
-                    }
-                    else if constexpr (std::is_same_v<T, ExistsCmd>)
-                    {
-                         // Deprecated.
                     }
                     else if constexpr (std::is_same_v<T, StopCmd>)
                     {
-                        mailbox_.Close();
+                        // Mailbox close handled by ScopeGuard or manual?
+                        // If we Close here, PopBlocking next loop returns nullopt.
+                        // But we want to break immediately.
                         arg.done.set_value();
                         stop_now = true;
                     }
@@ -920,6 +900,26 @@ namespace pomai::core
         };
 
         // -------------------------
+        // 0. SCAN Active MemTable (Newest)
+        // -------------------------
+        // We must check Active MemTable before Frozen/Segments.
+        // It uses shared_lock internal to IterateWithStatus, so safe to call concurrently.
+        if (snap->mem) {
+            snap->mem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+                 if (seen_tracker_.Contains(id)) return;
+                 seen_tracker_.MarkSeen(id); 
+
+                 if (is_deleted) {
+                     seen_tracker_.MarkTombstone(id);
+                     return;
+                 }
+
+                 float score = pomai::core::Dot(query, vec);
+                 push_topk(id, score);
+            });
+        }
+
+        // -------------------------
         // 1-PASS MERGE SCAN: Frozen MemTables (newest → oldest)
         // -------------------------
         // Process each ID exactly once. If ID seen before, skip.
@@ -1017,10 +1017,10 @@ namespace pomai::core
         
         size_t num_segments = snap->segments.size();
         if (num_segments > 0) {
-            if (thread_pool_) {
+            if (segment_pool_) {
                  futures.reserve(num_segments);
                  for(auto& seg : snap->segments) {
-                      futures.push_back(thread_pool_->Enqueue([&, seg]() { 
+                      futures.push_back(segment_pool_->Enqueue([&, seg]() { 
                           return search_segment(seg); 
                       }));
                  }
@@ -1038,7 +1038,7 @@ namespace pomai::core
         
         for (size_t i = 0; i < num_segments; ++i) {
             SegmentResult res;
-            if (thread_pool_) {
+            if (segment_pool_) {
                 res = futures[i].get();
             } else {
                 res = std::move(inline_results[i]);

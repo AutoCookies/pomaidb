@@ -14,10 +14,12 @@ namespace pomai
     class DbImpl final : public DB
     {
     public:
-        explicit DbImpl(DBOptions opt) : mgr_(std::move(opt))
-        {
-            // Keep behavior simple: open manager (creates default membrane if needed).
-            (void)mgr_.Open();
+        explicit DbImpl(DBOptions opt) : mgr_(std::move(opt)) {}
+
+        Status Init() {
+            auto st = mgr_.Open();
+            if (!st.ok()) return st;
+            return Status::Ok();
         }
 
         // ---- DB lifetime ----
@@ -132,7 +134,19 @@ namespace pomai
     {
         if (!out)
             return Status::InvalidArgument("out=null");
-        *out = std::make_unique<DbImpl>(options);
+        if (options.path.empty())
+            return Status::InvalidArgument("path empty");
+        if (options.dim == 0)
+            return Status::InvalidArgument("dim must be > 0");
+        if (options.shard_count == 0)
+            return Status::InvalidArgument("shard_count must be > 0");
+        
+        auto impl = std::make_unique<DbImpl>(options);
+        auto st = impl->Init();
+        if (!st.ok()) {
+             return st;
+        }
+        *out = std::move(impl);
         return Status::Ok();
     }
 
