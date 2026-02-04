@@ -119,6 +119,7 @@ namespace pomai::core
         pomai::DBOptions opt = base_;
         opt.dim = spec.dim;
         opt.shard_count = spec.shard_count;
+        opt.index_params = spec.index_params;
 
         // Keep simple on-disk layout (no manifest integration yet here).
         opt.path = base_.path + "/membranes/" + spec.name;

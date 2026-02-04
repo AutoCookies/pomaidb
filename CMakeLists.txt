@@ -29,6 +29,7 @@ add_library(pomai STATIC
   src/table/segment.cc
 
   src/core/index/ivf_coarse.cc
+  src/core/index/ivf_flat.cc
   src/core/distance.cc
 
   # Gate #1/#2 utilities (linked into libpomai)

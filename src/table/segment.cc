@@ -1,5 +1,6 @@
 #include "table/segment.h"
 #include "util/crc32c.h"
+#include "core/index/ivf_flat.h" 
 
 #include <algorithm>
 #include <cstring>
@@ -135,6 +136,51 @@ namespace pomai::table
         return pomai::Status::Ok();
     }
 
+    pomai::Status SegmentBuilder::BuildIndex(uint32_t nlist) {
+         // Gather valid vectors for training
+         std::vector<float> training_data;
+         training_data.reserve(entries_.size() * dim_);
+         size_t num_live = 0;
+         
+         for(const auto& e : entries_) {
+             if (!e.is_deleted) {
+                 training_data.insert(training_data.end(), e.vec.begin(), e.vec.end());
+                 num_live++;
+             }
+         }
+         
+         pomai::index::IvfFlatIndex::Options opt;
+         opt.nlist = nlist;
+         if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1, num_live);
+
+         auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
+         auto st = idx->Train(training_data, num_live);
+         if (!st.ok()) return st;
+         
+         for(const auto& e : entries_) {
+             if (!e.is_deleted) {
+                 st = idx->Add(e.id, e.vec);
+                 if (!st.ok()) return st;
+             }
+         }
+         
+         std::string idx_path = path_ + ".idx.tmp";
+         st = idx->Save(idx_path);
+         if (!st.ok()) return st;
+         
+         std::string final_idx_path = path_;
+         if (final_idx_path.size() > 4 && final_idx_path.substr(final_idx_path.size()-4) == ".dat") {
+             final_idx_path = final_idx_path.substr(0, final_idx_path.size()-4);
+         }
+         final_idx_path += ".idx";
+         
+         if (rename(idx_path.c_str(), final_idx_path.c_str()) != 0) {
+             return pomai::Status::IOError("rename idx failed");
+         }
+         
+         return pomai::Status::Ok();
+    }
+
 
     // Reader Implementation
 
@@ -176,8 +222,25 @@ namespace pomai::table
         size_t expected_min = sizeof(SegmentHeader) + reader->count_ * reader->entry_size_ + 4; // + CRC
         if (size < expected_min) return pomai::Status::Corruption("segment truncated");
 
+        // Try load index (best effort)
+        std::string idx_path = path;
+        if (idx_path.size() > 4 && idx_path.substr(idx_path.size()-4) == ".dat") {
+             idx_path = idx_path.substr(0, idx_path.size()-4);
+        }
+        idx_path += ".idx";
+        
+        // Ignore error if not found (fallback to scan)
+        (void)pomai::index::IvfFlatIndex::Load(idx_path, &reader->index_);
+
         *out = std::move(reader);
         return pomai::Status::Ok();
+    }
+
+    pomai::Status SegmentReader::Search(std::span<const float> query, uint32_t nprobe, 
+                                        std::vector<pomai::VectorId>* out_candidates) const
+    {
+        if (!index_) return pomai::Status::Ok(); // Empty candidates -> Fallback
+        return index_->Search(query, nprobe, out_candidates);
     }
 
     pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec) const

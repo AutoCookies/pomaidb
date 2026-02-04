@@ -12,10 +12,12 @@
 #include "core/shard/mailbox.h"
 #include "core/shard/seen_tracker.h"
 #include "core/shard/snapshot.h"
-#include "pomai/search.h"
+#include "pomai/search.h" // Restored
 #include "pomai/iterator.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/options.h" 
+#include "util/thread_pool.h" 
 
 namespace pomai::storage
 {
@@ -130,7 +132,9 @@ namespace pomai::core
                      std::uint32_t dim,
                      std::unique_ptr<storage::Wal> wal,
                      std::unique_ptr<table::MemTable> mem,
-                     std::size_t mailbox_cap);
+                     std::size_t mailbox_cap,
+                     const pomai::IndexParams& index_params,
+                     pomai::util::ThreadPool* thread_pool = nullptr); // Optional for tests
                      
         ~ShardRuntime();
 
@@ -226,6 +230,9 @@ namespace pomai::core
 
         std::jthread worker_;
         std::atomic<bool> started_{false};
+
+        pomai::util::ThreadPool* thread_pool_{nullptr};
+        pomai::IndexParams index_params_;
     };
 
 } // namespace pomai::core

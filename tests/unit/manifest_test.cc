@@ -66,7 +66,8 @@ namespace
         b.shard_count = 4;
         b.dim = 16;
         b.metric = pomai::MetricType::kCosine;
-        b.index_params.num_lists = 99;
+        b.index_params.nlist = 99;
+        b.index_params.nprobe = 10;
 
         POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, a));
         POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, b));
@@ -83,7 +84,8 @@ namespace
         POMAI_EXPECT_EQ(got.shard_count, static_cast<std::uint32_t>(4));
         POMAI_EXPECT_EQ(got.dim, static_cast<std::uint32_t>(16));
         POMAI_EXPECT_TRUE(got.metric == pomai::MetricType::kCosine);
-        POMAI_EXPECT_EQ(got.index_params.num_lists, static_cast<std::uint32_t>(99));
+        POMAI_EXPECT_EQ(got.index_params.nlist, static_cast<std::uint32_t>(99));
+        POMAI_EXPECT_EQ(got.index_params.nprobe, static_cast<std::uint32_t>(10));
 
         // Create again => AlreadyExists.
         auto st = pomai::storage::Manifest::CreateMembrane(root, a);

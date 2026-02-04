@@ -11,6 +11,9 @@
 #include "pomai/types.h"
 #include "util/posix_file.h"
 
+// Forward declare in correct namespace
+namespace pomai::index { class IvfFlatIndex; }
+
 namespace pomai::table
 {
 
@@ -64,6 +67,14 @@ namespace pomai::table
         };
         FindResult Find(pomai::VectorId id, std::span<const float> *out_vec) const;
         
+        // Approximate Search via IVF Index.
+        // If index is missing, returns OK with empty candidates (caller must fallback).
+        pomai::Status Search(std::span<const float> query, uint32_t nprobe, 
+                             std::vector<pomai::VectorId>* out_candidates) const;
+
+        bool HasIndex() const { return index_ != nullptr; }
+
+        
         // Read entry at index [0, Count()-1]
         // Returns ID, Vector (if not deleted), and Deleted Status.
         pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const;
@@ -104,6 +115,8 @@ namespace pomai::table
         
         const uint8_t* base_addr_ = nullptr;
         std::size_t file_size_ = 0;
+        
+        std::unique_ptr<pomai::index::IvfFlatIndex> index_;
     };
 
     class SegmentBuilder
@@ -118,6 +131,13 @@ namespace pomai::table
 
         pomai::Status Finish();
         
+        // Build the sidecar index file (.idx) using the vectors added so far.
+        // Should be called BEFORE Finish() moves contents to disk?
+        // No, current Finish() streams to disk. But we buffer entries_ in memory.
+        // So we can build index from entries_.
+        // This is separate method to update existing code minimally.
+        pomai::Status BuildIndex(uint32_t nlist);
+
         uint32_t Count() const { return static_cast<uint32_t>(entries_.size()); }
 
     private:

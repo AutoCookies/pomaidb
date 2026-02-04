@@ -20,10 +20,8 @@ namespace pomai
 
     struct IndexParams
     {
-        // Example parameters for IVF or HNSW
-        uint32_t num_lists = 100;
-        uint32_t ef_construction = 200;
-        uint32_t ef_search = 50;
+        uint32_t nlist = 64;
+        uint32_t nprobe = 8;
     };
 
     struct DBOptions
@@ -32,6 +30,7 @@ namespace pomai
         uint32_t shard_count = 4;
         uint32_t dim = 512;
         FsyncPolicy fsync = FsyncPolicy::kNever;
+        IndexParams index_params;
     };
 
     // One membrane = one logical collection.
