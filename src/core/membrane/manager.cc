@@ -6,6 +6,7 @@
 
 #include "core/engine/engine.h"
 #include "storage/manifest/manifest.h"
+#include "pomai/iterator.h"  // For SnapshotIterator
 
 
 namespace pomai::core
@@ -223,6 +224,14 @@ namespace pomai::core
         auto *e = GetEngineOrNull(membrane);
         if (!e) return Status::NotFound("membrane not found");
         return e->Compact();
+    }
+
+    Status MembraneManager::NewIterator(std::string_view membrane, std::unique_ptr<pomai::SnapshotIterator> *out)
+    {
+        if (!out) return Status::InvalidArgument("out is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->NewIterator(out);
     }
 
 } // namespace pomai::core

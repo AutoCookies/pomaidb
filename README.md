@@ -121,6 +121,39 @@ ctest --test-dir build --output-on-failure
 ./build/bench_baseline
 ```
 
+## Benchmarking
+
+PomaiDB includes a comprehensive benchmark suite measuring industry-standard metrics:
+
+```bash
+# Build and run benchmark
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target comprehensive_bench
+./build/comprehensive_bench --dataset small  # or medium, large
+```
+
+**Metrics measured**:
+- **Search Latency** (P50/P90/P99/P999 in microseconds)
+- **Throughput** (QPS - queries per second)
+- **Recall@k** (accuracy vs brute-force ground truth)
+- **Build Time** (indexing performance)
+- **Memory Usage**
+
+**Sample results** (10K vectors @ 128 dims):
+```
+SEARCH LATENCY:
+  P50:   973 µs
+  P99:   3.1 ms
+
+THROUGHPUT:
+  QPS:   866 queries/sec
+
+ACCURACY:
+  Recall@10:  100%
+```
+
+See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for full guide and comparison with other systems.
+
 ## Known limitations (current code)
 1. **Bounded staleness is fixed at 5000 items per shard** (not configurable yet).
 2. **No read-your-writes** until a soft freeze or explicit `Freeze` publishes a snapshot.

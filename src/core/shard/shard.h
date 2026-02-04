@@ -33,6 +33,7 @@ namespace pomai::core
 
         Status Freeze();
         Status Compact();
+        Status NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out);
 
     private:
         std::unique_ptr<ShardRuntime> rt_;

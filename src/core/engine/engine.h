@@ -9,6 +9,7 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/iterator.h"
 #include "util/thread_pool.h"
 
 namespace pomai::core
@@ -35,6 +36,7 @@ namespace pomai::core
         Status Flush();
         Status Freeze();
         Status Compact();
+        Status NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out);
 
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
 

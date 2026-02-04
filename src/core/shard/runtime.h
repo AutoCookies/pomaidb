@@ -10,8 +10,10 @@
 #include <vector>
 
 #include "core/shard/mailbox.h"
+#include "core/shard/seen_tracker.h"
 #include "core/shard/snapshot.h"
 #include "pomai/search.h"
+#include "pomai/iterator.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
 
@@ -100,7 +102,18 @@ namespace pomai::core
         std::promise<pomai::Status> done;
     };
 
-    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd, FreezeCmd, CompactCmd>;
+    struct IteratorReply
+    {
+        pomai::Status st;
+        std::unique_ptr<pomai::SnapshotIterator> iterator;
+    };
+
+    struct IteratorCmd
+    {
+        std::promise<IteratorReply> done;
+    };
+
+    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd, FreezeCmd, CompactCmd, IteratorCmd>;
 
     class ShardRuntime
     {
@@ -129,6 +142,8 @@ namespace pomai::core
         pomai::Status Freeze(); // MemTable -> Segment
         pomai::Status Compact(); // Compact Segments
 
+        pomai::Status NewIterator(std::unique_ptr<pomai::SnapshotIterator>* out); // Create snapshot iterator
+
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
                              std::vector<pomai::SearchHit> *out);
@@ -148,6 +163,7 @@ namespace pomai::core
         pomai::Status HandleFlush(FlushCmd &c);
         pomai::Status HandleFreeze(FreezeCmd &c);
         pomai::Status HandleCompact(CompactCmd &c);
+        IteratorReply HandleIterator(IteratorCmd &c);
         SearchReply HandleSearch(SearchCmd &c);
         // GetReply HandleGet(GetCmd &c); // Deprecated
         // std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c); // Deprecated
@@ -191,6 +207,9 @@ namespace pomai::core
         // IVF coarse index for candidate selection (centroid routing).
         std::unique_ptr<pomai::index::IvfCoarse> ivf_;
         std::vector<pomai::VectorId> candidates_scratch_;
+        // Shard-local reusable structure for search visibility tracking (DB-grade)
+        SeenTracker seen_tracker_;
+
 
         BoundedMpscQueue<Command> mailbox_;
         std::atomic<std::uint64_t> ops_processed_{0};

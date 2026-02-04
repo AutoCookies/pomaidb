@@ -188,6 +188,20 @@ namespace pomai::core
         return Status::Ok();
     }
 
+    Status Engine::NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out)
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        if (!out) return Status::InvalidArgument("out is null");
+        
+        // For now: return iterator from first shard only
+        // TODO: Implement multi-shard iterator that merges across all shards
+        if (shards_.empty()) {
+            return Status::Internal("no shards available");
+        }
+        
+        return shards_[0]->NewIterator(out);
+    }
+
     Status Engine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out)
     {
         if (!opened_)

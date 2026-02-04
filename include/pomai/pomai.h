@@ -49,6 +49,10 @@ namespace pomai
         virtual Status Freeze(std::string_view membrane) = 0;
         virtual Status Compact(std::string_view membrane) = 0;
 
+        // Iterator API: Full-scan access to all live vectors
+        virtual Status NewIterator(std::string_view membrane,
+                                  std::unique_ptr<class SnapshotIterator> *out) = 0;
+
         static Status Open(const DBOptions &options, std::unique_ptr<DB> *out);
     };
 

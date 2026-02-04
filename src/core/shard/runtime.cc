@@ -12,6 +12,7 @@
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 #include "table/segment.h" // Added
+#include "core/shard/iterator.h"
 #include "core/shard/manifest.h"
 #include <queue>
 
@@ -290,6 +291,22 @@ namespace pomai::core
         return f.get();
     }
 
+    pomai::Status ShardRuntime::NewIterator(std::unique_ptr<pomai::SnapshotIterator>* out)
+    {
+        IteratorCmd cmd;
+        auto f = cmd.done.get_future();
+        auto st = Enqueue(Command{std::move(cmd)});
+        if (!st.ok())
+            return st;
+        
+        IteratorReply reply = f.get();
+        if (!reply.st.ok())
+            return reply.st;
+        
+        *out = std::move(reply.iterator);
+        return pomai::Status::Ok();
+    }
+
     // LOCK-FREE SEARCH
     pomai::Status ShardRuntime::Search(std::span<const float> query,
                                        std::uint32_t topk,
@@ -353,6 +370,10 @@ namespace pomai::core
                     else if constexpr (std::is_same_v<T, CompactCmd>)
                     {
                         arg.done.set_value(HandleCompact(arg));
+                    }
+                    else if constexpr (std::is_same_v<T, IteratorCmd>)
+                    {
+                        arg.done.set_value(HandleIterator(arg));
                     }
                     else if constexpr (std::is_same_v<T, SearchCmd>)
                     {
@@ -462,99 +483,161 @@ namespace pomai::core
         return wal_->Flush();
     }
 
+    // -------------------------
+    // HandleFreeze: Atomic Freeze Pipeline (DB-Grade Durability)
+    // -------------------------
+    // Guarantees:
+    // 1. All segments built and fsynced BEFORE manifest commit
+    // 2. Manifest committed ONCE (atomically)
+    // 3. WAL reset ONLY after all above succeed
+    // 4. Directory fsynced at each durability boundary
+    //
+    // Crash safety: If crash at any point, recovery sees:
+    // - Either old manifest (if crash before manifest commit) → segments ignored, WAL replayed
+    // - Or new manifest (if crash after) → segments visible, WAL safe to reset
+
     pomai::Status ShardRuntime::HandleFreeze(FreezeCmd &)
     {
-        // Force flush of everything (Frozen + Active).
-        // Simplified: Just flush Active to Frozen, then Flush Frozen to Segment?
-        // Or just Flush Active -> Segment (and what about Frozen?).
-        // For correctness, we must persist all.
-        // Current simplistic Freeze: Mem -> Segment.
-        // If we have frozen_mem_, we should flush them too.
-        
-        // 1. Rotate current active to frozen (so mem_ is empty)
+        // Step 1: Rotate Active → Frozen (idempotent if already empty)
         if (mem_->GetCount() > 0) {
-            RotateMemTable();
+            auto st = RotateMemTable();
+            if (!st.ok()) {
+                return pomai::Status::Internal("Freeze: RotateMemTable failed: " + st.message());
+            }
         }
         
-        if (frozen_mem_.empty()) return pomai::Status::Ok();
+        if (frozen_mem_.empty()) {
+            return pomai::Status::Ok(); // Nothing to freeze
+        }
 
-        // 2. Build one segment from ALL frozen tables?
-        // Or one segment per table?
-        // Let's do one segment per table loop for simplicity in this PR.
+        // Step 2: Build ALL segments FIRST (no manifest changes yet)
+        struct BuiltSegment {
+            std::string filename;
+            std::string filepath;
+            std::shared_ptr<table::SegmentReader> reader;
+        };
+        std::vector<BuiltSegment> built_segments;
+        built_segments.reserve(frozen_mem_.size());
         
         for (auto& fmem : frozen_mem_) {
-             if (fmem->GetCount() == 0) continue;
-             
-             auto now = std::chrono::steady_clock::now().time_since_epoch().count(); 
-             std::string name = "seg_" + std::to_string(now) + "_" + std::to_string(reinterpret_cast<uint64_t>(fmem.get())) + ".dat";
-             std::string path = (fs::path(shard_dir_) / name).string();
-
-             table::SegmentBuilder builder(path, dim_);
-             fmem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                 (void)builder.Add(id, vec, is_deleted);
-             });
-             auto st = builder.Finish();
-             if (!st.ok()) return st;
-
-             std::vector<std::string> seg_names;
-             st = ShardManifest::Load(shard_dir_, &seg_names);
-             if (!st.ok()) return st;
-             seg_names.insert(seg_names.begin(), name);
-             st = ShardManifest::Commit(shard_dir_, seg_names);
-             if (!st.ok()) return st;
-             
-             // Reload
-             std::unique_ptr<table::SegmentReader> reader;
-             st = table::SegmentReader::Open(path, &reader);
-             if (!st.ok()) return st;
-             segments_.insert(segments_.begin(), std::move(reader));
+            if (fmem->GetCount() == 0) continue; // Skip empty frozen tables
+            
+            // Generate deterministic filename (timestamp-based, unique)
+            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            std::string filename = "seg_" + std::to_string(now) + "_" + 
+                                   std::to_string(reinterpret_cast<uint64_t>(fmem.get())) + ".dat";
+            std::string filepath = (fs::path(shard_dir_) / filename).string();
+            
+            // Build segment to disk
+            table::SegmentBuilder builder(filepath, dim_);
+            fmem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+                (void)builder.Add(id, vec, is_deleted);
+            });
+            
+            auto st = builder.Finish();
+            if (!st.ok()) {
+                return pomai::Status::Internal("Freeze: SegmentBuilder::Finish failed: " + st.message());
+            }
+            
+            // Fsync directory after segment file creation (durability boundary)
+            st = pomai::util::FsyncDir(shard_dir_);
+            if (!st.ok()) {
+                return pomai::Status::Internal("Freeze: FsyncDir after segment failed: " + st.message());
+            }
+            
+            // Open reader (will be added to segments_ later, after manifest commit)
+            std::unique_ptr<table::SegmentReader> reader;
+            st = table::SegmentReader::Open(filepath, &reader);
+            if (!st.ok()) {
+                return pomai::Status::Internal("Freeze: SegmentReader::Open failed: " + st.message());
+            }
+            
+            built_segments.push_back({filename, filepath, std::move(reader)});
         }
 
-        // 3. Clear Frozen & Reset WAL
-        frozen_mem_.clear();
-        auto st = wal_->Reset();
-        // We rely on "All flushed".
-        if (!st.ok()) return st; 
+        // Step 3: Commit manifest ATOMICALLY (single write)
+        // Load existing manifest
+        std::vector<std::string> seg_names;
+        auto st = ShardManifest::Load(shard_dir_, &seg_names);
+        if (!st.ok()) {
+            return pomai::Status::Internal("Freeze: ShardManifest::Load failed: " + st.message());
+        }
         
+        // Prepend new segments (newest first)
+        for (const auto& bs : built_segments) {
+            seg_names.insert(seg_names.begin(), bs.filename);
+        }
+        
+        // Atomic commit (write manifest.new → fsync → rename → fsync dir)
+        st = ShardManifest::Commit(shard_dir_, seg_names);
+        if (!st.ok()) {
+            return pomai::Status::Internal("Freeze: ShardManifest::Commit failed: " + st.message());
+        }
+        
+        // Step 4: Update in-memory state (only after manifest persisted)
+        for (auto& bs : built_segments) {
+            segments_.insert(segments_.begin(), std::move(bs.reader));
+        }
+        
+        // Step 5: Clear frozen memtables and reset WAL (only after all above succeed)
+        frozen_mem_.clear();
+        st = wal_->Reset();
+        if (!st.ok()) {
+            // WAL reset failed, but segments are durable. Log and continue?
+            // Or return error? For now, return error.
+            return pomai::Status::Internal("Freeze: WAL::Reset failed: " + st.message());
+        }
+        
+        // Step 6: Publish new snapshot (make segments visible to readers)
         PublishSnapshot();
 
         return pomai::Status::Ok();
     }
 
+    // -------------------------
+    // HandleCompact: DB-Grade Compaction (Tombstone Purging)
+    // -------------------------
+    // "Database Moat": Tombstones protect against resurrection in newer segments,
+    // but compaction PURGES them to reduce read amplification.
+    //
+    // Strategy:
+    // 1. K-way merge (newest → oldest)
+    // 2. Keep ONLY newest version per ID
+    // 3. PURGE tombstones entirely (don't write to compacted segment)
+    // 4. Result: Compacted segment contains ONLY live data
+    
     pomai::Status ShardRuntime::HandleCompact(CompactCmd &c)
     {
-        // (Compact logic remains same, but must update snapshot)
-        // ... (Original logic) ...
-        // Need to verify if Compact implementation modifies segments_.
-        // Yes.
-        // I need to paste original Compact logic and add PublishSnapshot();
-        // Since I'm replacing the whole file/methods, I should check if I missed it.
-        // I will trust that I can just call PublishSnapshot() at the end.
-        
         if (segments_.empty()) return pomai::Status::Ok();
 
-        // 1. Prepare Output
+        // Step 1: Prepare output segment
         auto sys_now = std::chrono::system_clock::now().time_since_epoch().count();
         std::string name = "seg_" + std::to_string(sys_now) + "_compacted.dat";
         std::string path = (fs::path(shard_dir_) / name).string();
 
         table::SegmentBuilder builder(path, dim_);
 
-        // 2. K-way Merge
+        // Step 2: K-way merge (newest → oldest)
         struct Cursor {
             VectorId id;
             uint32_t seg_idx;
             uint32_t entry_idx;
             bool is_deleted;
+            
+            // Min-heap by (ID, segment_index)
+            // Smaller ID first; for same ID, smaller seg_idx (newer) first
             bool operator>(const Cursor& other) const {
                 if (id != other.id) return id > other.id;
-                return seg_idx > other.seg_idx;
+                return seg_idx > other.seg_idx;  // Newer segments have smaller index
             }
         };
 
         std::priority_queue<Cursor, std::vector<Cursor>, std::greater<Cursor>> heap;
+        
+        // Initialize heap with first entry from each segment
         for (uint32_t i = 0; i < segments_.size(); ++i) {
-            VectorId id; bool del;
+            VectorId id;
+            bool del;
             if (segments_[i]->ReadAt(0, &id, nullptr, &del).ok()) {
                 heap.push({id, i, 0, del});
             }
@@ -562,51 +645,120 @@ namespace pomai::core
 
         VectorId last_id = std::numeric_limits<VectorId>::max();
         bool is_first = true;
+        
+        uint64_t total_entries_scanned = 0;
+        uint64_t tombstones_purged = 0;
+        uint64_t old_versions_dropped = 0;
+        uint64_t live_entries_kept = 0;
 
+        // Step 3: Merge and purge
         while (!heap.empty()) {
             Cursor top = heap.top();
             heap.pop();
+            total_entries_scanned++;
             
+            // Process only newest version of each ID
             if (is_first || top.id != last_id) {
-                if (!top.is_deleted) {
+                // This is the newest version of this ID
+                
+                if (top.is_deleted) {
+                    // ✅ PURGE TOMBSTONE (don't write to compacted segment)
+                    tombstones_purged++;
+                } else {
+                    // ✅ KEEP LIVE DATA (newest version only)
                     std::span<const float> vec;
                     if (segments_[top.seg_idx]->ReadAt(top.entry_idx, nullptr, &vec, nullptr).ok()) {
                         builder.Add(top.id, vec, false);
+                        live_entries_kept++;
                     }
                 }
+                
                 last_id = top.id;
                 is_first = false;
+            } else {
+                // ✅ DROP OLD VERSION (already processed newest)
+                old_versions_dropped++;
             }
+            
+            // Advance cursor in this segment
             uint32_t next_idx = top.entry_idx + 1;
-            VectorId next_id; bool next_del;
+            VectorId next_id;
+            bool next_del;
             if (segments_[top.seg_idx]->ReadAt(next_idx, &next_id, nullptr, &next_del).ok()) {
                 heap.push({next_id, top.seg_idx, next_idx, next_del});
             }
         }
 
+        // Step 4: Finalize compacted segment
         auto st = builder.Finish();
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+            return pomai::Status::Internal("Compact: SegmentBuilder::Finish failed: " + st.message());
+        }
         
+        // Fsync directory after segment creation
+        st = pomai::util::FsyncDir(shard_dir_);
+        if (!st.ok()) {
+            return pomai::Status::Internal("Compact: FsyncDir after segment failed: " + st.message());
+        }
+
+        // Step 5: Atomic manifest update (replace all old segments with new one)
         std::vector<std::string> seg_names;
         seg_names.push_back(name);
         st = ShardManifest::Commit(shard_dir_, seg_names);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+            return pomai::Status::Internal("Compact: ShardManifest::Commit failed: " + st.message());
+        }
 
+        // Step 6: Update in-memory state (swap segments)
         std::vector<std::shared_ptr<table::SegmentReader>> old_segments = std::move(segments_);
         segments_.clear();
 
         std::unique_ptr<table::SegmentReader> reader;
         st = table::SegmentReader::Open(path, &reader);
-        if (!st.ok()) return st;
+        if (!st.ok()) {
+            return pomai::Status::Internal("Compact: SegmentReader::Open failed: " + st.message());
+        }
         segments_.push_back(std::move(reader));
         
+        // Step 7: Delete old segment files
         for (const auto& old : old_segments) {
-             std::error_code ec;
-             fs::remove(old->Path(), ec);
+            std::error_code ec;
+            fs::remove(old->Path(), ec);
+            // Ignore errors (best-effort cleanup)
         }
         
+        // Step 8: Publish new snapshot
         PublishSnapshot();
+        
+        // TODO: Log compaction metrics
+        // std::cerr << "Compaction: scanned=" << total_entries_scanned 
+        //           << " purged=" << tombstones_purged 
+        //           << " dropped=" << old_versions_dropped 
+        //           << " kept=" << live_entries_kept << "\n";
+
         return pomai::Status::Ok();
+    }
+
+    IteratorReply ShardRuntime::HandleIterator(IteratorCmd &c)
+    {
+        (void)c;  // unused parameter
+        
+        // Create iterator with current snapshot (point-in-time view)
+        auto snapshot = current_snapshot_.load();
+        
+        if (!snapshot) {
+            IteratorReply reply;
+            reply.st = pomai::Status::Internal("HandleIterator: snapshot is null");
+            return reply;
+        }
+        
+        // Create ShardIterator
+        auto shard_iter = std::make_unique<ShardIterator>(snapshot);
+        
+        IteratorReply reply;
+        reply.st = pomai::Status::Ok();
+        reply.iterator = std::move(shard_iter);
+        return reply;
     }
 
     SearchReply ShardRuntime::HandleSearch(SearchCmd &c)
@@ -628,8 +780,8 @@ namespace pomai::core
         return r;
     }
 
-    // -------------------------
-    // SearchLocalInternal: IVF-coarse
+// -------------------------
+    // SearchLocalInternal: DB-grade 1-pass merge scan
     // -------------------------
 
     pomai::Status ShardRuntime::SearchLocalInternal(
@@ -641,30 +793,10 @@ namespace pomai::core
         out->clear();
         out->reserve(topk);
 
-        // Phase 1: Build tombstone set from all frozen memtables
-        // We need to track which IDs have been deleted so we can skip them
-        // when scanning older memtables and segments.
-        std::unordered_set<VectorId> tombstones;
-        std::unordered_set<VectorId> seen_ids;  // Track IDs we've already scored
-        
-        // Collect tombstones from all frozen memtables (newest to oldest)
-        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
-            (*it)->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                if (is_deleted) {
-                    tombstones.insert(id);
-                }
-            });
-        }
-        
-        // Also collect tombstones from segments (Newest -> Oldest)
-        for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
-            (*it)->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                if (is_deleted) {
-                    tombstones.insert(id);
-                }
-            });
-        }
-        
+        // Begin new search iteration (resets seen tracker via generation increment)
+        seen_tracker_.BeginSearch();
+
+        // Inline top-K heap maintenance
         auto push_topk = [&](pomai::VectorId id, float score)
         {
             if (out->size() < topk)
@@ -691,28 +823,57 @@ namespace pomai::core
                            { return a.score > b.score; });
         };
 
-        // Phase 2: Scan frozen memtables (newest to oldest)
-        // Skip tombstones and already-seen IDs
+        // -------------------------
+        // 1-PASS MERGE SCAN: Frozen MemTables (newest → oldest)
+        // -------------------------
+        // Process each ID exactly once. If ID seen before, skip.
+        // If tombstone, mark and skip. Otherwise, score and push to heap.
+        
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
-             (*it)->ForEach([&](VectorId id, std::span<const float> vec) {
-                  if (tombstones.count(id) || seen_ids.count(id)) return;
-                  seen_ids.insert(id);
-                  float score = pomai::core::Dot(query, vec);
-                  push_topk(id, score);
-             });
+            (*it)->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+                // Skip if already processed (newest-wins)
+                if (seen_tracker_.Contains(id)) return;
+                
+                // Mark as seen
+                seen_tracker_.MarkSeen(id);
+                
+                // If tombstone, skip scoring
+                if (is_deleted) {
+                    seen_tracker_.MarkTombstone(id);
+                    return;
+                }
+                
+                // Score and push to top-K
+                float score = pomai::core::Dot(query, vec);
+                push_topk(id, score);
+            });
         }
 
-        // Phase 3: Scan segments (newest to oldest)
-        // Skip tombstones and already-seen IDs
+        // -------------------------
+        // 1-PASS MERGE SCAN: Segments (newest → oldest)
+        // -------------------------
+        
         for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
             (*it)->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                if (is_deleted || tombstones.count(id) || seen_ids.count(id)) return;
-                seen_ids.insert(id);
+                // Skip if already processed (newest-wins)
+                if (seen_tracker_.Contains(id)) return;
+                
+                // Mark as seen
+                seen_tracker_.MarkSeen(id);
+                
+                // If tombstone, skip scoring
+                if (is_deleted) {
+                    seen_tracker_.MarkTombstone(id);
+                    return;
+                }
+                
+                // Score and push to top-K
                 float score = pomai::core::Dot(query, vec);
                 push_topk(id, score);
             });
         }
         
+        // Final sort (descending by score)
         std::sort(out->begin(), out->end(),
                   [](const auto &a, const auto &b)
                   { return a.score > b.score; });

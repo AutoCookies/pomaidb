@@ -20,6 +20,7 @@ add_library(pomai STATIC
   src/core/engine/engine.cc
   src/core/shard/shard.cc
   src/core/shard/runtime.cc
+  src/core/shard/iterator.cc
   src/core/shard/manifest.cc
   src/core/membrane/manager.cc
   src/table/memtable.cc
@@ -202,6 +203,11 @@ endif()
 add_executable(bench_baseline tests/bench_baseline.cc)
 target_link_libraries(bench_baseline PRIVATE pomai)
 target_include_directories(bench_baseline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Comprehensive Benchmark (Industry-standard metrics)
+add_executable(comprehensive_bench benchmarks/comprehensive_bench.cc)
+target_link_libraries(comprehensive_bench PRIVATE pomai)
+target_include_directories(comprehensive_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # =========================
 # Tools

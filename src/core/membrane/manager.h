@@ -8,6 +8,7 @@
 #include "pomai/options.h"
 #include "pomai/search.h"
 #include "pomai/status.h"
+#include "pomai/iterator.h"
 
 namespace pomai::core
 {
@@ -44,6 +45,7 @@ namespace pomai::core
 
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);
+        Status NewIterator(std::string_view membrane, std::unique_ptr<pomai::SnapshotIterator> *out);
 
         // Default membrane convenience: use name "__default__"
         static constexpr std::string_view kDefaultMembrane = "__default__";

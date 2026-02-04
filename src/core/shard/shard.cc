@@ -1,6 +1,7 @@
 #include "core/shard/shard.h"
 
 #include <utility>
+#include "pomai/iterator.h"  // For SnapshotIterator
 
 namespace pomai::core
 {
@@ -42,5 +43,6 @@ namespace pomai::core
 
     Status Shard::Freeze() { return rt_->Freeze(); }
     Status Shard::Compact() { return rt_->Compact(); }
+    Status Shard::NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out) { return rt_->NewIterator(out); }
 
 } // namespace pomai::core

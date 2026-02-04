@@ -113,6 +113,11 @@ namespace pomai
             return mgr_.Compact(membrane);
         }
 
+        Status NewIterator(std::string_view membrane, std::unique_ptr<SnapshotIterator> *out) override
+        {
+            return mgr_.NewIterator(membrane, out);
+        }
+
     private:
         core::MembraneManager mgr_;
     };
