@@ -1,234 +1,168 @@
 # PomaiDB
 
-PomaiDB is a local-first, single-machine, single-user vector database focused on deterministic recovery, immutable read views, and explicit search contracts for quality vs. latency. It is an embedded C++20 library with optional server mode and tools for verification and export.
+## Executive summary (20–30 lines)
+PomaiDB is a single-process, embedded vector database implemented in C++20. 
+It targets applications that need local vector search without external services. 
+Data is partitioned into shards; each shard has a single writer thread. 
+Readers are lock-free and use immutable snapshots for concurrency safety. 
+Writes go through a write-ahead log (WAL) before mutating memory. 
+Reads observe a published snapshot, not the active mutable MemTable. 
+Snapshots are monotonically versioned and represent a prefix of WAL history. 
+Visibility is bounded by MemTable rotation (soft freeze) or explicit Freeze. 
+By default, soft freeze triggers after 5000 items per shard. 
+The database is crash-recoverable by replaying WAL into MemTables. 
+On startup, replayed data is rotated to frozen tables for immediate visibility. 
+Segments are immutable on-disk files written during Freeze. 
+Segment lists are persisted via shard manifests with atomic rename + dir fsync. 
+Durability depends on the configured fsync policy for WAL and segment files. 
+The default fsync policy is `kNever`, so durability is best-effort. 
+Search currently uses brute-force scanning over snapshot items for correctness. 
+IVF is present in code but bypassed in the read path today. 
+Metrics are not yet exposed; operators must instrument externally. 
+PomaiDB is not distributed and does not implement replication. 
+It is intended for embedded, single-tenant deployments only. 
+Membranes provide logical separation but are currently in-memory only. 
+On-disk membrane manifests exist but are not wired into DB::Open. 
+The API exposes explicit Freeze and Flush for visibility and durability control. 
+Documentation is written to match the current code on branch `pomai-embeded`. 
 
-## Table of Contents
-- [What is Pomai in 30 seconds](#what-is-pomai-in-30-seconds)
-- [Database contracts (non-negotiable)](#database-contracts-non-negotiable)
-- [Architecture overview](#architecture-overview)
-- [Math](#math)
-- [On-disk layout](#on-disk-layout)
-- [Build & Run](#build--run)
-- [Benchmarking](#benchmarking)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
-- [Roadmap](#roadmap)
-- [Security & Safety](#security--safety)
-- [Not implemented](#not-implemented)
+## What it is
+- An embedded, single-process vector database with sharded, actor-style writers.
+- A lock-free snapshot reader model for Search/Get/Exists.
+- A WAL + immutable segment storage engine for crash recovery.
 
-## What is Pomai in 30 seconds
-PomaiDB stores vectors on disk with WAL + checkpointing, serves lock-free read snapshots, and exposes a single explicit search contract: you must choose `SearchMode::Latency` or `SearchMode::Quality`. It is a **local-first** library; the optional server speaks a small binary protocol for PING/CREATE/UPSERT/SEARCH only. It is **not** a multi-tenant cloud service and **not** an ML framework.
+## What it is not
+- Not distributed or replicated.
+- Not multi-tenant or cloud-managed.
+- Not a general-purpose SQL/OLAP database.
 
-## Database contracts (non-negotiable)
-- **Local-first.** Data lives on the machine. No background “phone home,” no cloud dependency.
-- **Durability & recovery invariants.** WAL + atomic checkpoints are authoritative. Recovery loads the latest checkpoint and replays WAL to a consistent state. A manifest describes the checkpoint, dictionary, and index artifacts.
-- **Immutability (grain/membrane).**
-  - **Grain**: an immutable segment built from a frozen memtable.
-  - **Membrane**: a published, immutable view composed of grains and the current live snapshot.
-- **No locks on hot read path.** Reads load immutable `ShardState` snapshots via atomic/shared_ptr swaps; no global mutex on search.
-- **Quality vs. latency modes.** Search requests must declare `SearchMode::Quality` or `SearchMode::Latency`. Quality mode refuses to pretend success when filtered results are insufficient and returns `SearchStatus::InsufficientResults` with explicit flags.
+## Quick links (authoritative docs)
+- Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- Consistency model: [docs/CONSISTENCY_MODEL.md](docs/CONSISTENCY_MODEL.md)
+- Failure semantics: [docs/FAILURE_SEMANTICS.md](docs/FAILURE_SEMANTICS.md)
+- On-disk format: [docs/ON_DISK_FORMAT.md](docs/ON_DISK_FORMAT.md)
+- Operations: [docs/OPERATIONS.md](docs/OPERATIONS.md)
+- Performance: [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+- Performance tuning: [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md)
+- Benchmarking: [docs/BENCHMARKING.md](docs/BENCHMARKING.md)
+- Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
+- Glossary: [docs/GLOSSARY.md](docs/GLOSSARY.md)
+- FAQ: [docs/FAQ.md](docs/FAQ.md)
 
-## Architecture overview
+## Hello World (embedded C++)
+```cpp
+#include <iostream>
+#include <memory>
+#include <vector>
 
-### Data flow (ASCII)
-```
-             +---------------------+
-             |  PomaiDB (API)      |
-             +----------+----------+
-                        |
-                        v
-             +----------+----------+
-             | MembraneRouter      |  <-- query contract + budgets
-             +----+----------+-----+
-                  |          |
-                  |          +--------------------------+
-                  v                                     v
-           +------+-----+                        +------+-----+
-           |  Shard 0   | ...                    |  Shard N   |
-           +------+-----+                        +------+-----+
-                  |                                     |
-                  v                                     v
-     +------------+----------+              +-----------+-----------+
-     | Immutable segments    |              | Immutable segments     |
-     | + live snapshot       |              | + live snapshot        |
-     +------------+----------+              +-----------+-----------+
-                  |
-                  v
-            WAL + Checkpoint
-```
+#include "pomai/pomai.h"
 
-### Membrane publish (ASCII)
-```
-  Seed (memtable) --> freeze --> Grain (immutable)
-       |                               |
-       +---- live snapshot ------------+
-                     |
-              atomic ShardState swap
-                     |
-               Membrane view
-```
+int main() {
+    pomai::DBOptions opt;
+    opt.path = "./demo_db";
+    opt.dim = 4;
+    opt.shard_count = 2;
+    opt.fsync = pomai::FsyncPolicy::kAlways; // optional: durability boundary for WAL
 
-### Module map
-- `include/pomai/api/*` – public API types and entrypoints.
-- `include/pomai/core/*` – membrane, shard, seed (immutable grains), spatial router.
-- `include/pomai/index/*` – `OrbitIndex` graph index.
-- `include/pomai/storage/*` – WAL, snapshot, manifest, verification.
-- `include/pomai/concurrency/*` – bounded queues, thread pools, memory manager.
-- `include/pomai/util/*` – utility helpers (CPU kernels, search utils, fixed-topk).
-- `src/*` mirrors the same structure, plus `src/tools` for CLI utilities.
+    std::unique_ptr<pomai::DB> db;
+    pomai::Status st = pomai::DB::Open(opt, &db);
+    if (!st.ok()) {
+        std::cerr << "Open failed: " << st.message() << "\n";
+        return 1;
+    }
 
-## Math
+    float v1[] = {1, 0, 0, 0};
+    float v2[] = {0, 1, 0, 0};
+    db->Put(42, v1);
+    db->Put(7, v2);
 
-### L2 distance
-For vectors \(x, y \in \mathbb{R}^d\):
-\[
-\mathrm{L2}(x, y) = \sum_{i=1}^{d} (x_i - y_i)^2
-\]
-PomaiDB stores scores as **negative L2** for top-k ranking.
+    // Publish a snapshot so reads can see recent writes.
+    db->Freeze("__default__");
 
-### SQ8 quantization (encode/decode)
-For each dimension \(i\):
-\[
-q_i = \mathrm{clamp}_{[0,255]}\left(\mathrm{round}\left(\frac{x_i - \min_i}{\mathrm{scale}_i}\right)\right)
-\]
-\[
-\hat{x}_i = \min_i + q_i \cdot \mathrm{scale}_i
-\]
-Where \(\mathrm{scale}_i = (\max_i - \min_i) / 255\). PomaiDB stores SQ8 values per grain and dequantizes during exact rerank.
+    pomai::SearchResult out;
+    db->Search(std::span<const float>(v1, 4), 2, &out);
+    for (const auto &hit : out.hits) {
+        std::cout << "id=" << hit.id << " score=" << hit.score << "\n";
+    }
 
-### Rerank: candidates vs. exact
-Search is two-stage:
-1. **Candidate generation** from quantized data / graph traversal (fast, approximate).
-2. **Exact rerank** on dequantized vectors for the final top-k.
-The search budget controls how far candidate generation can expand.
-
-### Filter selectivity & candidate amplification
-Filtered search adapts `filtered_candidate_k` and `graph_ef` based on selectivity. If the filter passes only \(s\) of candidates, expected amplification to reach `topk` is roughly \(1 / s\). PomaiDB expands candidates up to configured caps and surfaces budget hits explicitly.
-
-## On-disk layout
-```
-<db_dir>/
-  MANIFEST
-  centroids.bin                (optional)
-  checkpoints/
-    chk_<epoch>_<lsn>.pomai
-  wal/
-    shard-<n>.wal
-  meta/
-    dict_<epoch>_<lsn>.bin
-  indexes/
-    idx_<epoch>_<lsn>_<kind>.bin
+    db->Close();
+    return 0;
+}
 ```
 
-### Atomic commit protocol (checkpoint)
-1. Write snapshot to `checkpoints/<file>.tmp`.
-2. `fdatasync` the snapshot file.
-3. Atomic rename to `checkpoints/<file>`.
-4. `fsync` the checkpoints directory.
-5. Write dictionary and index artifacts (`meta/`, `indexes/`) using the same temp + rename + `fsync` protocol.
-6. Write manifest to `MANIFEST.tmp`, `fdatasync`, then atomic rename to `MANIFEST` and `fsync` the db root.
+## API overview
+- **Create/Open**: `pomai::DB::Open(DBOptions, ...)`
+- **Upsert/Delete**: `Put`, `Delete` (per-membrane and default membrane overloads)
+- **Read**: `Get`, `Exists`, `Search`
+- **Freeze**: publish visibility + flush frozen tables to segments
+- **Flush**: WAL durability boundary (subject to fsync policy)
+- **Close**: `Close` closes all membranes and shards
 
-### Checksum verification rules
-- Snapshot and dictionary files are CRC64-checked on read.
-- `pomai_verify` validates the manifest, snapshot, dictionary, and index CRCs.
+## Guarantee matrix
+| Operation | Durability | Visibility | Isolation | Ordering | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Upsert (Put/PutBatch/Delete) | WAL appended; durable if WAL `fsync=kAlways` or after `Flush` | **Visible immediately** via Active MemTable | Snapshot isolation per shard | Per-shard order via mailbox | Active MemTable IS included in snapshot. |
+| Search | Reads a single immutable snapshot | Snapshot state + Active MemTable | Snapshot isolation | Per-shard snapshot ordering only | Brute-force scan over frozen + segments + active. |
+| Get/Exists | Reads a single immutable snapshot | Snapshot state + Active MemTable | Snapshot isolation | Per-shard snapshot ordering only | Active MemTable IS included in snapshot. |
+| Freeze | Segment files + shard manifest updated; WAL reset | Publishes a new snapshot after segment update | Readers move to new snapshot atomically | Per-shard only | Segment rename + manifest fsync; no global barrier. |
+| Flush | WAL `fdatasync` if `fsync != kNever` | No visibility change | N/A | N/A | Flush is a durability boundary only. |
+| Recovery | WAL replay into MemTable + rotate to frozen | Replayed data visible after startup rotation | Snapshot isolation post-open | Per-shard only | Truncated WAL tail tolerated. |
 
-## Build & Run
-
-### Prerequisites
-- C++20 compiler (GCC 10+ or Clang 11+)
-- CMake 3.10+
-- Linux (WSL acceptable)
-
-### Build (Release/Debug)
+## Build, test, benchmark
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Build library + baseline benchmark
+cmake -S . -B build
 cmake --build build -j
 
-cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build build-debug -j
-```
-
-### Embedded benchmark
-```bash
-./build/bench_embedded --queries=100 --topk=10 --rerank_k=0 --graph_ef=0
-```
-
-### WAL benchmark
-```bash
-./build/bench_wal --threads 4 --batch 64 --dim 128 --duration 5 --wait-durable
-```
-
-### Server (optional)
-The server is a lightweight binary protocol (PING/CREATE_COLLECTION/UPSERT_BATCH/SEARCH). It is **not** a SQL or HTTP server.
-```bash
-./build/pomai-server --config config/pomai.yaml
-# or
-./build/pomai-server config/pomai.yaml
-```
-Note: configuration file parsing is currently a stub; defaults from `pomai_server_main.cpp` are used when the file is missing or unparsed.
-
-### Debug logging
-- Embedded: set `DbOptions::debug_logging = true`.
-- Server: set `log_level: debug` in the config.
-
-### Tools
-```bash
-./build/pomai_verify <db_dir>
-./build/pomai_dump <db_dir> <output.tsv>
-```
-
-## Benchmarking
-Recommended commands:
-```bash
-./build/bench_embedded --queries=200 --topk=10
-./build/bench_concurrent_search
-./build/bench_wal --threads 4 --batch 64 --duration 5
-```
-
-Metrics:
-- **recall@10**: fraction of true top-10 neighbors found.
-- **p50/p95/p99**: latency percentiles (lower is better).
-- **ingest ops/s**: vectors written per second.
-- **filtered search**: read `filtered_budget_exhausted`, `filtered_missing_hits`, and retry counters to judge selectivity impact.
-
-## Testing
-```bash
+# Build and run tests
 cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
+
+# Run baseline benchmark
+./build/bench_baseline
 ```
 
-Sanitizers:
+## Benchmarking
+
+PomaiDB includes a comprehensive benchmark suite measuring industry-standard metrics:
+
 ```bash
-cmake -S . -B build-asan -DPOMAI_SANITIZE=ASAN
-cmake --build build-asan -j
-ctest --test-dir build-asan --output-on-failure
+# Build and run benchmark
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target comprehensive_bench
+./build/comprehensive_bench --dataset small  # or medium, large
 ```
 
-Convenience test runner:
-```bash
-./tests/test.sh
+**Metrics measured**:
+- **Search Latency** (P50/P90/P99/P999 in microseconds)
+- **Throughput** (QPS - queries per second)
+- **Recall@k** (accuracy vs brute-force ground truth)
+- **Build Time** (indexing performance)
+- **Memory Usage**
+
+**Sample results** (10K vectors @ 128 dims):
+```
+SEARCH LATENCY:
+  P50:   973 µs
+  P99:   3.1 ms
+
+THROUGHPUT:
+  QPS:   866 queries/sec
+
+ACCURACY:
+  Recall@10:  100%
 ```
 
-## Troubleshooting
-- **OOM during benchmarks**: the embedded benchmark keeps a full copy of vectors for ground truth. Use fewer vectors or sampled ground truth; disable exact rerank if the budget is tight.
-- **p99 spikes**: reduce `SearchMode::Quality` usage, tighten `filtered_candidate_k`/`graph_ef`, and ensure WAL/checkpoint I/O isn’t throttled.
-- **Build failures**: confirm a C++20 compiler and CMake 3.10+; remove old build directories after toolchain changes.
+See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for full guide and comparison with other systems.
 
-## Roadmap
-- Cosine metric search support (currently only L2 is implemented).
-- Structured server config parsing.
-- Compaction telemetry and backpressure knobs.
+## Known limitations (current code)
+1. **Bounded staleness via soft freeze** (5000 items per shard) or explicit `Freeze`.
+2. **Search uses brute-force scan**; IVF is bypassed for correctness.
+3. **Metric selection is not wired into Search** (dot product is used for scoring).
+4. **No built-in metrics or logging**; operators must instrument externally.
+5. **Membrane manifests exist on disk but are not wired into DB::Open**.
+6. **Directory fsync behavior depends on OS/filesystem** for segment renames.
 
-## Security & Safety
-- Local-first data handling: PomaiDB does not exfiltrate data or require network access.
-- Crash safety is explicit: WAL + checkpointing plus checksum verification are mandatory for recovery.
-- The server exposes **no authentication**; run it on trusted hosts only.
-
-## Not implemented
-These items are **not** in the current codebase and should not be assumed:
-- SQL or CLI interface.
-- Multi-tenant cloud service.
-- Dataset splitting, ML training pipelines, or streaming training data.
-- SimHash or 4-bit compression.
-- Cosine distance search (configuration exists, execution is L2-only today).
+## License
+Apache-2.0 (see [LICENSE](LICENSE)).

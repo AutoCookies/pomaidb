@@ -20,11 +20,16 @@ add_library(pomai STATIC
   src/core/engine/engine.cc
   src/core/shard/shard.cc
   src/core/shard/runtime.cc
+  src/core/shard/iterator.cc
+  src/core/shard/manifest.cc
   src/core/membrane/manager.cc
   src/table/memtable.cc
   src/storage/wal/wal.cc
   src/storage/manifest/manifest.cc
+  src/table/segment.cc
+
   src/core/index/ivf_coarse.cc
+  src/core/distance.cc
 
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
@@ -107,14 +112,38 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(mailbox_test)
   pomai_add_labeled_test(mailbox_test "unit")
 
+  add_executable(segment_test tests/unit/segment_test.cc)
+  pomai_setup_test(segment_test)
+  pomai_add_labeled_test(segment_test "unit")
+  
+  add_executable(shard_manifest_test tests/unit/shard_manifest_test.cc)
+  pomai_setup_test(shard_manifest_test)
+  pomai_add_labeled_test(shard_manifest_test "unit")
+
+  add_executable(oracle_test tests/unit/oracle_test.cc tests/common/bruteforce_oracle.cc)
+  pomai_setup_test(oracle_test)
+  pomai_add_labeled_test(oracle_test "unit")
+
+  add_executable(recall_test tests/recall/recall_test.cc tests/recall/recall_dataset.cc tests/common/bruteforce_oracle.cc)
+  pomai_setup_test(recall_test)
+  pomai_add_labeled_test(recall_test "recall")
+
   # ---- Integration (embedded DB API) ----
   add_executable(db_basic_test tests/integ/db_basic_test.cc)
   pomai_setup_test(db_basic_test)
   pomai_add_labeled_test(db_basic_test "integ")
 
+  add_executable(db_batch_test tests/integ/db_batch_test.cc)
+  pomai_setup_test(db_batch_test)
+  pomai_add_labeled_test(db_batch_test "integ")
+
   add_executable(db_persistence_test tests/integ/db_persistence_test.cc)
   pomai_setup_test(db_persistence_test)
   pomai_add_labeled_test(db_persistence_test "integ")
+
+  add_executable(db_segment_test tests/integ/db_segment_test.cc)
+  pomai_setup_test(db_segment_test)
+  pomai_add_labeled_test(db_segment_test "integ")
 
   add_executable(manifest_test tests/unit/manifest_test.cc)
   pomai_setup_test(manifest_test)
@@ -124,10 +153,31 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(membrane_test)
   pomai_add_labeled_test(membrane_test "integ")
 
+  add_executable(manifest_corruption_test tests/crash/manifest_corruption_test.cc)
+  pomai_setup_test(manifest_corruption_test)
+  pomai_add_labeled_test(manifest_corruption_test "crash")
+
   # ---- Crash (Gate #2) ----
   if (POMAI_ENABLE_CRASH_TESTS)
     add_executable(pomai_crash_test tests/crash/crash_replay_test.cc)
-    pomai_setup_test(pomai_crash_test)
+    
+    # Manual setup loosely based on pomai_setup_test but without test_runner.cc
+    target_link_libraries(pomai_crash_test PRIVATE pomai)
+    if (MSVC)
+      target_compile_options(pomai_crash_test PRIVATE /W4 /permissive-)
+    else()
+      target_compile_options(pomai_crash_test PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    endif()
+    target_include_directories(pomai_crash_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    if (POMAI_IS_TSAN)
+      target_compile_options(pomai_crash_test PRIVATE -fno-pie)
+      target_link_options(pomai_crash_test PRIVATE -no-pie)
+    endif()
+
     add_test(NAME pomai_crash_replay COMMAND pomai_crash_test)
     set_tests_properties(pomai_crash_replay PROPERTIES LABELS "crash")
   endif()
@@ -152,3 +202,28 @@ if (POMAI_BUILD_BENCH)
   # target_link_libraries(my_bench PRIVATE pomai)
   # target_include_directories(my_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endif()
+
+# Baseline Benchmark
+add_executable(bench_baseline tests/bench_baseline.cc)
+target_link_libraries(bench_baseline PRIVATE pomai)
+target_include_directories(bench_baseline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Comprehensive Benchmark (Industry-standard metrics)
+add_executable(comprehensive_bench benchmarks/comprehensive_bench.cc)
+target_link_libraries(comprehensive_bench PRIVATE pomai)
+target_include_directories(comprehensive_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Ingestion Throughput Benchmark
+add_executable(ingestion_bench benchmarks/ingestion_bench.cc)
+target_link_libraries(ingestion_bench PRIVATE pomai)
+target_include_directories(ingestion_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# =========================
+# Tools
+# =========================
+add_executable(pomai_inspect src/tools/pomai_inspect.cc)
+target_link_libraries(pomai_inspect PRIVATE pomai)
+target_include_directories(pomai_inspect PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)

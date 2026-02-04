@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <utility>
+#include <vector>
 
 #include "core/engine/engine.h"
+#include "storage/manifest/manifest.h"
+#include "pomai/iterator.h"  // For SnapshotIterator
+
 
 namespace pomai::core
 {
@@ -25,7 +29,46 @@ namespace pomai::core
         if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists)
             return st;
 
-        return OpenMembrane(kDefaultMembrane);
+        st = OpenMembrane(kDefaultMembrane);
+        if (!st.ok()) return st;
+
+        // Restore other membranes from manifest
+        std::vector<std::string> membranes;
+        st = storage::Manifest::ListMembranes(base_.path, &membranes);
+        if (!st.ok()) 
+        {
+             // If manifest corrupted or missing, we might want to fail hard?
+             // Since we just created default membrane, EnsureInitialized must have run.
+             return st;
+        }
+
+        for (const auto& name : membranes)
+        {
+            if (name == kDefaultMembrane) continue;
+            
+            // "Create" in memory without checking manifest (already checked via ListMembranes)
+            // But we can use the existing CreateMembrane logic which re-loads manifest?
+            // Actually, CreateMembrane checks if manifest exists.
+            // Let's use GetMembrane to get spec, then create in-memory engine, then open.
+            
+            pomai::MembraneSpec mspec;
+            st = storage::Manifest::GetMembrane(base_.path, name, &mspec);
+            if (!st.ok()) return st;
+
+            // Register engine in manager (in-memory)
+            if (engines_.find(name) == engines_.end()) {
+                pomai::DBOptions opt = base_;
+                opt.dim = mspec.dim;
+                opt.shard_count = mspec.shard_count;
+                opt.path = base_.path + "/membranes/" + name;
+                engines_.emplace(name, std::make_unique<Engine>(opt));
+            }
+
+            st = OpenMembrane(name);
+            if (!st.ok()) return st;
+        }
+
+        return Status::Ok();
     }
 
     Status MembraneManager::Close()
@@ -130,6 +173,35 @@ namespace pomai::core
         return e->Put(id, vec);
     }
 
+    Status MembraneManager::PutBatch(std::string_view membrane,
+                                     const std::vector<VectorId>& ids,
+                                     const std::vector<std::span<const float>>& vectors)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->PutBatch(ids, vectors);
+    }
+
+    Status MembraneManager::Get(std::string_view membrane, VectorId id, std::vector<float> *out)
+    {
+        if (!out)
+            return Status::InvalidArgument("out is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e)
+            return Status::NotFound("membrane not found");
+        return e->Get(id, out);
+    }
+
+    Status MembraneManager::Exists(std::string_view membrane, VectorId id, bool *exists)
+    {
+        if (!exists)
+            return Status::InvalidArgument("exists is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e)
+            return Status::NotFound("membrane not found");
+        return e->Exists(id, exists);
+    }
+
     Status MembraneManager::Delete(std::string_view membrane, VectorId id)
     {
         auto *e = GetEngineOrNull(membrane);
@@ -147,6 +219,28 @@ namespace pomai::core
         if (!e)
             return Status::NotFound("membrane not found");
         return e->Search(query, topk, out);
+    }
+
+    Status MembraneManager::Freeze(std::string_view membrane)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->Freeze();
+    }
+
+    Status MembraneManager::Compact(std::string_view membrane)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->Compact();
+    }
+
+    Status MembraneManager::NewIterator(std::string_view membrane, std::unique_ptr<pomai::SnapshotIterator> *out)
+    {
+        if (!out) return Status::InvalidArgument("out is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->NewIterator(out);
     }
 
 } // namespace pomai::core

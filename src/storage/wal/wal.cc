@@ -38,6 +38,7 @@ namespace pomai::storage
     public:
         pomai::util::PosixFile file;
         std::string path;
+        std::vector<std::uint8_t> scratch; // Reusable buffer for encoding frames
     };
 
     Wal::Wal(std::string db_path,
@@ -120,9 +121,12 @@ namespace pomai::storage
 
         const std::size_t payload_bytes = vec.size_bytes();
 
-        // Frame = [len][RecordPrefix][payload][crc32c]
-        std::vector<std::uint8_t> frame;
-        frame.reserve(sizeof(FrameHeader) + sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
+        // reuse scratch buffer
+        auto &frame = impl_->scratch;
+        frame.clear();
+        // heuristic reserve
+        if (frame.capacity() < 128 + payload_bytes)
+             frame.reserve(128 + payload_bytes);
 
         FrameHeader fh{};
         fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
@@ -157,8 +161,8 @@ namespace pomai::storage
         rp.id = id;
         rp.dim = 0;
 
-        std::vector<std::uint8_t> frame;
-        frame.reserve(sizeof(FrameHeader) + sizeof(RecordPrefix) + sizeof(std::uint32_t));
+        auto &frame = impl_->scratch;
+        frame.clear();
 
         FrameHeader fh{};
         fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + sizeof(std::uint32_t));
@@ -179,6 +183,73 @@ namespace pomai::storage
         file_off_ += frame.size();
         bytes_in_seg_ += frame.size();
 
+        if (fsync_ == pomai::FsyncPolicy::kAlways)
+            return impl_->file.SyncData();
+        return pomai::Status::Ok();
+    }
+
+    pomai::Status Wal::AppendBatch(const std::vector<pomai::VectorId>& ids,
+                                    const std::vector<std::span<const float>>& vectors)
+    {
+        // Validation
+        if (ids.size() != vectors.size())
+            return pomai::Status::InvalidArgument("ids and vectors size mismatch");
+        if (ids.empty())
+            return pomai::Status::Ok();  // No-op for empty batch
+        
+        // Batch all records into single scratch buffer
+        auto &frame = impl_->scratch;
+        frame.clear();
+        
+        // Calculate total size needed
+        std::size_t total_bytes = 0;
+        for (const auto& vec : vectors) {
+            total_bytes += sizeof(FrameHeader) + sizeof(RecordPrefix) + 
+                          vec.size_bytes() + sizeof(std::uint32_t);
+        }
+        frame.reserve(total_bytes);
+        
+        // Encode each record
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            RecordPrefix rp{};
+            rp.seq = ++seq_;
+            rp.op = static_cast<std::uint8_t>(Op::kPut);
+            rp.id = ids[i];
+            rp.dim = static_cast<std::uint32_t>(vectors[i].size());
+            
+            const std::size_t payload_bytes = vectors[i].size_bytes();
+            
+            FrameHeader fh{};
+            fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
+            
+            // Build single frame
+            const std::size_t frame_start = frame.size();
+            AppendBytes(&frame, &fh, sizeof(fh));
+            AppendBytes(&frame, &rp, sizeof(rp));
+            AppendBytes(&frame, vectors[i].data(), payload_bytes);
+            
+            // CRC over record prefix + payload (not frame header)
+            const std::uint32_t crc = pomai::util::Crc32c(
+                frame.data() + frame_start + sizeof(FrameHeader),
+                fh.len - sizeof(std::uint32_t)
+            );
+            AppendBytes(&frame, &crc, sizeof(crc));
+        }
+        
+        // Rotate if needed
+        auto st = RotateIfNeeded(frame.size());
+        if (!st.ok())
+            return st;
+        
+        // Single write for entire batch
+        st = impl_->file.PWrite(file_off_, frame.data(), frame.size());
+        if (!st.ok())
+            return st;
+        
+        file_off_ += frame.size();
+        bytes_in_seg_ += frame.size();
+        
+        // Single fsync for entire batch (KEY OPTIMIZATION)
         if (fsync_ == pomai::FsyncPolicy::kAlways)
             return impl_->file.SyncData();
         return pomai::Status::Ok();
@@ -281,6 +352,43 @@ namespace pomai::storage
             (void)f.Close();
         }
         return pomai::Status::Ok();
+    }
+    pomai::Status Wal::Reset()
+    {
+        if (impl_) {
+            impl_->file.Close();
+            delete impl_;
+            impl_ = nullptr;
+        }
+
+        // Delete all wal files
+        for (std::uint64_t g = 0; ; ++g) {
+            std::string p = SegmentPath(g);
+            std::error_code ec;
+            if (!fs::exists(p, ec)) break;
+            fs::remove(p, ec);
+        }
+        
+        // Reset state
+        gen_ = 0;
+        seq_ = 0; // Safe to reset seq if MemTable is empty/flushed.
+        file_off_ = 0;
+        bytes_in_seg_ = 0;
+
+        // Re-open (creates new wal_0.log)
+        impl_ = new Impl();
+        impl_->path = SegmentPath(gen_);
+        
+        // Create directory just in case (Open does it? No, Open calls create_directories).
+        // Let's call Open logic or just do minimal.
+        // Replicating Open logic:
+        // Open() assumes closed.
+        // But here we set impl_ already?
+        // Let's reuse Open() logic but Open() scans for gen_.
+        // We deleted everything. So Open() will find no files, set gen_=0.
+        // So:
+        delete impl_; impl_ = nullptr; // Reset impl again
+        return Open();
     }
 
 } // namespace pomai::storage

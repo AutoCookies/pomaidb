@@ -84,7 +84,11 @@ namespace pomai::core
             if (!st.ok())
                 return st;
 
-            auto rt = std::make_unique<ShardRuntime>(i, opt_.dim, std::move(wal), std::move(mem), kMailboxCap);
+            auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
+            // Create shard dir if not exists (Wal might have created parent, but shards/i might be missing if new logic?)
+            std::filesystem::create_directories(shard_dir, ec);
+
+            auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem), kMailboxCap);
             auto shard = std::make_unique<Shard>(std::move(rt));
 
             st = shard->Start();
@@ -93,6 +97,11 @@ namespace pomai::core
 
             shards_.push_back(std::move(shard));
         }
+        
+        // Init thread pool
+        size_t threads = std::thread::hardware_concurrency();
+        if (threads < 4) threads = 4;
+        search_pool_ = std::make_unique<util::ThreadPool>(threads);
 
         opened_ = true;
         return Status::Ok();
@@ -102,6 +111,7 @@ namespace pomai::core
     {
         if (!opened_)
             return Status::Ok();
+        search_pool_.reset(); // Stop pool first
         shards_.clear();
         opened_ = false;
         return Status::Ok();
@@ -115,6 +125,65 @@ namespace pomai::core
             return Status::InvalidArgument("dim mismatch");
         const auto sid = ShardOf(id, opt_.shard_count);
         return shards_[sid]->Put(id, vec);
+    }
+
+    Status Engine::PutBatch(const std::vector<VectorId>& ids,
+                            const std::vector<std::span<const float>>& vectors)
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        if (ids.size() != vectors.size()) return Status::InvalidArgument("size mismatch");
+        if (ids.empty()) return Status::Ok();
+
+        // 1. Group by shard
+        uint32_t shard_count = opt_.shard_count;
+        std::vector<std::vector<VectorId>> shard_ids(shard_count);
+        std::vector<std::vector<std::span<const float>>> shard_vecs(shard_count);
+
+        // Pre-allocate assuming uniform distribution
+        size_t reserve_size = (ids.size() / shard_count) + 1;
+        for(uint32_t i=0; i<shard_count; ++i) {
+            shard_ids[i].reserve(reserve_size);
+            shard_vecs[i].reserve(reserve_size);
+        }
+
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (static_cast<uint32_t>(vectors[i].size()) != opt_.dim)
+                return Status::InvalidArgument("dim mismatch");
+            
+            uint32_t s = ShardOf(ids[i], shard_count);
+            shard_ids[s].push_back(ids[i]);
+            shard_vecs[s].push_back(vectors[i]);
+        }
+
+        // 2. Dispatch to shards
+        for (uint32_t i = 0; i < shard_count; ++i) {
+            if (shard_ids[i].empty()) continue;
+            // Shard::PutBatch is synchronous (waits for future)
+            Status st = shards_[i]->PutBatch(shard_ids[i], shard_vecs[i]);
+            if (!st.ok()) return st;
+        }
+
+        return Status::Ok();
+    }
+
+    Status Engine::Get(VectorId id, std::vector<float> *out)
+    {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        if (!out)
+            return Status::InvalidArgument("out=null");
+        const auto sid = ShardOf(id, opt_.shard_count);
+        return shards_[sid]->Get(id, out);
+    }
+
+    Status Engine::Exists(VectorId id, bool *exists)
+    {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        if (!exists)
+            return Status::InvalidArgument("exists=null");
+        const auto sid = ShardOf(id, opt_.shard_count);
+        return shards_[sid]->Exists(id, exists);
     }
 
     Status Engine::Delete(VectorId id)
@@ -138,6 +207,40 @@ namespace pomai::core
         return Status::Ok();
     }
 
+    Status Engine::Freeze()
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        for (auto &s : shards_) {
+            Status st = s->Freeze();
+            if (!st.ok()) return st;
+        }
+        return Status::Ok();
+    }
+
+    Status Engine::Compact()
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        for (auto &s : shards_) {
+            Status st = s->Compact();
+            if (!st.ok()) return st;
+        }
+        return Status::Ok();
+    }
+
+    Status Engine::NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out)
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        if (!out) return Status::InvalidArgument("out is null");
+        
+        // For now: return iterator from first shard only
+        // TODO: Implement multi-shard iterator that merges across all shards
+        if (shards_.empty()) {
+            return Status::Internal("no shards available");
+        }
+        
+        return shards_[0]->NewIterator(out);
+    }
+
     Status Engine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out)
     {
         if (!opened_)
@@ -152,16 +255,17 @@ namespace pomai::core
             return Status::Ok();
 
         std::vector<std::vector<pomai::SearchHit>> per(opt_.shard_count);
-        std::vector<std::thread> ts;
-        ts.reserve(opt_.shard_count);
+        std::vector<std::future<pomai::Status>> futures;
+        futures.reserve(opt_.shard_count);
 
         for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
         {
-            ts.emplace_back([&, i]
-                            { (void)shards_[i]->SearchLocal(query, topk, &per[i]); });
+            futures.push_back(search_pool_->Enqueue([&, i]
+                            { return shards_[i]->SearchLocal(query, topk, &per[i]); }));
         }
-        for (auto &t : ts)
-            t.join();
+        
+        for (auto &f : futures)
+            (void)f.get();
 
         std::vector<pomai::SearchHit> merged;
         for (auto &v : per)

@@ -41,13 +41,54 @@ namespace pomai::table
         return pomai::Status::Ok();
     }
 
-    pomai::Status MemTable::Delete(pomai::VectorId id)
+    pomai::Status MemTable::PutBatch(const std::vector<pomai::VectorId>& ids,
+                                      const std::vector<std::span<const float>>& vectors)
     {
-        auto it = map_.find(id);
-        if (it == map_.end())
+        // Validation
+        if (ids.size() != vectors.size())
+            return pomai::Status::InvalidArgument("ids and vectors size mismatch");
+        if (ids.empty())
             return pomai::Status::Ok();
-        it->second = nullptr;
+        
+        // Validate dimensions for all vectors
+        for (const auto& vec : vectors) {
+            if (vec.size() != dim_)
+                return pomai::Status::InvalidArgument("dim mismatch");
+        }
+        
+        // Batch insert: allocate and copy all vectors
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            float *dst = static_cast<float *>(arena_.Allocate(vectors[i].size_bytes(), alignof(float)));
+            std::memcpy(dst, vectors[i].data(), vectors[i].size_bytes());
+            map_[ids[i]] = dst;
+        }
+        
         return pomai::Status::Ok();
     }
+
+    pomai::Status MemTable::Delete(pomai::VectorId id)
+    {
+        map_[id] = nullptr;
+        return pomai::Status::Ok();
+    }
+
+    pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec) const {
+        if (!out_vec) return Status::InvalidArgument("out_vec is null");
+        auto it = map_.find(id);
+        if (it == map_.end() || it->second == nullptr) {
+            *out_vec = nullptr;
+            return Status::NotFound("vector not found");
+        }
+        *out_vec = it->second;
+        return Status::Ok();
+    }
+
+    void MemTable::Clear()
+    {
+        map_.clear();
+        arena_.Clear();
+    }
+
+
 
 } // namespace pomai::table

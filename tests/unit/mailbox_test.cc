@@ -42,4 +42,5 @@ POMAI_TEST(Mailbox_BasicMpsc)
   const std::uint64_t expected_one = (static_cast<std::uint64_t>(kPer) * (kPer + 1)) / 2;
   const std::uint64_t expected = expected_one * kProducers;
   POMAI_EXPECT_EQ(sum.load(), expected);
+  POMAI_EXPECT_EQ(q.Size(), 0);
 }

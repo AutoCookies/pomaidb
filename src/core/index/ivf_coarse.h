@@ -51,13 +51,11 @@ namespace pomai::index
 
         // Stats
         std::uint64_t live_count() const { return live_count_; }
-        bool ready() const { return seeded_ == opt_.nlist && opt_.nlist > 0; }
+        bool ready() const { return trained_; }
 
     private:
         std::uint32_t AssignCentroid(std::span<const float> vec) const;
         void SeedOrUpdateCentroid(std::uint32_t cid, std::span<const float> vec);
-
-        static float Dot(std::span<const float> a, std::span<const float> b);
 
         std::uint32_t dim_;
         Options opt_;
@@ -72,8 +70,22 @@ namespace pomai::index
         // id -> centroid assignment (for delete/move)
         std::unordered_map<pomai::VectorId, std::uint32_t> id2list_;
 
-        std::uint32_t seeded_ = 0;
+        // Training state
+        bool trained_ = false;
+        std::vector<float> train_buffer_; // Flattened buffer for training
+        std::vector<pomai::VectorId> train_ids_; // IDs corresponding to buffer
+        
+        // Train using buffered data.
+        void Train();
+
         std::uint64_t live_count_ = 0;
+
+        struct ScoredCentroid
+        {
+            std::uint32_t id;
+            float score;
+        };
+        mutable std::vector<ScoredCentroid> scratch_scored_;
     };
 
 } // namespace pomai::index

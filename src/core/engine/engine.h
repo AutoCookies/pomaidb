@@ -9,6 +9,8 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/iterator.h"
+#include "util/thread_pool.h"
 
 namespace pomai::core
 {
@@ -28,8 +30,15 @@ namespace pomai::core
         Status Close();
 
         Status Put(VectorId id, std::span<const float> vec);
+        Status PutBatch(const std::vector<VectorId>& ids,
+                        const std::vector<std::span<const float>>& vectors);
+        Status Get(VectorId id, std::vector<float> *out);
+        Status Exists(VectorId id, bool *exists);
         Status Delete(VectorId id);
         Status Flush();
+        Status Freeze();
+        Status Compact();
+        Status NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out);
 
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
 
@@ -43,6 +52,7 @@ namespace pomai::core
         bool opened_ = false;
 
         std::vector<std::unique_ptr<Shard>> shards_;
+        std::unique_ptr<util::ThreadPool> search_pool_;
     };
 
 } // namespace pomai::core

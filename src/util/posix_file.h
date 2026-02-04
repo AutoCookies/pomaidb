@@ -29,12 +29,18 @@ namespace pomai::util
         pomai::Status SyncData();
         pomai::Status SyncAll();
         pomai::Status Close();
+        
+        // Maps the entire file into memory (Read Only). 
+        // If successful, data/size are valid until PosixFile is closed/destroyed.
+        pomai::Status Map(const void** out_data, std::size_t* out_size);
 
         int fd() const noexcept { return fd_; }
 
     private:
         explicit PosixFile(int fd) : fd_(fd) {}
         int fd_ = -1;
+        void* map_addr_ = nullptr;
+        std::size_t map_size_ = 0;
     };
 
     pomai::Status FsyncDir(const std::string &dir_path);

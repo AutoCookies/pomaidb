@@ -105,6 +105,7 @@ mkdir -p "${BUILD_DIR}"
 cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
   -G "${GENERATOR}" \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}" \
+  -DPOMAI_BUILD_TESTS=ON \
   "${CMAKE_COMPILER_ARGS[@]}" \
   "${CMAKE_EXTRA_FLAGS[@]}"
 

@@ -30,6 +30,22 @@ namespace pomai
             return mgr_.Put(core::MembraneManager::kDefaultMembrane, id, vec);
         }
 
+        Status PutBatch(const std::vector<VectorId>& ids,
+                        const std::vector<std::span<const float>>& vectors) override
+        {
+            return mgr_.PutBatch(core::MembraneManager::kDefaultMembrane, ids, vectors);
+        }
+
+        Status Get(VectorId id, std::vector<float> *out) override
+        {
+            return mgr_.Get(core::MembraneManager::kDefaultMembrane, id, out);
+        }
+
+        Status Exists(VectorId id, bool *exists) override
+        {
+            return mgr_.Exists(core::MembraneManager::kDefaultMembrane, id, exists);
+        }
+
         Status Delete(VectorId id) override
         {
             return mgr_.Delete(core::MembraneManager::kDefaultMembrane, id);
@@ -72,6 +88,16 @@ namespace pomai
             return mgr_.Put(membrane, id, vec);
         }
 
+        Status Get(std::string_view membrane, VectorId id, std::vector<float> *out) override
+        {
+            return mgr_.Get(membrane, id, out);
+        }
+
+        Status Exists(std::string_view membrane, VectorId id, bool *exists) override
+        {
+            return mgr_.Exists(membrane, id, exists);
+        }
+
         Status Delete(std::string_view membrane, VectorId id) override
         {
             return mgr_.Delete(membrane, id);
@@ -81,6 +107,21 @@ namespace pomai
                       uint32_t topk, SearchResult *out) override
         {
             return mgr_.Search(membrane, query, topk, out);
+        }
+
+        Status Freeze(std::string_view membrane) override
+        {
+            return mgr_.Freeze(membrane);
+        }
+
+        Status Compact(std::string_view membrane) override
+        {
+            return mgr_.Compact(membrane);
+        }
+
+        Status NewIterator(std::string_view membrane, std::unique_ptr<SnapshotIterator> *out) override
+        {
+            return mgr_.NewIterator(membrane, out);
         }
 
     private:

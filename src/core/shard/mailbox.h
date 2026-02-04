@@ -20,6 +20,7 @@ namespace pomai::core
             if (closed_ || q_.size() >= capacity_)
                 return false;
             q_.emplace_back(std::move(v));
+            size_atomic_.fetch_add(1, std::memory_order_relaxed);
             cv_.notify_one();
             return true;
         }
@@ -32,6 +33,7 @@ namespace pomai::core
             if (closed_)
                 return false;
             q_.emplace_back(std::move(v));
+            size_atomic_.fetch_add(1, std::memory_order_relaxed);
             cv_.notify_one();
             return true;
         }
@@ -45,6 +47,7 @@ namespace pomai::core
                 return std::nullopt;
             T v = std::move(q_.front());
             q_.pop_front();
+            size_atomic_.fetch_sub(1, std::memory_order_relaxed);
             cv_space_.notify_one();
             return v;
         }
@@ -57,6 +60,11 @@ namespace pomai::core
             cv_space_.notify_all();
         }
 
+        std::size_t Size() const
+        {
+            return size_atomic_.load(std::memory_order_relaxed);
+        }
+
     private:
         std::mutex mu_;
         std::condition_variable cv_;
@@ -64,6 +72,7 @@ namespace pomai::core
         std::deque<T> q_;
         std::size_t capacity_ = 0;
         bool closed_ = false;
+        std::atomic<std::size_t> size_atomic_{0};
     };
 
     // Backward-compatible name used across the codebase.
