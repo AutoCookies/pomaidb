@@ -30,6 +30,8 @@ namespace pomai::core
         Status Close();
 
         Status Put(VectorId id, std::span<const float> vec);
+        Status PutBatch(const std::vector<VectorId>& ids,
+                        const std::vector<std::span<const float>>& vectors);
         Status Get(VectorId id, std::vector<float> *out);
         Status Exists(VectorId id, bool *exists);
         Status Delete(VectorId id);

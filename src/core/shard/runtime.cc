@@ -123,6 +123,7 @@ namespace pomai::core
         // Copy atomic/shared state
         snap->segments = segments_; // Shared ownership of segments
         snap->frozen_memtables = frozen_mem_; // Shared ownership of frozen tables
+        snap->mem = mem_.get(); // Active memtable (raw ptr, owned by ShardRuntime)
         
         // INVARIANT: All frozen memtables are immutable (count fixed)
         for (const auto& fmem : snap->frozen_memtables) {
@@ -179,6 +180,36 @@ namespace pomai::core
         return f.get();
     }
 
+    pomai::Status ShardRuntime::PutBatch(const std::vector<pomai::VectorId>& ids,
+                                          const std::vector<std::span<const float>>& vectors)
+    {
+        // Validation
+        if (ids.size() != vectors.size())
+            return pomai::Status::InvalidArgument("ids and vectors size mismatch");
+        if (ids.empty())
+            return pomai::Status::Ok();
+        
+        // Validate dimensions
+        for (const auto& vec : vectors) {
+            if (vec.size() != dim_)
+                return pomai::Status::InvalidArgument("dim mismatch");
+        }
+        
+        // Deep copy vectors into command (avoid lifetime issues)
+        BatchPutCmd cmd;
+        cmd.ids = ids;
+        cmd.vectors.reserve(vectors.size());
+        for (const auto& vec : vectors) {
+            cmd.vectors.emplace_back(vec.begin(), vec.end());
+        }
+        
+        auto f = cmd.done.get_future();
+        auto st = Enqueue(Command{std::move(cmd)});
+        if (!st.ok())
+            return st;
+        return f.get();
+    }
+
     pomai::Status ShardRuntime::Delete(pomai::VectorId id)
     {
         DelCmd c;
@@ -212,6 +243,18 @@ namespace pomai::core
     }
 
     pomai::Status ShardRuntime::GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out) {
+        // 0. Check Active MemTable
+        if (snap->mem) {
+            const float* p = snap->mem->GetPtr(id);
+            if (p) {
+                out->assign(p, p + dim_);
+                return Status::Ok();
+            }
+            if (snap->mem->IsTombstone(id)) {
+                return Status::NotFound("tombstone"); 
+            }
+        }
+
         // 1. Check Frozen MemTables (Newest -> Oldest)
         
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
@@ -359,6 +402,10 @@ namespace pomai::core
                     {
                         arg.done.set_value(HandleDel(arg));
                     }
+                    else if constexpr (std::is_same_v<T, BatchPutCmd>)
+                    {
+                        arg.done.set_value(HandleBatchPut(arg));
+                    }
                     else if constexpr (std::is_same_v<T, FlushCmd>)
                     {
                         arg.done.set_value(HandleFlush(arg));
@@ -449,6 +496,37 @@ namespace pomai::core
         if (mem_->GetCount() >= 5000) {
             (void)RotateMemTable();
         }
+        return pomai::Status::Ok();
+    }
+
+    pomai::Status ShardRuntime::HandleBatchPut(BatchPutCmd &c)
+    {
+        // Validation (already done in PutBatch, but belt-and-suspenders)
+        if (c.ids.size() != c.vectors.size())
+            return pomai::Status::InvalidArgument("ids and vectors size mismatch");
+        
+        // Convert owned vectors to spans for WAL/MemTable
+        std::vector<std::span<const float>> spans;
+        spans.reserve(c.vectors.size());
+        for (const auto& vec : c.vectors) {
+            spans.emplace_back(vec);
+        }
+        
+        // 1. Batch write to WAL (KEY OPTIMIZATION: single fsync)
+        auto st = wal_->AppendBatch(c.ids, spans);
+        if (!st.ok())
+            return st;
+        
+        // 2. Batch update MemTable
+        st = mem_->PutBatch(c.ids, spans);
+        if (!st.ok())
+            return st;
+        
+        // 3. Check threshold for soft freeze (same as single Put)
+        if (mem_->GetCount() >= 5000) {
+            (void)RotateMemTable();
+        }
+        
         return pomai::Status::Ok();
     }
     

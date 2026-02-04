@@ -15,6 +15,12 @@ namespace pomai::core
         return rt_->Put(id, vec);
     }
 
+    pomai::Status Shard::PutBatch(const std::vector<pomai::VectorId>& ids,
+                                  const std::vector<std::span<const float>>& vectors)
+    {
+        return rt_->PutBatch(ids, vectors);
+    }
+
     pomai::Status Shard::Get(pomai::VectorId id, std::vector<float> *out)
     {
         return rt_->Get(id, out);

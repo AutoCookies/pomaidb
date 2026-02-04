@@ -13,7 +13,9 @@ cmake --build build --target comprehensive_bench
 ./build/comprehensive_bench
 
 # Run medium dataset (100K vectors)
-./build/comprehensive_bench --dataset medium --threads 4
+./build/comprehensive_bench --dataset small  # or medium, large
+
+> **⚠️ LOW-END DEVICE WARNING**: On 2-core CPUs with 8GB RAM, avoid medium/large datasets. They use brute-force search which is very slow (P99 ~100ms, 79% recall). Stick to `--dataset small` or use single thread: `--threads 1`. See [PERFORMANCE_TUNING.md](PERFORMANCE_TUNING.md) for optimization tips.
 
 # Run large dataset (1M vectors) with JSON output
 ./build/comprehensive_bench --dataset large --threads 8 --output results.json
@@ -70,6 +72,24 @@ Three preset configurations:
 | **small** | 10,000 | 128 | 1,000 | Development, CI |
 | **medium** | 100,000 | 256 | 5,000 | Integration testing |
 | **large** | 1,000,000 | 768 | 10,000 | Production validation |
+
+### Low-End Devices (2-core CPU, 8GB RAM)
+
+If running on modest hardware like **Dell Latitude E5440** (i5 2-core):
+
+```bash
+# ✅ RECOMMENDED: Small dataset, single-threaded
+./comprehensive_bench --dataset small --threads 1
+# Expected: P99 ~2ms, QPS ~900, Recall 100%
+
+# ⚠️ AVOID: Medium with multiple threads
+# Multi-threading on 2 cores causes thrashing
+# Expected: P99 ~100ms, QPS ~96, Recall ~79% (poor)
+```
+
+**Why slow**: PomaiDB uses brute-force search (IVF bypassed). For 100K vectors @ 256 dims, that's ~25M operations per query.
+
+See [PERFORMANCE_TUNING.md](PERFORMANCE_TUNING.md) for detailed optimization guide.
 
 ---
 

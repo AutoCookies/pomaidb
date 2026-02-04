@@ -127,6 +127,45 @@ namespace pomai::core
         return shards_[sid]->Put(id, vec);
     }
 
+    Status Engine::PutBatch(const std::vector<VectorId>& ids,
+                            const std::vector<std::span<const float>>& vectors)
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        if (ids.size() != vectors.size()) return Status::InvalidArgument("size mismatch");
+        if (ids.empty()) return Status::Ok();
+
+        // 1. Group by shard
+        uint32_t shard_count = opt_.shard_count;
+        std::vector<std::vector<VectorId>> shard_ids(shard_count);
+        std::vector<std::vector<std::span<const float>>> shard_vecs(shard_count);
+
+        // Pre-allocate assuming uniform distribution
+        size_t reserve_size = (ids.size() / shard_count) + 1;
+        for(uint32_t i=0; i<shard_count; ++i) {
+            shard_ids[i].reserve(reserve_size);
+            shard_vecs[i].reserve(reserve_size);
+        }
+
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (static_cast<uint32_t>(vectors[i].size()) != opt_.dim)
+                return Status::InvalidArgument("dim mismatch");
+            
+            uint32_t s = ShardOf(ids[i], shard_count);
+            shard_ids[s].push_back(ids[i]);
+            shard_vecs[s].push_back(vectors[i]);
+        }
+
+        // 2. Dispatch to shards
+        for (uint32_t i = 0; i < shard_count; ++i) {
+            if (shard_ids[i].empty()) continue;
+            // Shard::PutBatch is synchronous (waits for future)
+            Status st = shards_[i]->PutBatch(shard_ids[i], shard_vecs[i]);
+            if (!st.ok()) return st;
+        }
+
+        return Status::Ok();
+    }
+
     Status Engine::Get(VectorId id, std::vector<float> *out)
     {
         if (!opened_)

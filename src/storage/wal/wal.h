@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <vector>
 
 #include "pomai/options.h"
 #include "pomai/status.h"
@@ -28,6 +29,10 @@ namespace pomai::storage
 
         pomai::Status AppendPut(pomai::VectorId id, std::span<const float> vec);
         pomai::Status AppendDelete(pomai::VectorId id);
+        
+        // Batch append: Write multiple Put records with single fsync (5-10x faster)
+        pomai::Status AppendBatch(const std::vector<pomai::VectorId>& ids,
+                                  const std::vector<std::span<const float>>& vectors);
 
         pomai::Status Flush();
         pomai::Status ReplayInto(pomai::table::MemTable &mem);

@@ -23,6 +23,11 @@ namespace pomai
 
         // Default membrane (optional semantic; can map to "default")
         virtual Status Put(VectorId id, std::span<const float> vec) = 0;
+        // Batch upsert (5-10x faster than sequential Put for large batches)
+        // ids.size() must equal vectors.size()
+        // All vectors must have dimension matching DBOptions.dim
+        virtual Status PutBatch(const std::vector<VectorId>& ids,
+                                const std::vector<std::span<const float>>& vectors) = 0;
         virtual Status Get(VectorId id, std::vector<float> *out) = 0;
         virtual Status Exists(VectorId id, bool *exists) = 0;
         virtual Status Delete(VectorId id) = 0;

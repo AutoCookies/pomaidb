@@ -188,6 +188,73 @@ namespace pomai::storage
         return pomai::Status::Ok();
     }
 
+    pomai::Status Wal::AppendBatch(const std::vector<pomai::VectorId>& ids,
+                                    const std::vector<std::span<const float>>& vectors)
+    {
+        // Validation
+        if (ids.size() != vectors.size())
+            return pomai::Status::InvalidArgument("ids and vectors size mismatch");
+        if (ids.empty())
+            return pomai::Status::Ok();  // No-op for empty batch
+        
+        // Batch all records into single scratch buffer
+        auto &frame = impl_->scratch;
+        frame.clear();
+        
+        // Calculate total size needed
+        std::size_t total_bytes = 0;
+        for (const auto& vec : vectors) {
+            total_bytes += sizeof(FrameHeader) + sizeof(RecordPrefix) + 
+                          vec.size_bytes() + sizeof(std::uint32_t);
+        }
+        frame.reserve(total_bytes);
+        
+        // Encode each record
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            RecordPrefix rp{};
+            rp.seq = ++seq_;
+            rp.op = static_cast<std::uint8_t>(Op::kPut);
+            rp.id = ids[i];
+            rp.dim = static_cast<std::uint32_t>(vectors[i].size());
+            
+            const std::size_t payload_bytes = vectors[i].size_bytes();
+            
+            FrameHeader fh{};
+            fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
+            
+            // Build single frame
+            const std::size_t frame_start = frame.size();
+            AppendBytes(&frame, &fh, sizeof(fh));
+            AppendBytes(&frame, &rp, sizeof(rp));
+            AppendBytes(&frame, vectors[i].data(), payload_bytes);
+            
+            // CRC over record prefix + payload (not frame header)
+            const std::uint32_t crc = pomai::util::Crc32c(
+                frame.data() + frame_start + sizeof(FrameHeader),
+                fh.len - sizeof(std::uint32_t)
+            );
+            AppendBytes(&frame, &crc, sizeof(crc));
+        }
+        
+        // Rotate if needed
+        auto st = RotateIfNeeded(frame.size());
+        if (!st.ok())
+            return st;
+        
+        // Single write for entire batch
+        st = impl_->file.PWrite(file_off_, frame.data(), frame.size());
+        if (!st.ok())
+            return st;
+        
+        file_off_ += frame.size();
+        bytes_in_seg_ += frame.size();
+        
+        // Single fsync for entire batch (KEY OPTIMIZATION)
+        if (fsync_ == pomai::FsyncPolicy::kAlways)
+            return impl_->file.SyncData();
+        return pomai::Status::Ok();
+    }
+
     pomai::Status Wal::Flush()
     {
         if (!impl_)

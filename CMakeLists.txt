@@ -133,6 +133,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(db_basic_test)
   pomai_add_labeled_test(db_basic_test "integ")
 
+  add_executable(db_batch_test tests/integ/db_batch_test.cc)
+  pomai_setup_test(db_batch_test)
+  pomai_add_labeled_test(db_batch_test "integ")
+
   add_executable(db_persistence_test tests/integ/db_persistence_test.cc)
   pomai_setup_test(db_persistence_test)
   pomai_add_labeled_test(db_persistence_test "integ")
@@ -208,6 +212,11 @@ target_include_directories(bench_baseline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/in
 add_executable(comprehensive_bench benchmarks/comprehensive_bench.cc)
 target_link_libraries(comprehensive_bench PRIVATE pomai)
 target_include_directories(comprehensive_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Ingestion Throughput Benchmark
+add_executable(ingestion_bench benchmarks/ingestion_bench.cc)
+target_link_libraries(ingestion_bench PRIVATE pomai)
+target_include_directories(ingestion_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # =========================
 # Tools

@@ -50,6 +50,13 @@ namespace pomai::core
         std::promise<pomai::Status> done;
     };
 
+    struct BatchPutCmd
+    {
+        std::vector<pomai::VectorId> ids;
+        std::vector<std::vector<float>> vectors;  // Owned copies
+        std::promise<pomai::Status> done;
+    };
+
     struct FlushCmd
     {
         std::promise<pomai::Status> done;
@@ -113,7 +120,7 @@ namespace pomai::core
         std::promise<IteratorReply> done;
     };
 
-    using Command = std::variant<PutCmd, DelCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd, FreezeCmd, CompactCmd, IteratorCmd>;
+    using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd, FreezeCmd, CompactCmd, IteratorCmd>;
 
     class ShardRuntime
     {
@@ -134,6 +141,8 @@ namespace pomai::core
         pomai::Status Enqueue(Command &&cmd);
 
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status PutBatch(const std::vector<pomai::VectorId>& ids,
+                               const std::vector<std::span<const float>>& vectors);
         pomai::Status Get(pomai::VectorId id, std::vector<float> *out);
         pomai::Status Exists(pomai::VectorId id, bool *exists);
         pomai::Status Delete(pomai::VectorId id);
@@ -159,6 +168,7 @@ namespace pomai::core
 
         // Internal helpers
         pomai::Status HandlePut(PutCmd &c);
+        pomai::Status HandleBatchPut(BatchPutCmd &c);
         pomai::Status HandleDel(DelCmd &c);
         pomai::Status HandleFlush(FlushCmd &c);
         pomai::Status HandleFreeze(FreezeCmd &c);

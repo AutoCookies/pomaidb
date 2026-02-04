@@ -43,6 +43,8 @@ Documentation is written to match the current code on branch `pomai-embeded`.
 - On-disk format: [docs/ON_DISK_FORMAT.md](docs/ON_DISK_FORMAT.md)
 - Operations: [docs/OPERATIONS.md](docs/OPERATIONS.md)
 - Performance: [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
+- Performance tuning: [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md)
+- Benchmarking: [docs/BENCHMARKING.md](docs/BENCHMARKING.md)
 - Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
 - Glossary: [docs/GLOSSARY.md](docs/GLOSSARY.md)
 - FAQ: [docs/FAQ.md](docs/FAQ.md)
@@ -99,9 +101,9 @@ int main() {
 ## Guarantee matrix
 | Operation | Durability | Visibility | Isolation | Ordering | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Upsert (Put/Delete) | WAL appended; durable if WAL `fsync=kAlways` or after `Flush` | Not visible until soft freeze or `Freeze` | Snapshot isolation per shard | Per-shard order via mailbox | Active MemTable is not in snapshot. |
-| Search | Reads a single immutable snapshot | Snapshot state only | Snapshot isolation | Per-shard snapshot ordering only | Brute-force scan over frozen + segments. |
-| Get/Exists | Reads a single immutable snapshot | Snapshot state only | Snapshot isolation | Per-shard snapshot ordering only | Active MemTable is not in snapshot. |
+| Upsert (Put/PutBatch/Delete) | WAL appended; durable if WAL `fsync=kAlways` or after `Flush` | **Visible immediately** via Active MemTable | Snapshot isolation per shard | Per-shard order via mailbox | Active MemTable IS included in snapshot. |
+| Search | Reads a single immutable snapshot | Snapshot state + Active MemTable | Snapshot isolation | Per-shard snapshot ordering only | Brute-force scan over frozen + segments + active. |
+| Get/Exists | Reads a single immutable snapshot | Snapshot state + Active MemTable | Snapshot isolation | Per-shard snapshot ordering only | Active MemTable IS included in snapshot. |
 | Freeze | Segment files + shard manifest updated; WAL reset | Publishes a new snapshot after segment update | Readers move to new snapshot atomically | Per-shard only | Segment rename + manifest fsync; no global barrier. |
 | Flush | WAL `fdatasync` if `fsync != kNever` | No visibility change | N/A | N/A | Flush is a durability boundary only. |
 | Recovery | WAL replay into MemTable + rotate to frozen | Replayed data visible after startup rotation | Snapshot isolation post-open | Per-shard only | Truncated WAL tail tolerated. |
@@ -155,13 +157,12 @@ ACCURACY:
 See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for full guide and comparison with other systems.
 
 ## Known limitations (current code)
-1. **Bounded staleness is fixed at 5000 items per shard** (not configurable yet).
-2. **No read-your-writes** until a soft freeze or explicit `Freeze` publishes a snapshot.
-3. **Search uses brute-force scan**; IVF is bypassed for correctness.
-4. **Metric selection is not wired into Search** (dot product is used for scoring).
-5. **No built-in metrics or logging**; operators must instrument externally.
-6. **Membrane manifests exist on disk but are not wired into DB::Open**.
-7. **Directory fsync behavior depends on OS/filesystem** for segment renames.
+1. **Bounded staleness via soft freeze** (5000 items per shard) or explicit `Freeze`.
+2. **Search uses brute-force scan**; IVF is bypassed for correctness.
+3. **Metric selection is not wired into Search** (dot product is used for scoring).
+4. **No built-in metrics or logging**; operators must instrument externally.
+5. **Membrane manifests exist on disk but are not wired into DB::Open**.
+6. **Directory fsync behavior depends on OS/filesystem** for segment renames.
 
 ## License
 Apache-2.0 (see [LICENSE](LICENSE)).

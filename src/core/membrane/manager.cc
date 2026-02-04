@@ -173,6 +173,15 @@ namespace pomai::core
         return e->Put(id, vec);
     }
 
+    Status MembraneManager::PutBatch(std::string_view membrane,
+                                     const std::vector<VectorId>& ids,
+                                     const std::vector<std::span<const float>>& vectors)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->PutBatch(ids, vectors);
+    }
+
     Status MembraneManager::Get(std::string_view membrane, VectorId id, std::vector<float> *out)
     {
         if (!out)

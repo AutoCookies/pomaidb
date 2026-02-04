@@ -30,6 +30,12 @@ namespace pomai
             return mgr_.Put(core::MembraneManager::kDefaultMembrane, id, vec);
         }
 
+        Status PutBatch(const std::vector<VectorId>& ids,
+                        const std::vector<std::span<const float>>& vectors) override
+        {
+            return mgr_.PutBatch(core::MembraneManager::kDefaultMembrane, ids, vectors);
+        }
+
         Status Get(VectorId id, std::vector<float> *out) override
         {
             return mgr_.Get(core::MembraneManager::kDefaultMembrane, id, out);
