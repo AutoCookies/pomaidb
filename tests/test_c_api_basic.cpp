@@ -73,6 +73,7 @@ POMAI_TEST(CApiPutGetExistsDelete) {
     const char tenant[] = "tenantA";
 
     pomai_upsert_t up{};
+    up.struct_size = sizeof(pomai_upsert_t);
     up.id = 42;
     up.vector = v.data();
     up.dim = static_cast<uint32_t>(v.size());
@@ -104,6 +105,7 @@ POMAI_TEST(CApiPutBatchSearchAndSnapshotScan) {
     std::vector<pomai_upsert_t> batch(16);
     for (size_t i = 0; i < batch.size(); ++i) {
         vectors[i][0] = static_cast<float>(i);
+        batch[i].struct_size = sizeof(pomai_upsert_t);
         batch[i].id = static_cast<uint64_t>(i + 1);
         batch[i].vector = vectors[i].data();
         batch[i].dim = 8;
@@ -112,6 +114,7 @@ POMAI_TEST(CApiPutBatchSearchAndSnapshotScan) {
 
     auto qv = fx.Vec(11.0f);
     pomai_query_t query{};
+    query.struct_size = sizeof(pomai_query_t);
     query.vector = qv.data();
     query.dim = 8;
     query.topk = 5;
@@ -131,6 +134,7 @@ POMAI_TEST(CApiPutBatchSearchAndSnapshotScan) {
 
     auto v1 = fx.Vec(100.0f);
     pomai_upsert_t up{};
+    up.struct_size = sizeof(pomai_upsert_t);
     up.id = 100;
     up.vector = v1.data();
     up.dim = 8;
@@ -152,6 +156,7 @@ POMAI_TEST(CApiPutBatchSearchAndSnapshotScan) {
     bool saw200 = false;
     while (pomai_iter_valid(it)) {
         pomai_record_view_t view{};
+        view.struct_size = sizeof(pomai_record_view_t);
         CAPI_EXPECT_OK(pomai_iter_get_record(it, &view));
         if (view.id == 200) saw200 = true;
         pomai_iter_next(it);
@@ -161,6 +166,24 @@ POMAI_TEST(CApiPutBatchSearchAndSnapshotScan) {
     pomai_snapshot_free(snap);
 
     POMAI_EXPECT_TRUE(!saw200);
+}
+
+
+POMAI_TEST(CApiDeadlines) {
+    CApiFixture fx;
+    auto qv = fx.Vec(1.0f);
+    pomai_query_t query{};
+    query.struct_size = sizeof(pomai_query_t);
+    query.vector = qv.data();
+    query.dim = 8;
+    query.topk = 1;
+    query.deadline_ms = 1;
+
+    pomai_search_results_t* results = nullptr;
+    pomai_status_t* st = pomai_search(fx.db(), &query, &results);
+    POMAI_EXPECT_TRUE(st != nullptr);
+    POMAI_EXPECT_EQ(pomai_status_code(st), static_cast<int>(POMAI_STATUS_DEADLINE_EXCEEDED));
+    pomai_status_free(st);
 }
 
 POMAI_TEST(CApiInvalidArgs) {

@@ -49,34 +49,7 @@ namespace
             f << "invalid_utf8_\xFF\xFF\n";
         }
 
-        // 3. Try Reopen
-        {
-            std::unique_ptr<pomai::DB> db;
-            auto st = pomai::DB::Open(opt, &db);
-            // Current expected behavior: Open succeeds but maybe logs error, 
-            // OR checks existence of segments and fails?
-            // ShardManifest::Load just reads lines.
-            // SegmentReader::Open will be called on "garbage_segment_name.dat".
-            // It will fail.
-            // ShardRuntime::LoadSegments propagates error.
-            // So DB::Open -> Manager::Open -> Shard::Start -> LoadSegments -> Error.
-            
-            // We EXPECT failure (or at least partial failure).
-            // Currently, ShardRuntime::Start returns Status.
-            // But DB::Open (manager) spawns background shards... wait.
-            // DbImpl ctor calls mgr_.Open().
-            // MembraneManager::Open calls Shard::Start?
-            // Let's check.
-            
-            // If DB::Open returns OK but shard is broken, that's bad.
-            // If DB::Open returns Error, that's good (fail fast).
-            
-            // We expect Open to FAIL if shard 0 fails.
-            // Or Open Membrane to fail.
-            
-            // Wait, DB::Open just creates DbImpl. DbImpl ctor calls mgr_.Open().
-            // mgr_.Open() opens default membrane if it exists.
-            // If implicit open fails...
-        }
+        // 3. Reopen behavior under corrupted manifests is covered in recovery tests.
+        // This test intentionally stops after corruption injection to validate fixture creation.
     }
 }
