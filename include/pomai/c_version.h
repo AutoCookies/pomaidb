@@ -5,16 +5,20 @@
 extern "C" {
 #endif
 
-#include "pomai/version.h"
+#include <stdint.h>
 
-// ABI Versioning
-#define POMAI_C_ABI_VERSION 1
+#define POMAI_C_ABI_VERSION_MAJOR 1u
+#define POMAI_C_ABI_VERSION_MINOR 0u
+#define POMAI_C_ABI_VERSION_PATCH 0u
 
-// Returns a version string like "0.1.0"
-const char* pomai_version_string();
+#define POMAI_C_ABI_VERSION \
+    ((POMAI_C_ABI_VERSION_MAJOR << 16u) | (POMAI_C_ABI_VERSION_MINOR << 8u) | POMAI_C_ABI_VERSION_PATCH)
 
-// Returns the ABI version (monotonic integer)
-unsigned int pomai_abi_version();
+// Returns packed ABI version using POMAI_C_ABI_VERSION encoding.
+uint32_t pomai_abi_version(void);
+
+// Returns PomaiDB engine version string.
+const char* pomai_version_string(void);
 
 #ifdef __cplusplus
 }

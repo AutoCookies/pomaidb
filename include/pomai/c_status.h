@@ -7,33 +7,35 @@ extern "C" {
 
 #include <stdint.h>
 
-// Opaque status object.
-// If a function returns pomai_status_t*, NULL indicates success (POMAI_OK).
-// If not NULL, it indicates an error and must be freed by pomai_status_free().
+// Status object used by all C API entrypoints.
+// Convention: NULL status pointer means success (POMAI_STATUS_OK).
+// Non-NULL means failure and must be released with pomai_status_free().
 typedef struct pomai_status_t pomai_status_t;
 
 typedef enum {
-    POMAI_OK = 0,
-    POMAI_INVALID_ARGUMENT = 1,
-    POMAI_NOT_FOUND = 2,
-    POMAI_ALREADY_EXISTS = 3,
-    POMAI_PERMISSION_DENIED = 4,
-    POMAI_RESOURCE_EXHAUSTED = 5,
-    POMAI_FAILED_PRECONDITION = 6,
-    POMAI_ABORTED = 7,
-    POMAI_IO_ERROR = 8,
-    POMAI_INTERNAL = 9,
-    POMAI_PARTIAL_FAILURE = 10,
-    POMAI_UNKNOWN = 11,
-} pomai_error_code_t;
+    POMAI_STATUS_OK = 0,
+    POMAI_STATUS_INVALID_ARGUMENT = 1,
+    POMAI_STATUS_NOT_FOUND = 2,
+    POMAI_STATUS_ALREADY_EXISTS = 3,
+    POMAI_STATUS_IO_ERROR = 4,
+    POMAI_STATUS_CORRUPTION = 5,
+    POMAI_STATUS_RESOURCE_EXHAUSTED = 6,
+    POMAI_STATUS_DEADLINE_EXCEEDED = 7,
+    POMAI_STATUS_INTERNAL = 8,
+    POMAI_STATUS_UNIMPLEMENTED = 9,
+    POMAI_STATUS_PARTIAL_FAILURE = 10,
+} pomai_status_code_t;
 
-// Frees the status object. Safe to call with NULL.
+// Returns NULL (success sentinel). Useful for wrappers wanting a uniform symbol.
+pomai_status_t* pomai_status_ok(void);
+
+// Releases a non-NULL status object. Safe for NULL.
 void pomai_status_free(pomai_status_t* status);
 
-// Returns the error code from the status object.
+// Returns status code; NULL => POMAI_STATUS_OK.
 int pomai_status_code(const pomai_status_t* status);
 
-// Returns the error message. The string is owned by the status object.
+// Returns UTF-8 error message; NULL => "".
 const char* pomai_status_message(const pomai_status_t* status);
 
 #ifdef __cplusplus
