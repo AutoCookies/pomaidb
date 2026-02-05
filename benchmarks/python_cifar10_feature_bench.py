@@ -136,6 +136,8 @@ class PomaiClient:
 
         self.lib.pomai_put_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiUpsert), ctypes.c_size_t]
         self.lib.pomai_put_batch.restype = ctypes.c_void_p
+        self.lib.pomai_freeze.argtypes = [ctypes.c_void_p]
+        self.lib.pomai_freeze.restype = ctypes.c_void_p
 
         self.lib.pomai_search.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiQuery), ctypes.POINTER(ctypes.POINTER(PomaiSearchResults))]
         self.lib.pomai_search.restype = ctypes.c_void_p
@@ -185,6 +187,9 @@ class PomaiClient:
             batch[i].metadata = None
             batch[i].metadata_len = 0
         self._check(self.lib.pomai_put_batch(self.db, batch, n))
+
+    def freeze(self) -> None:
+        self._check(self.lib.pomai_freeze(self.db))
 
     def search(self, vec: Sequence[float], topk: int) -> List[int]:
         cvec = (ctypes.c_float * self.dim)(*vec)
@@ -339,6 +344,17 @@ def extract_feature(raw: Sequence[int]) -> List[float]:
     return feat
 
 
+def load_samples(args: argparse.Namespace) -> Tuple[str, List[List[int]], List[int]]:
+    try:
+        if args.download:
+            maybe_download_cifar(args.dataset_root)
+        return load_cifar_samples(args.dataset_root, args.images)
+    except Exception:
+        if not args.allow_fake_fallback:
+            raise
+        return make_fake_cifar(args.images)
+
+
 def extract_features(images: Sequence[Sequence[int]]) -> Tuple[List[List[float]], float]:
     t0 = time.perf_counter()
     vecs = [extract_feature(img) for img in images]
@@ -357,29 +373,20 @@ def run(args: argparse.Namespace) -> BenchResult:
     if not args.lib.exists():
         raise SystemExit(f"missing shared library: {args.lib}")
 
-    backend = ""
-    images: List[List[int]]
-    labels: List[int]
-
-    try:
-        if args.download:
-            maybe_download_cifar(args.dataset_root)
-        backend, images, labels = load_cifar_samples(args.dataset_root, args.images)
-    except Exception:
-        if not args.allow_fake_fallback:
-            raise
-        backend, images, labels = make_fake_cifar(args.images)
+    backend, images, labels = load_samples(args)
 
     vecs, feat_time = extract_features(images)
     dim = len(vecs[0])
     ids = [i + 1 for i in range(len(vecs))]
 
     with tempfile.TemporaryDirectory(prefix="pomai_py_bench_") as td:
-        client = PomaiClient(args.lib, Path(td), dim=dim, shards=args.shards)
+        db_path = Path(td)
+        client = PomaiClient(args.lib, db_path, dim=dim, shards=args.shards)
         try:
             t0 = time.perf_counter()
             for i in range(0, len(ids), args.batch_size):
                 client.put_batch(ids[i:i + args.batch_size], vecs[i:i + args.batch_size])
+            client.freeze()
             ingest_time = time.perf_counter() - t0
 
             scan_t0 = time.perf_counter()

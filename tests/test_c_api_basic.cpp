@@ -18,7 +18,8 @@ public:
         opts_.shards = 2;
         opts_.dim = 8;
         std::string cmd = "rm -rf " + dir_;
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str());
+        (void)rc;
         auto* st = pomai_open(&opts_, &db_);
         if (st != nullptr) {
             std::abort();
@@ -33,7 +34,8 @@ public:
             }
         }
         std::string cmd = "rm -rf " + dir_;
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str());
+        (void)rc;
     }
 
     pomai_db_t* db() { return db_; }
@@ -167,6 +169,56 @@ POMAI_TEST(CApiPutBatchSearchAndSnapshotScan) {
 
     POMAI_EXPECT_TRUE(!saw200);
 }
+
+
+POMAI_TEST(CApiFreezePublishesToSnapshotScan) {
+    CApiFixture fx;
+
+    auto v = fx.Vec(3.0f);
+    pomai_upsert_t up{};
+    up.struct_size = sizeof(pomai_upsert_t);
+    up.id = 778;
+    up.vector = v.data();
+    up.dim = 8;
+
+    CAPI_EXPECT_OK(pomai_put(fx.db(), &up));
+
+    pomai_snapshot_t* before = nullptr;
+    CAPI_EXPECT_OK(pomai_get_snapshot(fx.db(), &before));
+
+    CAPI_EXPECT_OK(pomai_freeze(fx.db()));
+
+    pomai_snapshot_t* after = nullptr;
+    CAPI_EXPECT_OK(pomai_get_snapshot(fx.db(), &after));
+
+    auto scan_has_id = [&](pomai_snapshot_t* snap, uint64_t id) {
+        pomai_scan_options_t scan_opts{};
+        pomai_scan_options_init(&scan_opts);
+        pomai_iter_t* it = nullptr;
+        CAPI_EXPECT_OK(pomai_scan(fx.db(), &scan_opts, snap, &it));
+
+        bool found = false;
+        while (pomai_iter_valid(it)) {
+            pomai_record_view_t view{};
+            view.struct_size = sizeof(pomai_record_view_t);
+            CAPI_EXPECT_OK(pomai_iter_get_record(it, &view));
+            if (view.id == id) {
+                found = true;
+            }
+            pomai_iter_next(it);
+        }
+        CAPI_EXPECT_OK(pomai_iter_status(it));
+        pomai_iter_free(it);
+        return found;
+    };
+
+    POMAI_EXPECT_TRUE(!scan_has_id(before, 778));
+    POMAI_EXPECT_TRUE(scan_has_id(after, 778));
+
+    pomai_snapshot_free(before);
+    pomai_snapshot_free(after);
+}
+
 
 
 POMAI_TEST(CApiDeadlines) {
