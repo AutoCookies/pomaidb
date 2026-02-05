@@ -170,7 +170,7 @@ namespace pomai::index
             for(uint32_t k=0; k<opt_.nlist; ++k) {
                 float* dst = &new_centroids[k * dim_];
                 if (cluster_counts[k] > 0) {
-                    float inv = 1.0f / cluster_counts[k];
+                    float inv = 1.0f / static_cast<float>(cluster_counts[k]);
                     for(uint32_t d=0; d<dim_; ++d) dst[d] *= inv;
                 } else {
                     // Empty cluster: keep old or re-init?

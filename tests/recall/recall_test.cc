@@ -69,7 +69,6 @@ POMAI_TEST(Recall_Clustered_Basic) {
     POMAI_EXPECT_OK(wal->Open());
     
     auto mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);
-    MemTable* mem_ptr = mem.get(); // Observer for Oracle
 
     // Enable Parallelism
     pomai::util::ThreadPool pool(4);
@@ -136,7 +135,7 @@ POMAI_TEST(Recall_Clustered_Basic) {
         sum += r;
         if (r < min_r) min_r = r;
     }
-    double avg = sum / recalls.size();
+    double avg = sum / static_cast<double>(recalls.size());
     
     std::cout << "------------------------------------------------\n";
     std::cout << "RECALL REPORT\n";
@@ -173,7 +172,6 @@ POMAI_TEST(Recall_Uniform_Hard) {
     POMAI_EXPECT_OK(wal->Open());
     
     auto mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);
-    MemTable* mem_ptr = mem.get();
     
     ShardRuntime rt(shard_id, path, dopt.dim, std::move(wal), std::move(mem), 1024, pomai::IndexParams{});
     POMAI_EXPECT_OK(rt.Start());
@@ -220,7 +218,7 @@ POMAI_TEST(Recall_Uniform_Hard) {
     double p50 = latencies_us[latencies_us.size() / 2];
     double p95 = latencies_us[latencies_us.size() * 95 / 100];
     
-    double avg = sum / dopt.num_queries;
+    double avg = sum / static_cast<double>(dopt.num_queries);
     std::cout << "------------------------------------------------\n";
     std::cout << "RECALL REPORT (Uniform)\n";
     std::cout << "Mean Recall: " << avg << "\n";

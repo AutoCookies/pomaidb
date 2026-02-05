@@ -3,6 +3,8 @@
 #include <exception>
 #include <iostream>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace pomai::test
@@ -26,6 +28,21 @@ namespace pomai::test
     {
         Registrar(const char *name, TestFn fn) { Registry().push_back(TestCase{name, fn}); }
     };
+
+    template <typename A, typename B>
+    inline bool ExpectEq(const A &a, const B &b)
+    {
+        if constexpr (std::is_integral_v<A> && std::is_integral_v<B> &&
+                      !std::is_same_v<std::remove_cv_t<A>, bool> &&
+                      !std::is_same_v<std::remove_cv_t<B>, bool>)
+        {
+            return std::cmp_equal(a, b);
+        }
+        else
+        {
+            return a == b;
+        }
+    }
 
     inline int RunAll()
     {
@@ -72,7 +89,7 @@ namespace pomai::test
     {                                                            \
         auto _a = (a);                                           \
         auto _b = (b);                                           \
-        if (!((_a) == (_b)))                                     \
+        if (!(::pomai::test::ExpectEq(_a, _b)))                  \
         {                                                        \
             std::cerr << "EXPECT_EQ failed: " #a " != " #b "\n"; \
             std::abort();                                        \
