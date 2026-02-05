@@ -287,4 +287,20 @@ namespace pomai::core
         return e->NewIterator(out);
     }
 
+    Status MembraneManager::GetSnapshot(std::string_view membrane, std::shared_ptr<pomai::Snapshot>* out)
+    {
+        if (!out) return Status::InvalidArgument("out is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->GetSnapshot(out);
+    }
+
+    Status MembraneManager::NewIterator(std::string_view membrane, const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out)
+    {
+        if (!out) return Status::InvalidArgument("out is null");
+        auto *e = GetEngineOrNull(membrane);
+        if (!e) return Status::NotFound("membrane not found");
+        return e->NewIterator(snap, out);
+    }
+
 } // namespace pomai::core

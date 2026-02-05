@@ -11,6 +11,7 @@
 #include "pomai/status.h"
 #include "pomai/types.h"
 #include "pomai/iterator.h"
+#include "pomai/snapshot.h"
 #include "util/thread_pool.h"
 
 namespace pomai::core
@@ -42,6 +43,8 @@ namespace pomai::core
         Status Freeze();
         Status Compact();
         Status NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out);
+        Status GetSnapshot(std::shared_ptr<pomai::Snapshot>* out);
+        Status NewIterator(const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out);
 
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
         Status Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);

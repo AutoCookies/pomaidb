@@ -163,6 +163,16 @@ namespace pomai
             return mgr_.NewIterator(membrane, out);
         }
 
+        Status GetSnapshot(std::string_view membrane, std::shared_ptr<Snapshot>* out) override
+        {
+            return mgr_.GetSnapshot(membrane, out);
+        }
+
+        Status NewIterator(std::string_view membrane, const std::shared_ptr<Snapshot>& snap, std::unique_ptr<SnapshotIterator> *out) override
+        {
+            return mgr_.NewIterator(membrane, snap, out);
+        }
+
     private:
         core::MembraneManager mgr_;
     };

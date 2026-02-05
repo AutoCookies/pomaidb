@@ -9,7 +9,9 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/iterator.h"
-#include "pomai/metadata.h" // Added
+#include "pomai/iterator.h"
+#include "pomai/metadata.h"
+#include "pomai/snapshot.h"
 
 namespace pomai::core
 {
@@ -53,6 +55,8 @@ namespace pomai::core
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);
         Status NewIterator(std::string_view membrane, std::unique_ptr<pomai::SnapshotIterator> *out);
+        Status GetSnapshot(std::string_view membrane, std::shared_ptr<pomai::Snapshot>* out);
+        Status NewIterator(std::string_view membrane, const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out);
 
         // Default membrane convenience: use name "__default__"
         static constexpr std::string_view kDefaultMembrane = "__default__";

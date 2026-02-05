@@ -66,5 +66,23 @@ namespace pomai::core
     Status Shard::Freeze() { return rt_->Freeze(); }
     Status Shard::Compact() { return rt_->Compact(); }
     Status Shard::NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out) { return rt_->NewIterator(out); }
+    Status Shard::NewIterator(std::shared_ptr<ShardSnapshot> snap, std::unique_ptr<pomai::SnapshotIterator> *out) {
+        // We're expecting NewIterator(snap, out) in runtime.
+        // Wait, did I add it to Runtime header? No, I added it to Runtime source but not header in Step 91?
+        // Let me check Step 91. I added `GetSnapshot` but not `NewIterator(snap)`.
+        // I need to add it to Runtime header FIRST.
+        // But since I'm already in this tool call, I can't check.
+        // I'll update Shard.cc assuming Runtime has it (I will add it next if missing).
+        // Actually, Shard::NewIterator(snap) calls rt_->NewIterator(snap).
+        // But `Shard` definition in Step 80 has `NewIterator` override.
+        // Wait, Step 92 updated Shard.h.
+        // So Shard.h has it.
+        // I need to update Runtime.h too.
+        return rt_->NewIterator(std::move(snap), out); 
+    }
+
+    std::shared_ptr<ShardSnapshot> Shard::GetSnapshot() {
+        return rt_->GetSnapshot();
+    }
 
 } // namespace pomai::core

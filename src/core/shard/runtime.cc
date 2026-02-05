@@ -367,6 +367,12 @@ namespace pomai::core
         return pomai::Status::Ok();
     }
 
+    pomai::Status ShardRuntime::NewIterator(std::shared_ptr<ShardSnapshot> snap, std::unique_ptr<pomai::SnapshotIterator>* out)
+    {
+        *out = std::make_unique<ShardIterator>(std::move(snap));
+        return pomai::Status::Ok();
+    }
+
     // LOCK-FREE SEARCH
     pomai::Status ShardRuntime::Search(std::span<const float> query,
                                        std::uint32_t topk,

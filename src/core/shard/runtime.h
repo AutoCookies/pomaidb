@@ -143,6 +143,11 @@ namespace pomai::core
         pomai::Status Compact(); // Compact Segments
 
         pomai::Status NewIterator(std::unique_ptr<pomai::SnapshotIterator>* out); // Create snapshot iterator
+        pomai::Status NewIterator(std::shared_ptr<ShardSnapshot> snap, std::unique_ptr<pomai::SnapshotIterator>* out); // Added
+        
+        std::shared_ptr<ShardSnapshot> GetSnapshot() {
+             return current_snapshot_.load(std::memory_order_acquire);
+        }
 
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
@@ -190,9 +195,6 @@ namespace pomai::core
 
         // Snapshot management
         void PublishSnapshot();
-        std::shared_ptr<ShardSnapshot> GetSnapshot() {
-             return current_snapshot_.load(std::memory_order_acquire);
-        }
         
         // Soft Freeze: Move active memtable to frozen.
         pomai::Status RotateMemTable();

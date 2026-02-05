@@ -9,6 +9,7 @@
 #include "core/shard/shard.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
+#include "core/snapshot_wrapper.h"
 
 namespace pomai::core
 {
@@ -286,6 +287,37 @@ namespace pomai::core
         }
         
         return shards_[0]->NewIterator(out);
+    }
+
+    Status Engine::GetSnapshot(std::shared_ptr<pomai::Snapshot>* out)
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        if (!out) return Status::InvalidArgument("out is null");
+        
+        if (shards_.empty()) {
+            return Status::Internal("no shards available");
+        }
+        
+        // Single Shard implementation for now
+        auto s = shards_[0]->GetSnapshot();
+        *out = std::make_shared<SnapshotWrapper>(std::move(s));
+        return Status::Ok();
+    }
+
+    Status Engine::NewIterator(const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out)
+    {
+        if (!opened_) return Status::InvalidArgument("engine not opened");
+        if (!out) return Status::InvalidArgument("out is null");
+        if (!snap) return Status::InvalidArgument("snap is null");
+
+        auto wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(snap);
+        if (!wrapper) return Status::InvalidArgument("invalid snapshot type");
+        
+        if (shards_.empty()) {
+            return Status::Internal("no shards available");
+        }
+        
+        return shards_[0]->NewIterator(wrapper->GetInternal(), out);
     }
 
     Status Engine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out)

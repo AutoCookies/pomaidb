@@ -9,6 +9,7 @@
 #include "search.h"
 #include "status.h"
 #include "types.h"
+#include "snapshot.h"
 
 namespace pomai
 {
@@ -73,6 +74,11 @@ namespace pomai
         // Iterator API: Full-scan access to all live vectors
         virtual Status NewIterator(std::string_view membrane,
                                   std::unique_ptr<class SnapshotIterator> *out) = 0;
+
+        // Snapshot API
+        virtual Status GetSnapshot(std::string_view membrane, std::shared_ptr<Snapshot>* out) = 0;
+        virtual Status NewIterator(std::string_view membrane, const std::shared_ptr<Snapshot>& snap,
+                                   std::unique_ptr<class SnapshotIterator> *out) = 0;
 
         static Status Open(const DBOptions &options, std::unique_ptr<DB> *out);
     };
