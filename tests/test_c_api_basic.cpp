@@ -18,7 +18,8 @@ public:
         opts_.shards = 2;
         opts_.dim = 8;
         std::string cmd = "rm -rf " + dir_;
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str());
+        (void)rc;
         auto* st = pomai_open(&opts_, &db_);
         if (st != nullptr) {
             std::abort();
@@ -33,7 +34,8 @@ public:
             }
         }
         std::string cmd = "rm -rf " + dir_;
-        std::system(cmd.c_str());
+        const int rc = std::system(cmd.c_str());
+        (void)rc;
     }
 
     pomai_db_t* db() { return db_; }
