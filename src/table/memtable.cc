@@ -34,12 +34,27 @@ namespace pomai::table
 
     pomai::Status MemTable::Put(pomai::VectorId id, std::span<const float> vec)
     {
+        return Put(id, vec, pomai::Metadata());
+    }
+
+    pomai::Status MemTable::Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta)
+    {
         std::unique_lock lock(mutex_);
         if (vec.size() != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
         float *dst = static_cast<float *>(arena_.Allocate(vec.size_bytes(), alignof(float)));
         std::memcpy(dst, vec.data(), vec.size_bytes());
         map_[id] = dst;
+        
+        // Store metadata if not empty
+        // For MVP with just 'tenant', check if tenant is empty
+        if (!meta.tenant.empty()) {
+            metadata_[id] = meta;
+        } else {
+            // Ensure no metadata exists if empty (overwrite case)
+            metadata_.erase(id);
+        }
+        
         return pomai::Status::Ok();
     }
 
@@ -72,7 +87,8 @@ namespace pomai::table
     pomai::Status MemTable::Delete(pomai::VectorId id)
     {
         std::unique_lock lock(mutex_);
-        map_[id] = nullptr;
+        map_[id] = nullptr; // Tombstone
+        metadata_.erase(id); // Clear metadata
         return pomai::Status::Ok();
     }
 
@@ -88,10 +104,32 @@ namespace pomai::table
         return Status::Ok();
     }
 
+    pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec, pomai::Metadata* out_meta) const {
+        std::shared_lock lock(mutex_);
+        if (!out_vec) return Status::InvalidArgument("out_vec is null");
+        auto it = map_.find(id);
+        if (it == map_.end() || it->second == nullptr) {
+            *out_vec = nullptr;
+            return Status::NotFound("vector not found");
+        }
+        *out_vec = it->second;
+        
+        if (out_meta) {
+            auto meta_it = metadata_.find(id);
+            if (meta_it != metadata_.end()) {
+                *out_meta = meta_it->second;
+            } else {
+                *out_meta = pomai::Metadata(); // Default/Empty
+            }
+        }
+        return Status::Ok();
+    }
+
     void MemTable::Clear()
     {
         std::unique_lock lock(mutex_);
         map_.clear();
+        metadata_.clear();
         arena_.Clear();
     }
 

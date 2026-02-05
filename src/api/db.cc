@@ -32,6 +32,13 @@ namespace pomai
             return mgr_.Put(core::MembraneManager::kDefaultMembrane, id, vec);
         }
 
+        Status Put(VectorId id, std::span<const float> vec, const Metadata& meta) override
+        {
+            return mgr_.Put(core::MembraneManager::kDefaultMembrane, id, vec, meta);
+        }
+
+
+
         Status PutBatch(const std::vector<VectorId>& ids,
                         const std::vector<std::span<const float>>& vectors) override
         {
@@ -41,6 +48,11 @@ namespace pomai
         Status Get(VectorId id, std::vector<float> *out) override
         {
             return mgr_.Get(core::MembraneManager::kDefaultMembrane, id, out);
+        }
+
+        Status Get(VectorId id, std::vector<float> *out, Metadata* out_meta) override
+        {
+            return mgr_.Get(core::MembraneManager::kDefaultMembrane, id, out, out_meta);
         }
 
         Status Exists(VectorId id, bool *exists) override
@@ -53,10 +65,7 @@ namespace pomai
             return mgr_.Delete(core::MembraneManager::kDefaultMembrane, id);
         }
 
-        Status Search(std::span<const float> query, uint32_t topk, SearchResult *out) override
-        {
-            return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, out);
-        }
+
 
         // ---- Membrane API ----
         Status CreateMembrane(const MembraneSpec &spec) override
@@ -90,9 +99,19 @@ namespace pomai
             return mgr_.Put(membrane, id, vec);
         }
 
+        Status Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta) override
+        {
+            return mgr_.Put(membrane, id, vec, meta);
+        }
+
         Status Get(std::string_view membrane, VectorId id, std::vector<float> *out) override
         {
             return mgr_.Get(membrane, id, out);
+        }
+
+        Status Get(std::string_view membrane, VectorId id, std::vector<float> *out, Metadata* out_meta) override
+        {
+            return mgr_.Get(membrane, id, out, out_meta);
         }
 
         Status Exists(std::string_view membrane, VectorId id, bool *exists) override
@@ -105,10 +124,28 @@ namespace pomai
             return mgr_.Delete(membrane, id);
         }
 
+        Status Search(std::span<const float> query, uint32_t topk, SearchResult *out) override
+        {
+            return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, out);
+        }
+
+        Status Search(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult *out) override
+        {
+            return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, opts, out);
+        }
+
+        // ...
+
         Status Search(std::string_view membrane, std::span<const float> query,
                       uint32_t topk, SearchResult *out) override
         {
             return mgr_.Search(membrane, query, topk, out);
+        }
+
+        Status Search(std::string_view membrane, std::span<const float> query,
+                      uint32_t topk, const SearchOptions& opts, SearchResult *out) override
+        {
+            return mgr_.Search(membrane, query, topk, opts, out);
         }
 
         Status Freeze(std::string_view membrane) override

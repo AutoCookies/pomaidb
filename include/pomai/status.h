@@ -20,6 +20,7 @@ namespace pomai
 
         kIO, // I/O error
         kInternal,
+        kPartial, // Partial failure (some shards failed)
         kUnknown,
     };
 
@@ -84,6 +85,10 @@ namespace pomai
         static Status Internal(std::string_view m)
         {
             return Status(ErrorCode::kInternal, std::string(m));
+        }
+        static Status Partial(std::string_view m)
+        {
+            return Status(ErrorCode::kPartial, std::string(m));
         }
         static Status Unknown(std::string_view m)
         {

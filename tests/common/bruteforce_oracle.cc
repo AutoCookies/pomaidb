@@ -40,7 +40,7 @@ std::vector<pomai::SearchHit> BruteForceSearch(
     // 2. Scan Segments
     for (const auto& seg : segments) {
         if (seg) {
-            seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+            seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata*) {
                 if (is_deleted) return;
                 add_hit(id, vec);
             });

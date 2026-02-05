@@ -158,6 +158,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(db_consistency_test)
   pomai_add_labeled_test(db_consistency_test "integ")
 
+  add_executable(db_partial_search_test tests/integ/db_partial_search_test.cc)
+  pomai_setup_test(db_partial_search_test)
+  pomai_add_labeled_test(db_partial_search_test "integ")
+
   add_executable(manifest_test tests/unit/manifest_test.cc)
   pomai_setup_test(manifest_test)
   pomai_add_labeled_test(manifest_test "unit")
@@ -166,9 +170,33 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(membrane_test)
   pomai_add_labeled_test(membrane_test "integ")
 
+  add_executable(membrane_persistence_test tests/integ/membrane_persistence_test.cc)
+  pomai_setup_test(membrane_persistence_test)
+  pomai_add_labeled_test(membrane_persistence_test "integ")
+
+  add_executable(shard_concurrency_test tests/integ/shard_concurrency_test.cc)
+  pomai_setup_test(shard_concurrency_test)
+  pomai_add_labeled_test(shard_concurrency_test "integ")
+
+  add_executable(iterator_test tests/integ/iterator_test.cc)
+  pomai_setup_test(iterator_test)
+  pomai_add_labeled_test(iterator_test "integ")
+
+  add_executable(metadata_test tests/integ/metadata_test.cc)
+  pomai_setup_test(metadata_test)
+  pomai_add_labeled_test(metadata_test "integ")
+
+  add_executable(search_filter_test tests/integ/search_filter_test.cc)
+  pomai_setup_test(search_filter_test)
+  pomai_add_labeled_test(search_filter_test "integ")
+
   add_executable(manifest_corruption_test tests/crash/manifest_corruption_test.cc)
   pomai_setup_test(manifest_corruption_test)
   pomai_add_labeled_test(manifest_corruption_test "crash")
+
+  add_executable(recovery_test tests/crash/recovery_test.cc)
+  pomai_setup_test(recovery_test)
+  pomai_add_labeled_test(recovery_test "crash")
 
   # ---- Crash (Gate #2) ----
   if (POMAI_ENABLE_CRASH_TESTS)

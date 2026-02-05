@@ -197,6 +197,14 @@ namespace pomai::core
         return e->Put(id, vec);
     }
 
+    Status MembraneManager::Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta)
+    {
+        auto *e = GetEngineOrNull(membrane);
+        if (!e)
+            return Status::NotFound("membrane not found");
+        return e->Put(id, vec, meta);
+    }
+
     Status MembraneManager::PutBatch(std::string_view membrane,
                                      const std::vector<VectorId>& ids,
                                      const std::vector<std::span<const float>>& vectors)
@@ -208,12 +216,17 @@ namespace pomai::core
 
     Status MembraneManager::Get(std::string_view membrane, VectorId id, std::vector<float> *out)
     {
+        return Get(membrane, id, out, nullptr);
+    }
+
+    Status MembraneManager::Get(std::string_view membrane, VectorId id, std::vector<float> *out, Metadata* out_meta)
+    {
         if (!out)
             return Status::InvalidArgument("out is null");
         auto *e = GetEngineOrNull(membrane);
         if (!e)
             return Status::NotFound("membrane not found");
-        return e->Get(id, out);
+        return e->Get(id, out, out_meta);
     }
 
     Status MembraneManager::Exists(std::string_view membrane, VectorId id, bool *exists)
@@ -237,12 +250,19 @@ namespace pomai::core
     Status MembraneManager::Search(std::string_view membrane, std::span<const float> query,
                                    std::uint32_t topk, pomai::SearchResult *out)
     {
+        // Default options (empty filters)
+        return Search(membrane, query, topk, SearchOptions{}, out);
+    }
+
+    Status MembraneManager::Search(std::string_view membrane, std::span<const float> query,
+                                   std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out)
+    {
         if (!out)
             return Status::InvalidArgument("out is null");
         auto *e = GetEngineOrNull(membrane);
         if (!e)
             return Status::NotFound("membrane not found");
-        return e->Search(query, topk, out);
+        return e->Search(query, topk, opts, out);
     }
 
     Status MembraneManager::Freeze(std::string_view membrane)

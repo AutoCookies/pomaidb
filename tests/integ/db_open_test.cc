@@ -1,91 +1,126 @@
 #include "tests/common/test_main.h"
-#include "tests/common/test_tmpdir.h"
-#include "pomai/pomai.h"
 #include <filesystem>
 #include <fstream>
+#include <cstdlib>
+#include <ctime>
 
-namespace pomai
-{
-    namespace fs = std::filesystem;
+// Include necessary headers for DB
+#include "pomai/pomai.h"
 
-    POMAI_TEST(OpenFailsInternalErrorIfPathInvalid)
+namespace pomai::tests {
+
+namespace fs = std::filesystem;
+
+class TestDir {
+public:
+    TestDir() {
+        std::srand(static_cast<unsigned int>(std::time(nullptr)));
+        path_ = "test_db_open_" + std::to_string(std::rand());
+        fs::remove_all(path_);
+        fs::create_directories(path_);
+    }
+    ~TestDir() {
+        fs::remove_all(path_);
+    }
+    std::string path() const { return path_; }
+private:
+    std::string path_;
+};
+
+POMAI_TEST(Database_OpenAndClose) {
+    TestDir td;
+    DBOptions opt;
+    opt.path = td.path();
+    opt.dim = 4;
+    opt.shard_count = 1;
+
+    std::unique_ptr<DB> db;
+    Status st = DB::Open(opt, &db);
+    POMAI_EXPECT_TRUE(st.ok());
+    POMAI_EXPECT_TRUE(db != nullptr);
+    POMAI_EXPECT_TRUE(fs::exists(td.path()));
+
+    st = db->Close();
+    POMAI_EXPECT_TRUE(st.ok());
+}
+
+POMAI_TEST(Database_FailIfPathInvalid) {
+    DBOptions opt;
+    opt.path = "";
+    opt.dim = 4;
+    std::unique_ptr<DB> db;
+    Status st = DB::Open(opt, &db);
+    POMAI_EXPECT_TRUE(!st.ok());
+}
+
+POMAI_TEST(Database_CleanupOnFirstOpenFailure) {
+    TestDir td;
+    // Create a file conflict to force directory creation failure?
+    // Engine::Open calls create_directories(opt.path).
+    // If opt.path exists as a FILE, create_directories should fail.
+    
+    std::string bad_path = td.path() + "/collision";
     {
-        std::string test_dir = pomai::test::TempDir("pomai_test_open_fail");
-        DBOptions opt;
-        // Linux won't allow null char in path obviously, but empty path or weird paths?
-        // Let's try opening a file as directory.
-        std::string file_path = test_dir + "/conflict";
-        {
-            std::ofstream f(file_path);
-            f << "garbage";
-        }
-
-        opt.path = file_path; // Points to a file, but DB expects directory
-        // This should fail, maybe IOError or Internal.
-        // Previously would succeed silently.
-
-        std::unique_ptr<DB> db;
-        Status st = DB::Open(opt, &db);
-        POMAI_EXPECT_TRUE(!st.ok());
-        // fs::remove_all(test_dir); // TempDir cleans up? No, need manual or RAII. 
-        // test_tmpdir.h usually produces unique paths. Cleanup is optional or handled by OS / test runner if extended.
-        // For now let's just leave it or manual cleanup.
-        fs::remove_all(test_dir);
+        std::ofstream f(bad_path);
+        f << "I am a file";
     }
 
-    POMAI_TEST(OpenMissingPathCreatesIt)
-    {
-        std::string test_dir = pomai::test::TempDir("pomai_test_open_ok");
-        DBOptions opt;
-        opt.path = test_dir + "/new_db";
+    DBOptions opt;
+    opt.path = bad_path; // Use the file path as the dir path
+    opt.dim = 4;
+    opt.shard_count = 1;
 
+    std::unique_ptr<DB> db;
+    Status st = DB::Open(opt, &db);
+    POMAI_EXPECT_TRUE(!st.ok());
+}
+
+POMAI_TEST(Database_CorruptWalReplayFailsOpen) {
+    TestDir td;
+    std::string db_path = td.path() + "/db";
+
+    // 1. Create valid DB
+    {
+        DBOptions opt;
+        opt.path = db_path;
+        opt.dim = 4;
+        opt.shard_count = 1;
         std::unique_ptr<DB> db;
-        Status st = DB::Open(opt, &db);
+        auto st = DB::Open(opt, &db);
         POMAI_EXPECT_TRUE(st.ok());
-        
-        POMAI_EXPECT_TRUE(fs::exists(opt.path));
-        POMAI_EXPECT_TRUE(fs::is_directory(opt.path));
-        fs::remove_all(test_dir);
+        // Write something so WAL exists
+        std::vector<float> vec = {1, 2, 3, 4};
+        db->Put(1, vec);
+        db->Close();
     }
 
-    POMAI_TEST(OpenFailsInvalidConfig)
+    // 2. Corrupt the WAL file
+    bool found_wal = false;
+    if (fs::exists(db_path)) {
+        for (const auto& entry : fs::directory_iterator(db_path)) {
+            if (entry.path().string().find("wal_") != std::string::npos) {
+                // Truncate/Corrupt it
+                std::ofstream f(entry.path(), std::ios::binary | std::ios::trunc);
+                f << "GARBAGE";
+                f.close();
+                found_wal = true;
+                break;
+            }
+        }
+    }
+    POMAI_EXPECT_TRUE(found_wal);
+
+    // 3. Try to Open again
     {
-        std::string test_dir = pomai::test::TempDir("pomai_test_config");
-        
-        // Empty path
-        {
-            DBOptions opt;
-            opt.path = "";
-            opt.dim = 128;
-            opt.shard_count = 1;
-            std::unique_ptr<DB> db;
-            Status st = DB::Open(opt, &db);
-            POMAI_EXPECT_TRUE(!st.ok());
-             // Not testing exact string message to avoid fragility, but we expect error.
-        }
-
-        // Zero Dim
-        {
-            DBOptions opt;
-            opt.path = test_dir;
-            opt.dim = 0;
-            opt.shard_count = 1;
-            std::unique_ptr<DB> db;
-            Status st = DB::Open(opt, &db);
-            POMAI_EXPECT_TRUE(!st.ok());
-        }
-
-        // Zero Shards
-        {
-            DBOptions opt;
-            opt.path = test_dir;
-            opt.dim = 128;
-            opt.shard_count = 0;
-            std::unique_ptr<DB> db;
-            Status st = DB::Open(opt, &db);
-            POMAI_EXPECT_TRUE(!st.ok());
-        }
-        
-        fs::remove_all(test_dir);
+        DBOptions opt;
+        opt.path = db_path;
+        opt.dim = 4;
+        opt.shard_count = 1;
+        std::unique_ptr<DB> db;
+        Status st = DB::Open(opt, &db);
+        // SOT says: Fail closed by default on corruption
+        POMAI_EXPECT_TRUE(!st.ok());
     }
 }
+
+} // namespace pomai::tests

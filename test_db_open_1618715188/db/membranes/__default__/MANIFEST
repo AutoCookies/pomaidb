@@ -1,0 +1,7 @@
+pomai.membrane.v2
+name __default__
+shards 1
+dim 4
+metric L2
+index_params 64 8
+)_Ä

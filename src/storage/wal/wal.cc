@@ -15,7 +15,8 @@ namespace pomai::storage
     enum class Op : std::uint8_t
     {
         kPut = 1,
-        kDel = 2
+        kDel = 2,
+        kPutMeta = 3
     };
 
 #pragma pack(push, 1)
@@ -113,44 +114,97 @@ namespace pomai::storage
 
     pomai::Status Wal::AppendPut(pomai::VectorId id, std::span<const float> vec)
     {
-        RecordPrefix rp{};
-        rp.seq = ++seq_;
-        rp.op = static_cast<std::uint8_t>(Op::kPut);
-        rp.id = id;
-        rp.dim = static_cast<std::uint32_t>(vec.size());
+        return AppendPut(id, vec, pomai::Metadata());
+    }
 
-        const std::size_t payload_bytes = vec.size_bytes();
+    pomai::Status Wal::AppendPut(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta)
+    {
+        // If metadata is empty, use standard kPut for compatibility and compactness
+        if (meta.tenant.empty()) {
+            RecordPrefix rp{};
+            rp.seq = ++seq_;
+            rp.op = static_cast<std::uint8_t>(Op::kPut);
+            rp.id = id;
+            rp.dim = static_cast<std::uint32_t>(vec.size());
 
-        // reuse scratch buffer
-        auto &frame = impl_->scratch;
-        frame.clear();
-        // heuristic reserve
-        if (frame.capacity() < 128 + payload_bytes)
-             frame.reserve(128 + payload_bytes);
+            const std::size_t payload_bytes = vec.size_bytes();
 
-        FrameHeader fh{};
-        fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
-        AppendBytes(&frame, &fh, sizeof(fh));
-        AppendBytes(&frame, &rp, sizeof(rp));
-        AppendBytes(&frame, vec.data(), payload_bytes);
+            // reuse scratch buffer
+            auto &frame = impl_->scratch;
+            frame.clear();
+            // heuristic reserve
+            if (frame.capacity() < 128 + payload_bytes)
+                 frame.reserve(128 + payload_bytes);
 
-        const std::uint32_t crc = pomai::util::Crc32c(frame.data() + sizeof(FrameHeader), fh.len - sizeof(std::uint32_t));
-        AppendBytes(&frame, &crc, sizeof(crc));
+            FrameHeader fh{};
+            fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
+            AppendBytes(&frame, &fh, sizeof(fh));
+            AppendBytes(&frame, &rp, sizeof(rp));
+            AppendBytes(&frame, vec.data(), payload_bytes);
 
-        auto st = RotateIfNeeded(frame.size());
-        if (!st.ok())
-            return st;
+            const std::uint32_t crc = pomai::util::Crc32c(frame.data() + sizeof(FrameHeader), fh.len - sizeof(std::uint32_t));
+            AppendBytes(&frame, &crc, sizeof(crc));
 
-        st = impl_->file.PWrite(file_off_, frame.data(), frame.size());
-        if (!st.ok())
-            return st;
+            auto st = RotateIfNeeded(frame.size());
+            if (!st.ok()) return st;
 
-        file_off_ += frame.size();
-        bytes_in_seg_ += frame.size();
+            st = impl_->file.PWrite(file_off_, frame.data(), frame.size());
+            if (!st.ok()) return st;
 
-        if (fsync_ == pomai::FsyncPolicy::kAlways)
-            return impl_->file.SyncData();
-        return pomai::Status::Ok();
+            file_off_ += frame.size();
+            bytes_in_seg_ += frame.size();
+
+            if (fsync_ == pomai::FsyncPolicy::kAlways)
+                return impl_->file.SyncData();
+            return pomai::Status::Ok();
+        } 
+        else 
+        {
+            // Use kPutMeta
+            RecordPrefix rp{};
+            rp.seq = ++seq_;
+            rp.op = static_cast<std::uint8_t>(Op::kPutMeta);
+            rp.id = id;
+            rp.dim = static_cast<std::uint32_t>(vec.size());
+
+            const std::size_t vec_bytes = vec.size_bytes();
+            const std::size_t meta_len = meta.tenant.size();
+            const std::size_t meta_bytes = sizeof(std::uint32_t) + meta_len;
+            const std::size_t payload_bytes = vec_bytes + meta_bytes;
+
+            auto &frame = impl_->scratch;
+            frame.clear();
+            if (frame.capacity() < 128 + payload_bytes)
+                 frame.reserve(128 + payload_bytes);
+
+            FrameHeader fh{};
+            fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
+            
+            AppendBytes(&frame, &fh, sizeof(fh));
+            AppendBytes(&frame, &rp, sizeof(rp));
+            AppendBytes(&frame, vec.data(), vec_bytes);
+            
+            // Serialize metadata: [len(4)][bytes]
+            std::uint32_t len32 = static_cast<std::uint32_t>(meta_len);
+            AppendBytes(&frame, &len32, sizeof(len32));
+            AppendBytes(&frame, meta.tenant.data(), meta_len);
+
+            const std::uint32_t crc = pomai::util::Crc32c(frame.data() + sizeof(FrameHeader), fh.len - sizeof(std::uint32_t));
+            AppendBytes(&frame, &crc, sizeof(crc));
+
+            auto st = RotateIfNeeded(frame.size());
+            if (!st.ok()) return st;
+
+            st = impl_->file.PWrite(file_off_, frame.data(), frame.size());
+            if (!st.ok()) return st;
+
+            file_off_ += frame.size();
+            bytes_in_seg_ += frame.size();
+            
+            if (fsync_ == pomai::FsyncPolicy::kAlways)
+                return impl_->file.SyncData();
+            return pomai::Status::Ok();
+        }
     }
 
     pomai::Status Wal::AppendDelete(pomai::VectorId id)
@@ -187,6 +241,11 @@ namespace pomai::storage
             return impl_->file.SyncData();
         return pomai::Status::Ok();
     }
+// ... (BatchAppend skipped for brevity)
+
+
+
+
 
     pomai::Status Wal::AppendBatch(const std::vector<pomai::VectorId>& ids,
                                     const std::vector<std::span<const float>>& vectors)
@@ -330,6 +389,30 @@ namespace pomai::storage
                     st = mem.Put(rp->id, std::span<const float>{vec, dim});
                     if (!st.ok())
                         return st;
+                }
+                else if (rp->op == static_cast<std::uint8_t>(Op::kPutMeta))
+                {
+                    const std::uint32_t dim = rp->dim;
+                    const std::size_t vec_bytes = static_cast<std::size_t>(dim) * sizeof(float);
+                    // Minimal check: headers + vec + meta_len(4) + crc(4)
+                    if (fh.len < sizeof(RecordPrefix) + vec_bytes + 4 + 4)
+                        return pomai::Status::Corruption("wal putmeta too short");
+
+                    const float *vec = reinterpret_cast<const float *>(body.data() + sizeof(RecordPrefix));
+                    
+                    // Decode metadata
+                    const uint8_t* meta_ptr = body.data() + sizeof(RecordPrefix) + vec_bytes;
+                    uint32_t meta_len = *reinterpret_cast<const uint32_t*>(meta_ptr);
+                    
+                    const std::size_t expect = sizeof(RecordPrefix) + vec_bytes + 4 + meta_len + sizeof(std::uint32_t);
+                    if (expect != fh.len)
+                         return pomai::Status::Corruption("wal putmeta length mismatch");
+                         
+                    std::string tenant(reinterpret_cast<const char*>(meta_ptr + 4), meta_len);
+                    pomai::Metadata meta(std::move(tenant));
+                    
+                    st = mem.Put(rp->id, std::span<const float>{vec, dim}, meta);
+                    if (!st.ok()) return st;
                 }
                 else if (rp->op == static_cast<std::uint8_t>(Op::kDel))
                 {

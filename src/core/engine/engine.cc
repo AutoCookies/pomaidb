@@ -64,41 +64,21 @@ namespace pomai::core
             return Status::InvalidArgument("shard_count must be > 0");
 
         std::error_code ec;
-        std::filesystem::create_directories(opt_.path, ec);
-        if (ec)
-            return Status::IOError("create_directories failed");
+        bool created_root_dir = false;
+        if (!std::filesystem::exists(opt_.path, ec)) {
+            // We are creating it new.
+            if (!std::filesystem::create_directories(opt_.path, ec)) {
+                 return Status::IOError("create_directories failed");
+            }
+            created_root_dir = true;
+        } else if (ec) {
+             return Status::IOError("stat failed: " + ec.message());
+        }
 
         shards_.clear();
         shards_.reserve(opt_.shard_count);
 
-        for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
-        {
-            auto wal = std::make_unique<storage::Wal>(opt_.path, i, kWalSegmentBytes, opt_.fsync);
-            auto st = wal->Open();
-            if (!st.ok())
-                return st;
-
-            auto mem = std::make_unique<table::MemTable>(opt_.dim, kArenaBlockBytes);
-
-            st = wal->ReplayInto(*mem);
-            if (!st.ok())
-                return st;
-
-            auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
-            // Create shard dir if not exists (Wal might have created parent, but shards/i might be missing if new logic?)
-            std::filesystem::create_directories(shard_dir, ec);
-
-            auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem), kMailboxCap, opt_.index_params, search_pool_.get(), segment_pool_.get());
-            auto shard = std::make_unique<Shard>(std::move(rt));
-
-            st = shard->Start();
-            if (!st.ok())
-                return st;
-
-            shards_.push_back(std::move(shard));
-        }
-        
-        // Init thread pools
+        // Init thread pools FIRST so shards get valid pointers.
         size_t threads = std::thread::hardware_concurrency();
         if (threads < 4) threads = 4;
         
@@ -106,8 +86,54 @@ namespace pomai::core
         search_pool_ = std::make_unique<util::ThreadPool>(threads);
         
         // Segment pool handles parallel segment scans (preventing deadlock)
-        // Can be same size or larger.
         segment_pool_ = std::make_unique<util::ThreadPool>(threads);
+
+        Status first_error = Status::Ok();
+
+        for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
+        {
+            auto wal = std::make_unique<storage::Wal>(opt_.path, i, kWalSegmentBytes, opt_.fsync);
+            auto st = wal->Open();
+            if (!st.ok()) {
+                first_error = st;
+                break;
+            }
+
+            auto mem = std::make_unique<table::MemTable>(opt_.dim, kArenaBlockBytes);
+
+            st = wal->ReplayInto(*mem);
+            if (!st.ok()) {
+                first_error = st;
+                break;
+            }
+
+            auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
+            std::filesystem::create_directories(shard_dir, ec);
+
+            auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem), kMailboxCap, opt_.index_params, search_pool_.get(), segment_pool_.get());
+            auto shard = std::make_unique<Shard>(std::move(rt));
+
+            st = shard->Start();
+            if (!st.ok()) {
+                first_error = st;
+                break;
+            }
+
+            shards_.push_back(std::move(shard));
+        }
+        
+        if (!first_error.ok()) {
+            // Cleanup
+            shards_.clear(); // Stop and destroy any shards we started
+            search_pool_.reset();
+            segment_pool_.reset();
+            if (created_root_dir) {
+                // Remove the directory we just created to be atomic
+                std::error_code ignore;
+                std::filesystem::remove_all(opt_.path, ignore);
+            }
+            return first_error;
+        }
 
         opened_ = true;
         return Status::Ok();
@@ -131,6 +157,16 @@ namespace pomai::core
             return Status::InvalidArgument("dim mismatch");
         const auto sid = ShardOf(id, opt_.shard_count);
         return shards_[sid]->Put(id, vec);
+    }
+
+    Status Engine::Put(VectorId id, std::span<const float> vec, const pomai::Metadata& meta)
+    {
+        if (!opened_)
+            return Status::InvalidArgument("engine not opened");
+        if (static_cast<std::uint32_t>(vec.size()) != opt_.dim)
+            return Status::InvalidArgument("dim mismatch");
+        const auto sid = ShardOf(id, opt_.shard_count);
+        return shards_[sid]->Put(id, vec, meta);
     }
 
     Status Engine::PutBatch(const std::vector<VectorId>& ids,
@@ -174,12 +210,17 @@ namespace pomai::core
 
     Status Engine::Get(VectorId id, std::vector<float> *out)
     {
+        return Get(id, out, nullptr);
+    }
+
+    Status Engine::Get(VectorId id, std::vector<float> *out, pomai::Metadata* out_meta)
+    {
         if (!opened_)
             return Status::InvalidArgument("engine not opened");
         if (!out)
             return Status::InvalidArgument("out=null");
         const auto sid = ShardOf(id, opt_.shard_count);
-        return shards_[sid]->Get(id, out);
+        return shards_[sid]->Get(id, out, out_meta);
     }
 
     Status Engine::Exists(VectorId id, bool *exists)
@@ -249,6 +290,11 @@ namespace pomai::core
 
     Status Engine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out)
     {
+        return Search(query, topk, SearchOptions{}, out);
+    }
+
+    Status Engine::Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out)
+    {
         if (!opened_)
             return Status::InvalidArgument("engine not opened");
         if (!out)
@@ -267,18 +313,23 @@ namespace pomai::core
         for (std::uint32_t i = 0; i < opt_.shard_count; ++i)
         {
             futures.push_back(search_pool_->Enqueue([&, i]
-                            { return shards_[i]->SearchLocal(query, topk, &per[i]); }));
+                            { return shards_[i]->SearchLocal(query, topk, opts, &per[i]); }));
         }
         
-        for (auto &f : futures)
-            (void)f.get();
-
         std::vector<pomai::SearchHit> merged;
-        for (auto &v : per)
-            merged.insert(merged.end(), v.begin(), v.end());
+        for (size_t i = 0; i < futures.size(); ++i) {
+            Status st = futures[i].get();
+            if (!st.ok()) {
+                out->errors.push_back({static_cast<uint32_t>(i), st.message()});
+            } else {
+                // Only merge hits from successful shards
+                merged.insert(merged.end(), per[i].begin(), per[i].end());
+            }
+        }
 
         MergeTopK(&merged, topk);
         out->hits = std::move(merged);
+        
         return Status::Ok();
     }
 

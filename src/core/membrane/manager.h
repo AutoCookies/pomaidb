@@ -9,6 +9,7 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/iterator.h"
+#include "pomai/metadata.h" // Added
 
 namespace pomai::core
 {
@@ -38,13 +39,16 @@ namespace pomai::core
         Status ListMembranes(std::vector<std::string> *out) const;
 
         Status Put(std::string_view membrane, VectorId id, std::span<const float> vec);
+        Status Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta); // Overload
         Status PutBatch(std::string_view membrane,
                         const std::vector<VectorId>& ids,
                         const std::vector<std::span<const float>>& vectors);
         Status Get(std::string_view membrane, VectorId id, std::vector<float> *out);
+        Status Get(std::string_view membrane, VectorId id, std::vector<float> *out, Metadata* out_meta); // Added
         Status Exists(std::string_view membrane, VectorId id, bool *exists);
         Status Delete(std::string_view membrane, VectorId id);
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
+        Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
 
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);

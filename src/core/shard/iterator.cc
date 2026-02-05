@@ -80,11 +80,11 @@ namespace pomai::core
             
             // Check if entry is valid (not seen, not tombstone)
             if (found) {
-                if (seen_.count(current_id_) == 0) {
-                    // Found valid entry
+                if (seen_.count(current_id_) == 0 && !current_vec_.empty()) {
+                    // Found valid live entry (not a duplicate, not a tombstone)
                     return;
                 } else {
-                    // Skip duplicate (already seen newer version)
+                    // Skip duplicate or tombstone
                     entry_idx_++;
                     continue;
                 }
@@ -109,19 +109,19 @@ namespace pomai::core
             
             fmem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
                 if (current_entry == entry_idx_) {
+                    current_id_ = id;
                     if (!is_deleted) {
-                        current_id_ = id;
                         current_vec_.assign(vec.begin(), vec.end());
-                        found = true;
+                    } else {
+                        current_vec_.clear(); // Tombstone: clear vector
                     }
-                    // If deleted, we still "found" it but it's a tombstone
-                    // The caller will skip it and advance
+                    found = true;
                 }
                 current_entry++;
             });
             
             if (found) {
-                return true;
+                return true; // Found entry (live or tombstone)
             }
             
             // No more entries in this memtable, move to next
@@ -146,13 +146,13 @@ namespace pomai::core
             auto st = seg->ReadAt(static_cast<uint32_t>(entry_idx_), &id, &vec, &is_deleted);
             
             if (st.ok()) {
+                current_id_ = id;
                 if (!is_deleted) {
-                    current_id_ = id;
                     current_vec_.assign(vec.begin(), vec.end());
-                    return true;
+                } else {
+                    current_vec_.clear(); // Tombstone: clear vector
                 }
-                // Tombstone found but we still return true (caller will skip)
-                return false;
+                return true; // Found entry (live or tombstone)
             }
             
             // No more entries in this segment, move to next

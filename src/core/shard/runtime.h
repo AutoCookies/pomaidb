@@ -12,6 +12,7 @@
 #include "core/shard/mailbox.h"
 #include "core/shard/seen_tracker.h"
 #include "core/shard/snapshot.h"
+#include "pomai/metadata.h"
 #include "pomai/search.h" // Restored
 #include "pomai/iterator.h"
 #include "pomai/status.h"
@@ -43,6 +44,7 @@ namespace pomai::core
         VectorId id{};
         const float *vec{};
         std::uint32_t dim{};
+        pomai::Metadata meta{}; // Added
         std::promise<pomai::Status> done;
     };
 
@@ -128,9 +130,11 @@ namespace pomai::core
         pomai::Status Enqueue(Command &&cmd);
 
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta); // Overload
         pomai::Status PutBatch(const std::vector<pomai::VectorId>& ids,
                                const std::vector<std::span<const float>>& vectors);
         pomai::Status Get(pomai::VectorId id, std::vector<float> *out);
+        pomai::Status Get(pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta); // Added
         pomai::Status Exists(pomai::VectorId id, bool *exists);
         pomai::Status Delete(pomai::VectorId id);
 
@@ -143,6 +147,10 @@ namespace pomai::core
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
                              std::vector<pomai::SearchHit> *out);
+        pomai::Status Search(std::span<const float> query,
+                             std::uint32_t topk,
+                             const SearchOptions& opts,
+                             std::vector<pomai::SearchHit> *out); // Overload
 
         // Non-blocking enqueue. Returns ResourceExhausted if full.
         pomai::Status TryEnqueue(Command &&cmd);
@@ -166,13 +174,16 @@ namespace pomai::core
         // std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c); // Deprecated
 
         // Lock-free internal helpers
-        pomai::Status GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out);
+        pomai::Status GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta = nullptr);
         std::pair<pomai::Status, bool> ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id);
 
-        pomai::Status SearchLocalInternal(std::shared_ptr<ShardSnapshot> snap, 
+        pomai::Status SearchLocalInternal(std::shared_ptr<table::MemTable> active,
+                                          std::shared_ptr<ShardSnapshot> snap, 
                                           std::span<const float> query,
                                           std::uint32_t topk,
+                                          const SearchOptions& opts,
                                           std::vector<pomai::SearchHit> *out);
+
                                           
         // Helper to load segments
         pomai::Status LoadSegments();
@@ -191,7 +202,7 @@ namespace pomai::core
         const std::uint32_t dim_;
 
         std::unique_ptr<storage::Wal> wal_;
-        std::unique_ptr<table::MemTable> mem_;
+        std::atomic<std::shared_ptr<table::MemTable>> mem_;
         // New: Frozen memtables (awaiting flush to disk)
         std::vector<std::shared_ptr<table::MemTable>> frozen_mem_;
         
@@ -203,10 +214,6 @@ namespace pomai::core
 
         // IVF coarse index for candidate selection (centroid routing).
         std::unique_ptr<pomai::index::IvfCoarse> ivf_;
-        std::vector<pomai::VectorId> candidates_scratch_;
-        // Shard-local reusable structure for search visibility tracking (DB-grade)
-        SeenTracker seen_tracker_;
-
 
         BoundedMpscQueue<Command> mailbox_;
         std::atomic<std::uint64_t> ops_processed_{0};

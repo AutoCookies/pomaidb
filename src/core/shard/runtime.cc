@@ -15,6 +15,8 @@
 #include "core/shard/iterator.h"
 #include "core/shard/manifest.h"
 #include <queue>
+#include "core/shard/filter_evaluator.h" // Added
+#include "pomai/metadata.h" // Added
 
 namespace pomai::core
 {
@@ -40,6 +42,16 @@ namespace pomai::core
           segment_pool_(segment_pool),
           index_params_(index_params)
     {
+        // P0.3: Validate thread pool wiring
+        // These pools are used in Search and Segment operations.
+        // Null pools would cause segfaults. Fail fast here.
+        if (!thread_pool_) {
+            throw std::invalid_argument("ShardRuntime: thread_pool cannot be null");
+        }
+        if (!segment_pool_) {
+            throw std::invalid_argument("ShardRuntime: segment_pool cannot be null");
+        }
+        
         pomai::index::IvfCoarse::Options opt;
         opt.nlist = index_params_.nlist;
         opt.nprobe = index_params_.nprobe;
@@ -65,7 +77,9 @@ namespace pomai::core
             return pomai::Status::Busy("shard already started");
         
         // If we have replayed data in MemTable, rotate it to Frozen so it's visible in Snapshot.
-        if (mem_->GetCount() > 0) {
+        // Use atomic load to get shared_ptr
+        auto m = mem_.load(std::memory_order_relaxed);
+        if (m && m->GetCount() > 0) {
             (void)RotateMemTable();
         }
 
@@ -117,9 +131,6 @@ namespace pomai::core
     // -------------------------
     // Snapshot & Rotation
     // -------------------------
-    // -------------------------
-    // Snapshot & Rotation
-    // -------------------------
     void ShardRuntime::PublishSnapshot()
     {
         auto snap = std::make_shared<ShardSnapshot>();
@@ -129,11 +140,9 @@ namespace pomai::core
         // Copy atomic/shared state
         snap->segments = segments_; // Shared ownership of segments
         snap->frozen_memtables = frozen_mem_; // Shared ownership of frozen tables
-        snap->mem = mem_.get(); // Active memtable (raw ptr, owned by ShardRuntime)
         
         // INVARIANT: All frozen memtables are immutable (count fixed)
         for (const auto& fmem : snap->frozen_memtables) {
-            // usage count might be > 1 (snapshot + frozen_mem_) or more if multiple snapshots
             assert(fmem.use_count() >= 2); 
             (void)fmem;
         }
@@ -150,18 +159,17 @@ namespace pomai::core
     pomai::Status ShardRuntime::RotateMemTable()
     {
         // Move mutable mem_ to frozen_mem_
-        if (mem_->GetCount() == 0) return pomai::Status::Ok();
+        // Since we are single writer, we can load relaxed.
+        auto old_mem = mem_.load(std::memory_order_relaxed);
+        if (old_mem->GetCount() == 0) return pomai::Status::Ok();
         
-        // Transfer ownership from unique_ptr to shared_ptr
-        std::shared_ptr<table::MemTable> old_mem = std::move(mem_);
+        // Push old shared_ptr to frozen
         frozen_mem_.push_back(old_mem);
         
-        // Allocate new MemTable
-        // We reuse the same arena block size constant? Need to expose it or hardcode.
-        // engine.cc uses kArenaBlockBytes = 1MB. We should probably pass it or use default.
-        // mem_->ArenaBlockBytes? No getter.
-        // Let's assume 1MB.
-        mem_ = std::make_unique<table::MemTable>(dim_, 1u << 20);
+        // Create new MemTable
+        // engine.cc uses kArenaBlockBytes = 1MB. Assuming 1MB here too.
+        auto new_mem = std::make_shared<table::MemTable>(dim_, 1u << 20);
+        mem_.store(new_mem, std::memory_order_release);
         
         PublishSnapshot();
         return pomai::Status::Ok();
@@ -173,6 +181,11 @@ namespace pomai::core
 
     pomai::Status ShardRuntime::Put(pomai::VectorId id, std::span<const float> vec)
     {
+        return Put(id, vec, pomai::Metadata());
+    }
+
+    pomai::Status ShardRuntime::Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta)
+    {
         if (vec.size() != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
 
@@ -180,12 +193,36 @@ namespace pomai::core
         cmd.id = id;
         cmd.vec = vec.data(); 
         cmd.dim = static_cast<std::uint32_t>(vec.size());
+        cmd.meta = meta; // Copy metadata
         
         auto f = cmd.done.get_future();
         auto st = Enqueue(Command{std::move(cmd)});
         if (!st.ok())
             return st;
         return f.get();
+    }
+// ... (BatchPut skipped) ...
+
+    pomai::Status ShardRuntime::HandlePut(PutCmd &c)
+    {
+        if (c.dim != dim_)
+            return pomai::Status::InvalidArgument("dim mismatch");
+
+        // 1. Write WAL
+        auto st = wal_->AppendPut(c.id, {c.vec, c.dim}, c.meta);
+        if (!st.ok())
+            return st;
+
+        // 2. Update MemTable
+        auto m = mem_.load(std::memory_order_relaxed);
+        st = m->Put(c.id, {c.vec, c.dim}, c.meta);
+        if (!st.ok()) return st;
+
+        // 3. Check Threshold for Soft Freeze (e.g. 5000 items)
+        if (m->GetCount() >= 5000) {
+            (void)RotateMemTable();
+        }
+        return pomai::Status::Ok();
     }
 
     pomai::Status ShardRuntime::PutBatch(const std::vector<pomai::VectorId>& ids,
@@ -232,58 +269,60 @@ namespace pomai::core
 
     pomai::Status ShardRuntime::Get(pomai::VectorId id, std::vector<float> *out)
     {
-        if (!out) return Status::InvalidArgument("out is null");
-        auto snap = GetSnapshot();
-        if (!snap) return Status::Aborted("shard not ready");
-        return GetFromSnapshot(snap, id, out);
+        return Get(id, out, nullptr);
     }
 
-    pomai::Status ShardRuntime::Exists(pomai::VectorId id, bool *exists)
+    pomai::Status ShardRuntime::Get(pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta)
     {
-        if (!exists) return Status::InvalidArgument("exists is null");
-        auto snap = GetSnapshot();
-        if (!snap) return Status::Aborted("shard not ready");
-        auto res = ExistsInSnapshot(snap, id);
-        if (res.first.ok()) {
-            *exists = res.second;
-        }
-        return res.first;
-    }
+        if (!out) return Status::InvalidArgument("out is null");
 
-    pomai::Status ShardRuntime::GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out) {
-        // 0. Check Active MemTable
-        if (snap->mem) {
-            const float* p = snap->mem->GetPtr(id);
-            if (p) {
-                out->assign(p, p + dim_);
+        // 0. Check Active MemTable (P0.2 Unified RYW)
+        auto active = mem_.load(std::memory_order_acquire);
+        if (active) {
+            if (active->IsTombstone(id)) {
+                return Status::NotFound("tombstone");
+            }
+            const float* ptr = nullptr;
+            if (active->Get(id, &ptr, out_meta).ok() && ptr) { // Use new MemTable::Get overload
+                out->assign(ptr, ptr + dim_);
                 return Status::Ok();
             }
-            if (snap->mem->IsTombstone(id)) {
-                return Status::NotFound("tombstone"); 
-            }
         }
 
-        // 1. Check Frozen MemTables (Newest -> Oldest)
+        // 1. Check Snapshot (Frozen + Segments)
+        auto snap = GetSnapshot();
+        if (!snap) return Status::Aborted("shard not ready");
         
+        return GetFromSnapshot(snap, id, out, out_meta);
+    }
+
+    // ... Exists ...
+
+    pomai::Status ShardRuntime::GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta) {
+        // NOTE: Active MemTable is checked by caller (Get) for RYW.
+        // Snapshot only contains Frozen + Segments.
+
+        // 1. Check Frozen MemTables (Newest -> Oldest)
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
             if ((*it)->IsTombstone(id)) {
                 return Status::NotFound("tombstone");
             }
-            const float* p = (*it)->GetPtr(id);
-            if (p) {
+            const float* p = nullptr;
+            if ((*it)->Get(id, &p, out_meta).ok() && p) {
                 out->assign(p, p + dim_);
                 return Status::Ok();
             }
         }
 
         // 2. Check Segments (Newest -> Oldest)
-        // segments_ is [Newest, ..., Oldest] (based on HandleFreeze insert(begin))
-        
         for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
             std::span<const float> svec;
-            auto res = (*it)->Find(id, &svec);
+            pomai::Metadata s_meta;
+            auto res = (*it)->Find(id, &svec, out_meta ? &s_meta : nullptr);
             if (res == table::SegmentReader::FindResult::kFound) {
                 out->assign(svec.begin(), svec.end());
+                // V1 Segment has no metadata. Return empty.
+                if (out_meta) *out_meta = s_meta;
                 return Status::Ok();
             } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
                 return Status::NotFound("tombstone");
@@ -293,17 +332,49 @@ namespace pomai::core
         return Status::NotFound("vector not found");
     }
 
+    pomai::Status ShardRuntime::Exists(pomai::VectorId id, bool *exists)
+    {
+        if (!exists) return Status::InvalidArgument("exists is null");
+        
+        // 0. Check Active MemTable (P0.2 Unified RYW)
+        auto active = mem_.load(std::memory_order_acquire);
+        if (active) {
+            if (active->IsTombstone(id)) {
+                *exists = false;
+                return Status::Ok();
+            }
+            const float* ptr = nullptr;
+            if (active->Get(id, &ptr).ok() && ptr) {
+                *exists = true;
+                return Status::Ok();
+            }
+        }
+
+        // 1. Check Snapshot
+        auto snap = GetSnapshot();
+        if (!snap) return Status::Aborted("shard not ready");
+        
+        auto res = ExistsInSnapshot(snap, id);
+        if (res.first.ok()) {
+            *exists = res.second;
+        }
+        return res.first;
+    }
+
+
+
     std::pair<pomai::Status, bool> ShardRuntime::ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id) {
         // 1. Check Frozen (Newest -> Oldest)
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
              if ((*it)->IsTombstone(id)) return {Status::Ok(), false};
-             if ((*it)->GetPtr(id)) return {Status::Ok(), true};
+             const float* p = nullptr;
+             if ((*it)->Get(id, &p).ok() && p) return {Status::Ok(), true};
         }
 
         // 2. Check Segments (Newest -> Oldest)
         for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
             std::span<const float> svec;
-            auto res = (*it)->Find(id, &svec);
+            auto res = (*it)->Find(id, &svec, nullptr); 
              if (res == table::SegmentReader::FindResult::kFound) {
                 return {Status::Ok(), true};
             } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
@@ -363,6 +434,14 @@ namespace pomai::core
                                        std::uint32_t topk,
                                        std::vector<pomai::SearchHit> *out)
     {
+        return Search(query, topk, SearchOptions{}, out);
+    }
+
+    pomai::Status ShardRuntime::Search(std::span<const float> query,
+                                       std::uint32_t topk,
+                                       const SearchOptions& opts,
+                                       std::vector<pomai::SearchHit> *out)
+    {
         if (!out)
             return pomai::Status::InvalidArgument("out null");
         if (query.size() != dim_)
@@ -377,8 +456,11 @@ namespace pomai::core
         auto snap = GetSnapshot();
         if (!snap) return pomai::Status::Aborted("shard not ready");
 
-        // Local Search using Snapshot (Bypass Mailbox)
-        return SearchLocalInternal(snap, query, topk, out);
+        // P0.2: Capture active memtable for concurrency
+        auto active = mem_.load(std::memory_order_acquire);
+
+        // Local Search using Snapshot + Active (Bypass Mailbox)
+        return SearchLocalInternal(active, snap, query, topk, opts, out);
     }
 
     // -------------------------
@@ -463,27 +545,7 @@ namespace pomai::core
     // Handlers
     // -------------------------
 
-    pomai::Status ShardRuntime::HandlePut(PutCmd &c)
-    {
-        if (c.dim != dim_)
-            return pomai::Status::InvalidArgument("dim mismatch");
 
-        // 1. Write WAL
-        auto st = wal_->AppendPut(c.id, {c.vec, c.dim});
-        if (!st.ok())
-            return st;
-
-        // 2. Update MemTable
-        st = mem_->Put(c.id, {c.vec, c.dim});
-        if (!st.ok()) return st;
-
-        // 3. Check Threshold for Soft Freeze (e.g. 5000 items)
-        // Hardcoding 5000 for now as per plan
-        if (mem_->GetCount() >= 5000) {
-            (void)RotateMemTable();
-        }
-        return pomai::Status::Ok();
-    }
 
     pomai::Status ShardRuntime::HandleBatchPut(BatchPutCmd &c)
     {
@@ -504,12 +566,13 @@ namespace pomai::core
             return st;
         
         // 2. Batch update MemTable
-        st = mem_->PutBatch(c.ids, spans);
+        auto m = mem_.load(std::memory_order_relaxed);
+        st = m->PutBatch(c.ids, spans);
         if (!st.ok())
             return st;
         
         // 3. Check threshold for soft freeze (same as single Put)
-        if (mem_->GetCount() >= 5000) {
+        if (m->GetCount() >= 5000) {
             (void)RotateMemTable();
         }
         
@@ -524,7 +587,7 @@ namespace pomai::core
         if (!st.ok())
             return st;
 
-        st = mem_->Delete(c.id);
+        st = mem_.load(std::memory_order_relaxed)->Delete(c.id);
         if (!st.ok())
             return st;
 
@@ -563,7 +626,7 @@ namespace pomai::core
     pomai::Status ShardRuntime::HandleFreeze(FreezeCmd &)
     {
         // Step 1: Rotate Active → Frozen (idempotent if already empty)
-        if (mem_->GetCount() > 0) {
+        if (mem_.load(std::memory_order_relaxed)->GetCount() > 0) {
             auto st = RotateMemTable();
             if (!st.ok()) {
                 return pomai::Status::Internal("Freeze: RotateMemTable failed: " + st.message());
@@ -594,8 +657,9 @@ namespace pomai::core
             
             // Build segment to disk
             table::SegmentBuilder builder(filepath, dim_);
-            fmem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                (void)builder.Add(id, vec, is_deleted);
+            fmem->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                pomai::Metadata meta_copy = meta ? *meta : pomai::Metadata();
+                (void)builder.Add(id, vec, is_deleted, meta_copy);
             });
             
             // Build Sidecar Index
@@ -738,8 +802,9 @@ namespace pomai::core
                 } else {
                     // ✅ KEEP LIVE DATA (newest version only)
                     std::span<const float> vec;
-                    if (segments_[top.seg_idx]->ReadAt(top.entry_idx, nullptr, &vec, nullptr).ok()) {
-                        builder.Add(top.id, vec, false);
+                    pomai::Metadata meta; // Compact needs to preserve metadata!
+                    if (segments_[top.seg_idx]->ReadAt(top.entry_idx, nullptr, &vec, nullptr, &meta).ok()) {
+                        builder.Add(top.id, vec, false, meta);
                         live_entries_kept++;
                     }
                 }
@@ -839,17 +904,11 @@ namespace pomai::core
 
     SearchReply ShardRuntime::HandleSearch(SearchCmd &c)
     {
-        // Legacy fallback
         SearchReply r;
-        // Use internal helper but we need to create a snapshot from current state manually?
-        // Or just use the Atomic Snapshot.
-        // It's safe to use atomic snapshot even from Writer thread.
         auto snap = GetSnapshot();
         if(snap) {
-             // We need to pass the snap to SearchLocalInternal
-             // But SearchLocalInternal needs to be updated.
-             // I'll update SearchLocalInternal signature below.
-             r.st = SearchLocalInternal(snap, {c.query.data(), c.query.size()}, c.topk, &r.hits);
+             auto active = mem_.load(std::memory_order_acquire);
+             r.st = SearchLocalInternal(active, snap, {c.query.data(), c.query.size()}, c.topk, SearchOptions{}, &r.hits);
         } else {
             r.st = Status::Aborted("no snapshot");
         }
@@ -861,245 +920,165 @@ namespace pomai::core
     // -------------------------
 
     pomai::Status ShardRuntime::SearchLocalInternal(
+            std::shared_ptr<table::MemTable> active,
             std::shared_ptr<ShardSnapshot> snap,
             std::span<const float> query,
             std::uint32_t topk,
+            const SearchOptions& opts,
             std::vector<pomai::SearchHit> *out)
     {
         out->clear();
         out->reserve(topk);
 
-        // Begin new search iteration (resets seen tracker via generation increment)
-        seen_tracker_.BeginSearch();
+        // Initialize local SeenTracker for this search
+        SeenTracker seen_tracker;
+        seen_tracker.BeginSearch();
 
         // Inline top-K heap maintenance
+        auto cmp = [](const pomai::SearchHit& a, const pomai::SearchHit& b) {
+            return a.score > b.score; // min-heap by score (keep largest)
+        };
+        std::priority_queue<pomai::SearchHit, std::vector<pomai::SearchHit>, decltype(cmp)> pq(cmp);
+
         auto push_topk = [&](pomai::VectorId id, float score)
         {
-            if (out->size() < topk)
-            {
-                out->push_back({id, score});
-                if (out->size() == topk)
-                {
-                    std::make_heap(out->begin(), out->end(),
-                                   [](const auto &a, const auto &b)
-                                   { return a.score > b.score; }); // min-heap by score
-                }
-                return;
+            if (pq.size() < topk) {
+                pq.push({id, score});
+            } else if (score > pq.top().score) {
+                pq.pop();
+                pq.push({id, score});
             }
-
-            if (score <= (*out)[0].score)
-                return;
-
-            std::pop_heap(out->begin(), out->end(),
-                          [](const auto &a, const auto &b)
-                          { return a.score > b.score; });
-            (*out)[topk - 1] = {id, score};
-            std::push_heap(out->begin(), out->end(),
-                           [](const auto &a, const auto &b)
-                           { return a.score > b.score; });
         };
 
         // -------------------------
         // 0. SCAN Active MemTable (Newest)
         // -------------------------
-        // We must check Active MemTable before Frozen/Segments.
-        // It uses shared_lock internal to IterateWithStatus, so safe to call concurrently.
-        if (snap->mem) {
-            snap->mem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                 if (seen_tracker_.Contains(id)) return;
-                 seen_tracker_.MarkSeen(id); 
-
+        if (active) {
+            active->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                 if (seen_tracker.Contains(id)) return;
+                 seen_tracker.MarkSeen(id); 
+                 
                  if (is_deleted) {
-                     seen_tracker_.MarkTombstone(id);
+                     seen_tracker.MarkTombstone(id);
                      return;
                  }
 
+                 // Check Filter
+                 const pomai::Metadata default_meta;
+                 const pomai::Metadata& m = meta ? *meta : default_meta;
+                 if (!core::FilterEvaluator::Matches(m, opts)) {
+                     return;
+                 }
+                 
                  float score = pomai::core::Dot(query, vec);
                  push_topk(id, score);
             });
         }
 
         // -------------------------
-        // 1-PASS MERGE SCAN: Frozen MemTables (newest → oldest)
+        // 1. SCAN Frozen MemTables (Newest -> Oldest)
         // -------------------------
-        // Process each ID exactly once. If ID seen before, skip.
-        // If tombstone, mark and skip. Otherwise, score and push to heap.
-        
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
-            (*it)->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                // Skip if already processed (newest-wins)
-                if (seen_tracker_.Contains(id)) return;
+            (*it)->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                if (seen_tracker.Contains(id)) return;
+                seen_tracker.MarkSeen(id);
                 
-                // Mark as seen
-                seen_tracker_.MarkSeen(id);
-                
-                // If tombstone, skip scoring
                 if (is_deleted) {
-                    seen_tracker_.MarkTombstone(id);
+                    seen_tracker.MarkTombstone(id);
+                    return;
+                }
+
+                const pomai::Metadata default_meta;
+                const pomai::Metadata& m = meta ? *meta : default_meta;
+                if (!core::FilterEvaluator::Matches(m, opts)) {
                     return;
                 }
                 
-                // Score and push to top-K
                 float score = pomai::core::Dot(query, vec);
                 push_topk(id, score);
             });
         }
 
         // -------------------------
-        // 1-PASS MERGE SCAN: Segments (Newest -> Oldest)
+        // 2. SCAN Segments (Newest -> Oldest)
         // -------------------------
+        // Parallel Scan with mutex for top-k merge
         
         uint32_t nprobe = index_params_.nprobe; 
         
-        struct SegmentResult {
-            std::vector<VectorId> candidates;
-            std::vector<std::pair<VectorId, float>> hits;
-        };
+        std::vector<std::future<void>> futures;
+        futures.reserve(snap->segments.size());
+        
+        std::mutex out_mutex;
+        
+        for (auto& seg : snap->segments) {
+             futures.push_back(segment_pool_->Enqueue([&, seg]() {
+                  // Fallback: Full Scan (ForEach) vs Index
+                  
+                  if (seg->HasIndex() && opts.filters.empty()) {
+                      // Optimization: Use Index only if NO filters for now
+                      std::vector<VectorId> candidates;
+                      if(seg->Search(query, nprobe, &candidates).ok()) {
+                          for(auto id : candidates) {
+                              std::span<const float> vec;
+                              bool is_del = false;
+                              pomai::Metadata meta;
+                              
+                              auto status = seg->Get(id, &vec, &meta); 
+                              if (!status.ok()) continue; // Deleted or not found (tombstone)
+                              
+                              {
+                                  std::lock_guard<std::mutex> lock(out_mutex);
+                                  if (seen_tracker.Contains(id)) continue;
+                                  seen_tracker.MarkSeen(id); 
+                                  
+                                  float score = pomai::core::Dot(query, vec);
+                                  push_topk(id, score);
+                              }
+                          }
+                          return;
+                      }
+                  }
+                  
+                  // Fallback or Filtered Scan
+                  seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                        std::lock_guard<std::mutex> lock(out_mutex);
+                        if (seen_tracker.Contains(id)) return; 
+                        seen_tracker.MarkSeen(id);
 
-        std::vector<std::future<SegmentResult>> futures;
-        std::vector<SegmentResult> inline_results;
-        
-        // Group segments into tasks implies we iterate them.
-        // Segments are already ordered roughly newest to oldest. 
-        // We can just parallelize all segments if pool is available.
-        
-        // Lambda to search a single segment (or batch)
-        auto search_segment = [&](std::shared_ptr<table::SegmentReader> seg) -> SegmentResult {
-            SegmentResult res;
-            if (seg->HasIndex()) {
-                // IVF Path
-                std::vector<VectorId> candidates;
-                Status st = seg->Search(query, nprobe, &candidates);
-                if (st.ok()) {
-                     res.candidates = std::move(candidates);
-                }
-            } else {
-                // Brute force scan inside segment
-                // This might return A LOT of results locally, we probably want top-K per segment?
-                // Or just scan and return hits?
-                // The main SearchLocalInternal merges everything.
-                // For simplicity in this phase, let's just stick to IVF-only parallelization logic 
-                // or just do candidates gathering.
-                // BRUTE FORCE SCAN IS SLOW.
-                // If we parallelize brute force, we should return top-K from that segment.
-                // Let's implement full parallel support.
-                
-                seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                     if (is_deleted) return; // Wait, we need to handle tombstones globally? 
-                     // No, "Delete" in segment means it's a tombstone for OLDER segments?
-                     // SegmentReader::ForEach returns is_deleted flag.
-                     // If it is_deleted, it IS a tombstone.
-                     // So we should return it as a tombstone hit?
-                     // Or just ignore it?
-                     // The SeenTracker logic handles tombstones.
-                     // But SeenTracker is not thread-safe.
-                     // So parallel tasks CANNOT touch SeenTracker.
-                     // They must return raw hits/tombstones, and main thread merges.
-                     
-                     float score = pomai::core::Dot(query, vec);
-                     // Just collect ALL hits? Too expensive if segment is large.
-                     // Collect Top-K locally? Yes.
-                     // But we also need Tombstones to hide older versions.
-                     // If we see a tombstone, we must report it.
-                     res.hits.push_back({id, is_deleted ? -std::numeric_limits<float>::infinity() : score});
-                     // Wait, how to distinguish tombstone in pair?
-                     // We need a better struct.
-                });
-            }
-            return res;
-        };
-        
-        // NOTE: SeenTracker is NOT thread-safe.
-        // Parallel Strategy:
-        // 1. Scatter: Search segments in parallel. 
-        //    Each task returns Candidates (IVF) or Top-K Hits (Brute Force).
-        // 2. Gather: Main thread processes results in Newer->Older order using SeenTracker.
-        
-        size_t num_segments = snap->segments.size();
-        if (num_segments > 0) {
-            if (segment_pool_) {
-                 futures.reserve(num_segments);
-                 for(auto& seg : snap->segments) {
-                      futures.push_back(segment_pool_->Enqueue([&, seg]() { 
-                          return search_segment(seg); 
-                      }));
-                 }
-            } else {
-                 inline_results.reserve(num_segments);
-                 for(auto& seg : snap->segments) {
-                      inline_results.push_back(search_segment(seg));
-                 }
-            }
+                        if (is_deleted) {
+                            seen_tracker.MarkTombstone(id);
+                            return;
+                        }
+
+                        // Check Filter
+                        const pomai::Metadata default_meta;
+                        const pomai::Metadata& m = meta ? *meta : default_meta;
+                        if (!core::FilterEvaluator::Matches(m, opts)) {
+                            return;
+                        }
+
+                        float score = pomai::core::Dot(query, vec);
+                        push_topk(id, score);
+                  });
+             }));
         }
         
-        // Wait and Merge (Strict Order: Newest -> Oldest)
-        // segments_ in snapshot are [0]=Newest ... [N]=Oldest.
-        // So we just iterate 0..N and consume results.
-        
-        for (size_t i = 0; i < num_segments; ++i) {
-            SegmentResult res;
-            if (segment_pool_) {
-                res = futures[i].get();
-            } else {
-                res = std::move(inline_results[i]);
-            }
-            
-            auto& seg = snap->segments[i]; // Need to access segment for Rerank/Find
-            
-            // 1. Process IVF Candidates
-            for (VectorId id : res.candidates) {
-                 if (seen_tracker_.Contains(id)) continue;
-                 seen_tracker_.MarkSeen(id); 
-                 
-                 std::span<const float> vec;
-                 auto fr = seg->Find(id, &vec);
-                 if (fr == table::SegmentReader::FindResult::kFound) {
-                      float score = pomai::core::Dot(query, vec);
-                      push_topk(id, score);
-                 } else if (fr == table::SegmentReader::FindResult::kFoundTombstone) {
-                      seen_tracker_.MarkTombstone(id);
-                 }
-            }
-            
-            // 2. Process Brute Force Hits (if any)
-            // Warning: simple loop here assumes search_segment logic for brute force
-            // matches this structure.
-            // Currently search_segment for BF returns ALL hits in `hits` vector 
-            // where score = -inf if tombstone?
-            // This is inefficient for large segments (RAM).
-            // But we mostly use IVF now.
-            // Let's refine brute force later (Phase 4B).
-            // For now, if no index, we used to do `seg->ForEach` with direct callback using seen_tracker.
-            // If we parallelize, `seen_tracker` logic breaks.
-            // Valid Approach: 
-            //   If NO index, run serialized (old way) to allow streaming update of seen_tracker?
-            //   OR returns top-K local + all tombstones.
-            //   Given current scope, let's keep Brute Force SERIAL for simplicity in this PR
-            //   and only parallelize IVF gather step.
-            
-            if (!seg->HasIndex()) {
-                 // Serial Fallback for non-indexed segments
-                 seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted) {
-                    if (seen_tracker_.Contains(id)) return;
-                    seen_tracker_.MarkSeen(id);
-                    if (is_deleted) {
-                        seen_tracker_.MarkTombstone(id);
-                        return;
-                    }
-                    float score = pomai::core::Dot(query, vec);
-                    push_topk(id, score);
-                });
-            }
+        for (auto& f : futures) {
+            f.wait();
         }
         
-        // Final sort (descending by score)
+        // Finalize results
+        while(!pq.empty()) {
+            out->push_back(pq.top());
+            pq.pop();
+        }
+        
+        // Sort descending
         std::sort(out->begin(), out->end(),
                   [](const auto &a, const auto &b)
                   { return a.score > b.score; });
 
         return pomai::Status::Ok();
     }
-
 } // namespace pomai::core
-
-

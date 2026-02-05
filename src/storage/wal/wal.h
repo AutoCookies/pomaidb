@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "pomai/metadata.h"
 #include "pomai/options.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
@@ -28,6 +29,7 @@ namespace pomai::storage
         pomai::Status Open();
 
         pomai::Status AppendPut(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status AppendPut(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta); // Added
         pomai::Status AppendDelete(pomai::VectorId id);
         
         // Batch append: Write multiple Put records with single fsync (5-10x faster)

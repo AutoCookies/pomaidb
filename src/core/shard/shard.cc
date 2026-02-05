@@ -15,6 +15,11 @@ namespace pomai::core
         return rt_->Put(id, vec);
     }
 
+    pomai::Status Shard::Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta)
+    {
+        return rt_->Put(id, vec, meta);
+    }
+
     pomai::Status Shard::PutBatch(const std::vector<pomai::VectorId>& ids,
                                   const std::vector<std::span<const float>>& vectors)
     {
@@ -23,7 +28,12 @@ namespace pomai::core
 
     pomai::Status Shard::Get(pomai::VectorId id, std::vector<float> *out)
     {
-        return rt_->Get(id, out);
+        return rt_->Get(id, out, nullptr);
+    }
+
+    pomai::Status Shard::Get(pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta)
+    {
+        return rt_->Get(id, out, out_meta);
     }
 
     pomai::Status Shard::Exists(pomai::VectorId id, bool *exists)
@@ -44,7 +54,13 @@ namespace pomai::core
     pomai::Status Shard::SearchLocal(std::span<const float> q, std::uint32_t k,
                               std::vector<pomai::SearchHit> *out) const
     {
-        return rt_->Search(q, k, out);
+        return rt_->Search(q, k, SearchOptions{}, out);
+    }
+
+    pomai::Status Shard::SearchLocal(std::span<const float> q, std::uint32_t k,
+                              const SearchOptions& opts, std::vector<pomai::SearchHit> *out) const
+    {
+        return rt_->Search(q, k, opts, out);
     }
 
     Status Shard::Freeze() { return rt_->Freeze(); }

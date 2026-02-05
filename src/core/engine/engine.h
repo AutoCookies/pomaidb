@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "pomai/options.h"
+#include "pomai/metadata.h"
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
@@ -30,9 +31,11 @@ namespace pomai::core
         Status Close();
 
         Status Put(VectorId id, std::span<const float> vec);
+        Status Put(VectorId id, std::span<const float> vec, const pomai::Metadata& meta); // Overload
         Status PutBatch(const std::vector<VectorId>& ids,
                         const std::vector<std::span<const float>>& vectors);
         Status Get(VectorId id, std::vector<float> *out);
+        Status Get(VectorId id, std::vector<float> *out, pomai::Metadata* out_meta); // Added
         Status Exists(VectorId id, bool *exists);
         Status Delete(VectorId id);
         Status Flush();
@@ -41,6 +44,7 @@ namespace pomai::core
         Status NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out);
 
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
+        Status Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
 
         const pomai::DBOptions &options() const { return opt_; }
 

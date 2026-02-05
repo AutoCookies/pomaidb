@@ -13,11 +13,21 @@ namespace pomai
         float score = 0.0f; // higher is better
     };
 
+    struct ShardError
+    {
+        uint32_t shard_id;
+        std::string message;
+    };
+
     struct SearchResult
     {
         std::vector<SearchHit> hits;
+        std::vector<ShardError> errors; // Partial failures
 
-        void Clear() { hits.clear(); }
+        void Clear() { 
+            hits.clear(); 
+            errors.clear(); 
+        }
     };
 
 } // namespace pomai
