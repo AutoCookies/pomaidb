@@ -210,6 +210,13 @@ pomai_status_t* pomai_delete(pomai_db_t* db, uint64_t id) {
     return ToCStatus(db->db->Delete(id));
 }
 
+pomai_status_t* pomai_freeze(pomai_db_t* db) {
+    if (db == nullptr) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "db must be non-null");
+    }
+    return ToCStatus(db->db->Freeze(kDefaultMembrane));
+}
+
 pomai_status_t* pomai_get(pomai_db_t* db, uint64_t id, pomai_record_t** out_record) {
     if (db == nullptr || out_record == nullptr) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "db/out_record must be non-null");

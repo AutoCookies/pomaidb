@@ -18,6 +18,7 @@ POMAI_API pomai_status_t* pomai_close(pomai_db_t* db);
 POMAI_API pomai_status_t* pomai_put(pomai_db_t* db, const pomai_upsert_t* item);
 POMAI_API pomai_status_t* pomai_put_batch(pomai_db_t* db, const pomai_upsert_t* items, size_t n);
 POMAI_API pomai_status_t* pomai_delete(pomai_db_t* db, uint64_t id);
+POMAI_API pomai_status_t* pomai_freeze(pomai_db_t* db);
 
 POMAI_API pomai_status_t* pomai_get(pomai_db_t* db, uint64_t id, pomai_record_t** out_record);
 POMAI_API void pomai_record_free(pomai_record_t* record);

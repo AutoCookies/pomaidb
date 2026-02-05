@@ -136,6 +136,8 @@ class PomaiClient:
 
         self.lib.pomai_put_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiUpsert), ctypes.c_size_t]
         self.lib.pomai_put_batch.restype = ctypes.c_void_p
+        self.lib.pomai_freeze.argtypes = [ctypes.c_void_p]
+        self.lib.pomai_freeze.restype = ctypes.c_void_p
 
         self.lib.pomai_search.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiQuery), ctypes.POINTER(ctypes.POINTER(PomaiSearchResults))]
         self.lib.pomai_search.restype = ctypes.c_void_p
@@ -185,6 +187,9 @@ class PomaiClient:
             batch[i].metadata = None
             batch[i].metadata_len = 0
         self._check(self.lib.pomai_put_batch(self.db, batch, n))
+
+    def freeze(self) -> None:
+        self._check(self.lib.pomai_freeze(self.db))
 
     def search(self, vec: Sequence[float], topk: int) -> List[int]:
         cvec = (ctypes.c_float * self.dim)(*vec)
@@ -381,6 +386,7 @@ def run(args: argparse.Namespace) -> BenchResult:
             t0 = time.perf_counter()
             for i in range(0, len(ids), args.batch_size):
                 client.put_batch(ids[i:i + args.batch_size], vecs[i:i + args.batch_size])
+            client.freeze()
             ingest_time = time.perf_counter() - t0
         finally:
             client.close()
