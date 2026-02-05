@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <random>
@@ -220,50 +221,77 @@ pomai::Status IvfFlatIndex::Save(const std::string& path) const {
 
 pomai::Status IvfFlatIndex::Load(const std::string& path, std::unique_ptr<IvfFlatIndex>* out) {
     if (!out) return pomai::Status::InvalidArgument("out is null");
-    
+
     std::ifstream in(path, std::ios::binary);
     if (!in) return pomai::Status::NotFound("Index file not found");
-    
+
+    in.seekg(0, std::ios::end);
+    const std::streamoff file_size = in.tellg();
+    if (file_size < 0) return pomai::Status::Internal("Failed to stat index file");
+    in.seekg(0, std::ios::beg);
+
     // Header
     char magic[kMagicLen];
     in.read(magic, kMagicLen);
-    if (in.gcount() != kMagicLen || std::string(magic) != std::string(kMagic)) {
-        return pomai::Status::Internal("Invalid index magic");
+    if (in.gcount() != static_cast<std::streamsize>(kMagicLen) ||
+        std::memcmp(magic, kMagic, kMagicLen) != 0) {
+        return pomai::Status::Corruption("Invalid index magic");
     }
-    
+
     uint32_t version;
     ReadPod(in, version);
-    if (version != 1) return pomai::Status::Internal("Unsupported version");
-    
+    if (version != 1) return pomai::Status::Corruption("Unsupported version");
+
     uint32_t dim, nlist;
     ReadPod(in, dim);
     ReadPod(in, nlist);
-    
+
     size_t total_count;
     ReadPod(in, total_count);
-    
+
+    if (!in) return pomai::Status::Corruption("Truncated index header");
+    if (dim == 0 || nlist == 0) {
+        return pomai::Status::Corruption("Invalid index dimensions");
+    }
+
+    const uint64_t centroid_floats = static_cast<uint64_t>(dim) * static_cast<uint64_t>(nlist);
+    const uint64_t centroid_bytes = centroid_floats * sizeof(float);
+    const uint64_t fixed_header = kMagicLen + sizeof(uint32_t) * 3 + sizeof(size_t);
+    const uint64_t min_bytes_needed = fixed_header + centroid_bytes + static_cast<uint64_t>(nlist) * sizeof(uint32_t);
+    if (centroid_floats > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+        min_bytes_needed > static_cast<uint64_t>(file_size)) {
+        return pomai::Status::Corruption("Index header claims oversized payload");
+    }
+
     Options opt;
     opt.nlist = nlist;
     auto idx = std::make_unique<IvfFlatIndex>(dim, opt);
     idx->total_count_ = total_count;
     idx->trained_ = true;
-    
+
     // Centroids
-    idx->centroids_.resize(nlist * dim);
-    in.read(reinterpret_cast<char*>(idx->centroids_.data()), nlist * dim * sizeof(float));
-    
+    idx->centroids_.resize(static_cast<size_t>(centroid_floats));
+    in.read(reinterpret_cast<char*>(idx->centroids_.data()), static_cast<std::streamsize>(centroid_bytes));
+
     // Lists
+    uint64_t ids_seen = 0;
+    const uint64_t max_possible_ids = (static_cast<uint64_t>(file_size) - fixed_header - centroid_bytes - static_cast<uint64_t>(nlist) * sizeof(uint32_t)) / sizeof(pomai::VectorId);
     for (uint32_t i = 0; i < nlist; ++i) {
         uint32_t sz;
         ReadPod(in, sz);
+        ids_seen += static_cast<uint64_t>(sz);
+        if (ids_seen > max_possible_ids) {
+            return pomai::Status::Corruption("Index list size exceeds file size");
+        }
+
         idx->lists_[i].resize(sz);
         if (sz > 0) {
-            in.read(reinterpret_cast<char*>(idx->lists_[i].data()), sz * sizeof(pomai::VectorId));
+            in.read(reinterpret_cast<char*>(idx->lists_[i].data()), static_cast<std::streamsize>(static_cast<uint64_t>(sz) * sizeof(pomai::VectorId)));
         }
     }
-    
-    if (!in) return pomai::Status::Internal("Read failed/Truncated");
-    
+
+    if (!in) return pomai::Status::Corruption("Read failed/Truncated");
+
     *out = std::move(idx);
     return pomai::Status::Ok();
 }
