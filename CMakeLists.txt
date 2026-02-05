@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pomai LANGUAGES CXX)
+project(pomai LANGUAGES C CXX)
 
 # =========================
 # Global build settings
@@ -35,6 +35,7 @@ add_library(pomai STATIC
 
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
+  src/util/crc32c.cc
 )
 
 target_include_directories(pomai
@@ -47,15 +48,27 @@ target_include_directories(pomai
 # =========================
 # Library: pomai_c (C ABI)
 # =========================
-add_library(pomai_c SHARED
+set(POMAI_C_API_SOURCES
   src/capi/capi_status.cc
   src/capi/capi_db.cc
   src/capi/capi_scan.cc
 )
 
+add_library(pomai_c SHARED ${POMAI_C_API_SOURCES})
+add_library(pomai_c_static STATIC ${POMAI_C_API_SOURCES})
+
+set_target_properties(pomai_c_static PROPERTIES OUTPUT_NAME pomai_c)
+
 target_link_libraries(pomai_c PRIVATE pomai)
+target_link_libraries(pomai_c_static PRIVATE pomai)
 
 target_include_directories(pomai_c
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_include_directories(pomai_c_static
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE
@@ -64,8 +77,10 @@ target_include_directories(pomai_c
 
 if (MSVC)
   target_compile_options(pomai_c PRIVATE /W4 /permissive-)
+  target_compile_options(pomai_c_static PRIVATE /W4 /permissive-)
 else()
   target_compile_options(pomai_c PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  target_compile_options(pomai_c_static PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
 if (MSVC)
@@ -297,12 +312,28 @@ target_include_directories(pomai_inspect PRIVATE
 # C API Tests & Examples
 # =========================
 if (POMAI_BUILD_TESTS)
-    add_executable(c_api_test tests/test_c_api_basic.cpp)
-    target_link_libraries(c_api_test PRIVATE pomai_c gtest_main)
-    target_include_directories(c_api_test PRIVATE include)
-    pomai_add_test(c_api_test)
+  add_executable(c_api_test tests/test_c_api_basic.cpp)
+  target_link_libraries(c_api_test PRIVATE pomai_c)
+  target_sources(c_api_test PRIVATE tests/common/test_runner.cc)
+  target_include_directories(c_api_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME c_api_test COMMAND c_api_test)
 endif()
 
 add_executable(c_basic_example examples/c_basic.c)
 target_link_libraries(c_basic_example PRIVATE pomai_c)
 target_include_directories(c_basic_example PRIVATE include)
+
+add_executable(c_scan_export_example examples/c_scan_export.c)
+target_link_libraries(c_scan_export_example PRIVATE pomai_c)
+target_include_directories(c_scan_export_example PRIVATE include)
+
+install(TARGETS pomai pomai_c pomai_c_static
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)
+install(FILES
+  include/pomai/c_api.h
+  include/pomai/c_status.h
+  include/pomai/c_types.h
+  include/pomai/c_version.h
+  DESTINATION include/pomai)
