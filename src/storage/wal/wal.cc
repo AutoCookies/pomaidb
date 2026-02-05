@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <vector>
+#include <cstring>
 
 #include "table/memtable.h"
 #include "util/crc32c.h"
@@ -51,6 +52,16 @@ namespace pomai::storage
           segment_bytes_(segment_bytes),
           fsync_(fsync) {}
 
+    Wal::~Wal()
+    {
+        if (impl_)
+        {
+            (void)impl_->file.Close();
+            delete impl_;
+            impl_ = nullptr;
+        }
+    }
+
     std::string Wal::SegmentPath(std::uint64_t gen) const
     {
         return (fs::path(db_path_) / ("wal_" + std::to_string(shard_id_) + "_" + std::to_string(gen) + ".log")).string();
@@ -69,7 +80,11 @@ namespace pomai::storage
 
         auto st = pomai::util::PosixFile::OpenAppend(impl_->path, &impl_->file);
         if (!st.ok())
+        {
+            delete impl_;
+            impl_ = nullptr;
             return st;
+        }
 
         // Determine current size and append offset
         std::error_code ec;
@@ -102,7 +117,11 @@ namespace pomai::storage
         impl_->path = SegmentPath(gen_);
         auto st = pomai::util::PosixFile::OpenAppend(impl_->path, &impl_->file);
         if (!st.ok())
+        {
+            delete impl_;
+            impl_ = nullptr;
             return st;
+        }
         return pomai::Status::Ok();
     }
 
@@ -367,8 +386,8 @@ namespace pomai::storage
                     return pomai::Status::Corruption("wal frame too small");
                 }
 
-                const std::uint32_t stored_crc = *reinterpret_cast<const std::uint32_t *>(
-                    body.data() + (fh.len - sizeof(std::uint32_t)));
+                std::uint32_t stored_crc = 0;
+                std::memcpy(&stored_crc, body.data() + (fh.len - sizeof(std::uint32_t)), sizeof(stored_crc));
                 const std::uint32_t calc_crc = pomai::util::Crc32c(body.data(), fh.len - sizeof(std::uint32_t));
                 if (stored_crc != calc_crc)
                 {
@@ -385,8 +404,9 @@ namespace pomai::storage
                     if (expect != fh.len)
                         return pomai::Status::Corruption("wal put length mismatch");
 
-                    const float *vec = reinterpret_cast<const float *>(body.data() + sizeof(RecordPrefix));
-                    st = mem.Put(rp->id, std::span<const float>{vec, dim});
+                    std::vector<float> vec(dim);
+                    std::memcpy(vec.data(), body.data() + sizeof(RecordPrefix), vec_bytes);
+                    st = mem.Put(rp->id, std::span<const float>{vec.data(), dim});
                     if (!st.ok())
                         return st;
                 }
@@ -398,11 +418,13 @@ namespace pomai::storage
                     if (fh.len < sizeof(RecordPrefix) + vec_bytes + 4 + 4)
                         return pomai::Status::Corruption("wal putmeta too short");
 
-                    const float *vec = reinterpret_cast<const float *>(body.data() + sizeof(RecordPrefix));
-                    
+                    std::vector<float> vec(dim);
+                    std::memcpy(vec.data(), body.data() + sizeof(RecordPrefix), vec_bytes);
+
                     // Decode metadata
                     const uint8_t* meta_ptr = body.data() + sizeof(RecordPrefix) + vec_bytes;
-                    uint32_t meta_len = *reinterpret_cast<const uint32_t*>(meta_ptr);
+                    uint32_t meta_len = 0;
+                    std::memcpy(&meta_len, meta_ptr, sizeof(meta_len));
                     
                     const std::size_t expect = sizeof(RecordPrefix) + vec_bytes + 4 + meta_len + sizeof(std::uint32_t);
                     if (expect != fh.len)
@@ -411,7 +433,7 @@ namespace pomai::storage
                     std::string tenant(reinterpret_cast<const char*>(meta_ptr + 4), meta_len);
                     pomai::Metadata meta(std::move(tenant));
                     
-                    st = mem.Put(rp->id, std::span<const float>{vec, dim}, meta);
+                    st = mem.Put(rp->id, std::span<const float>{vec.data(), dim}, meta);
                     if (!st.ok()) return st;
                 }
                 else if (rp->op == static_cast<std::uint8_t>(Op::kDel))

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 #include <span>
+#include <cstring>
 
 #include "pomai/status.h"
 #include "pomai/types.h"
@@ -80,18 +81,19 @@ namespace pomai::table
         {
             if (count_ == 0) return;
             const uint8_t* p = base_addr_ + sizeof(SegmentHeader);
-            const uint64_t* meta_offsets = nullptr;
+            const uint8_t* meta_offsets_base = nullptr;
             const char* meta_blob = nullptr;
             
             if (metadata_offset_ > 0) {
-                meta_offsets = reinterpret_cast<const uint64_t*>(base_addr_ + metadata_offset_);
+                meta_offsets_base = base_addr_ + metadata_offset_;
                  // Blob starts after offsets array
                  // count_ entries -> (count_ + 1) offsets
-                 meta_blob = reinterpret_cast<const char*>(meta_offsets + (count_ + 1));
+                 meta_blob = reinterpret_cast<const char*>(meta_offsets_base + (count_ + 1) * sizeof(uint64_t));
             }
             
             for (uint32_t i = 0; i < count_; ++i) {
-                 uint64_t id = *reinterpret_cast<const uint64_t*>(p);
+                 uint64_t id = 0;
+                 std::memcpy(&id, p, sizeof(id));
                  uint8_t flags = *(p + 8);
                  const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
                  
@@ -101,9 +103,11 @@ namespace pomai::table
                  pomai::Metadata meta_obj;
                  const pomai::Metadata* meta_ptr = nullptr;
                  
-                 if (meta_offsets && meta_blob) {
-                     uint64_t start = meta_offsets[i];
-                     uint64_t end = meta_offsets[i+1];
+                 if (meta_offsets_base && meta_blob) {
+                     uint64_t start = 0;
+                     uint64_t end = 0;
+                     std::memcpy(&start, meta_offsets_base + i * sizeof(uint64_t), sizeof(start));
+                     std::memcpy(&end, meta_offsets_base + (i + 1) * sizeof(uint64_t), sizeof(end));
                      if (end > start) {
                          meta_obj.tenant = std::string(meta_blob + start, end - start);
                          meta_ptr = &meta_obj;

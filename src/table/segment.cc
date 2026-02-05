@@ -295,12 +295,14 @@ namespace pomai::table
     {
         if (metadata_offset_ == 0 || index >= count_) return;
         
-        const uint64_t* meta_offsets = reinterpret_cast<const uint64_t*>(base_addr_ + metadata_offset_);
+        const uint8_t* meta_offsets_base = base_addr_ + metadata_offset_;
         // Blob starts after (count_ + 1) offsets
-        const char* meta_blob = reinterpret_cast<const char*>(meta_offsets + (count_ + 1));
-        
-        uint64_t start = meta_offsets[index];
-        uint64_t end = meta_offsets[index+1];
+        const char* meta_blob = reinterpret_cast<const char*>(meta_offsets_base + (count_ + 1) * sizeof(uint64_t));
+
+        uint64_t start = 0;
+        uint64_t end = 0;
+        std::memcpy(&start, meta_offsets_base + index * sizeof(uint64_t), sizeof(start));
+        std::memcpy(&end, meta_offsets_base + (index + 1) * sizeof(uint64_t), sizeof(end));
         
         if (end > start) {
             out->tenant = std::string(meta_blob + start, end - start);

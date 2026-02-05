@@ -25,6 +25,10 @@ namespace pomai::storage
             std::uint32_t shard_id,
             std::size_t segment_bytes,
             pomai::FsyncPolicy fsync);
+        ~Wal();
+
+        Wal(const Wal &) = delete;
+        Wal &operator=(const Wal &) = delete;
 
         pomai::Status Open();
 
