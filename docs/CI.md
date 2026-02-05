@@ -1,319 +1,57 @@
 # PomaiDB CI/CD Quick Reference
 
-Complete guide for running all quality checks locally before pushing code.
+This guide reflects the **current** CI setup in `.github/workflows/ci.yml`.
 
-## Quick Start - Run Everything
+## CI scope (current)
 
-```bash
-# Full CI pipeline (takes ~5-10 minutes)
-./tools/ci_local.sh
-```
+PomaiDB CI runs on **Linux only** (`ubuntu-latest`).
 
-Or run individual stages:
+Jobs:
+- `build-test-linux`: configure + build + ctest
+- `tsan-linux`: TSAN-instrumented build and `-L tsan` tests
+- `python-ffi-smoke`: build `pomai_c` shared library and run ctypes smoke test
+- `perf-gate`: build performance harness and enforce baseline thresholds
 
-```bash
-# 1. Build
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-
-# 2. Unit & Integration Tests
-ctest --test-dir build --output-on-failure -j$(nproc)
-
-# 3. Performance Gates
-./tools/perf_gate.sh --dataset=small
-
-# 4. Fuzzing (optional, 10K random operations)
-./tools/fuzz.sh
-```
-
----
-
-## Test Categories
-
-### 1. Core Functionality Tests
+## Run equivalent checks locally (Ubuntu)
 
 ```bash
-# Basic DB operations
-./build/db_basic_test
+# 1) Build + tests
+cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 
-# Consistency guarantees (RYW semantics)
-./build/db_consistency_test
+# 2) TSAN
+CC=clang CXX=clang++ cmake -S . -B build-tsan -DPOMAI_BUILD_TESTS=ON \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_C_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' \
+  -DCMAKE_CXX_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' \
+  -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=thread' \
+  -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=thread'
+cmake --build build-tsan --parallel
+ctest --test-dir build-tsan --output-on-failure -L tsan
 
-# Multi-shard error handling
-./build/db_partial_search_test
+# 3) Python FFI smoke
+cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
+cmake --build build --target pomai_c --parallel
+python3 tests/ffi/python_ctypes_smoke.py
 
-# Membrane persistence
-./build/membrane_persistence_test
+# 4) Performance gate
+cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
+cmake --build build --target ci_perf_bench --parallel
+python3 tools/perf_gate.py --build-dir build --baseline benchmarks/perf_baseline.json --threshold 0.10
 ```
 
-**Expected**: All tests pass ✓
-
-### 2. Snapshot Iterator Tests
+## Docker-assisted CI-like run
 
 ```bash
-# Full-scan iteration with tombstone filtering
-./build/iterator_test
+docker build -t pomaidb/dev:local .
+docker run --rm pomaidb/dev:local
+# or
+
+docker compose up --build pomaidb-dev
 ```
 
-**Expected**: All 5 test cases pass (ID iteration, tombstones, deduplication, snapshot isolation, ordering)
+## Notes
 
-### 3. Crash Recovery & Safety
-
-```bash
-# WAL corruption, incomplete flush, concurrent consistency
-./build/recovery_test
-
-# Multi-round crash simulation (requires ~30 seconds)
-POMAI_ENABLE_CRASH_TESTS=1 ./build/pomai_crash_test
-```
-
-**Expected**: No data loss, graceful corruption handling
-
-### 4. Performance Benchmarks
-
-```bash
-# Small dataset (10K vectors, ~30 seconds)
-./build/comprehensive_bench --dataset small --threads 1
-
-# Medium dataset (100K vectors, ~2-3 minutes)
-./build/comprehensive_bench --dataset medium --threads 4 --output results.json
-
-# Check performance gates
-./tools/perf_gate.sh --dataset=small
-```
-
-**Expected**:
-- Small: P99 < 10ms, QPS > 300, Recall > 40%
-- JSON output saved for tracking
-
-### 5. Fuzzing (Random Operations)
-
-```bash
-# 10K random Put/Delete/Get/Search operations
-./tools/fuzz.sh
-```
-
-**Expected**: No crashes, all operations complete
-
----
-
-## Complete Test Suite
-
-Run all tests with CTest:
-
-```bash
-# All tests (parallel execution)
-ctest --test-dir build --output-on-failure -j8
-
-# Specific labels
-ctest --test-dir build -L integ    # Integration tests only
-ctest --test-dir build -L crash    # Crash recovery tests
-ctest --test-dir build -L bench    # Benchmarks
-```
-
----
-
-## CI Pipeline Stages
-
-### Stage 1: Build & Compile
-
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CXX_FLAGS="-Wall -Werror"
-cmake --build build -j$(nproc)
-```
-
-**Gate**: Build must succeed with zero warnings/errors
-
-### Stage 2: Unit & Integration Tests
-
-```bash
-ctest --test-dir build --output-on-failure -j$(nproc) -L integ
-```
-
-**Gate**: All tests must pass
-
-### Stage 3: Performance Validation
-
-```bash
-./tools/perf_gate.sh --dataset=small
-```
-
-**Gate**: Must meet baseline thresholds (P99, QPS, Recall)
-
-### Stage 4: Safety & Robustness
-
-```bash
-./build/recovery_test
-```
-
-**Gate**: Crash recovery tests pass
-
-### Stage 5: Export & Tools
-
-```bash
-# Verify pomai_inspect works
-./build/pomai_inspect scan /tmp/test_db --format=json > /dev/null
-```
-
-**Gate**: Tools execute without errors
-
----
-
-## Local Pre-Commit Checklist
-
-Before pushing code, verify:
-
-- [ ] `cmake --build build` succeeds
-- [ ] `ctest --test-dir build -L integ` passes
-- [ ] `./tools/perf_gate.sh --dataset=small` passes
-- [ ] Code formatted (if applicable)
-
-**Optional but recommended**:
-- [ ] `./build/recovery_test` passes
-- [ ] `./tools/fuzz.sh` completes successfully
-
----
-
-## Automated CI Configuration
-
-### GitHub Actions Example
-
-```yaml
-name: CI
-
-on: [push, pull_request]
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Build
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j$(nproc)
-      
-      - name: Test
-        run: ctest --test-dir build --output-on-failure -j$(nproc)
-      
-      - name: Performance Gate
-        run: ./tools/perf_gate.sh --dataset=small
-```
-
-# Optional Windows ABI build verification
-```yaml
-
-  windows-build:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Configure (Windows)
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DPOMAI_BUILD_TESTS=ON
-
-      - name: Build (Windows)
-        run: cmake --build build --config Release
-
-      - name: Test (Windows)
-        run: ctest --test-dir build -C Release --output-on-failure
-```
-
-### GitLab CI Example
-
-```yaml
-stages:
-  - build
-  - test
-  - benchmark
-
-build:
-  stage: build
-  script:
-    - cmake -B build -DCMAKE_BUILD_TYPE=Release
-    - cmake --build build -j$(nproc)
-
-test:
-  stage: test
-  script:
-    - ctest --test-dir build --output-on-failure -j$(nproc)
-
-benchmark:
-  stage: benchmark
-  script:
-    - ./tools/perf_gate.sh --dataset=small
-  allow_failure: true  # Performance gate optional
-```
-
----
-
-## Troubleshooting
-
-### Tests Fail
-
-```bash
-# Run specific test with verbose output
-./build/db_basic_test --verbose
-
-# Check test logs
-cat build/Testing/Temporary/LastTest.log
-```
-
-### Performance Gate Fails
-
-```bash
-# Get detailed benchmark results
-./build/comprehensive_bench --dataset small --output results.json
-cat results.json
-
-# Adjust thresholds in tools/perf_gate.sh if needed
-```
-
-### Build Errors
-
-```bash
-# Clean rebuild
-rm -rf build
-cmake -B build
-cmake --build build
-```
-
----
-
-## Performance Tracking
-
-Save benchmark results over time:
-
-```bash
-# Run and save with timestamp
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-./build/comprehensive_bench --dataset small \
-  --output "results_${TIMESTAMP}.json"
-
-# Compare with baseline
-python3 scripts/compare_benchmarks.py results_baseline.json results_${TIMESTAMP}.json
-```
-
----
-
-## Quick Commands
-
-```bash
-# Fast iteration during development
-alias pomai-test='cmake --build build && ctest --test-dir build -L integ'
-alias pomai-bench='./build/comprehensive_bench --dataset small'
-alias pomai-gate='./tools/perf_gate.sh --dataset=small'
-
-# Full pre-commit check
-alias pomai-ci='cmake --build build && ctest --test-dir build && ./tools/perf_gate.sh'
-```
-
----
-
-## References
-
-- [Benchmarking Guide](BENCHMARKING.md)
-- [SOT (Single Source of Truth)](SOT.md)
-- Test source: `tests/integ/`, `tests/crash/`
-- Tools: `tools/perf_gate.sh`, `tools/fuzz.sh`
+- The repository does not ship a standalone production DB server binary; CI validates the embedded library and C ABI artifacts.
+- If you need macOS/Windows verification for a downstream integration, run it in that downstream project pipeline.

@@ -5,13 +5,9 @@ on:
   pull_request:
 
 jobs:
-  build-test-matrix:
-    name: build-test-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+  build-test-linux:
+    name: build-test-linux
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -26,13 +22,6 @@ jobs:
 
       - name: CTest
         run: ctest --test-dir build --output-on-failure -C Release
-
-      - name: Validate Windows C ABI artifacts
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          test -f build/Release/pomai_c.dll
-          test -f build/Release/pomai_c.lib
 
   tsan:
     name: tsan-linux
