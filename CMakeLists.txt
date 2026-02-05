@@ -20,6 +20,7 @@ add_library(pomai STATIC
   src/core/engine/engine.cc
   src/core/shard/shard.cc
   src/core/shard/runtime.cc
+  src/core/shard/layer_lookup.cc
   src/core/shard/iterator.cc
   src/core/shard/manifest.cc
   src/core/membrane/manager.cc

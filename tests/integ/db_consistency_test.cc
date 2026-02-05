@@ -163,4 +163,49 @@ POMAI_TEST(Consistency_Tombstone_Hides_Frozen) {
     POMAI_EXPECT_TRUE(!found);
 }
 
+POMAI_TEST(Consistency_Get_UsesCanonicalNewestWinsAcrossAllLayers) {
+    DBOptions opt;
+    opt.path = pomai::test::TempDir("consistency_newest_wins_layers");
+    opt.dim = 4;
+    opt.shard_count = 1;
+    opt.fsync = FsyncPolicy::kNever;
+
+    std::unique_ptr<DB> db;
+    POMAI_EXPECT_OK(DB::Open(opt, &db));
+
+    MembraneSpec spec;
+    spec.name = "default";
+    spec.dim = 4;
+    spec.shard_count = 1;
+    POMAI_EXPECT_OK(db->CreateMembrane(spec));
+    POMAI_EXPECT_OK(db->OpenMembrane("default"));
+
+    const auto v_old = MakeVec(4, 1.0f);
+    const auto v_new = MakeVec(4, 2.0f);
+
+    POMAI_EXPECT_OK(db->Put("default", 77, v_old, Metadata{"tenant-old"}));
+    POMAI_EXPECT_OK(db->Freeze("default"));
+
+    // Active memtable now has a newer value than the latest published segment.
+    POMAI_EXPECT_OK(db->Put("default", 77, v_new, Metadata{"tenant-new"}));
+
+    std::vector<float> out;
+    Metadata out_meta;
+    POMAI_EXPECT_OK(db->Get("default", 77, &out, &out_meta));
+    POMAI_EXPECT_EQ(out.size(), 4u);
+    POMAI_EXPECT_EQ(out[0], 2.0f);
+    POMAI_EXPECT_EQ(out_meta.tenant, "tenant-new");
+
+    // New tombstone in active must hide older values from frozen/segment layers.
+    POMAI_EXPECT_OK(db->Delete("default", 77));
+    Status st = db->Get("default", 77, &out, &out_meta);
+    POMAI_EXPECT_TRUE(st.code() == ErrorCode::kNotFound);
+
+    bool exists = true;
+    POMAI_EXPECT_OK(db->Exists("default", 77, &exists));
+    POMAI_EXPECT_TRUE(!exists);
+
+    POMAI_EXPECT_OK(db->Close());
+}
+
 } // namespace

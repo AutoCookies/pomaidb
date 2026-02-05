@@ -14,6 +14,7 @@
 #include "table/segment.h" // Added
 #include "core/shard/iterator.h"
 #include "core/shard/manifest.h"
+#include "core/shard/layer_lookup.h"
 #include <queue>
 #include "core/shard/filter_evaluator.h" // Added
 #include "pomai/metadata.h" // Added
@@ -42,16 +43,6 @@ namespace pomai::core
           segment_pool_(segment_pool),
           index_params_(index_params)
     {
-        // P0.3: Validate thread pool wiring
-        // These pools are used in Search and Segment operations.
-        // Null pools would cause segfaults. Fail fast here.
-        if (!thread_pool_) {
-            throw std::invalid_argument("ShardRuntime: thread_pool cannot be null");
-        }
-        if (!segment_pool_) {
-            throw std::invalid_argument("ShardRuntime: segment_pool cannot be null");
-        }
-        
         pomai::index::IvfCoarse::Options opt;
         opt.nlist = index_params_.nlist;
         opt.nprobe = index_params_.nprobe;
@@ -276,112 +267,59 @@ namespace pomai::core
     {
         if (!out) return Status::InvalidArgument("out is null");
 
-        // 0. Check Active MemTable (P0.2 Unified RYW)
         auto active = mem_.load(std::memory_order_acquire);
-        if (active) {
-            if (active->IsTombstone(id)) {
-                return Status::NotFound("tombstone");
-            }
-            const float* ptr = nullptr;
-            if (active->Get(id, &ptr, out_meta).ok() && ptr) { // Use new MemTable::Get overload
-                out->assign(ptr, ptr + dim_);
-                return Status::Ok();
-            }
-        }
-
-        // 1. Check Snapshot (Frozen + Segments)
         auto snap = GetSnapshot();
         if (!snap) return Status::Aborted("shard not ready");
-        
-        return GetFromSnapshot(snap, id, out, out_meta);
+
+        const auto lookup = LookupById(active, snap, id, dim_);
+        if (lookup.state == LookupState::kTombstone) {
+            return Status::NotFound("tombstone");
+        }
+        if (lookup.state == LookupState::kFound) {
+            out->assign(lookup.vec.begin(), lookup.vec.end());
+            if (out_meta) {
+                *out_meta = lookup.meta;
+            }
+            return Status::Ok();
+        }
+        return Status::NotFound("vector not found");
     }
 
     // ... Exists ...
 
     pomai::Status ShardRuntime::GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta) {
-        // NOTE: Active MemTable is checked by caller (Get) for RYW.
-        // Snapshot only contains Frozen + Segments.
-
-        // 1. Check Frozen MemTables (Newest -> Oldest)
-        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
-            if ((*it)->IsTombstone(id)) {
-                return Status::NotFound("tombstone");
-            }
-            const float* p = nullptr;
-            if ((*it)->Get(id, &p, out_meta).ok() && p) {
-                out->assign(p, p + dim_);
-                return Status::Ok();
-            }
+        const auto lookup = LookupById(nullptr, snap, id, dim_);
+        if (lookup.state == LookupState::kTombstone) {
+            return Status::NotFound("tombstone");
         }
-
-        // 2. Check Segments (Newest -> Oldest)
-        for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
-            std::span<const float> svec;
-            pomai::Metadata s_meta;
-            auto res = (*it)->Find(id, &svec, out_meta ? &s_meta : nullptr);
-            if (res == table::SegmentReader::FindResult::kFound) {
-                out->assign(svec.begin(), svec.end());
-                // V1 Segment has no metadata. Return empty.
-                if (out_meta) *out_meta = s_meta;
-                return Status::Ok();
-            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
-                return Status::NotFound("tombstone");
+        if (lookup.state == LookupState::kFound) {
+            out->assign(lookup.vec.begin(), lookup.vec.end());
+            if (out_meta) {
+                *out_meta = lookup.meta;
             }
+            return Status::Ok();
         }
-        
         return Status::NotFound("vector not found");
     }
 
     pomai::Status ShardRuntime::Exists(pomai::VectorId id, bool *exists)
     {
         if (!exists) return Status::InvalidArgument("exists is null");
-        
-        // 0. Check Active MemTable (P0.2 Unified RYW)
-        auto active = mem_.load(std::memory_order_acquire);
-        if (active) {
-            if (active->IsTombstone(id)) {
-                *exists = false;
-                return Status::Ok();
-            }
-            const float* ptr = nullptr;
-            if (active->Get(id, &ptr).ok() && ptr) {
-                *exists = true;
-                return Status::Ok();
-            }
-        }
 
-        // 1. Check Snapshot
+        auto active = mem_.load(std::memory_order_acquire);
         auto snap = GetSnapshot();
         if (!snap) return Status::Aborted("shard not ready");
-        
-        auto res = ExistsInSnapshot(snap, id);
-        if (res.first.ok()) {
-            *exists = res.second;
-        }
-        return res.first;
+
+        const auto lookup = LookupById(active, snap, id, dim_);
+        *exists = (lookup.state == LookupState::kFound);
+        return Status::Ok();
     }
 
 
 
     std::pair<pomai::Status, bool> ShardRuntime::ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id) {
-        // 1. Check Frozen (Newest -> Oldest)
-        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
-             if ((*it)->IsTombstone(id)) return {Status::Ok(), false};
-             const float* p = nullptr;
-             if ((*it)->Get(id, &p).ok() && p) return {Status::Ok(), true};
-        }
-
-        // 2. Check Segments (Newest -> Oldest)
-        for (auto it = snap->segments.begin(); it != snap->segments.end(); ++it) {
-            std::span<const float> svec;
-            auto res = (*it)->Find(id, &svec, nullptr); 
-             if (res == table::SegmentReader::FindResult::kFound) {
-                return {Status::Ok(), true};
-            } else if (res == table::SegmentReader::FindResult::kFoundTombstone) {
-                return {Status::Ok(), false};
-            }
-        }
-        return {Status::Ok(), false};
+        const auto lookup = LookupById(nullptr, snap, id, dim_);
+        return {Status::Ok(), lookup.state == LookupState::kFound};
     }
 
     pomai::Status ShardRuntime::Flush()
@@ -1008,11 +946,10 @@ namespace pomai::core
         
         std::vector<std::future<void>> futures;
         futures.reserve(snap->segments.size());
-        
+
         std::mutex out_mutex;
-        
-        for (auto& seg : snap->segments) {
-             futures.push_back(segment_pool_->Enqueue([&, seg]() {
+
+        auto scan_segment = [&](const std::shared_ptr<table::SegmentReader>& seg) {
                   // Fallback: Full Scan (ForEach) vs Index
                   
                   if (seg->HasIndex() && opts.filters.empty()) {
@@ -1021,7 +958,6 @@ namespace pomai::core
                       if(seg->Search(query, nprobe, &candidates).ok()) {
                           for(auto id : candidates) {
                               std::span<const float> vec;
-                              bool is_del = false;
                               pomai::Metadata meta;
                               
                               auto status = seg->Get(id, &vec, &meta); 
@@ -1061,7 +997,14 @@ namespace pomai::core
                         float score = pomai::core::Dot(query, vec);
                         push_topk(id, score);
                   });
-             }));
+        };
+
+        for (auto& seg : snap->segments) {
+            if (segment_pool_) {
+                futures.push_back(segment_pool_->Enqueue([&, seg]() { scan_segment(seg); }));
+            } else {
+                scan_segment(seg);
+            }
         }
         
         for (auto& f : futures) {
