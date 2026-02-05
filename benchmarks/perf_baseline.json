@@ -1,0 +1,17 @@
+{
+  "config": {
+    "dim": 64,
+    "vectors": 2000,
+    "queries": 300,
+    "topk": 10,
+    "iterations": 3
+  },
+  "metrics": {
+    "ingest_qps": 18000.0,
+    "search_latency_us": {
+      "p50": 1700.0,
+      "p95": 2300.0,
+      "p99": 2600.0
+    }
+  }
+}
