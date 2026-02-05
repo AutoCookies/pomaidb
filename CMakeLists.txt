@@ -273,6 +273,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(shard_runtime_tsan_test tests/tsan/shard_runtime_tsan_test.cc)
   pomai_setup_test(shard_runtime_tsan_test)
   pomai_add_labeled_test(shard_runtime_tsan_test "tsan")
+
+  add_executable(basic_workload_tsan_test tests/tsan/basic_workload_tsan_test.cc)
+  pomai_setup_test(basic_workload_tsan_test)
+  pomai_add_labeled_test(basic_workload_tsan_test "tsan")
 endif()
 
 # =========================
@@ -300,6 +304,11 @@ target_include_directories(comprehensive_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 add_executable(ingestion_bench benchmarks/ingestion_bench.cc)
 target_link_libraries(ingestion_bench PRIVATE pomai)
 target_include_directories(ingestion_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# Deterministic CI benchmark for perf gate
+add_executable(ci_perf_bench benchmarks/ci_perf_bench.cc)
+target_link_libraries(ci_perf_bench PRIVATE pomai)
+target_include_directories(ci_perf_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # =========================
 # Tools

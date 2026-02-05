@@ -26,6 +26,12 @@ namespace pomai::storage
         std::uint32_t len; // bytes after this header: [type+payload+crc]
     };
 
+    struct WalFileHeader
+    {
+        char magic[12]; // "pomai.wal.v1"
+        std::uint32_t version;
+    };
+
     struct RecordPrefix
     {
         std::uint64_t seq;
@@ -34,6 +40,9 @@ namespace pomai::storage
         std::uint32_t dim; // PUT only, else 0
     };
 #pragma pack(pop)
+
+    constexpr char kWalMagic[] = "pomai.wal.v1";
+    constexpr std::uint32_t kWalVersion = 1;
 
     class Wal::Impl
     {
@@ -90,8 +99,27 @@ namespace pomai::storage
         std::uint64_t sz = 0;
         if (fs::exists(impl_->path, ec))
             sz = static_cast<std::uint64_t>(fs::file_size(impl_->path, ec));
-        file_off_ = sz;
-        bytes_in_seg_ = static_cast<std::size_t>(sz);
+
+        if (sz == 0)
+        {
+            WalFileHeader hdr{};
+            std::memcpy(hdr.magic, kWalMagic, sizeof(hdr.magic));
+            hdr.version = kWalVersion;
+            st = impl_->file.PWrite(0, &hdr, sizeof(hdr));
+            if (!st.ok())
+            {
+                delete impl_;
+                impl_ = nullptr;
+                return st;
+            }
+            file_off_ = sizeof(WalFileHeader);
+            bytes_in_seg_ = sizeof(WalFileHeader);
+        }
+        else
+        {
+            file_off_ = sz;
+            bytes_in_seg_ = static_cast<std::size_t>(sz);
+        }
         return pomai::Status::Ok();
     }
 
@@ -121,6 +149,14 @@ namespace pomai::storage
             impl_ = nullptr;
             return st;
         }
+        WalFileHeader hdr{};
+        std::memcpy(hdr.magic, kWalMagic, sizeof(hdr.magic));
+        hdr.version = kWalVersion;
+        st = impl_->file.PWrite(0, &hdr, sizeof(hdr));
+        if (!st.ok())
+            return st;
+        file_off_ = sizeof(WalFileHeader);
+        bytes_in_seg_ = sizeof(WalFileHeader);
         return pomai::Status::Ok();
     }
 
@@ -358,6 +394,23 @@ namespace pomai::storage
                 return pomai::Status::IoError("wal file_size failed");
 
             std::uint64_t off = 0;
+            if (file_size >= sizeof(WalFileHeader))
+            {
+                WalFileHeader hdr{};
+                std::size_t got = 0;
+                st = f.ReadAt(0, &hdr, sizeof(hdr), &got);
+                if (!st.ok())
+                    return st;
+                if (got != sizeof(hdr))
+                    return pomai::Status::Corruption("wal short file header");
+
+                if (std::memcmp(hdr.magic, kWalMagic, sizeof(hdr.magic)) == 0)
+                {
+                    if (hdr.version != kWalVersion)
+                        return pomai::Status::Corruption("wal version mismatch");
+                    off = sizeof(WalFileHeader);
+                }
+            }
             while (off + sizeof(FrameHeader) <= file_size)
             {
                 FrameHeader fh{};

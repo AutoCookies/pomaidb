@@ -111,6 +111,16 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
+
+## ABI stability gates in CI
+
+PomaiDB treats the C ABI as production/stable only when all of these gates are green in CI:
+- Cross-platform build/test matrix (`ubuntu-latest`, `macos-latest`, `windows-latest`).
+- Linux TSAN workload covering open → put_batch → search → scan → close.
+- On-disk format validation tests for version mismatch/corruption safety.
+- Python `ctypes` smoke test loading `libpomai_c` and executing open/put_batch/search/close.
+- Performance guardrail check against committed baseline with 10% regression thresholds for ingest throughput and p95 search latency.
+
 ## Example (C)
 
 See:

@@ -120,4 +120,33 @@ namespace pomai
         }
         fs::remove_all(dir);
     }
+    POMAI_TEST(Wal_VersionMismatch_FailsSafely)
+    {
+        std::string dir = pomai::test::TempDir("wal_bad_version");
+
+        {
+            auto wal = std::make_unique<Wal>(dir, 0, 1024*1024, FsyncPolicy::kNever);
+            POMAI_EXPECT_OK(wal->Open());
+            std::vector<float> v1 = {1.0f, 2.0f};
+            POMAI_EXPECT_OK(wal->AppendPut(7, v1));
+        }
+
+        std::string log_path = dir + "/wal_0_0.log";
+        {
+            std::fstream f(log_path, std::ios::in | std::ios::out | std::ios::binary);
+            POMAI_EXPECT_TRUE(f.is_open());
+            f.seekp(12); // header version field
+            std::uint32_t bad_version = 999;
+            f.write(reinterpret_cast<const char*>(&bad_version), sizeof(bad_version));
+        }
+
+        table::MemTable mem(2, 4096);
+        auto wal = std::make_unique<Wal>(dir, 0, 1024*1024, FsyncPolicy::kNever);
+        Status st = wal->ReplayInto(mem);
+        POMAI_EXPECT_TRUE(!st.ok());
+        POMAI_EXPECT_EQ(st.code(), ErrorCode::kAborted);
+
+        fs::remove_all(dir);
+    }
+
 }
