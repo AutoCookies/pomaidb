@@ -56,8 +56,9 @@ POMAI_TEST(DB_SegmentLoading_ReadTest) {
     std::unique_ptr<pomai::DB> db;
     POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
     
-    // Register "default" membrane in Manager (since Manager doesn't scan Manifest yet)
-    POMAI_EXPECT_OK(db->CreateMembrane(spec));
+    // Register "default" membrane in Manager (allow pre-existing on-disk membrane)
+    auto create_st = db->CreateMembrane(spec);
+    POMAI_EXPECT_TRUE(create_st.ok() || create_st.code() == pomai::ErrorCode::kAlreadyExists);
     
     // Must open membrane to load shards
     POMAI_EXPECT_OK(db->OpenMembrane(membrane));

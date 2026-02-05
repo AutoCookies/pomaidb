@@ -30,11 +30,15 @@ namespace pomai::table
         
         pomai::Status Delete(pomai::VectorId id);
 
-        size_t GetCount() const { return map_.size(); }
+        size_t GetCount() const {
+            std::shared_lock lock(mutex_);
+            return map_.size();
+        }
         void Clear();
 
         const float *GetPtr(pomai::VectorId id) const
         {
+            std::shared_lock lock(mutex_);
             auto it = map_.find(id);
             if (it == map_.end())
                 return nullptr;
@@ -43,6 +47,7 @@ namespace pomai::table
 
         bool IsTombstone(pomai::VectorId id) const
         {
+            std::shared_lock lock(mutex_);
             auto it = map_.find(id);
             return (it != map_.end()) && (it->second == nullptr);
         }
