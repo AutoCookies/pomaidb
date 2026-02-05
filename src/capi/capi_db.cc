@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -27,6 +29,28 @@ struct SearchResultsWrapper {
     std::vector<float> scores;
     std::vector<uint32_t> shard_ids;
 };
+
+constexpr uint32_t MinOptionsStructSize() {
+    return static_cast<uint32_t>(offsetof(pomai_options_t, memory_budget_bytes) + sizeof(uint64_t));
+}
+
+constexpr uint32_t MinUpsertStructSize() {
+    return static_cast<uint32_t>(offsetof(pomai_upsert_t, metadata_len) + sizeof(uint32_t));
+}
+
+constexpr uint32_t MinQueryStructSize() {
+    return static_cast<uint32_t>(offsetof(pomai_query_t, alpha) + sizeof(float));
+}
+
+
+bool DeadlineExceeded(uint32_t deadline_ms) {
+    if (deadline_ms == 0) {
+        return false;
+    }
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch());
+    return now_ms.count() >= deadline_ms;
+}
 
 bool ParseTenantFilter(const char* expr, pomai::SearchOptions* out_opts) {
     if (expr == nullptr || *expr == '\0') {
@@ -71,32 +95,42 @@ const char* pomai_version_string(void) {
 }
 
 uint32_t pomai_abi_version(void) {
-    return POMAI_C_ABI_VERSION;
+    return POMAI_ABI_VERSION;
 }
 
 void pomai_options_init(pomai_options_t* opts) {
     if (opts == nullptr) {
         return;
     }
+    opts->struct_size = static_cast<uint32_t>(sizeof(pomai_options_t));
     opts->path = nullptr;
     opts->shards = 4;
     opts->dim = 512;
     opts->search_threads = 0;
     opts->fsync_policy = POMAI_FSYNC_POLICY_NEVER;
     opts->memory_budget_bytes = 0;
+    opts->deadline_ms = 0;
 }
 
 void pomai_scan_options_init(pomai_scan_options_t* opts) {
     if (opts == nullptr) {
         return;
     }
+    opts->struct_size = static_cast<uint32_t>(sizeof(pomai_scan_options_t));
     opts->start_id = 0;
     opts->has_start_id = false;
+    opts->deadline_ms = 0;
 }
 
 pomai_status_t* pomai_open(const pomai_options_t* opts, pomai_db_t** out_db) {
     if (opts == nullptr || out_db == nullptr) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "opts/out_db must be non-null");
+    }
+    if (opts->struct_size < MinOptionsStructSize()) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "options.struct_size is too small");
+    }
+    if (DeadlineExceeded(opts->deadline_ms)) {
+        return MakeStatus(POMAI_STATUS_DEADLINE_EXCEEDED, "deadline exceeded before open");
     }
     if (opts->path == nullptr || opts->path[0] == '\0') {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "options.path must be non-empty");
@@ -133,6 +167,9 @@ pomai_status_t* pomai_put(pomai_db_t* db, const pomai_upsert_t* item) {
     if (db == nullptr || item == nullptr || item->vector == nullptr || item->dim == 0) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "invalid put arguments");
     }
+    if (item->struct_size < MinUpsertStructSize()) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "upsert.struct_size is too small");
+    }
     std::span<const float> vec(item->vector, item->dim);
     return ToCStatus(db->db->Put(item->id, vec, ToMetadata(*item)));
 }
@@ -154,6 +191,9 @@ pomai_status_t* pomai_put_batch(pomai_db_t* db, const pomai_upsert_t* items, siz
     vecs.reserve(n);
 
     for (size_t i = 0; i < n; ++i) {
+        if (items[i].struct_size < MinUpsertStructSize()) {
+            return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "all batch items require valid struct_size");
+        }
         if (items[i].vector == nullptr || items[i].dim == 0) {
             return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "all batch items require vector and dim");
         }
@@ -186,6 +226,7 @@ pomai_status_t* pomai_get(pomai_db_t* db, uint64_t id, pomai_record_t** out_reco
     w->vec_data = std::move(vec);
     w->meta_data.assign(meta.tenant.begin(), meta.tenant.end());
 
+    w->pub.struct_size = static_cast<uint32_t>(sizeof(pomai_record_t));
     w->pub.id = id;
     w->pub.dim = static_cast<uint32_t>(w->vec_data.size());
     w->pub.vector = w->vec_data.data();
@@ -212,6 +253,12 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     if (db == nullptr || query == nullptr || out == nullptr || query->vector == nullptr || query->dim == 0 || query->topk == 0) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "invalid search args");
     }
+    if (query->struct_size < MinQueryStructSize()) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "query.struct_size is too small");
+    }
+    if (DeadlineExceeded(query->deadline_ms)) {
+        return MakeStatus(POMAI_STATUS_DEADLINE_EXCEEDED, "deadline exceeded before search");
+    }
 
     pomai::SearchResult res;
     pomai::SearchOptions opts;
@@ -224,6 +271,10 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
         return ToCStatus(st);
     }
 
+    if (DeadlineExceeded(query->deadline_ms)) {
+        return MakeStatus(POMAI_STATUS_DEADLINE_EXCEEDED, "deadline exceeded after search");
+    }
+
     auto* w = new SearchResultsWrapper();
     w->ids.reserve(res.hits.size());
     w->scores.reserve(res.hits.size());
@@ -234,6 +285,7 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
         w->shard_ids.push_back(UINT32_MAX);
     }
 
+    w->pub.struct_size = static_cast<uint32_t>(sizeof(pomai_search_results_t));
     w->pub.count = w->ids.size();
     w->pub.ids = w->ids.data();
     w->pub.scores = w->scores.data();

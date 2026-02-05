@@ -7,6 +7,8 @@ extern "C" {
 
 #include <stdint.h>
 
+#include "pomai/c_types.h"
+
 // Status object used by all C API entrypoints.
 // Convention: NULL status pointer means success (POMAI_STATUS_OK).
 // Non-NULL means failure and must be released with pomai_status_free().
@@ -27,16 +29,16 @@ typedef enum {
 } pomai_status_code_t;
 
 // Returns NULL (success sentinel). Useful for wrappers wanting a uniform symbol.
-pomai_status_t* pomai_status_ok(void);
+POMAI_API pomai_status_t* pomai_status_ok(void);
 
 // Releases a non-NULL status object. Safe for NULL.
-void pomai_status_free(pomai_status_t* status);
+POMAI_API void pomai_status_free(pomai_status_t* status);
 
 // Returns status code; NULL => POMAI_STATUS_OK.
-int pomai_status_code(const pomai_status_t* status);
+POMAI_API int pomai_status_code(const pomai_status_t* status);
 
 // Returns UTF-8 error message; NULL => "".
-const char* pomai_status_message(const pomai_status_t* status);
+POMAI_API const char* pomai_status_message(const pomai_status_t* status);
 
 #ifdef __cplusplus
 }

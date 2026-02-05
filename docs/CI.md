@@ -202,6 +202,24 @@ jobs:
         run: ./tools/perf_gate.sh --dataset=small
 ```
 
+# Optional Windows ABI build verification
+```yaml
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Configure (Windows)
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DPOMAI_BUILD_TESTS=ON
+
+      - name: Build (Windows)
+        run: cmake --build build --config Release
+
+      - name: Test (Windows)
+        run: ctest --test-dir build -C Release --output-on-failure
+```
+
 ### GitLab CI Example
 
 ```yaml

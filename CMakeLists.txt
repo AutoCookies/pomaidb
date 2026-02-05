@@ -62,6 +62,9 @@ set_target_properties(pomai_c_static PROPERTIES OUTPUT_NAME pomai_c)
 target_link_libraries(pomai_c PRIVATE pomai)
 target_link_libraries(pomai_c_static PRIVATE pomai)
 
+# Export C API symbols when building shared library on Windows.
+target_compile_definitions(pomai_c PRIVATE POMAI_C_BUILD_DLL)
+
 target_include_directories(pomai_c
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
