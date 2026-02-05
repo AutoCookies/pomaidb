@@ -5,7 +5,7 @@ This document defines the stable C ABI contract for embedding PomaiDB from any F
 ## Design principles
 
 - **C-only ABI**: all exported functions use `extern "C"` and plain C types.
-- **Cross-platform exports**: all public symbols are declared with `POMAI_API`.
+- **Portable exports**: public symbols are declared with `POMAI_API` for shared-library use.
 - **Opaque handles**: `pomai_db_t`, `pomai_snapshot_t`, `pomai_iter_t` are opaque.
 - **Explicit status model**: every API returns `pomai_status_t*`; `NULL` means success.
 - **Single ownership rule**: caller owns inputs; Pomai owns returned result objects.
@@ -99,23 +99,10 @@ Pomai preserves shard-level partial failure semantics:
 
 For a fixed snapshot, iterator order is deterministic and stable for that snapshot. New writes after snapshot creation are excluded from that iterator.
 
-## Windows build/export support
-
-The C API shared library builds as a `.dll` on Windows and exports the same symbols through `POMAI_API`.
-
-### Minimal Windows build commands
-
-```powershell
-cmake -B build -G "Visual Studio 17 2022" -A x64 -DPOMAI_BUILD_TESTS=ON
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-```
-
-
 ## ABI stability gates in CI
 
 PomaiDB treats the C ABI as production/stable only when all of these gates are green in CI:
-- Cross-platform build/test matrix (`ubuntu-latest`, `macos-latest`, `windows-latest`).
+- Linux CI build/test gate (`ubuntu-latest`).
 - Linux TSAN workload covering open → put_batch → search → scan → close.
 - On-disk format validation tests for version mismatch/corruption safety.
 - Python `ctypes` smoke test loading `libpomai_c` and executing open/put_batch/search/close.

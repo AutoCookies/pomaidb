@@ -23,6 +23,12 @@
 2. **Embedded server**
    - Not provided in this branch. (Assumption based on build targets.)
 
+
+## Containerized workflows (Ubuntu)
+- The repository `Dockerfile` is a build/test image for the embedded library (not a standalone DB server image).
+- Build and run: `docker build -t pomaidb/dev:local . && docker run --rm pomaidb/dev:local`.
+- Compose service: `docker compose up --build pomaidb-dev` using `docker-compose.yml` (with `docker-compose.yaml` compatibility copy).
+
 ## Resource tuning
 - **Shard count**: Choose `DBOptions.shard_count` based on CPU cores and write concurrency; each shard has a dedicated writer thread. (Source: `Engine::OpenLocked`, `ShardRuntime`.)
 - **Memory budget**:
