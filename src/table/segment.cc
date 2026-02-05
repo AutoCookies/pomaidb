@@ -189,7 +189,7 @@ namespace pomai::table
          
          pomai::index::IvfFlatIndex::Options opt;
          opt.nlist = nlist;
-         if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1, num_live);
+         if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1U, static_cast<uint32_t>(num_live));
 
          auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
          auto st = idx->Train(training_data, num_live);

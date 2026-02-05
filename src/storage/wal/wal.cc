@@ -40,7 +40,6 @@ namespace pomai::storage
     public:
         pomai::util::PosixFile file;
         std::string path;
-        std::vector<std::uint8_t> scratch; // Reusable buffer for encoding frames
     };
 
     Wal::Wal(std::string db_path,
@@ -149,7 +148,7 @@ namespace pomai::storage
             const std::size_t payload_bytes = vec.size_bytes();
 
             // reuse scratch buffer
-            auto &frame = impl_->scratch;
+            auto &frame = scratch_;
             frame.clear();
             // heuristic reserve
             if (frame.capacity() < 128 + payload_bytes)
@@ -191,7 +190,7 @@ namespace pomai::storage
             const std::size_t meta_bytes = sizeof(std::uint32_t) + meta_len;
             const std::size_t payload_bytes = vec_bytes + meta_bytes;
 
-            auto &frame = impl_->scratch;
+            auto &frame = scratch_;
             frame.clear();
             if (frame.capacity() < 128 + payload_bytes)
                  frame.reserve(128 + payload_bytes);
@@ -234,7 +233,7 @@ namespace pomai::storage
         rp.id = id;
         rp.dim = 0;
 
-        auto &frame = impl_->scratch;
+        auto &frame = scratch_;
         frame.clear();
 
         FrameHeader fh{};
@@ -276,7 +275,7 @@ namespace pomai::storage
             return pomai::Status::Ok();  // No-op for empty batch
         
         // Batch all records into single scratch buffer
-        auto &frame = impl_->scratch;
+        auto &frame = scratch_;
         frame.clear();
         
         // Calculate total size needed

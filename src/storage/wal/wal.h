@@ -65,6 +65,7 @@ namespace pomai::storage
         // POSIX file (append by pwrite at tracked offset)
         class Impl;
         Impl *impl_ = nullptr;
+        std::vector<std::uint8_t> scratch_;
     };
 
 } // namespace pomai::storage

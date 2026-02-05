@@ -129,7 +129,7 @@ pomai::Status IvfFlatIndex::Train(std::span<const float> data, size_t num_vector
         
         for (uint32_t c = 0; c < opt_.nlist; ++c) {
             if (counts[c] > 0) {
-                float inv = 1.0f / counts[c];
+                float inv = 1.0f / static_cast<float>(counts[c]);
                 float* dst = &new_centroids[c * dim_];
                 for (uint32_t k = 0; k < dim_; ++k) dst[k] *= inv;
             } else {
