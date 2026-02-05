@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/comprehensive_bench.dir/benchmarks/comprehensive_bench.cc.o -o comprehensive_bench  libpomai.a 

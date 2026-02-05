@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpomai_c.a CMakeFiles/pomai_c_static.dir/src/capi/capi_status.cc.o CMakeFiles/pomai_c_static.dir/src/capi/capi_db.cc.o CMakeFiles/pomai_c_static.dir/src/capi/capi_scan.cc.o
-/usr/bin/ranlib libpomai_c.a

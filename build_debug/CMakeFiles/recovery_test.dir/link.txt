@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/recovery_test.dir/tests/crash/recovery_test.cc.o CMakeFiles/recovery_test.dir/tests/common/test_runner.cc.o -o recovery_test  libpomai.a 

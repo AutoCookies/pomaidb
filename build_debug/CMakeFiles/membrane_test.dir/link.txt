@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/membrane_test.dir/tests/integ/membrane_test.cc.o CMakeFiles/membrane_test.dir/tests/common/test_runner.cc.o -o membrane_test  libpomai.a 

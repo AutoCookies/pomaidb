@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/oracle_test.dir/tests/unit/oracle_test.cc.o CMakeFiles/oracle_test.dir/tests/common/bruteforce_oracle.cc.o CMakeFiles/oracle_test.dir/tests/common/test_runner.cc.o -o oracle_test  libpomai.a 

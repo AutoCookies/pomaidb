@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/wal_test.dir/tests/unit/wal_test.cc.o CMakeFiles/wal_test.dir/tests/common/test_runner.cc.o -o wal_test  libpomai.a 

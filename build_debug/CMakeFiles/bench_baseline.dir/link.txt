@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/bench_baseline.dir/tests/bench_baseline.cc.o -o bench_baseline  libpomai.a 

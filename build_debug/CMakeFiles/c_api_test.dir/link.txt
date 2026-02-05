@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/c_api_test.dir/tests/test_c_api_basic.cpp.o CMakeFiles/c_api_test.dir/tests/common/test_runner.cc.o -o c_api_test  -Wl,-rpath,/root/pomaieco/pomaidb/build_debug libpomai_c.so 

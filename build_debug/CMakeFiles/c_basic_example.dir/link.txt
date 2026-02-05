@@ -1,1 +1,0 @@
-/usr/bin/cc -g CMakeFiles/c_basic_example.dir/examples/c_basic.c.o -o c_basic_example  -Wl,-rpath,/root/pomaieco/pomaidb/build_debug libpomai_c.so 

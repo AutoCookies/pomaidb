@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/segment_test.dir/tests/unit/segment_test.cc.o CMakeFiles/segment_test.dir/tests/common/test_runner.cc.o -o segment_test  libpomai.a 

@@ -1,1 +1,0 @@
-/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/shard_manifest_test.dir/tests/unit/shard_manifest_test.cc.o CMakeFiles/shard_manifest_test.dir/tests/common/test_runner.cc.o -o shard_manifest_test  libpomai.a 
