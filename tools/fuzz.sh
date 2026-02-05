@@ -20,9 +20,17 @@ echo ""
 # Clean start
 rm -rf "$DB_PATH"
 
+# Ensure libpomai is built and up to date.
+if [ ! -f "./build/libpomai.a" ]; then
+    cmake -S . -B ./build
+fi
+
+echo "Building libpomai..."
+cmake --build ./build --target pomai
+
 # Build fuzzer if needed
-if [ ! -f "./build/tests/fuzz_operations" ]; then
-    echo "Building fuzzer..."
+if [ ! -f "./build/fuzz_operations" ]; then
+    echo "Building fuzzer harness..."
     cat > /tmp/fuzz_operations.cc << 'EOF'
 #include "pomai/pomai.h"
 #include <iostream>
@@ -109,7 +117,7 @@ int main(int argc, char** argv) {
 EOF
     
     g++ -std=c++20 /tmp/fuzz_operations.cc -o ./build/fuzz_operations \
-        -I./include -L./build -lpomai -lpthread || {
+        -I./include -L./build -Wl,--whole-archive -lpomai -Wl,--no-whole-archive -lpthread || {
         echo "Build failed, trying with installed pomai..."
         exit 1
     }
