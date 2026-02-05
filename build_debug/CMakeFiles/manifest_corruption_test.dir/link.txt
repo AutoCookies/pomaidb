@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/manifest_corruption_test.dir/tests/crash/manifest_corruption_test.cc.o CMakeFiles/manifest_corruption_test.dir/tests/common/test_runner.cc.o -o manifest_corruption_test  libpomai.a 

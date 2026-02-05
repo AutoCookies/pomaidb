@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/ingestion_bench.dir/benchmarks/ingestion_bench.cc.o -o ingestion_bench  libpomai.a 

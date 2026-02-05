@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/shard_concurrency_test.dir/tests/integ/shard_concurrency_test.cc.o CMakeFiles/shard_concurrency_test.dir/tests/common/test_runner.cc.o -o shard_concurrency_test  libpomai.a 

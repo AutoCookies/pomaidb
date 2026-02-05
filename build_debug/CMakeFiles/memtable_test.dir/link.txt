@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/memtable_test.dir/tests/unit/memtable_test.cc.o CMakeFiles/memtable_test.dir/tests/common/test_runner.cc.o -o memtable_test  libpomai.a 

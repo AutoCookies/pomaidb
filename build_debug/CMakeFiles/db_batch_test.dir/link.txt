@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/db_batch_test.dir/tests/integ/db_batch_test.cc.o CMakeFiles/db_batch_test.dir/tests/common/test_runner.cc.o -o db_batch_test  libpomai.a 

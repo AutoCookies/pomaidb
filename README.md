@@ -1,6 +1,10 @@
 # PomaiDB
 
-## Executive summary (20–30 lines)
+<p align="center">
+  <img src="./assets/logo.png" width="200" alt="Demo">
+</p>
+
+## Executive summary
 PomaiDB is a single-process, embedded vector database implemented in C++20. 
 It targets applications that need local vector search without external services. 
 Data is partitioned into shards; each shard has a single writer thread. 

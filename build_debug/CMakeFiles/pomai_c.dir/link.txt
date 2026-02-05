@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -fsanitize=address,undefined -fno-omit-frame-pointer -g -shared -Wl,-soname,libpomai_c.so -o libpomai_c.so CMakeFiles/pomai_c.dir/src/capi/capi_status.cc.o CMakeFiles/pomai_c.dir/src/capi/capi_db.cc.o CMakeFiles/pomai_c.dir/src/capi/capi_scan.cc.o  libpomai.a 

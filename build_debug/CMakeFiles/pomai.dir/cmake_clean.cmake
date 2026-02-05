@@ -1,0 +1,43 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/pomai.dir/src/api/db.cc.o"
+  "CMakeFiles/pomai.dir/src/api/db.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/distance.cc.o"
+  "CMakeFiles/pomai.dir/src/core/distance.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/engine/engine.cc.o"
+  "CMakeFiles/pomai.dir/src/core/engine/engine.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/index/ivf_coarse.cc.o"
+  "CMakeFiles/pomai.dir/src/core/index/ivf_coarse.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/index/ivf_flat.cc.o"
+  "CMakeFiles/pomai.dir/src/core/index/ivf_flat.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/membrane/manager.cc.o"
+  "CMakeFiles/pomai.dir/src/core/membrane/manager.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/shard/iterator.cc.o"
+  "CMakeFiles/pomai.dir/src/core/shard/iterator.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/shard/layer_lookup.cc.o"
+  "CMakeFiles/pomai.dir/src/core/shard/layer_lookup.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/shard/manifest.cc.o"
+  "CMakeFiles/pomai.dir/src/core/shard/manifest.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/shard/runtime.cc.o"
+  "CMakeFiles/pomai.dir/src/core/shard/runtime.cc.o.d"
+  "CMakeFiles/pomai.dir/src/core/shard/shard.cc.o"
+  "CMakeFiles/pomai.dir/src/core/shard/shard.cc.o.d"
+  "CMakeFiles/pomai.dir/src/storage/manifest/manifest.cc.o"
+  "CMakeFiles/pomai.dir/src/storage/manifest/manifest.cc.o.d"
+  "CMakeFiles/pomai.dir/src/storage/wal/wal.cc.o"
+  "CMakeFiles/pomai.dir/src/storage/wal/wal.cc.o.d"
+  "CMakeFiles/pomai.dir/src/table/memtable.cc.o"
+  "CMakeFiles/pomai.dir/src/table/memtable.cc.o.d"
+  "CMakeFiles/pomai.dir/src/table/segment.cc.o"
+  "CMakeFiles/pomai.dir/src/table/segment.cc.o.d"
+  "CMakeFiles/pomai.dir/src/util/crc32c.cc.o"
+  "CMakeFiles/pomai.dir/src/util/crc32c.cc.o.d"
+  "CMakeFiles/pomai.dir/src/util/posix_file.cc.o"
+  "CMakeFiles/pomai.dir/src/util/posix_file.cc.o.d"
+  "libpomai.a"
+  "libpomai.pdb"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/pomai.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()

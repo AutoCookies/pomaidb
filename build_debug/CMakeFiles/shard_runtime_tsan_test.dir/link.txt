@@ -1,0 +1,1 @@
+/usr/bin/c++ -fsanitize=address,undefined -fno-omit-frame-pointer -g CMakeFiles/shard_runtime_tsan_test.dir/tests/tsan/shard_runtime_tsan_test.cc.o CMakeFiles/shard_runtime_tsan_test.dir/tests/common/test_runner.cc.o -o shard_runtime_tsan_test  libpomai.a 
