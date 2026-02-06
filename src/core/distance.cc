@@ -13,18 +13,46 @@ namespace pomai::core
     {
         float DotScalar(std::span<const float> a, std::span<const float> b)
         {
-            float s = 0.0f;
+            float s0 = 0.0f;
+            float s1 = 0.0f;
+            float s2 = 0.0f;
+            float s3 = 0.0f;
             const std::size_t n = a.size();
-            for (std::size_t i = 0; i < n; ++i)
+            std::size_t i = 0;
+            for (; i + 4 <= n; i += 4) {
+                s0 += a[i] * b[i];
+                s1 += a[i + 1] * b[i + 1];
+                s2 += a[i + 2] * b[i + 2];
+                s3 += a[i + 3] * b[i + 3];
+            }
+            float s = s0 + s1 + s2 + s3;
+            for (; i < n; ++i) {
                 s += a[i] * b[i];
+            }
             return s;
         }
 
         float L2SqScalar(std::span<const float> a, std::span<const float> b)
         {
-            float s = 0.0f;
+            float s0 = 0.0f;
+            float s1 = 0.0f;
+            float s2 = 0.0f;
+            float s3 = 0.0f;
             const std::size_t n = a.size();
-            for (std::size_t i = 0; i < n; ++i)
+            std::size_t i = 0;
+            for (; i + 4 <= n; i += 4)
+            {
+                float d0 = a[i] - b[i];
+                float d1 = a[i + 1] - b[i + 1];
+                float d2 = a[i + 2] - b[i + 2];
+                float d3 = a[i + 3] - b[i + 3];
+                s0 += d0 * d0;
+                s1 += d1 * d1;
+                s2 += d2 * d2;
+                s3 += d3 * d3;
+            }
+            float s = s0 + s1 + s2 + s3;
+            for (; i < n; ++i)
             {
                 float d = a[i] - b[i];
                 s += d * d;
@@ -40,8 +68,19 @@ namespace pomai::core
             const float *pb = b.data();
             std::size_t n = a.size();
             
-            __m256 sum = _mm256_setzero_ps();
+            __m256 sum0 = _mm256_setzero_ps();
+            __m256 sum1 = _mm256_setzero_ps();
             std::size_t i = 0;
+            for (; i + 16 <= n; i += 16)
+            {
+                __m256 va0 = _mm256_loadu_ps(pa + i);
+                __m256 vb0 = _mm256_loadu_ps(pb + i);
+                __m256 va1 = _mm256_loadu_ps(pa + i + 8);
+                __m256 vb1 = _mm256_loadu_ps(pb + i + 8);
+                sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
+                sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
+            }
+            __m256 sum = _mm256_add_ps(sum0, sum1);
             for (; i + 8 <= n; i += 8)
             {
                 __m256 va = _mm256_loadu_ps(pa + i);
@@ -69,8 +108,21 @@ namespace pomai::core
             const float *pb = b.data();
             std::size_t n = a.size();
 
-            __m256 sum = _mm256_setzero_ps();
+            __m256 sum0 = _mm256_setzero_ps();
+            __m256 sum1 = _mm256_setzero_ps();
             std::size_t i = 0;
+            for (; i + 16 <= n; i += 16)
+            {
+                __m256 va0 = _mm256_loadu_ps(pa + i);
+                __m256 vb0 = _mm256_loadu_ps(pb + i);
+                __m256 va1 = _mm256_loadu_ps(pa + i + 8);
+                __m256 vb1 = _mm256_loadu_ps(pb + i + 8);
+                __m256 d0 = _mm256_sub_ps(va0, vb0);
+                __m256 d1 = _mm256_sub_ps(va1, vb1);
+                sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+                sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+            }
+            __m256 sum = _mm256_add_ps(sum0, sum1);
             for (; i + 8 <= n; i += 8)
             {
                 __m256 va = _mm256_loadu_ps(pa + i);

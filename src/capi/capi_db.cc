@@ -140,6 +140,7 @@ pomai_status_t* pomai_open(const pomai_options_t* opts, pomai_db_t** out_db) {
     cpp_opts.path = opts->path;
     cpp_opts.shard_count = opts->shards;
     cpp_opts.dim = opts->dim;
+    cpp_opts.search_threads = opts->search_threads;
     cpp_opts.fsync = (opts->fsync_policy == POMAI_FSYNC_POLICY_ALWAYS)
                          ? pomai::FsyncPolicy::kAlways
                          : pomai::FsyncPolicy::kNever;

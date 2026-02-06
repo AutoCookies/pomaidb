@@ -29,6 +29,7 @@ namespace pomai
         std::string path;
         uint32_t shard_count = 4;
         uint32_t dim = 512;
+        uint32_t search_threads = 0; // 0 => auto
         FsyncPolicy fsync = FsyncPolicy::kNever;
         IndexParams index_params;
         bool routing_enabled = false;

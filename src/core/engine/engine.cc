@@ -5,6 +5,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <queue>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -24,16 +25,49 @@ constexpr std::size_t kArenaBlockBytes = 1u << 20;  // 1 MiB
 constexpr std::size_t kWalSegmentBytes = 64u << 20; // 64 MiB
 constexpr std::uint64_t kPersistEveryPuts = 50000;
 
-static void MergeTopK(std::vector<pomai::SearchHit>* all, std::uint32_t k) {
-    if (!all) return;
-    if (all->size() <= k) {
-        std::sort(all->begin(), all->end(), [](const auto& a, const auto& b) { return a.score > b.score; });
-        return;
+struct WorseHit {
+    bool operator()(const pomai::SearchHit& a, const pomai::SearchHit& b) const {
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        return a.id > b.id;
     }
-    std::nth_element(all->begin(), all->begin() + static_cast<std::ptrdiff_t>(k), all->end(),
-                     [](const auto& a, const auto& b) { return a.score > b.score; });
-    all->resize(k);
-    std::sort(all->begin(), all->end(), [](const auto& a, const auto& b) { return a.score > b.score; });
+};
+
+bool IsBetterHit(const pomai::SearchHit& a, const pomai::SearchHit& b) {
+    if (a.score != b.score) {
+        return a.score > b.score;
+    }
+    return a.id < b.id;
+}
+
+static std::vector<pomai::SearchHit> MergeTopK(const std::vector<std::vector<pomai::SearchHit>>& per,
+                                               std::uint32_t k) {
+    std::vector<pomai::SearchHit> out;
+    if (k == 0) {
+        return out;
+    }
+    std::priority_queue<pomai::SearchHit, std::vector<pomai::SearchHit>, WorseHit> heap;
+    for (const auto& hits : per) {
+        for (const auto& hit : hits) {
+            if (heap.size() < k) {
+                heap.push(hit);
+                continue;
+            }
+            if (IsBetterHit(hit, heap.top())) {
+                heap.pop();
+                heap.push(hit);
+            }
+        }
+    }
+
+    out.reserve(heap.size());
+    while (!heap.empty()) {
+        out.push_back(heap.top());
+        heap.pop();
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return IsBetterHit(a, b); });
+    return out;
 }
 } // namespace
 
@@ -86,10 +120,20 @@ Status Engine::OpenLocked() {
     shards_.clear();
     shards_.reserve(opt_.shard_count);
 
-    size_t threads = std::thread::hardware_concurrency();
-    if (threads < 4) threads = 4;
-    search_pool_ = std::make_unique<util::ThreadPool>(threads);
-    segment_pool_ = std::make_unique<util::ThreadPool>(threads);
+    size_t threads = opt_.search_threads;
+    if (threads == 0) {
+        threads = std::thread::hardware_concurrency();
+    }
+    if (threads == 0) {
+        threads = 1;
+    }
+    if (threads > 1) {
+        search_pool_ = std::make_unique<util::ThreadPool>(threads);
+        segment_pool_ = std::make_unique<util::ThreadPool>(threads);
+    } else {
+        search_pool_.reset();
+        segment_pool_.reset();
+    }
 
     Status first_error = Status::Ok();
     for (std::uint32_t i = 0; i < opt_.shard_count; ++i) {
@@ -421,25 +465,28 @@ Status Engine::Search(std::span<const float> query,
     std::vector<std::future<pomai::Status>> futures;
     futures.reserve(probe_shards.size());
 
-    for (std::size_t i = 0; i < probe_shards.size(); ++i) {
-        const std::uint32_t sid = probe_shards[i];
-        futures.push_back(search_pool_->Enqueue([&, sid, i] { return shards_[sid]->SearchLocal(query, topk, opts, &per[i]); }));
+    if (search_pool_ && probe_shards.size() > 1) {
+        for (std::size_t i = 0; i < probe_shards.size(); ++i) {
+            const std::uint32_t sid = probe_shards[i];
+            futures.push_back(search_pool_->Enqueue([&, sid, i] { return shards_[sid]->SearchLocal(query, topk, opts, &per[i]); }));
+        }
+    } else {
+        for (std::size_t i = 0; i < probe_shards.size(); ++i) {
+            const std::uint32_t sid = probe_shards[i];
+            futures.push_back(std::async(std::launch::deferred, [&, sid, i] { return shards_[sid]->SearchLocal(query, topk, opts, &per[i]); }));
+        }
     }
 
-    std::vector<pomai::SearchHit> merged;
     std::uint64_t candidates_scanned = 0;
     for (size_t i = 0; i < futures.size(); ++i) {
         Status st = futures[i].get();
         candidates_scanned += shards_[probe_shards[i]]->LastQueryCandidatesScanned();
         if (!st.ok()) {
             out->errors.push_back({probe_shards[i], st.message()});
-        } else {
-            merged.insert(merged.end(), per[i].begin(), per[i].end());
         }
     }
 
-    MergeTopK(&merged, topk);
-    out->hits = std::move(merged);
+    out->hits = MergeTopK(per, topk);
     out->routed_shards_count = routed_shards_last_query_count_.load();
     out->routing_probe_centroids = routed_probe_centroids_last_query_.load();
     out->routed_buckets_count = candidates_scanned;
