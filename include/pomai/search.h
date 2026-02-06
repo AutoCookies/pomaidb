@@ -23,10 +23,14 @@ namespace pomai
     {
         std::vector<SearchHit> hits;
         std::vector<ShardError> errors; // Partial failures
+        uint32_t routed_shards_count = 0;
+        uint32_t routing_probe_centroids = 0;
 
-        void Clear() { 
-            hits.clear(); 
-            errors.clear(); 
+        void Clear() {
+            hits.clear();
+            errors.clear();
+            routed_shards_count = 0;
+            routing_probe_centroids = 0;
         }
     };
 

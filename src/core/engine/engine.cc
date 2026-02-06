@@ -369,6 +369,7 @@ std::vector<std::uint32_t> Engine::BuildProbeShards(std::span<const float> query
         std::vector<std::uint32_t> all(opt_.shard_count);
         for (std::uint32_t i = 0; i < opt_.shard_count; ++i) all[i] = i;
         routed_probe_centroids_last_query_.store(0);
+        routed_shards_last_query_count_.store(opt_.shard_count);
         return all;
     }
 
@@ -401,7 +402,6 @@ std::vector<std::uint32_t> Engine::BuildProbeShards(std::span<const float> query
 
     routed_probe_centroids_last_query_.store(probe);
     routed_shards_last_query_count_.store(static_cast<std::uint32_t>(out.size()));
-    std::cout << "[routing] mode=READY routed_shards=" << out.size() << " probe=" << probe << "\n";
     return out;
 }
 
@@ -438,6 +438,8 @@ Status Engine::Search(std::span<const float> query,
 
     MergeTopK(&merged, topk);
     out->hits = std::move(merged);
+    out->routed_shards_count = routed_shards_last_query_count_.load();
+    out->routing_probe_centroids = routed_probe_centroids_last_query_.load();
     return Status::Ok();
 }
 
