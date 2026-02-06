@@ -30,12 +30,6 @@ namespace pomai::table
     class SegmentReader;
 }
 
-// Forward declare IVF (avoid heavy include in header).
-namespace pomai::index
-{
-    class IvfCoarse;
-}
-
 namespace pomai::core
 {
 
@@ -213,9 +207,6 @@ namespace pomai::core
         // Snapshot
         std::atomic<std::shared_ptr<ShardSnapshot>> current_snapshot_;
         std::uint64_t next_snapshot_version_ = 1;
-
-        // IVF coarse index for candidate selection (centroid routing).
-        std::unique_ptr<pomai::index::IvfCoarse> ivf_;
 
         BoundedMpscQueue<Command> mailbox_;
         std::atomic<std::uint64_t> ops_processed_{0};

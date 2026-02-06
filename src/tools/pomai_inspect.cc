@@ -200,6 +200,7 @@ int CmdSegmentStats(const std::vector<std::string>& args) {
     
     size_t total_segment_size = 0;
     int segment_file_count = 0;
+    int sketch_file_count = 0;
     
     // Scan for membranes
     for (const auto& membrane_entry : fs::directory_iterator(db_path)) {
@@ -227,6 +228,9 @@ int CmdSegmentStats(const std::vector<std::string>& args) {
                         segment_file_count++;
                         total_segment_size += fs::file_size(file.path());
                     }
+                    if (fname.starts_with("seg_") && fname.ends_with(".dat.wsbr")) {
+                        sketch_file_count++;
+                    }
                 }
             }
             
@@ -243,6 +247,7 @@ int CmdSegmentStats(const std::vector<std::string>& args) {
     
     std::cout << "\nTotal:\n";
     std::cout << "  Segments: " << segment_file_count << "\n";
+    std::cout << "  WSBR sketches: " << sketch_file_count << "\n";
     std::cout << "  Size: " << (total_segment_size / (1024 * 1024)) << " MB\n\n";
     
     return 0;

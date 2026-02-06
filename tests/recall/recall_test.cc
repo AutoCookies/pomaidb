@@ -147,8 +147,8 @@ POMAI_TEST(Recall_Clustered_Basic) {
     
 
     // Phase 3: Enforce Gates
-    std::cout << "[RecallTest] Average Recall: " << avg << " (Target: 0.93)" << std::endl;
-    POMAI_EXPECT_TRUE(avg >= 0.93);
+    std::cout << "[RecallTest] Average Recall: " << avg << " (Target: 0.94)" << std::endl;
+    POMAI_EXPECT_TRUE(avg >= 0.94);
     POMAI_EXPECT_TRUE(min_r >= 0.10);
 }
 

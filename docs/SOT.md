@@ -49,3 +49,20 @@ Visibility rules:
 - Keep ingest and search hot paths allocation-aware.
 - Do not add extra vector copies on single `Put` path.
 - Batch ingestion can copy for ownership safety, but changes must be deliberate and benchmarkable.
+
+## WAL-Sketched Block Routing (WSBR) — single search algorithm
+PomaiDB uses exactly one ANN routing algorithm: WSBR. Segment search uses a block sketch sidecar (`.wsbr`) with deterministic 64-bit block signatures and exact scoring within selected blocks.
+
+Determinism rules:
+- Query signature generation is deterministic and seed-fixed.
+- Block ranking order uses `(hamming_distance, block_id)`.
+- Cross-shard/segment merges remain newest-wins with tombstone dominance and stable tie breakers.
+
+Failure semantics:
+- Missing/corrupt WSBR sidecar returns `Status::Corruption` (fail-closed).
+- No fallback to IVF/HNSW/PQ or alternate index family.
+
+Tuning knobs (`IndexParams`):
+- `wsbr_block_size`
+- `wsbr_top_blocks`
+- `wsbr_widen_blocks`

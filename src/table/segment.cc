@@ -1,12 +1,13 @@
 #include "table/segment.h"
 #include "util/crc32c.h"
-#include "core/index/ivf_flat.h" 
 
 #include <algorithm>
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
 #include <vector>
+#include <bit>
+#include <array>
 
 namespace pomai::table
 {
@@ -174,50 +175,93 @@ namespace pomai::table
         return pomai::Status::Ok();
     }
 
-    pomai::Status SegmentBuilder::BuildIndex(uint32_t nlist) {
-         // Gather valid vectors for training
-         std::vector<float> training_data;
-         training_data.reserve(entries_.size() * dim_);
-         size_t num_live = 0;
-         
-         for(const auto& e : entries_) {
-             if (!e.is_deleted) {
-                 training_data.insert(training_data.end(), e.vec.begin(), e.vec.end());
-                 num_live++;
-             }
-         }
-         
-         pomai::index::IvfFlatIndex::Options opt;
-         opt.nlist = nlist;
-         if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1U, static_cast<uint32_t>(num_live));
+    pomai::Status SegmentBuilder::BuildSketch(uint32_t block_size) {
+         if (block_size == 0) return pomai::Status::InvalidArgument("wsbr block_size must be > 0");
 
-         auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
-         auto st = idx->Train(training_data, num_live);
-         if (!st.ok()) return st;
-         
-         for(const auto& e : entries_) {
-             if (!e.is_deleted) {
-                 st = idx->Add(e.id, e.vec);
-                 if (!st.ok()) return st;
+         struct SketchHeader {
+             char magic[16];
+             uint32_t version;
+             uint32_t block_size;
+             uint32_t block_count;
+             uint32_t reserved;
+         };
+
+         struct SketchBlock {
+             uint64_t signature;
+             uint32_t start_index;
+             uint32_t count;
+             uint32_t reserved;
+         };
+
+         auto sig64 = [&](std::span<const float> vec) -> uint64_t {
+             uint64_t out = 0;
+             for (uint32_t b = 0; b < 64; ++b) {
+                 float sum = 0.0f;
+                 for (uint32_t d = 0; d < dim_; ++d) {
+                     const uint64_t seed = (static_cast<uint64_t>(b) << 32) ^ static_cast<uint64_t>(d * 2654435761u + 2246822519u);
+                     const float sign = ((seed ^ (seed >> 13) ^ (seed >> 29)) & 1ULL) ? 1.0f : -1.0f;
+                     sum += vec[d] * sign;
+                 }
+                 if (sum >= 0.0f) out |= (1ULL << b);
              }
+             return out;
+         };
+
+         std::vector<SketchBlock> blocks;
+         blocks.reserve((entries_.size() + block_size - 1) / block_size);
+
+         for (uint32_t start = 0; start < entries_.size(); start += block_size) {
+             const uint32_t count = std::min<uint32_t>(block_size, static_cast<uint32_t>(entries_.size()) - start);
+             std::array<int32_t, 64> bit_votes{};
+             for (uint32_t i = 0; i < count; ++i) {
+                 const auto& e = entries_[start + i];
+                 if (e.is_deleted) continue;
+                 uint64_t sig = sig64(e.vec);
+                 for (uint32_t b = 0; b < 64; ++b) {
+                     bit_votes[b] += ((sig >> b) & 1ULL) ? 1 : -1;
+                 }
+             }
+             uint64_t block_sig = 0;
+             for (uint32_t b = 0; b < 64; ++b) {
+                 if (bit_votes[b] >= 0) block_sig |= (1ULL << b);
+             }
+             blocks.push_back(SketchBlock{block_sig, start, count, 0});
          }
-         
-         std::string idx_path = path_ + ".idx.tmp";
-         st = idx->Save(idx_path);
+
+         SketchHeader h{};
+         std::memset(&h, 0, sizeof(h));
+         std::memcpy(h.magic, "pomai.wsbr.v1", 13);
+         h.version = 1;
+         h.block_size = block_size;
+         h.block_count = static_cast<uint32_t>(blocks.size());
+
+         std::string sketch_path = path_ + ".wsbr";
+         std::string tmp_path = sketch_path + ".tmp";
+         pomai::util::PosixFile file;
+         auto st = pomai::util::PosixFile::CreateTrunc(tmp_path, &file);
          if (!st.ok()) return st;
-         
-         std::string final_idx_path = path_;
-         if (final_idx_path.size() > 4 && final_idx_path.substr(final_idx_path.size()-4) == ".dat") {
-             final_idx_path = final_idx_path.substr(0, final_idx_path.size()-4);
+
+         st = file.PWrite(0, &h, sizeof(h));
+         if (!st.ok()) return st;
+         if (!blocks.empty()) {
+             st = file.PWrite(sizeof(h), blocks.data(), blocks.size() * sizeof(SketchBlock));
+             if (!st.ok()) return st;
          }
-         final_idx_path += ".idx";
-         
-         if (rename(idx_path.c_str(), final_idx_path.c_str()) != 0) {
-             return pomai::Status::IOError("rename idx failed");
+         uint32_t crc = 0;
+         crc = pomai::util::Crc32c(&h, sizeof(h), crc);
+         if (!blocks.empty()) crc = pomai::util::Crc32c(blocks.data(), blocks.size() * sizeof(SketchBlock), crc);
+         st = file.PWrite(sizeof(h) + blocks.size() * sizeof(SketchBlock), &crc, sizeof(crc));
+         if (!st.ok()) return st;
+         st = file.SyncData();
+         if (!st.ok()) return st;
+         st = file.Close();
+         if (!st.ok()) return st;
+         if (rename(tmp_path.c_str(), sketch_path.c_str()) != 0) {
+             return pomai::Status::IOError("rename wsbr sketch failed");
          }
-         
          return pomai::Status::Ok();
     }
+
 
 
     // Reader Implementation
@@ -270,25 +314,71 @@ namespace pomai::table
         size_t expected_min = sizeof(SegmentHeader) + reader->count_ * reader->entry_size_ + 4; // + CRC
         if (size < expected_min) return pomai::Status::Corruption("segment truncated");
 
-        // Try load index (best effort)
-        std::string idx_path = path;
-        if (idx_path.size() > 4 && idx_path.substr(idx_path.size()-4) == ".dat") {
-             idx_path = idx_path.substr(0, idx_path.size()-4);
+        struct SketchHeader {
+            char magic[16];
+            uint32_t version;
+            uint32_t block_size;
+            uint32_t block_count;
+            uint32_t reserved;
+        };
+
+        std::string sketch_path = path + ".wsbr";
+        pomai::util::PosixFile sketch_file;
+        st = pomai::util::PosixFile::OpenRead(sketch_path, &sketch_file);
+        if (!st.ok()) return pomai::Status::Corruption("missing wsbr sketch sidecar");
+
+        const void* sketch_data = nullptr;
+        size_t sketch_size = 0;
+        st = sketch_file.Map(&sketch_data, &sketch_size);
+        if (!st.ok()) return st;
+        if (sketch_size < sizeof(SketchHeader) + sizeof(uint32_t)) {
+            return pomai::Status::Corruption("wsbr sketch truncated");
         }
-        idx_path += ".idx";
-        
-        // Ignore error if not found (fallback to scan)
-        (void)pomai::index::IvfFlatIndex::Load(idx_path, &reader->index_);
+
+        const auto* sh = static_cast<const SketchHeader*>(sketch_data);
+        if (std::strncmp(sh->magic, "pomai.wsbr.v1", 13) != 0 || sh->version != 1) {
+            return pomai::Status::Corruption("bad wsbr sketch header");
+        }
+        const size_t blocks_bytes = static_cast<size_t>(sh->block_count) * sizeof(WsbrBlockSketch);
+        const size_t expected = sizeof(SketchHeader) + blocks_bytes + sizeof(uint32_t);
+        if (sketch_size != expected) return pomai::Status::Corruption("wsbr sketch size mismatch");
+        uint32_t file_crc = 0;
+        std::memcpy(&file_crc, static_cast<const uint8_t*>(sketch_data) + sizeof(SketchHeader) + blocks_bytes, sizeof(file_crc));
+        uint32_t calc_crc = 0;
+        calc_crc = pomai::util::Crc32c(sketch_data, sizeof(SketchHeader) + blocks_bytes, calc_crc);
+        if (calc_crc != file_crc) return pomai::Status::Corruption("wsbr sketch crc mismatch");
+
+        reader->wsbr_block_size_ = sh->block_size;
+        reader->wsbr_blocks_.resize(sh->block_count);
+        if (sh->block_count > 0) {
+            std::memcpy(reader->wsbr_blocks_.data(), static_cast<const uint8_t*>(sketch_data) + sizeof(SketchHeader), blocks_bytes);
+        }
 
         *out = std::move(reader);
         return pomai::Status::Ok();
     }
 
-    pomai::Status SegmentReader::Search(std::span<const float> query, uint32_t nprobe, 
-                                        std::vector<pomai::VectorId>* out_candidates) const
+    pomai::Status SegmentReader::RouteBlocks(std::uint64_t query_sig,
+                                            uint32_t top_blocks,
+                                            std::vector<WsbrBlockCandidate>* out_blocks) const
     {
-        if (!index_) return pomai::Status::Ok(); // Empty candidates -> Fallback
-        return index_->Search(query, nprobe, out_candidates);
+        if (!out_blocks) return pomai::Status::InvalidArgument("out_blocks is null");
+        out_blocks->clear();
+        if (wsbr_blocks_.empty()) return pomai::Status::Corruption("wsbr sketch has zero blocks");
+
+        std::vector<WsbrBlockCandidate> ranked;
+        ranked.reserve(wsbr_blocks_.size());
+        for (uint32_t i = 0; i < wsbr_blocks_.size(); ++i) {
+            const auto& b = wsbr_blocks_[i];
+            ranked.push_back(WsbrBlockCandidate{i, b.start_index, b.count, static_cast<uint32_t>(std::popcount(query_sig ^ b.signature))});
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (a.hamming != b.hamming) return a.hamming < b.hamming;
+            return a.block_id < b.block_id;
+        });
+        top_blocks = std::min<uint32_t>(top_blocks == 0 ? 1 : top_blocks, static_cast<uint32_t>(ranked.size()));
+        out_blocks->assign(ranked.begin(), ranked.begin() + top_blocks);
+        return pomai::Status::Ok();
     }
 
     void SegmentReader::GetMetadata(uint32_t index, pomai::Metadata* out) const

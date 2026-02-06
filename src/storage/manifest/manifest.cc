@@ -250,7 +250,7 @@ namespace pomai::storage
         static pomai::Status WriteMembraneManifest(std::string_view root_path, const pomai::MembraneSpec &spec)
         {
             std::string out;
-            out += "pomai.membrane.v2\n";
+            out += "pomai.membrane.v3\n";
             out += "name " + spec.name + "\n";
             out += "shards " + std::to_string(spec.shard_count) + "\n";
             out += "dim " + std::to_string(spec.dim) + "\n";
@@ -260,8 +260,9 @@ namespace pomai::storage
             else if (spec.metric == pomai::MetricType::kCosine) mtype = "COS";
             out += "metric " + mtype + "\n";
 
-            out += "index_params " + std::to_string(spec.index_params.nlist) + " " + 
-                   std::to_string(spec.index_params.nprobe) + "\n";
+            out += "index_params " + std::to_string(spec.index_params.wsbr_block_size) + " " +
+                   std::to_string(spec.index_params.wsbr_top_blocks) + " " +
+                   std::to_string(spec.index_params.wsbr_widen_blocks) + "\n";
 
             return AtomicWriteFile(MembraneManifestPath(root_path, spec.name), out);
         }
@@ -276,8 +277,8 @@ namespace pomai::storage
             std::string_view header = (p == std::string_view::npos) ? sv : sv.substr(0, p);
             
              // Allow v2
-            if (header != "pomai.membrane.v2")
-                 return pomai::Status::Corruption("bad membrane manifest header: expected v2");
+            if (header != "pomai.membrane.v2" && header != "pomai.membrane.v3")
+                 return pomai::Status::Corruption("bad membrane manifest header: expected v2/v3");
 
             sv = (p == std::string_view::npos) ? std::string_view{} : sv.substr(p + 1);
             
@@ -310,8 +311,9 @@ namespace pomai::storage
                     }
                 } else if (toks[0] == "index_params") {
                     if (toks.size() > 2) {
-                         ParseU32(toks[1], &spec->index_params.nlist);
-                         ParseU32(toks[2], &spec->index_params.nprobe);
+                         ParseU32(toks[1], &spec->index_params.wsbr_block_size);
+                         ParseU32(toks[2], &spec->index_params.wsbr_top_blocks);
+                         if (toks.size() > 3) ParseU32(toks[3], &spec->index_params.wsbr_widen_blocks);
                     }
                 }
             }

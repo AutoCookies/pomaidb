@@ -75,3 +75,24 @@ Validation rules:
 - Segment header validation: `src/table/segment.cc`
 - Shard manifest format + atomic commit: `src/core/shard/manifest.cc`
 - Root manifest format: `src/storage/manifest/manifest.cc`
+
+## WSBR sketch sidecar (`.wsbr`)
+Each segment `<seg>.dat` has sidecar `<seg>.dat.wsbr`.
+
+Binary layout (v1):
+- Header
+  - magic[16] = `pomai.wsbr.v1`
+  - version (u32) = 1
+  - block_size (u32)
+  - block_count (u32)
+  - reserved (u32)
+- Block entries (`block_count`)
+  - signature (u64)
+  - start_index (u32)
+  - count (u32)
+  - reserved (u32)
+- crc32c (u32) over header + block entries
+
+Validation:
+- magic/version/size/CRC must match.
+- Reader is fail-closed on mismatch (`Status::Corruption`).

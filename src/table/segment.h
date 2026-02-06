@@ -13,9 +13,6 @@
 #include "pomai/metadata.h"
 #include "util/posix_file.h"
 
-// Forward declare in correct namespace
-namespace pomai::index { class IvfFlatIndex; }
-
 namespace pomai::table
 {
 
@@ -62,11 +59,16 @@ namespace pomai::table
         FindResult Find(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const;
         FindResult Find(pomai::VectorId id, std::span<const float> *out_vec) const;
         
-        // Approximate Search via IVF Index.
-        pomai::Status Search(std::span<const float> query, uint32_t nprobe, 
-                             std::vector<pomai::VectorId>* out_candidates) const;
+        struct WsbrBlockCandidate {
+            uint32_t block_id = 0;
+            uint32_t start_index = 0;
+            uint32_t count = 0;
+            uint32_t hamming = 64;
+        };
 
-        bool HasIndex() const { return index_ != nullptr; }
+        pomai::Status RouteBlocks(std::uint64_t query_sig,
+                                  uint32_t top_blocks,
+                                  std::vector<WsbrBlockCandidate>* out_blocks) const;
 
         
         // Read entry at index [0, Count()-1]
@@ -137,7 +139,14 @@ namespace pomai::table
         const uint8_t* base_addr_ = nullptr;
         std::size_t file_size_ = 0;
         
-        std::unique_ptr<pomai::index::IvfFlatIndex> index_;
+        struct WsbrBlockSketch {
+            std::uint64_t signature = 0;
+            std::uint32_t start_index = 0;
+            std::uint32_t count = 0;
+            std::uint32_t reserved = 0;
+        };
+        std::vector<WsbrBlockSketch> wsbr_blocks_;
+        uint32_t wsbr_block_size_ = 512;
         
         // Internal helper
         void GetMetadata(uint32_t index, pomai::Metadata* out) const;
@@ -153,7 +162,7 @@ namespace pomai::table
 
         pomai::Status Finish();
         
-        pomai::Status BuildIndex(uint32_t nlist);
+        pomai::Status BuildSketch(uint32_t block_size);
 
         uint32_t Count() const { return static_cast<uint32_t>(entries_.size()); }
 

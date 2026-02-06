@@ -8,7 +8,6 @@
 #include <limits>
 
 #include "core/distance.h"
-#include "core/index/ivf_coarse.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 #include "table/segment.h" // Added
@@ -43,12 +42,6 @@ namespace pomai::core
           segment_pool_(segment_pool),
           index_params_(index_params)
     {
-        pomai::index::IvfCoarse::Options opt;
-        opt.nlist = index_params_.nlist;
-        opt.nprobe = index_params_.nprobe;
-        opt.warmup = 256;
-        opt.ema = 0.05f;
-        ivf_ = std::make_unique<pomai::index::IvfCoarse>(dim_, opt);
     }
 
     ShardRuntime::~ShardRuntime()
@@ -545,7 +538,6 @@ namespace pomai::core
         // This is STALENESS. "Reads may observe a slightly stale snapshot".
         // This is consistent.
         
-        (void)ivf_->Delete(c.id);
         return pomai::Status::Ok();
     }
 
@@ -607,9 +599,9 @@ namespace pomai::core
             });
             
             // Build Sidecar Index
-            auto st = builder.BuildIndex(index_params_.nlist);
+            auto st = builder.BuildSketch(index_params_.wsbr_block_size);
             if (!st.ok()) {
-                 return pomai::Status::Internal("Freeze: BuildIndex failed: " + st.message());
+                 return pomai::Status::Internal("Freeze: BuildSketch failed: " + st.message());
             }
 
             auto st_finish = builder.Finish();
@@ -770,9 +762,9 @@ namespace pomai::core
         }
 
         // Step 4: Finalize compacted segment
-        auto st = builder.BuildIndex(index_params_.nlist); 
+        auto st = builder.BuildSketch(index_params_.wsbr_block_size); 
         if (!st.ok()) {
-             return pomai::Status::Internal("Compact: BuildIndex failed: " + st.message());
+             return pomai::Status::Internal("Compact: BuildSketch failed: " + st.message());
         }
 
         st = builder.Finish();
@@ -948,75 +940,76 @@ namespace pomai::core
         // -------------------------
         // Parallel Scan with mutex for top-k merge
         
-        uint32_t nprobe = index_params_.nprobe; 
         
-        std::vector<std::future<void>> futures;
-        futures.reserve(snap->segments.size());
-
         std::mutex out_mutex;
+        std::atomic<bool> had_route_error{false};
+        std::string route_error_msg;
 
-        auto scan_segment = [&](const std::shared_ptr<table::SegmentReader>& seg) {
-                  // Fallback: Full Scan (ForEach) vs Index
-                  
-                  if (seg->HasIndex() && opts.filters.empty()) {
-                      // Optimization: Use Index only if NO filters for now
-                      std::vector<VectorId> candidates;
-                      if(seg->Search(query, nprobe, &candidates).ok()) {
-                          for(auto id : candidates) {
-                              std::span<const float> vec;
-                              pomai::Metadata meta;
-                              
-                              auto status = seg->Get(id, &vec, &meta); 
-                              if (!status.ok()) continue; // Deleted or not found (tombstone)
-                              
-                              {
-                                  std::lock_guard<std::mutex> lock(out_mutex);
-                                  if (seen_tracker.Contains(id)) continue;
-                                  seen_tracker.MarkSeen(id); 
-                                  
-                                  float score = pomai::core::Dot(query, vec);
-                                  push_topk(id, score);
-                              }
-                          }
-                          return;
-                      }
-                  }
-                  
-                  // Fallback or Filtered Scan
-                  seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
-                        std::lock_guard<std::mutex> lock(out_mutex);
-                        if (seen_tracker.Contains(id)) return; 
-                        seen_tracker.MarkSeen(id);
-
-                        if (is_deleted) {
-                            seen_tracker.MarkTombstone(id);
-                            return;
-                        }
-
-                        // Check Filter
-                        const pomai::Metadata default_meta;
-                        const pomai::Metadata& m = meta ? *meta : default_meta;
-                        if (!core::FilterEvaluator::Matches(m, opts)) {
-                            return;
-                        }
-
-                        float score = pomai::core::Dot(query, vec);
-                        push_topk(id, score);
-                  });
+        auto sig64 = [&](std::span<const float> vec) -> std::uint64_t {
+            std::uint64_t out_sig = 0;
+            for (std::uint32_t b = 0; b < 64; ++b) {
+                float sum = 0.0f;
+                for (std::uint32_t d = 0; d < dim_; ++d) {
+                    const std::uint64_t seed = (static_cast<std::uint64_t>(b) << 32) ^ static_cast<std::uint64_t>(d * 2654435761u + 2246822519u);
+                    const float sign = ((seed ^ (seed >> 13) ^ (seed >> 29)) & 1ULL) ? 1.0f : -1.0f;
+                    sum += vec[d] * sign;
+                }
+                if (sum >= 0.0f) out_sig |= (1ULL << b);
+            }
+            return out_sig;
         };
 
-        for (auto& seg : snap->segments) {
-            if (segment_pool_) {
-                futures.push_back(segment_pool_->Enqueue([&, seg]() { scan_segment(seg); }));
-            } else {
-                scan_segment(seg);
-            }
+        const std::uint64_t query_sig = sig64(query);
+
+        auto scan_segment = [&](const std::shared_ptr<table::SegmentReader>& seg) {
+                  // Ensure DB semantics: tombstones always applied, independent of routing.
+                  seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
+                      if (!is_deleted) return;
+                      std::lock_guard<std::mutex> lock(out_mutex);
+                      if (seen_tracker.Contains(id)) return;
+                      seen_tracker.MarkSeen(id);
+                      seen_tracker.MarkTombstone(id);
+                  });
+
+                  std::vector<table::SegmentReader::WsbrBlockCandidate> blocks;
+                  auto route_st = seg->RouteBlocks(query_sig, index_params_.wsbr_top_blocks, &blocks);
+                  if (!route_st.ok()) {
+                      had_route_error.store(true, std::memory_order_relaxed);
+                      std::lock_guard<std::mutex> lock(out_mutex);
+                      if (route_error_msg.empty()) route_error_msg = route_st.message();
+                      return;
+                  }
+                  for (const auto& block : blocks) {
+                      for (uint32_t i = 0; i < block.count; ++i) {
+                          pomai::VectorId id = 0;
+                          std::span<const float> vec;
+                          bool is_deleted = false;
+                          pomai::Metadata meta;
+                          auto st = seg->ReadAt(block.start_index + i, &id, &vec, &is_deleted, &meta);
+                          if (!st.ok()) continue;
+
+                          std::lock_guard<std::mutex> lock(out_mutex);
+                          if (seen_tracker.Contains(id)) continue;
+                          seen_tracker.MarkSeen(id);
+                          if (is_deleted) {
+                              seen_tracker.MarkTombstone(id);
+                              continue;
+                          }
+                          if (!core::FilterEvaluator::Matches(meta, opts)) continue;
+                          float score = pomai::core::Dot(query, vec);
+                          push_topk(id, score);
+                      }
+                  }
+        };
+
+        for (auto it = snap->segments.rbegin(); it != snap->segments.rend(); ++it) {
+            scan_segment(*it);
         }
         
-        for (auto& f : futures) {
-            f.wait();
+        if (had_route_error.load(std::memory_order_relaxed)) {
+            return pomai::Status::Corruption("wsbr routing failed: " + route_error_msg);
         }
-        
+
         // Finalize results
         while(!pq.empty()) {
             out->push_back(pq.top());
@@ -1027,6 +1020,18 @@ namespace pomai::core
         std::sort(out->begin(), out->end(),
                   [](const auto &a, const auto &b)
                   { return a.score > b.score; });
+
+        // Final semantic filter: newest-wins/tombstone dominance must hold.
+        std::vector<pomai::SearchHit> filtered;
+        filtered.reserve(out->size());
+        for (const auto& h : *out) {
+            const auto lookup = LookupById(active, snap, h.id, dim_);
+            if (lookup.state == LookupState::kFound) {
+                filtered.push_back(h);
+            }
+        }
+        *out = std::move(filtered);
+        if (out->size() > topk) out->resize(topk);
 
         return pomai::Status::Ok();
     }

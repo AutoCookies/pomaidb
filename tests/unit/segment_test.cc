@@ -30,6 +30,7 @@ namespace
         POMAI_EXPECT_OK(builder.Add(30, std::span<const float>(v3), /*is_deleted=*/true)); // Tombstone
         
         POMAI_EXPECT_OK(builder.Finish());
+        POMAI_EXPECT_OK(builder.BuildSketch(512));
         
         POMAI_EXPECT_EQ(builder.Count(), 3);
         POMAI_EXPECT_TRUE(fs::exists(path));

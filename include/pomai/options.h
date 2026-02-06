@@ -20,8 +20,9 @@ namespace pomai
 
     struct IndexParams
     {
-        uint32_t nlist = 64;
-        uint32_t nprobe = 8;
+        uint32_t wsbr_block_size = 512;
+        uint32_t wsbr_top_blocks = 4096;
+        uint32_t wsbr_widen_blocks = 32;
     };
 
     struct DBOptions
