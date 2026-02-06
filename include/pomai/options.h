@@ -21,7 +21,7 @@ namespace pomai
     struct IndexParams
     {
         uint32_t nlist = 64;
-        uint32_t nprobe = 8;
+        uint32_t nprobe = 10;
     };
 
     struct DBOptions
@@ -31,6 +31,11 @@ namespace pomai
         uint32_t dim = 512;
         FsyncPolicy fsync = FsyncPolicy::kNever;
         IndexParams index_params;
+        bool routing_enabled = false;
+        uint32_t routing_k = 0;
+        uint32_t routing_probe = 0;
+        uint32_t routing_warmup_mult = 20;
+        uint32_t routing_keep_prev = 1;
     };
 
     // One membrane = one logical collection.

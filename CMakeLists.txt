@@ -33,6 +33,10 @@ add_library(pomai STATIC
   src/core/index/ivf_flat.cc
   src/core/distance.cc
 
+  src/core/routing/routing_table.cc
+  src/core/routing/kmeans_lite.cc
+  src/core/routing/routing_persist.cc
+
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
   src/util/crc32c.cc
@@ -171,6 +175,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(oracle_test)
   pomai_add_labeled_test(oracle_test "unit")
 
+  add_executable(routing_table_test tests/unit/routing_table_test.cc)
+  pomai_setup_test(routing_table_test)
+  pomai_add_labeled_test(routing_table_test "unit")
+
   add_executable(recall_test tests/recall/recall_test.cc tests/recall/recall_dataset.cc tests/common/bruteforce_oracle.cc)
   pomai_setup_test(recall_test)
   pomai_add_labeled_test(recall_test "recall")
@@ -203,6 +211,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(db_partial_search_test tests/integ/db_partial_search_test.cc)
   pomai_setup_test(db_partial_search_test)
   pomai_add_labeled_test(db_partial_search_test "integ")
+
+  add_executable(routing_engine_test tests/integ/routing_engine_test.cc)
+  pomai_setup_test(routing_engine_test)
+  pomai_add_labeled_test(routing_engine_test "integ")
 
   add_executable(manifest_test tests/unit/manifest_test.cc)
   pomai_setup_test(manifest_test)
