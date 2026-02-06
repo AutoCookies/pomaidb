@@ -26,11 +26,11 @@ namespace pomai::table
     // CRC: Computed on the fly (incremental)
     
     SegmentBuilder::SegmentBuilder(std::string path, uint32_t dim)
-        : path_(std::move(path)), dim_(dim)
+        : path_(std::move(path)), dim_(dim), zero_buffer_(dim, 0.0f)
     {
     }
 
-    pomai::Status SegmentBuilder::Add(pomai::VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata& meta)
+    pomai::Status SegmentBuilder::Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted, const pomai::Metadata& meta)
     {
         Entry e;
         e.id = id;
@@ -39,14 +39,13 @@ namespace pomai::table
 
         if (is_deleted)
         {
-            // Tombstone: store zeros (deterministic, compressible)
-            e.vec.resize(dim_, 0.0f);
+            e.vec = pomai::VectorView{nullptr, dim_};
         }
         else
         {
-            if (vec.size() != dim_)
+            if (vec.dim != dim_)
                 return pomai::Status::InvalidArgument("dimension mismatch");
-            e.vec.assign(vec.begin(), vec.end());
+            e.vec = vec;
         }
         
         // Buffer locally for sorting (unavoidable for binary search)
@@ -54,7 +53,7 @@ namespace pomai::table
         return pomai::Status::Ok();
     }
 
-    pomai::Status SegmentBuilder::Add(pomai::VectorId id, std::span<const float> vec, bool is_deleted)
+    pomai::Status SegmentBuilder::Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted)
     {
         return Add(id, vec, is_deleted, pomai::Metadata());
     }
@@ -114,7 +113,8 @@ namespace pomai::table
             entry_buffer.push_back(0);
 
             // Vector (dim * 4 bytes)
-            const uint8_t* p_vec = reinterpret_cast<const uint8_t*>(e.vec.data());
+            const float* vec_ptr = e.is_deleted ? zero_buffer_.data() : e.vec.data;
+            const uint8_t* p_vec = reinterpret_cast<const uint8_t*>(vec_ptr);
             entry_buffer.insert(entry_buffer.end(), p_vec, p_vec + (dim_ * sizeof(float)));
 
             // Write entry
@@ -182,7 +182,7 @@ namespace pomai::table
          
          for(const auto& e : entries_) {
              if (!e.is_deleted) {
-                 training_data.insert(training_data.end(), e.vec.begin(), e.vec.end());
+                 training_data.insert(training_data.end(), e.vec.data, e.vec.data + dim_);
                  num_live++;
              }
          }
@@ -197,7 +197,7 @@ namespace pomai::table
          
          for(const auto& e : entries_) {
              if (!e.is_deleted) {
-                 st = idx->Add(e.id, e.vec);
+                 st = idx->Add(e.id, e.vec.span());
                  if (!st.ok()) return st;
              }
          }

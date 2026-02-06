@@ -41,8 +41,7 @@ namespace pomai::core
     struct PutCmd
     {
         VectorId id{};
-        const float *vec{};
-        std::uint32_t dim{};
+        pomai::VectorView vec{};
         pomai::Metadata meta{}; // Added
         std::promise<pomai::Status> done;
     };
@@ -56,7 +55,7 @@ namespace pomai::core
     struct BatchPutCmd
     {
         std::vector<pomai::VectorId> ids;
-        std::vector<std::vector<float>> vectors;  // Owned copies
+        std::vector<pomai::VectorView> vectors;  // Borrowed views, valid until command completes
         std::promise<pomai::Status> done;
     };
 

@@ -148,8 +148,8 @@ namespace pomai::table
     public:
         SegmentBuilder(std::string path, uint32_t dim);
         
-        pomai::Status Add(pomai::VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata& meta);
-        pomai::Status Add(pomai::VectorId id, std::span<const float> vec, bool is_deleted);
+        pomai::Status Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted, const pomai::Metadata& meta);
+        pomai::Status Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted);
 
         pomai::Status Finish();
         
@@ -160,7 +160,7 @@ namespace pomai::table
     private:
         struct Entry {
             pomai::VectorId id;
-            std::vector<float> vec; // Empty if deleted
+            pomai::VectorView vec;
             bool is_deleted;
             pomai::Metadata meta; // Added
         };
@@ -168,6 +168,7 @@ namespace pomai::table
         std::string path_;
         uint32_t dim_;
         std::vector<Entry> entries_;
+        std::vector<float> zero_buffer_;
     };
 
 } // namespace pomai::table

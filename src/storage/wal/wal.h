@@ -32,13 +32,13 @@ namespace pomai::storage
 
         pomai::Status Open();
 
-        pomai::Status AppendPut(pomai::VectorId id, std::span<const float> vec);
-        pomai::Status AppendPut(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta); // Added
+        pomai::Status AppendPut(pomai::VectorId id, pomai::VectorView vec);
+        pomai::Status AppendPut(pomai::VectorId id, pomai::VectorView vec, const pomai::Metadata& meta); // Added
         pomai::Status AppendDelete(pomai::VectorId id);
         
         // Batch append: Write multiple Put records with single fsync (5-10x faster)
         pomai::Status AppendBatch(const std::vector<pomai::VectorId>& ids,
-                                  const std::vector<std::span<const float>>& vectors);
+                                  const std::vector<pomai::VectorView>& vectors);
 
         pomai::Status Flush();
         pomai::Status ReplayInto(pomai::table::MemTable &mem);

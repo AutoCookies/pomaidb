@@ -264,8 +264,7 @@ namespace pomai::core
 
         PutCmd cmd;
         cmd.id = id;
-        cmd.vec = vec.data(); 
-        cmd.dim = static_cast<std::uint32_t>(vec.size());
+        cmd.vec = pomai::VectorView(vec);
         cmd.meta = meta; // Copy metadata
         
         auto f = cmd.done.get_future();
@@ -278,17 +277,17 @@ namespace pomai::core
 
     pomai::Status ShardRuntime::HandlePut(PutCmd &c)
     {
-        if (c.dim != dim_)
+        if (c.vec.dim != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
 
         // 1. Write WAL
-        auto st = wal_->AppendPut(c.id, {c.vec, c.dim}, c.meta);
+        auto st = wal_->AppendPut(c.id, c.vec, c.meta);
         if (!st.ok())
             return st;
 
         // 2. Update MemTable
         auto m = mem_.load(std::memory_order_relaxed);
-        st = m->Put(c.id, {c.vec, c.dim}, c.meta);
+        st = m->Put(c.id, c.vec, c.meta);
         if (!st.ok()) return st;
 
         // 3. Check Threshold for Soft Freeze (e.g. 5000 items)
@@ -313,12 +312,11 @@ namespace pomai::core
                 return pomai::Status::InvalidArgument("dim mismatch");
         }
         
-        // Deep copy vectors into command (avoid lifetime issues)
         BatchPutCmd cmd;
         cmd.ids = ids;
         cmd.vectors.reserve(vectors.size());
         for (const auto& vec : vectors) {
-            cmd.vectors.emplace_back(vec.begin(), vec.end());
+            cmd.vectors.emplace_back(vec);
         }
         
         auto f = cmd.done.get_future();
@@ -579,21 +577,14 @@ namespace pomai::core
         if (c.ids.size() != c.vectors.size())
             return pomai::Status::InvalidArgument("ids and vectors size mismatch");
         
-        // Convert owned vectors to spans for WAL/MemTable
-        std::vector<std::span<const float>> spans;
-        spans.reserve(c.vectors.size());
-        for (const auto& vec : c.vectors) {
-            spans.emplace_back(vec);
-        }
-        
         // 1. Batch write to WAL (KEY OPTIMIZATION: single fsync)
-        auto st = wal_->AppendBatch(c.ids, spans);
+        auto st = wal_->AppendBatch(c.ids, c.vectors);
         if (!st.ok())
             return st;
         
         // 2. Batch update MemTable
         auto m = mem_.load(std::memory_order_relaxed);
-        st = m->PutBatch(c.ids, spans);
+        st = m->PutBatch(c.ids, c.vectors);
         if (!st.ok())
             return st;
         
@@ -685,7 +676,7 @@ namespace pomai::core
             table::SegmentBuilder builder(filepath, dim_);
             fmem->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
                 pomai::Metadata meta_copy = meta ? *meta : pomai::Metadata();
-                (void)builder.Add(id, vec, is_deleted, meta_copy);
+                (void)builder.Add(id, pomai::VectorView(vec), is_deleted, meta_copy);
             });
             
             // Build Sidecar Index
@@ -830,7 +821,7 @@ namespace pomai::core
                     std::span<const float> vec;
                     pomai::Metadata meta; // Compact needs to preserve metadata!
                     if (segments_[top.seg_idx]->ReadAt(top.entry_idx, nullptr, &vec, nullptr, &meta).ok()) {
-                        builder.Add(top.id, vec, false, meta);
+                        builder.Add(top.id, pomai::VectorView(vec), false, meta);
                         live_entries_kept++;
                     }
                 }

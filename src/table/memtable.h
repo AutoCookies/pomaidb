@@ -16,13 +16,13 @@ namespace pomai::table
     public:
         MemTable(std::uint32_t dim, std::size_t arena_block_bytes);
 
-        pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status Put(pomai::VectorId id, pomai::VectorView vec);
         // Overload with metadata
-        pomai::Status Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta);
+        pomai::Status Put(pomai::VectorId id, pomai::VectorView vec, const pomai::Metadata& meta);
         
         // Batch put: Optimized for inserting multiple vectors at once
         pomai::Status PutBatch(const std::vector<pomai::VectorId>& ids,
-                               const std::vector<std::span<const float>>& vectors);
+                               const std::vector<pomai::VectorView>& vectors);
         
         pomai::Status Get(pomai::VectorId id, const float** out_vec) const;
         // Get metadata for an ID (returns empty/default if not found or no metadata)

@@ -32,18 +32,18 @@ namespace pomai::table
         map_.reserve(1u << 20);
     }
 
-    pomai::Status MemTable::Put(pomai::VectorId id, std::span<const float> vec)
+    pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec)
     {
         return Put(id, vec, pomai::Metadata());
     }
 
-    pomai::Status MemTable::Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta)
+    pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec, const pomai::Metadata& meta)
     {
         std::unique_lock lock(mutex_);
-        if (vec.size() != dim_)
+        if (vec.dim != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
         float *dst = static_cast<float *>(arena_.Allocate(vec.size_bytes(), alignof(float)));
-        std::memcpy(dst, vec.data(), vec.size_bytes());
+        std::memcpy(dst, vec.data, vec.size_bytes());
         map_[id] = dst;
         
         // Store metadata if not empty
@@ -59,7 +59,7 @@ namespace pomai::table
     }
 
     pomai::Status MemTable::PutBatch(const std::vector<pomai::VectorId>& ids,
-                                      const std::vector<std::span<const float>>& vectors)
+                                      const std::vector<pomai::VectorView>& vectors)
     {
         std::unique_lock lock(mutex_);
         // Validation
@@ -70,14 +70,14 @@ namespace pomai::table
         
         // Validate dimensions for all vectors
         for (const auto& vec : vectors) {
-            if (vec.size() != dim_)
+            if (vec.dim != dim_)
                 return pomai::Status::InvalidArgument("dim mismatch");
         }
         
         // Batch insert: allocate and copy all vectors
         for (std::size_t i = 0; i < ids.size(); ++i) {
             float *dst = static_cast<float *>(arena_.Allocate(vectors[i].size_bytes(), alignof(float)));
-            std::memcpy(dst, vectors[i].data(), vectors[i].size_bytes());
+            std::memcpy(dst, vectors[i].data, vectors[i].size_bytes());
             map_[ids[i]] = dst;
         }
         
