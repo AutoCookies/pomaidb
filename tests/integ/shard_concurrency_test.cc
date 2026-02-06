@@ -38,7 +38,7 @@ POMAI_TEST(ShardConcurrency_ParallelPuts) {
     for (int t = 0; t < num_threads; ++t) {
         threads.emplace_back([&, t]() {
             for (int i = 0; i < puts_per_thread; ++i) {
-                VectorId id = t * puts_per_thread + i;
+                VectorId id = static_cast<VectorId>(t * puts_per_thread + i);
                 std::vector<float> v = {
                     static_cast<float>(id), 
                     static_cast<float>(id + 1),
@@ -63,7 +63,7 @@ POMAI_TEST(ShardConcurrency_ParallelPuts) {
     db->Freeze("default");
     for (int t = 0; t < num_threads; ++t) {
         for (int i = 0; i < puts_per_thread; ++i) {
-            VectorId id = t * puts_per_thread + i;
+            VectorId id = static_cast<VectorId>(t * puts_per_thread + i);
             std::vector<float> out;
             Status st = db->Get("default", id, &out);
             POMAI_EXPECT_OK(st);
@@ -97,7 +97,7 @@ POMAI_TEST(ShardConcurrency_MixedOperations) {
     // Pre-populate some data
     for (int i = 0; i < 100; ++i) {
         std::vector<float> v = {1.0f, 2.0f, 3.0f, 4.0f};
-        db->Put("default", i, v);
+        db->Put("default", static_cast<VectorId>(i), v);
     }
     db->Freeze("default");
 
@@ -108,7 +108,7 @@ POMAI_TEST(ShardConcurrency_MixedOperations) {
     threads.emplace_back([&]() {
         for (int i = 100; i < 200 && !stop.load(); ++i) {
             std::vector<float> v = {5.0f, 6.0f, 7.0f, 8.0f};
-            db->Put("default", i, v);
+            db->Put("default", static_cast<VectorId>(i), v);
         }
     });
 
@@ -117,7 +117,7 @@ POMAI_TEST(ShardConcurrency_MixedOperations) {
         threads.emplace_back([&]() {
             std::vector<float> out;
             for (int i = 0; i < 50 && !stop.load(); ++i) {
-                db->Get("default", i % 100, &out);
+                db->Get("default", static_cast<VectorId>(i % 100), &out);
             }
         });
     }

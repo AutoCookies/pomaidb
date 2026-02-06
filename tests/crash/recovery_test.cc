@@ -34,8 +34,8 @@ POMAI_TEST(WAL_CorruptionDetection) {
         
         // Insert vectors
         std::vector<float> v = {1.0f, 2.0f, 3.0f, 4.0f};
-        for (int i = 0; i < 50; ++i) {
-            db->Put("default", i, v);
+        for (std::uint32_t i = 0; i < 50; ++i) {
+            db->Put("default", static_cast<VectorId>(i), v);
         }
         
         db->Flush();
@@ -80,8 +80,8 @@ POMAI_TEST(IncompleteFlushRecovery) {
         db->OpenMembrane("default");
         
         std::vector<float> v = {1.0f, 2.0f, 3.0f, 4.0f};
-        for (int i = 0; i < 30; ++i) {
-            db->Put("default", i, v);
+        for (std::uint32_t i = 0; i < 30; ++i) {
+            db->Put("default", static_cast<VectorId>(i), v);
         }
         
         db->Close();
@@ -95,7 +95,7 @@ POMAI_TEST(IncompleteFlushRecovery) {
         
         // Verify some data recovered
         std::vector<float> out;
-        auto st = db->Get("default", 0, &out);
+        auto st = db->Get("default", static_cast<VectorId>(0), &out);
         POMAI_EXPECT_OK(st);
         POMAI_EXPECT_EQ(out.size(), 4u);
         
@@ -123,8 +123,8 @@ POMAI_TEST(ConcurrentConsistency) {
     
     // Pre-populate
     std::vector<float> v = {1.0f, 2.0f, 3.0f, 4.0f};
-    for (int i = 0; i < 100; ++i) {
-        db->Put("default", i, v);
+    for (std::uint32_t i = 0; i < 100; ++i) {
+        db->Put("default", static_cast<VectorId>(i), v);
     }
     db->Freeze("default");
     
@@ -135,7 +135,7 @@ POMAI_TEST(ConcurrentConsistency) {
     for (int t = 0; t < 4; ++t) {
         threads.emplace_back([&, t]() {
             for (int i = 0; i < 25; ++i) {
-                VectorId id = (t * 25 + i) % 100;
+                VectorId id = static_cast<VectorId>((t * 25 + i) % 100);
                 std::vector<float> out;
                 auto st = db->Get("default", id, &out);
                 if (!st.ok() || out.size() != 4) {

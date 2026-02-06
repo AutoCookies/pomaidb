@@ -12,6 +12,10 @@ namespace pomai
     namespace fs = std::filesystem;
     using storage::Wal;
 
+    static VectorView ToVectorView(const std::vector<float>& vec) {
+        return VectorView(vec.data(), static_cast<std::uint32_t>(vec.size()));
+    }
+
     // Helper to extract data from MemTable
     static std::vector<float> GetVec(const table::MemTable& mem, VectorId id, uint32_t dim) {
         const float* ptr = nullptr;
@@ -27,10 +31,10 @@ namespace pomai
             POMAI_EXPECT_OK(wal->Open());
             
             std::vector<float> v1 = {1.0f, 2.0f};
-            POMAI_EXPECT_OK(wal->AppendPut(1, v1));
+            POMAI_EXPECT_OK(wal->AppendPut(1, ToVectorView(v1)));
             
             std::vector<float> v2 = {3.0f, 4.0f};
-            POMAI_EXPECT_OK(wal->AppendPut(2, v2));
+            POMAI_EXPECT_OK(wal->AppendPut(2, ToVectorView(v2)));
             
             POMAI_EXPECT_OK(wal->AppendDelete(1));
         }
@@ -62,7 +66,7 @@ namespace pomai
             auto wal = std::make_unique<Wal>(dir, 0, 1024*1024, FsyncPolicy::kNever);
             POMAI_EXPECT_OK(wal->Open());
             std::vector<float> v1 = {1.0f, 1.0f};
-            POMAI_EXPECT_OK(wal->AppendPut(10, v1));
+            POMAI_EXPECT_OK(wal->AppendPut(10, ToVectorView(v1)));
         }
 
         // 2. Append Partial Garbage to end of file manually
@@ -99,7 +103,7 @@ namespace pomai
             auto wal = std::make_unique<Wal>(dir, 0, 1024*1024, FsyncPolicy::kNever);
             POMAI_EXPECT_OK(wal->Open());
             std::vector<float> v1 = {1.0f, 1.0f};
-            POMAI_EXPECT_OK(wal->AppendPut(10, v1));
+            POMAI_EXPECT_OK(wal->AppendPut(10, ToVectorView(v1)));
         }
 
         // 2. Corrupt the file in the middle (byte 20 or so)
@@ -128,7 +132,7 @@ namespace pomai
             auto wal = std::make_unique<Wal>(dir, 0, 1024*1024, FsyncPolicy::kNever);
             POMAI_EXPECT_OK(wal->Open());
             std::vector<float> v1 = {1.0f, 2.0f};
-            POMAI_EXPECT_OK(wal->AppendPut(7, v1));
+            POMAI_EXPECT_OK(wal->AppendPut(7, ToVectorView(v1)));
         }
 
         std::string log_path = dir + "/wal_0_0.log";

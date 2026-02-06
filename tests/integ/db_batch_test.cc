@@ -45,8 +45,8 @@ namespace
         std::vector<std::vector<float>> vec_storage;
         std::vector<std::span<const float>> vecs;
         
-        for (int i=0; i<100; ++i) {
-            ids.push_back(1000 + i);
+        for (std::size_t i = 0; i < 100; ++i) {
+            ids.push_back(static_cast<pomai::VectorId>(1000 + i));
             vec_storage.push_back(MakeVec(opt.dim, static_cast<float>(i)));
         }
         for (const auto& v : vec_storage) {
@@ -59,7 +59,7 @@ namespace
         // CHECK IMMEDATELY BEFORE FREEZE
         {
              std::vector<float> check;
-             pomai::Status st = db->Get(1000, &check);
+             pomai::Status st = db->Get(static_cast<pomai::VectorId>(1000), &check);
              if (!st.ok()) printf("Before Freeze: Get(1000) failed: %s\n", st.message().c_str());
              else printf("Before Freeze: Get(1000) OK\n");
         }
@@ -68,9 +68,9 @@ namespace
         POMAI_EXPECT_OK(db->Freeze("default"));
 
         // Verify Get for all
-        for (int i=0; i<100; ++i) {
+        for (std::size_t i = 0; i < 100; ++i) {
             std::vector<float> out;
-            POMAI_EXPECT_OK(db->Get(1000 + i, &out));
+            POMAI_EXPECT_OK(db->Get(static_cast<pomai::VectorId>(1000 + i), &out));
             POMAI_EXPECT_EQ(out.size(), opt.dim);
             POMAI_EXPECT_EQ(out[0], vec_storage[i][0]);
         }

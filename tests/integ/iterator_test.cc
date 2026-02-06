@@ -35,8 +35,8 @@ POMAI_TEST(Iterator_AllInsertedIDs) {
 
     // Insert 100 vectors
     std::unordered_set<VectorId> inserted_ids;
-    for (int i = 0; i < 100; ++i) {
-        VectorId id = i;
+    for (std::uint32_t i = 0; i < 100; ++i) {
+        VectorId id = static_cast<VectorId>(i);
         auto v = MakeVec(4, static_cast<float>(i));
         POMAI_EXPECT_OK(db->Put("default", id, v));
         inserted_ids.insert(id);
@@ -82,16 +82,16 @@ POMAI_TEST(Iterator_TombstoneFiltering) {
     db->OpenMembrane("default");
 
     // Insert vectors
-    for (int i = 0; i < 50; ++i) {
+    for (std::uint32_t i = 0; i < 50; ++i) {
         auto v = MakeVec(4, static_cast<float>(i));
-        db->Put("default", i, v);
+        db->Put("default", static_cast<VectorId>(i), v);
     }
     
     // Delete every other vector
     std::unordered_set<VectorId> deleted_ids;
-    for (int i = 0; i < 50; i += 2) {
-        db->Delete("default", i);
-        deleted_ids.insert(i);
+    for (std::uint32_t i = 0; i < 50; i += 2) {
+        db->Delete("default", static_cast<VectorId>(i));
+        deleted_ids.insert(static_cast<VectorId>(i));
     }
     
     db->Freeze("default");
@@ -185,9 +185,9 @@ POMAI_TEST(Iterator_SnapshotIsolation) {
     db->OpenMembrane("default");
 
     // Insert initial data
-    for (int i = 0; i < 50; ++i) {
+    for (std::uint32_t i = 0; i < 50; ++i) {
         auto v = MakeVec(4, 1.0f);
-        db->Put("default", i, v);
+        db->Put("default", static_cast<VectorId>(i), v);
     }
     db->Freeze("default");
 
@@ -196,9 +196,9 @@ POMAI_TEST(Iterator_SnapshotIsolation) {
     db->NewIterator("default", &it);
     
     // Insert more data after iterator creation
-    for (int i = 100; i < 150; ++i) {
+    for (std::uint32_t i = 100; i < 150; ++i) {
         auto v = MakeVec(4, 2.0f);
-        db->Put("default", i, v);
+        db->Put("default", static_cast<VectorId>(i), v);
     }
     db->Freeze("default");
 
@@ -209,7 +209,7 @@ POMAI_TEST(Iterator_SnapshotIsolation) {
         iterated_ids.insert(id);
         
         // Should be from original range [0, 50)
-        POMAI_EXPECT_TRUE(id < 50);
+        POMAI_EXPECT_TRUE(id < static_cast<VectorId>(50));
         
         it->Next();
     }
@@ -238,9 +238,9 @@ POMAI_TEST(Iterator_DeterministicOrdering) {
     db->OpenMembrane("default");
 
     // Insert data
-    for (int i = 0; i < 30; ++i) {
+    for (std::uint32_t i = 0; i < 30; ++i) {
         auto v = MakeVec(4, static_cast<float>(i));
-        db->Put("default", i, v);
+        db->Put("default", static_cast<VectorId>(i), v);
     }
     db->Freeze("default");
 
