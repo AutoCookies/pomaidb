@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <thread>
 #include <variant>
@@ -163,6 +165,8 @@ namespace pomai::core
         std::uint64_t LastQueryCandidatesScanned() const { return last_query_candidates_scanned_.load(std::memory_order_relaxed); }
 
     private:
+        struct BackgroundJob;
+
         void RunLoop();
 
         // Internal helpers
@@ -170,8 +174,8 @@ namespace pomai::core
         pomai::Status HandleBatchPut(BatchPutCmd &c);
         pomai::Status HandleDel(DelCmd &c);
         pomai::Status HandleFlush(FlushCmd &c);
-        pomai::Status HandleFreeze(FreezeCmd &c);
-        pomai::Status HandleCompact(CompactCmd &c);
+        std::optional<pomai::Status> HandleFreeze(FreezeCmd &c);
+        std::optional<pomai::Status> HandleCompact(CompactCmd &c);
         IteratorReply HandleIterator(IteratorCmd &c);
         SearchReply HandleSearch(SearchCmd &c);
         // GetReply HandleGet(GetCmd &c); // Deprecated
@@ -197,6 +201,9 @@ namespace pomai::core
         
         // Soft Freeze: Move active memtable to frozen.
         pomai::Status RotateMemTable();
+
+        void PumpBackgroundWork(std::chrono::milliseconds budget);
+        void CancelBackgroundJob(const std::string& reason);
 
         const std::uint32_t shard_id_;
         const std::string shard_dir_;
@@ -226,6 +233,9 @@ namespace pomai::core
         pomai::util::ThreadPool* thread_pool_{nullptr};
         pomai::util::ThreadPool* segment_pool_{nullptr}; // Added
         pomai::IndexParams index_params_;
+
+        std::unique_ptr<BackgroundJob> background_job_;
+        std::uint64_t wal_epoch_{0};
     };
 
 } // namespace pomai::core

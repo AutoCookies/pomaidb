@@ -133,6 +133,38 @@ namespace pomai::table
         arena_.Clear();
     }
 
+    MemTable::Cursor MemTable::CreateCursor() const
+    {
+        return Cursor(this, map_.cbegin(), map_.cend());
+    }
+
+    bool MemTable::Cursor::Next(CursorEntry* out)
+    {
+        if (!out) {
+            return false;
+        }
+        if (it_ == end_) {
+            return false;
+        }
+        const auto id = it_->first;
+        const float* ptr = it_->second;
+        const bool is_deleted = (ptr == nullptr);
+        std::span<const float> vec;
+        if (!is_deleted) {
+            vec = std::span<const float>{ptr, mem_->dim_};
+        }
+        const pomai::Metadata* meta_ptr = nullptr;
+        if (!is_deleted) {
+            auto meta_it = mem_->metadata_.find(id);
+            if (meta_it != mem_->metadata_.end()) {
+                meta_ptr = &meta_it->second;
+            }
+        }
+        *out = CursorEntry{id, vec, is_deleted, meta_ptr};
+        ++it_;
+        return true;
+    }
+
 
 
 } // namespace pomai::table

@@ -20,6 +20,7 @@ struct RunMetrics {
     double p50_us = 0.0;
     double p95_us = 0.0;
     double p99_us = 0.0;
+    double p999_us = 0.0;
 };
 
 std::vector<float> MakeVec(std::uint64_t seed, std::uint32_t dim) {
@@ -91,6 +92,7 @@ RunMetrics OneRun(const std::string& db_path, std::uint32_t dim, std::uint32_t n
     m.p50_us = Percentile(lat_us, 0.50);
     m.p95_us = Percentile(lat_us, 0.95);
     m.p99_us = Percentile(lat_us, 0.99);
+    m.p999_us = Percentile(lat_us, 0.999);
     return m;
 }
 
@@ -110,11 +112,12 @@ int main(int argc, char** argv) {
     constexpr std::uint32_t topk = 10;
     constexpr int kIters = 3;
 
-    std::vector<double> ingest, p50, p95, p99;
+    std::vector<double> ingest, p50, p95, p99, p999;
     ingest.reserve(kIters);
     p50.reserve(kIters);
     p95.reserve(kIters);
     p99.reserve(kIters);
+    p999.reserve(kIters);
 
     for (int i = 0; i < kIters; ++i) {
         const auto m = OneRun("/tmp/pomai_ci_perf_" + std::to_string(i), dim, nvec, nquery, topk);
@@ -122,12 +125,14 @@ int main(int argc, char** argv) {
         p50.push_back(m.p50_us);
         p95.push_back(m.p95_us);
         p99.push_back(m.p99_us);
+        p999.push_back(m.p999_us);
     }
 
     const double med_ingest = Median(ingest);
     const double med_p50 = Median(p50);
     const double med_p95 = Median(p95);
     const double med_p99 = Median(p99);
+    const double med_p999 = Median(p999);
 
     std::ostream* os = &std::cout;
     std::ofstream out;
@@ -145,7 +150,8 @@ int main(int argc, char** argv) {
         << ", \"topk\": " << topk << ", \"iterations\": " << kIters << "},\n";
     *os << "  \"metrics\": {\n";
     *os << "    \"ingest_qps\": " << med_ingest << ",\n";
-    *os << "    \"search_latency_us\": {\"p50\": " << med_p50 << ", \"p95\": " << med_p95 << ", \"p99\": " << med_p99 << "}\n";
+    *os << "    \"search_latency_us\": {\"p50\": " << med_p50 << ", \"p95\": " << med_p95
+        << ", \"p99\": " << med_p99 << ", \"p999\": " << med_p999 << "}\n";
     *os << "  }\n";
     *os << "}\n";
 

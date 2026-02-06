@@ -36,6 +36,29 @@ namespace pomai::table
         }
         void Clear();
 
+        struct CursorEntry {
+            pomai::VectorId id;
+            std::span<const float> vec;
+            bool is_deleted;
+            const pomai::Metadata* meta;
+        };
+
+        class Cursor {
+        public:
+            bool Next(CursorEntry* out);
+
+        private:
+            friend class MemTable;
+            using MapIter = std::unordered_map<pomai::VectorId, float *>::const_iterator;
+            Cursor(const MemTable* mem, MapIter it, MapIter end) : mem_(mem), it_(it), end_(end) {}
+
+            const MemTable* mem_;
+            MapIter it_;
+            MapIter end_;
+        };
+
+        Cursor CreateCursor() const;
+
         const float *GetPtr(pomai::VectorId id) const
         {
             std::shared_lock lock(mutex_);

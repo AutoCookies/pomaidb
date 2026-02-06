@@ -41,9 +41,12 @@ def main() -> int:
     c_ingest = current['metrics']['ingest_qps']
     b_p95 = baseline['metrics']['search_latency_us']['p95']
     c_p95 = current['metrics']['search_latency_us']['p95']
+    b_p999 = baseline['metrics']['search_latency_us'].get('p999', baseline['metrics']['search_latency_us'].get('p99', 0.0))
+    c_p999 = current['metrics']['search_latency_us'].get('p999', current['metrics']['search_latency_us'].get('p99', 0.0))
 
     min_ingest = b_ingest * (1.0 - args.threshold)
     max_p95 = b_p95 * (1.0 + args.threshold)
+    max_p999 = b_p999 * (1.0 + args.threshold)
 
     failed = False
     print(f'ingest_qps baseline={b_ingest:.2f} current={c_ingest:.2f} min_allowed={min_ingest:.2f}')
@@ -54,6 +57,11 @@ def main() -> int:
     print(f'p95_us baseline={b_p95:.2f} current={c_p95:.2f} max_allowed={max_p95:.2f}')
     if c_p95 > max_p95:
         print('FAIL: p95 latency regression beyond threshold')
+        failed = True
+
+    print(f'p999_us baseline={b_p999:.2f} current={c_p999:.2f} max_allowed={max_p999:.2f}')
+    if c_p999 > max_p999:
+        print('FAIL: p999 latency regression beyond threshold')
         failed = True
 
     if failed:
