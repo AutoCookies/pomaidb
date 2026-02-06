@@ -38,6 +38,8 @@ Visibility rules:
 - Tombstone at any newer layer returns NotFound / false and blocks older data.
 - `Get` and `Exists` share the same canonical lookup semantics.
 - `Search` deduplicates by id with newest-wins behavior and excludes tombstoned records.
+- `Search` is deterministic for a given snapshot and query: ties are broken by `(score desc, id asc)`.
+- `Search` parallelism is restricted to scoring; visibility gating is built serially in layer order to enforce newest-wins.
 
 ## 5) Multi-shard policy
 

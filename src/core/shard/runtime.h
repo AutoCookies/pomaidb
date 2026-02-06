@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "core/shard/mailbox.h"
-#include "core/shard/seen_tracker.h"
 #include "core/shard/snapshot.h"
 #include "pomai/metadata.h"
 #include "pomai/search.h" // Restored

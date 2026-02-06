@@ -244,6 +244,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(search_filter_test)
   pomai_add_labeled_test(search_filter_test "integ")
 
+  add_executable(search_newest_wins_test tests/integ/search_newest_wins_test.cc)
+  pomai_setup_test(search_newest_wins_test)
+  pomai_add_labeled_test(search_newest_wins_test "integ")
+
   add_executable(manifest_corruption_test tests/crash/manifest_corruption_test.cc)
   pomai_setup_test(manifest_corruption_test)
   pomai_add_labeled_test(manifest_corruption_test "crash")
