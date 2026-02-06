@@ -317,6 +317,13 @@ add_executable(ingestion_bench benchmarks/ingestion_bench.cc)
 target_link_libraries(ingestion_bench PRIVATE pomai)
 target_include_directories(ingestion_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+
+# CBR-S benchmark suite
+add_executable(bench_cbrs benchmarks/bench_cbrs.cpp)
+target_link_libraries(bench_cbrs PRIVATE pomai)
+target_include_directories(bench_cbrs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set_target_properties(bench_cbrs PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # Deterministic CI benchmark for perf gate
 add_executable(ci_perf_bench benchmarks/ci_perf_bench.cc)
 target_link_libraries(ci_perf_bench PRIVATE pomai)
