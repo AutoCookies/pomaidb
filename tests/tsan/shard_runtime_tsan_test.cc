@@ -62,8 +62,7 @@ namespace
 
                     pomai::core::PutCmd c;
                     c.id = id;
-                    c.vec = v.data();
-                    c.dim = dim;
+                    c.vec = pomai::VectorView(v);
 
                     auto fut = c.done.get_future();
                     POMAI_EXPECT_OK(rt.Enqueue(pomai::core::Command{std::move(c)}));
