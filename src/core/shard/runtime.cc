@@ -948,41 +948,13 @@ namespace pomai::core
         // -------------------------
         // Parallel Scan with mutex for top-k merge
         
-        uint32_t nprobe = index_params_.nprobe; 
-        
         std::vector<std::future<void>> futures;
         futures.reserve(snap->segments.size());
 
         std::mutex out_mutex;
 
         auto scan_segment = [&](const std::shared_ptr<table::SegmentReader>& seg) {
-                  // Fallback: Full Scan (ForEach) vs Index
-                  
-                  if (seg->HasIndex() && opts.filters.empty()) {
-                      // Optimization: Use Index only if NO filters for now
-                      std::vector<VectorId> candidates;
-                      if(seg->Search(query, nprobe, &candidates).ok()) {
-                          for(auto id : candidates) {
-                              std::span<const float> vec;
-                              pomai::Metadata meta;
-                              
-                              auto status = seg->Get(id, &vec, &meta); 
-                              if (!status.ok()) continue; // Deleted or not found (tombstone)
-                              
-                              {
-                                  std::lock_guard<std::mutex> lock(out_mutex);
-                                  if (seen_tracker.Contains(id)) continue;
-                                  seen_tracker.MarkSeen(id); 
-                                  
-                                  float score = pomai::core::Dot(query, vec);
-                                  push_topk(id, score);
-                              }
-                          }
-                          return;
-                      }
-                  }
-                  
-                  // Fallback or Filtered Scan
+                  // Canonical path: brute-force full scan.
                   seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
                         std::lock_guard<std::mutex> lock(out_mutex);
                         if (seen_tracker.Contains(id)) return; 
