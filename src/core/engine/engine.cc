@@ -427,8 +427,10 @@ Status Engine::Search(std::span<const float> query,
     }
 
     std::vector<pomai::SearchHit> merged;
+    std::uint64_t candidates_scanned = 0;
     for (size_t i = 0; i < futures.size(); ++i) {
         Status st = futures[i].get();
+        candidates_scanned += shards_[probe_shards[i]]->LastQueryCandidatesScanned();
         if (!st.ok()) {
             out->errors.push_back({probe_shards[i], st.message()});
         } else {
@@ -440,6 +442,7 @@ Status Engine::Search(std::span<const float> query,
     out->hits = std::move(merged);
     out->routed_shards_count = routed_shards_last_query_count_.load();
     out->routing_probe_centroids = routed_probe_centroids_last_query_.load();
+    out->routed_buckets_count = candidates_scanned;
     return Status::Ok();
 }
 

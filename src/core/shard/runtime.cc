@@ -873,6 +873,7 @@ namespace pomai::core
     {
         out->clear();
         out->reserve(topk);
+        std::atomic<std::uint64_t> candidates_scanned{0};
 
         // Initialize local SeenTracker for this search
         SeenTracker seen_tracker;
@@ -899,6 +900,7 @@ namespace pomai::core
         // -------------------------
         if (active) {
             active->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                 candidates_scanned.fetch_add(1, std::memory_order_relaxed);
                  if (seen_tracker.Contains(id)) return;
                  seen_tracker.MarkSeen(id); 
                  
@@ -924,6 +926,7 @@ namespace pomai::core
         // -------------------------
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
             (*it)->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                candidates_scanned.fetch_add(1, std::memory_order_relaxed);
                 if (seen_tracker.Contains(id)) return;
                 seen_tracker.MarkSeen(id);
                 
@@ -956,6 +959,7 @@ namespace pomai::core
         auto scan_segment = [&](const std::shared_ptr<table::SegmentReader>& seg) {
                   // Canonical path: brute-force full scan.
                   seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                        candidates_scanned.fetch_add(1, std::memory_order_relaxed);
                         std::lock_guard<std::mutex> lock(out_mutex);
                         if (seen_tracker.Contains(id)) return; 
                         seen_tracker.MarkSeen(id);
@@ -1000,6 +1004,7 @@ namespace pomai::core
                   [](const auto &a, const auto &b)
                   { return a.score > b.score; });
 
+        last_query_candidates_scanned_.store(candidates_scanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
         return pomai::Status::Ok();
     }
 } // namespace pomai::core

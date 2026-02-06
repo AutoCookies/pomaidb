@@ -25,12 +25,14 @@ namespace pomai
         std::vector<ShardError> errors; // Partial failures
         uint32_t routed_shards_count = 0;
         uint32_t routing_probe_centroids = 0;
+        uint64_t routed_buckets_count = 0; // Candidate/bucket count when routing enabled.
 
         void Clear() {
             hits.clear();
             errors.clear();
             routed_shards_count = 0;
             routing_probe_centroids = 0;
+            routed_buckets_count = 0;
         }
     };
 

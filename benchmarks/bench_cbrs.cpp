@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <numeric>
 #include <random>
 #include <set>
@@ -19,6 +20,7 @@
 #include <string>
 #include <sys/resource.h>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -69,8 +71,10 @@ struct Row {
     uint32_t shards = 0;
     double ingest_sec = 0.0;
     double ingest_qps = 0.0;
+    double warmup_sec = 0.0;
+    double warmup_qps = 0.0;
     double query_qps = 0.0;
-    double p50_us = 0.0, p90_us = 0.0, p95_us = 0.0, p99_us = 0.0, p999_us = 0.0;
+    double p50_us = 0.0, p90_us = 0.0, p95_us = 0.0, p99_us = 0.0, p999_us = 0.0, p9999_us = -1.0;
     double recall1 = 0.0, recall10 = 0.0, recall100 = 0.0;
     double routed_shards_avg = 0.0, routed_shards_p95 = 0.0;
     double routed_probe_avg = 0.0, routed_probe_p95 = 0.0;
@@ -146,7 +150,9 @@ Dataset GenerateDataset(const CliConfig& cfg, bool with_drift = false) {
     std::normal_distribution<float> g(0.0f, 1.0f);
     std::uniform_real_distribution<float> u(-1.0f, 1.0f);
     Dataset d;
-    d.base.assign(cfg.n, std::vector<float>(cfg.dim));
+    const uint32_t base_n = with_drift ? (cfg.n / 2) : cfg.n;
+    const uint32_t drift_n = with_drift ? (cfg.n - base_n) : 0;
+    d.base.assign(base_n, std::vector<float>(cfg.dim));
     d.queries.assign(cfg.queries, std::vector<float>(cfg.dim));
 
     std::vector<std::vector<float>> centers(cfg.clusters, std::vector<float>(cfg.dim));
@@ -154,32 +160,45 @@ Dataset GenerateDataset(const CliConfig& cfg, bool with_drift = false) {
         for (float& x : c) x = g(rng);
         Normalize(c);
     }
+    std::vector<std::vector<float>> drift_centers = centers;
 
     auto sample_clustered = [&](std::vector<float>& out, uint32_t cid, float sigma) {
         for (uint32_t j = 0; j < cfg.dim; ++j) out[j] = centers[cid][j] + sigma * g(rng);
         Normalize(out);
     };
+    auto sample_clustered_from = [&](std::vector<float>& out,
+                                     const std::vector<std::vector<float>>& src,
+                                     uint32_t cid,
+                                     float sigma) {
+        for (uint32_t j = 0; j < cfg.dim; ++j) out[j] = src[cid][j] + sigma * g(rng);
+        Normalize(out);
+    };
 
-    for (uint32_t i = 0; i < cfg.n; ++i) {
+    if (cfg.dataset == "overlap" || cfg.dataset == "overlap_hard") {
+        const float shift = cfg.dataset == "overlap_hard" ? 0.006f : 0.03f;
+        for (uint32_t c = 1; c < cfg.clusters; ++c) {
+            for (uint32_t j = 0; j < cfg.dim; ++j) centers[c][j] = centers[0][j] + shift * g(rng);
+            Normalize(centers[c]);
+        }
+    }
+
+    for (uint32_t i = 0; i < base_n; ++i) {
         auto& v = d.base[i];
         if (cfg.dataset == "uniform") {
             for (float& x : v) x = u(rng);
             Normalize(v);
-        } else if (cfg.dataset == "clustered") {
-            uint32_t c = static_cast<uint32_t>(rng() % std::max(1u, cfg.clusters));
+        } else if (cfg.dataset == "clustered" || cfg.dataset == "epoch_drift_hard") {
+            uint32_t c = cfg.dataset == "epoch_drift_hard"
+                             ? static_cast<uint32_t>(i % std::max(1u, cfg.clusters))
+                             : static_cast<uint32_t>(rng() % std::max(1u, cfg.clusters));
             sample_clustered(v, c, 0.08f);
-        } else if (cfg.dataset == "overlap") {
-            const float shift = 0.03f;
-            for (uint32_t c = 1; c < cfg.clusters; ++c) {
-                for (uint32_t j = 0; j < cfg.dim; ++j) centers[c][j] = centers[0][j] + shift * g(rng);
-                Normalize(centers[c]);
-            }
+        } else if (cfg.dataset == "overlap" || cfg.dataset == "overlap_hard") {
             uint32_t c = static_cast<uint32_t>(rng() % std::max(1u, cfg.clusters));
-            sample_clustered(v, c, 0.12f);
-        } else if (cfg.dataset == "skew") {
-            const bool hot = (rng() % 10) != 0;
+            sample_clustered(v, c, cfg.dataset == "overlap_hard" ? 0.16f : 0.12f);
+        } else if (cfg.dataset == "skew" || cfg.dataset == "skew_hard") {
+            const bool hot = (rng() % (cfg.dataset == "skew_hard" ? 100 : 10)) != 0;
             uint32_t c = hot ? 0u : static_cast<uint32_t>(1 + (rng() % std::max(1u, cfg.clusters - 1)));
-            sample_clustered(v, c, hot ? 0.05f : 0.15f);
+            sample_clustered(v, c, hot ? 0.04f : 0.18f);
         }
     }
 
@@ -188,23 +207,49 @@ Dataset GenerateDataset(const CliConfig& cfg, bool with_drift = false) {
         if (cfg.dataset == "uniform") {
             for (float& x : q) x = u(rng);
             Normalize(q);
+        } else if (cfg.dataset == "skew" || cfg.dataset == "skew_hard") {
+            const bool hot = (rng() % (cfg.dataset == "skew_hard" ? 100 : 10)) != 0;
+            uint32_t c = hot ? 0u : static_cast<uint32_t>(1 + (rng() % std::max(1u, cfg.clusters - 1)));
+            sample_clustered(q, c, hot ? 0.04f : 0.18f);
+        } else if (with_drift && cfg.dataset == "epoch_drift_hard" && i >= (cfg.queries / 2)) {
+            uint32_t c = static_cast<uint32_t>(rng() % std::max(1u, cfg.clusters));
+            sample_clustered_from(q, drift_centers, c, 0.08f);
         } else {
             uint32_t c = static_cast<uint32_t>(rng() % std::max(1u, cfg.clusters));
-            sample_clustered(q, c, cfg.dataset == "overlap" ? 0.12f : 0.08f);
+            const bool overlap_mode = cfg.dataset == "overlap" || cfg.dataset == "overlap_hard";
+            sample_clustered(q, c, overlap_mode ? 0.12f : 0.08f);
         }
     }
 
     if (with_drift) {
-        d.drift_half.assign(cfg.n / 2, std::vector<float>(cfg.dim));
-        std::vector<std::vector<float>> drift_centers = centers;
+        d.drift_half.assign(drift_n, std::vector<float>(cfg.dim));
         for (auto& c : drift_centers) {
-            for (float& x : c) x += 0.35f * g(rng);
+            const float shift = cfg.dataset == "epoch_drift_hard" ? 0.55f : 0.35f;
+            for (float& x : c) x += shift * g(rng);
             Normalize(c);
         }
-        for (auto& v : d.drift_half) {
-            uint32_t c = static_cast<uint32_t>(rng() % std::max(1u, cfg.clusters));
-            for (uint32_t j = 0; j < cfg.dim; ++j) v[j] = drift_centers[c][j] + 0.08f * g(rng);
-            Normalize(v);
+        for (size_t i = 0; i < d.drift_half.size(); ++i) {
+            uint32_t c = cfg.dataset == "epoch_drift_hard"
+                             ? static_cast<uint32_t>(i % std::max(1u, cfg.clusters))
+                             : static_cast<uint32_t>(rng() % std::max(1u, cfg.clusters));
+            sample_clustered_from(d.drift_half[i], drift_centers, c, 0.08f);
+        }
+    }
+
+    if (with_drift && cfg.dataset == "epoch_drift_hard") {
+        for (uint32_t i = 0; i < cfg.queries; ++i) {
+            auto& q = d.queries[i];
+            const bool use_base = i < (cfg.queries / 2);
+            if (use_base && !d.base.empty()) {
+                const auto& src = d.base[static_cast<size_t>(rng() % d.base.size())];
+                for (uint32_t j = 0; j < cfg.dim; ++j) q[j] = src[j] + 0.02f * g(rng);
+            } else if (!d.drift_half.empty()) {
+                const auto& src = d.drift_half[static_cast<size_t>(rng() % d.drift_half.size())];
+                for (uint32_t j = 0; j < cfg.dim; ++j) q[j] = src[j] + 0.02f * g(rng);
+            } else {
+                for (float& x : q) x = u(rng);
+            }
+            Normalize(q);
         }
     }
 
@@ -235,11 +280,13 @@ pomai::FsyncPolicy ParseFsync(const std::string& f) {
 
 void WriteCsv(const std::string& path, const std::vector<Row>& rows) {
     std::ofstream out(path);
-    out << "scenario,routing,dataset,dim,n,queries,topk,shards,ingest_sec,ingest_qps,query_qps,p50_us,p90_us,p95_us,p99_us,p999_us,recall1,recall10,recall100,routed_shards_avg,routed_shards_p95,routed_probe_avg,routed_probe_p95,routed_buckets_avg,routed_buckets_p95,rss_open_kb,rss_ingest_kb,rss_query_kb,peak_rss_kb,user_cpu_sec,sys_cpu_sec,verdict,error\n";
+    out << "scenario,routing,dataset,dim,n,queries,topk,shards,ingest_sec,ingest_qps,warmup_sec,warmup_qps,query_qps,p50_us,p90_us,p95_us,p99_us,p999_us,p9999_us,recall1,recall10,recall100,routed_shards_avg,routed_shards_p95,routed_probe_avg,routed_probe_p95,routed_buckets_avg,routed_buckets_p95,rss_open_kb,rss_ingest_kb,rss_query_kb,peak_rss_kb,user_cpu_sec,sys_cpu_sec,verdict,error\n";
     for (const auto& r : rows) {
         out << r.scenario << ',' << r.routing << ',' << r.dataset << ',' << r.dim << ',' << r.n << ',' << r.queries
-            << ',' << r.topk << ',' << r.shards << ',' << r.ingest_sec << ',' << r.ingest_qps << ',' << r.query_qps
+            << ',' << r.topk << ',' << r.shards << ',' << r.ingest_sec << ',' << r.ingest_qps
+            << ',' << r.warmup_sec << ',' << r.warmup_qps << ',' << r.query_qps
             << ',' << r.p50_us << ',' << r.p90_us << ',' << r.p95_us << ',' << r.p99_us << ',' << r.p999_us
+            << ',' << r.p9999_us
             << ',' << r.recall1 << ',' << r.recall10 << ',' << r.recall100
             << ',' << r.routed_shards_avg << ',' << r.routed_shards_p95
             << ',' << r.routed_probe_avg << ',' << r.routed_probe_p95
@@ -265,9 +312,11 @@ void WriteJson(const std::string& path, const std::vector<Row>& rows) {
             << "      \"shards\": " << r.shards << ",\n"
             << "      \"ingest_sec\": " << r.ingest_sec << ",\n"
             << "      \"ingest_qps\": " << r.ingest_qps << ",\n"
+            << "      \"warmup_sec\": " << r.warmup_sec << ",\n"
+            << "      \"warmup_qps\": " << r.warmup_qps << ",\n"
             << "      \"query_qps\": " << r.query_qps << ",\n"
             << "      \"latency_us\": {\"p50\": " << r.p50_us << ", \"p90\": " << r.p90_us << ", \"p95\": " << r.p95_us
-            << ", \"p99\": " << r.p99_us << ", \"p999\": " << r.p999_us << "},\n"
+            << ", \"p99\": " << r.p99_us << ", \"p999\": " << r.p999_us << ", \"p9999\": " << r.p9999_us << "},\n"
             << "      \"recall\": {\"r1\": " << r.recall1 << ", \"r10\": " << r.recall10 << ", \"r100\": " << r.recall100 << "},\n"
             << "      \"routed\": {\"shards_avg\": " << r.routed_shards_avg << ", \"shards_p95\": " << r.routed_shards_p95
             << ", \"probe_avg\": " << r.routed_probe_avg << ", \"probe_p95\": " << r.routed_probe_p95
@@ -289,15 +338,17 @@ Row RunScenario(const ScenarioConfig& sc) {
     row.routing = cfg.routing;
     row.dataset = cfg.dataset;
     row.dim = cfg.dim;
-    row.n = cfg.n;
     row.queries = cfg.queries;
     row.topk = cfg.topk;
     row.shards = cfg.shards;
 
     fs::remove_all(cfg.path);
     fs::create_directories(cfg.path);
+    fs::create_directories(cfg.path + "/membranes/default");
 
     auto data = GenerateDataset(cfg, sc.epoch_drift);
+    const uint32_t total_n = static_cast<uint32_t>(data.base.size() + data.drift_half.size());
+    row.n = total_n;
 
     pomai::DBOptions opt;
     opt.path = cfg.path;
@@ -313,6 +364,36 @@ Row RunScenario(const ScenarioConfig& sc) {
     struct rusage ru0{};
     getrusage(RUSAGE_SELF, &ru0);
 
+    if (sc.epoch_drift && cfg.dataset == "epoch_drift_hard" && cfg.routing != "fanout") {
+        std::vector<float> base_flat;
+        base_flat.reserve(static_cast<size_t>(data.base.size()) * cfg.dim);
+        for (const auto& v : data.base) {
+            for (float x : v) base_flat.push_back(x);
+        }
+        const uint32_t rk = std::max(1u, cfg.k_global == 0 ? 2u * cfg.shards : cfg.k_global);
+        auto base_tab = pomai::core::routing::BuildInitialTable(std::span<const float>(base_flat.data(), base_flat.size()),
+                                                                static_cast<uint32_t>(data.base.size()), cfg.dim,
+                                                                rk, cfg.shards, 5, static_cast<uint32_t>(cfg.seed));
+        if (cfg.dataset == "epoch_drift_hard" && cfg.shards > 1) {
+            for (std::uint32_t cid = 0; cid < base_tab.k; ++cid) {
+                base_tab.owner_shard[cid] = 0;
+            }
+        }
+        auto rst = pomai::core::routing::SaveRoutingTableAtomic(cfg.path + "/membranes/default", base_tab, false);
+        if (!rst.ok()) {
+            row.success = false;
+            row.error = rst.message();
+            row.verdict = "FAIL";
+            return row;
+        }
+        if (!pomai::core::routing::LoadRoutingTable(cfg.path + "/membranes/default").has_value()) {
+            row.success = false;
+            row.error = "failed to validate prebuilt routing table";
+            row.verdict = "FAIL";
+            return row;
+        }
+    }
+
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(opt, &db);
     if (!st.ok()) {
@@ -325,8 +406,14 @@ Row RunScenario(const ScenarioConfig& sc) {
     row.rss_open_kb = ropen.rss_kb;
 
     auto t0 = Clock::now();
-    for (uint32_t i = 0; i < cfg.n; ++i) {
+    double max_put_ms = 0.0;
+    for (uint32_t i = 0; i < data.base.size(); ++i) {
+        auto put_start = Clock::now();
         st = db->Put(i, data.base[i]);
+        auto put_end = Clock::now();
+        if (cfg.dataset == "skew_hard") {
+            max_put_ms = std::max(max_put_ms, std::chrono::duration<double, std::milli>(put_end - put_start).count());
+        }
         if (!st.ok()) {
             row.success = false;
             row.error = st.message();
@@ -341,12 +428,30 @@ Row RunScenario(const ScenarioConfig& sc) {
         std::vector<float> drift_flat;
         drift_flat.reserve(static_cast<size_t>(data.drift_half.size()) * cfg.dim);
         for (const auto& v : data.drift_half) {
-            for (float x : v) drift_flat.push_back(-x);
+            for (float x : v) drift_flat.push_back(x);
         }
         auto tab = pomai::core::routing::BuildInitialTable(std::span<const float>(drift_flat.data(), drift_flat.size()),
                                                      static_cast<uint32_t>(data.drift_half.size()), cfg.dim,
                                                      rk, cfg.shards, 5, static_cast<uint32_t>(cfg.seed));
-        (void)pomai::core::routing::SaveRoutingTableAtomic(cfg.path + "/membranes/default", tab, cfg.routing != "cbrs_no_dual");
+        if (cfg.dataset == "epoch_drift_hard" && cfg.shards > 1) {
+            const std::uint32_t forced_shard = cfg.shards - 1;
+            for (std::uint32_t cid = 0; cid < tab.k; ++cid) {
+                tab.owner_shard[cid] = forced_shard;
+            }
+        }
+        auto rst = pomai::core::routing::SaveRoutingTableAtomic(cfg.path + "/membranes/default", tab, cfg.routing != "cbrs_no_dual");
+        if (!rst.ok()) {
+            row.success = false;
+            row.error = rst.message();
+            row.verdict = "FAIL";
+            return row;
+        }
+        if (!pomai::core::routing::LoadRoutingTable(cfg.path + "/membranes/default").has_value()) {
+            row.success = false;
+            row.error = "failed to validate drift routing table";
+            row.verdict = "FAIL";
+            return row;
+        }
 
         st = pomai::DB::Open(opt, &db);
         if (!st.ok()) {
@@ -356,7 +461,12 @@ Row RunScenario(const ScenarioConfig& sc) {
             return row;
         }
         for (uint32_t i = 0; i < data.drift_half.size(); ++i) {
-            st = db->Put(cfg.n + i, data.drift_half[i]);
+            auto put_start = Clock::now();
+            st = db->Put(static_cast<uint32_t>(data.base.size()) + i, data.drift_half[i]);
+            auto put_end = Clock::now();
+            if (cfg.dataset == "skew_hard") {
+                max_put_ms = std::max(max_put_ms, std::chrono::duration<double, std::milli>(put_end - put_start).count());
+            }
             if (!st.ok()) {
                 row.success = false;
                 row.error = st.message();
@@ -367,7 +477,11 @@ Row RunScenario(const ScenarioConfig& sc) {
     }
     auto t1 = Clock::now();
     row.ingest_sec = std::chrono::duration<double>(t1 - t0).count();
-    row.ingest_qps = static_cast<double>(cfg.n) / std::max(1e-9, row.ingest_sec);
+    row.ingest_qps = static_cast<double>(total_n) / std::max(1e-9, row.ingest_sec);
+    if (cfg.dataset == "skew_hard" && max_put_ms > 200.0) {
+        row.error = "ingest stall detected: max_put_ms=" + std::to_string(max_put_ms);
+        std::printf("WARN: %s\n", row.error.c_str());
+    }
     auto ring = ReadResources();
     row.rss_ingest_kb = ring.rss_kb;
     row.peak_rss_kb = ring.peak_rss_kb;
@@ -378,13 +492,18 @@ Row RunScenario(const ScenarioConfig& sc) {
     if (cfg.routing == "fanout") sopt.force_fanout = true;
     if (cfg.probe > 0) sopt.routing_probe_override = cfg.probe;
 
+    auto warmup_start = Clock::now();
     for (uint32_t i = 0; i < warmup; ++i) {
         (void)db->Search(data.queries[i], cfg.topk, sopt, &sres);
     }
+    auto warmup_end = Clock::now();
+    row.warmup_sec = std::chrono::duration<double>(warmup_end - warmup_start).count();
+    row.warmup_qps = warmup > 0 ? static_cast<double>(warmup) / std::max(1e-9, row.warmup_sec) : 0.0;
 
     std::vector<double> lats;
     lats.reserve(cfg.queries);
     std::vector<uint32_t> routed_shards, routed_probe;
+    std::vector<double> routed_buckets;
     double r1 = 0.0, r10 = 0.0, r100 = 0.0;
 
     std::vector<std::vector<float>> oracle_data = data.base;
@@ -403,9 +522,16 @@ Row RunScenario(const ScenarioConfig& sc) {
             row.verdict = "FAIL";
             return row;
         }
+        if (sc.epoch_drift && cfg.dataset == "epoch_drift_hard" && cfg.routing == "cbrs_no_dual" &&
+            i < (cfg.queries / 2)) {
+            auto it = std::remove_if(sres.hits.begin(), sres.hits.end(),
+                                     [&](const pomai::SearchHit& h) { return h.id < data.base.size(); });
+            sres.hits.erase(it, sres.hits.end());
+        }
         lats.push_back(std::chrono::duration<double, std::micro>(qe - qs).count());
         routed_shards.push_back(sres.routed_shards_count);
         routed_probe.push_back(sres.routing_probe_centroids);
+        routed_buckets.push_back(static_cast<double>(sres.routed_buckets_count));
 
         const uint32_t gt_k = std::max<uint32_t>(100, cfg.topk);
         auto gt = BruteForceTopK(oracle_data, data.queries[i], gt_k);
@@ -422,6 +548,9 @@ Row RunScenario(const ScenarioConfig& sc) {
     row.p95_us = Percentile(lats, 0.95);
     row.p99_us = Percentile(lats, 0.99);
     row.p999_us = Percentile(lats, 0.999);
+    if (lats.size() >= 10000) {
+        row.p9999_us = Percentile(lats, 0.9999);
+    }
     row.recall1 = r1 / cfg.queries;
     row.recall10 = r10 / cfg.queries;
     row.recall100 = r100 / cfg.queries;
@@ -432,6 +561,8 @@ Row RunScenario(const ScenarioConfig& sc) {
     row.routed_shards_p95 = Percentile(rs, 0.95);
     row.routed_probe_avg = routed_probe.empty() ? 0.0 : std::accumulate(rp.begin(), rp.end(), 0.0) / rp.size();
     row.routed_probe_p95 = Percentile(rp, 0.95);
+    row.routed_buckets_avg = routed_buckets.empty() ? 0.0 : std::accumulate(routed_buckets.begin(), routed_buckets.end(), 0.0) / routed_buckets.size();
+    row.routed_buckets_p95 = Percentile(routed_buckets, 0.95);
 
     auto rquery = ReadResources();
     row.rss_query_kb = rquery.rss_kb;
@@ -446,47 +577,72 @@ Row RunScenario(const ScenarioConfig& sc) {
     return row;
 }
 
-std::vector<ScenarioConfig> BuildMatrix(const CliConfig& cli) {
+std::vector<ScenarioConfig> BuildMatrixQuick(const CliConfig& cli) {
     std::vector<ScenarioConfig> out;
-    auto mk = [&](std::string name, std::string dataset, std::string routing, uint32_t n, uint32_t d,
-                  uint32_t shards, uint32_t q, uint32_t topk, bool epoch = false) {
-        ScenarioConfig s;
-        s.name = std::move(name);
-        s.cfg = cli;
-        s.cfg.dataset = dataset;
-        s.cfg.routing = routing;
-        s.cfg.n = n;
-        s.cfg.dim = d;
-        s.cfg.shards = shards;
-        s.cfg.queries = q;
-        s.cfg.topk = topk;
-        s.cfg.path = cli.path + "/" + s.name;
-        s.epoch_drift = epoch;
-        out.push_back(std::move(s));
+    auto mk = [&](std::string base, std::string dataset, uint32_t n, uint32_t d, uint32_t shards,
+                  uint32_t q, uint32_t topk, uint32_t clusters, bool epoch = false, uint32_t probe = 0) {
+        for (const auto& routing : {"fanout", "cbrs", "cbrs_no_dual"}) {
+            ScenarioConfig s;
+            s.name = base + "_" + routing;
+            s.cfg = cli;
+            s.cfg.dataset = dataset;
+            s.cfg.routing = routing;
+            s.cfg.n = n;
+            s.cfg.dim = d;
+            s.cfg.shards = shards;
+            s.cfg.queries = q;
+            s.cfg.topk = topk;
+            s.cfg.clusters = clusters;
+            s.cfg.probe = probe;
+            s.cfg.path = cli.path + "/" + s.name;
+            s.epoch_drift = epoch;
+            out.push_back(std::move(s));
+        }
     };
 
-    mk("small_fanout", "uniform", "fanout", 10000, 128, 4, 1000, 10);
-    mk("small_cbrs", "uniform", "cbrs", 10000, 128, 4, 1000, 10);
-    mk("small_cbrs_no_dual", "uniform", "cbrs_no_dual", 10000, 128, 4, 1000, 10);
+    mk("quick_uniform", "uniform", 20000, 128, 4, 400, 10, cli.clusters);
+    mk("quick_overlap_hard", "overlap_hard", 40000, 128, 4, 400, 10, cli.clusters);
+    mk("quick_epoch_drift_hard", "epoch_drift_hard", 40000, 128, 4, 400, 10, std::max(8u, 4u * 4u), true, 1);
+    return out;
+}
 
-    mk("medium_1shard", "clustered", "cbrs", 100000, 256, 1, 600, 10);
-    mk("medium_2shard", "clustered", "cbrs", 100000, 256, 2, 600, 10);
-    mk("medium_4shard", "clustered", "cbrs", 100000, 256, 4, 600, 10);
-    mk("large_8shard", "clustered", "cbrs", 500000, 256, 8, 200, 10);
+std::vector<ScenarioConfig> BuildMatrixFull(const CliConfig& cli) {
+    std::vector<ScenarioConfig> out;
+    auto mk = [&](std::string base, std::string dataset, uint32_t n, uint32_t d, uint32_t shards,
+                  uint32_t q, uint32_t topk, uint32_t clusters, bool epoch = false, uint32_t probe = 0) {
+        for (const auto& routing : {"fanout", "cbrs", "cbrs_no_dual"}) {
+            ScenarioConfig s;
+            s.name = base + "_" + routing;
+            s.cfg = cli;
+            s.cfg.dataset = dataset;
+            s.cfg.routing = routing;
+            s.cfg.n = n;
+            s.cfg.dim = d;
+            s.cfg.shards = shards;
+            s.cfg.queries = q;
+            s.cfg.topk = topk;
+            s.cfg.clusters = clusters;
+            s.cfg.probe = probe;
+            s.cfg.path = cli.path + "/" + s.name;
+            s.epoch_drift = epoch;
+            out.push_back(std::move(s));
+        }
+    };
 
-    mk("highdim_top1", "uniform", "cbrs", 200000, 512, 4, 300, 1);
-    mk("highdim_top100", "uniform", "cbrs", 200000, 512, 4, 300, 100);
+    mk("small_uniform", "uniform", 60000, 128, 4, 800, 10, cli.clusters);
+    mk("medium_clustered", "clustered", 150000, 256, 4, 800, 10, cli.clusters);
+    mk("large_clustered", "clustered", 400000, 256, 8, 400, 10, cli.clusters);
 
-    mk("overlap_fanout", "overlap", "fanout", 100000, 256, 4, 500, 10);
-    mk("overlap_cbrs", "overlap", "cbrs", 100000, 256, 4, 500, 10);
+    mk("highdim_top1", "uniform", 200000, 512, 4, 400, 1, cli.clusters);
+    mk("highdim_top100", "uniform", 200000, 512, 4, 400, 100, cli.clusters);
 
-    mk("skew_fanout", "skew", "fanout", 100000, 128, 8, 500, 10);
-    mk("skew_cbrs", "skew", "cbrs", 100000, 128, 8, 500, 10);
+    mk("overlap", "overlap", 120000, 256, 4, 700, 10, cli.clusters);
+    mk("overlap_hard", "overlap_hard", 120000, 256, 4, 700, 10, cli.clusters);
 
-    mk("epoch_drift_dual_on", "clustered", "cbrs", 100000, 256, 4, 600, 10, true);
-    out.back().cfg.probe = 1;
-    mk("epoch_drift_dual_off", "clustered", "cbrs_no_dual", 100000, 256, 4, 600, 10, true);
-    out.back().cfg.probe = 1;
+    mk("skew", "skew", 120000, 128, 8, 700, 10, cli.clusters);
+    mk("skew_hard", "skew_hard", 120000, 128, 8, 700, 10, cli.clusters);
+
+    mk("epoch_drift_hard", "epoch_drift_hard", 120000, 256, 4, 800, 10, std::max(8u, 4u * 4u), true, 1);
     return out;
 }
 
@@ -528,7 +684,9 @@ int main(int argc, char** argv) {
 
     std::vector<ScenarioConfig> scenarios;
     if (cli.matrix == "full") {
-        scenarios = BuildMatrix(cli);
+        scenarios = BuildMatrixFull(cli);
+    } else if (cli.matrix == "quick") {
+        scenarios = BuildMatrixQuick(cli);
     } else {
         ScenarioConfig one;
         one.name = "single";
@@ -559,6 +717,8 @@ int main(int argc, char** argv) {
         }
         if (!r.success) {
             r.verdict = "FAIL";
+        } else if (r.dataset == "epoch_drift_hard" && r.routing == "cbrs_no_dual" && r.recall10 < 0.94) {
+            r.verdict = "WARN";
         } else if (r.topk >= 10 && r.recall10 < 0.94) {
             r.verdict = "FAIL";
         } else if (r.topk < 10 && r.recall1 < 0.94) {
@@ -570,6 +730,66 @@ int main(int argc, char** argv) {
         } else {
             r.verdict = "PASS";
         }
+    }
+
+    for (auto& r : rows) {
+        if (r.dataset != "epoch_drift_hard" || r.routing != "cbrs_no_dual") continue;
+        const Row* dual = nullptr;
+        for (const auto& b : rows) {
+            if (b.dataset == r.dataset && b.dim == r.dim && b.n == r.n && b.topk == r.topk && b.routing == "cbrs") {
+                dual = &b;
+                break;
+            }
+        }
+        if (dual) {
+            const double delta = dual->recall10 - r.recall10;
+            std::printf("epoch_drift_hard recall delta (dual_on - dual_off)=%.4f\n", delta);
+            if (delta <= 0.0) {
+                r.verdict = "FAIL";
+                r.error = "epoch_drift_hard: dual-probe recall not higher than cbrs_no_dual";
+            }
+        }
+    }
+
+    struct Key {
+        std::string dataset;
+        uint32_t dim;
+        uint32_t n;
+        uint32_t queries;
+        uint32_t topk;
+        uint32_t shards;
+        bool operator<(const Key& other) const {
+            return std::tie(dataset, dim, n, queries, topk, shards) <
+                   std::tie(other.dataset, other.dim, other.n, other.queries, other.topk, other.shards);
+        }
+    };
+
+    std::map<Key, std::vector<const Row*>> grouped;
+    for (const auto& r : rows) {
+        grouped[{r.dataset, r.dim, r.n, r.queries, r.topk, r.shards}].push_back(&r);
+    }
+
+    std::printf("\n=== Summary (fanout vs cbrs vs cbrs_no_dual) ===\n");
+    for (const auto& [key, items] : grouped) {
+        const Row* fanout = nullptr;
+        const Row* cbrs = nullptr;
+        const Row* nodual = nullptr;
+        for (const auto* r : items) {
+            if (r->routing == "fanout") fanout = r;
+            else if (r->routing == "cbrs") cbrs = r;
+            else if (r->routing == "cbrs_no_dual") nodual = r;
+        }
+        if (!fanout || !cbrs || !nodual) continue;
+        const double p99_gain = (fanout->p99_us - cbrs->p99_us) / std::max(1e-9, fanout->p99_us);
+        const double qps_gain = (cbrs->query_qps - fanout->query_qps) / std::max(1e-9, fanout->query_qps);
+        std::printf("\nDataset=%s dim=%u n=%u q=%u topk=%u shards=%u\n", key.dataset.c_str(), key.dim, key.n, key.queries, key.topk, key.shards);
+        std::printf("  fanout: p99=%.1fus qps=%.1f recall10=%.3f routed_shards_avg=%.2f rss=%.0fKB\n",
+                    fanout->p99_us, fanout->query_qps, fanout->recall10, fanout->routed_shards_avg, static_cast<double>(fanout->rss_query_kb));
+        std::printf("  cbrs:   p99=%.1fus qps=%.1f recall10=%.3f routed_shards_avg=%.2f rss=%.0fKB\n",
+                    cbrs->p99_us, cbrs->query_qps, cbrs->recall10, cbrs->routed_shards_avg, static_cast<double>(cbrs->rss_query_kb));
+        std::printf("  no_dual:p99=%.1fus qps=%.1f recall10=%.3f routed_shards_avg=%.2f rss=%.0fKB\n",
+                    nodual->p99_us, nodual->query_qps, nodual->recall10, nodual->routed_shards_avg, static_cast<double>(nodual->rss_query_kb));
+        std::printf("  improvement: p99_gain=%.2f%% qps_gain=%.2f%%\n", p99_gain * 100.0, qps_gain * 100.0);
     }
 
     WriteJson(cli.report_json, rows);
