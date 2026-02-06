@@ -162,6 +162,7 @@ namespace pomai::core
 
         std::size_t GetQueueDepth() const { return mailbox_.Size(); }
         std::uint64_t GetOpsProcessed() const { return ops_processed_.load(std::memory_order_relaxed); }
+        std::uint64_t LastQueryCandidatesScanned() const { return last_query_candidates_scanned_.load(std::memory_order_relaxed); }
 
     private:
         void RunLoop();
@@ -219,6 +220,7 @@ namespace pomai::core
 
         BoundedMpscQueue<Command> mailbox_;
         std::atomic<std::uint64_t> ops_processed_{0};
+        std::atomic<std::uint64_t> last_query_candidates_scanned_{0};
 
         std::jthread worker_;
         std::atomic<bool> started_{false};
