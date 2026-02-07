@@ -32,7 +32,8 @@ build
 *.log
 *.prof
 *.csv
-./build
 ./data
 ./.history
 venv
+./*build
+./build*

@@ -20,10 +20,8 @@ namespace pomai
 
     struct IndexParams
     {
-        // Example parameters for IVF or HNSW
-        uint32_t num_lists = 100;
-        uint32_t ef_construction = 200;
-        uint32_t ef_search = 50;
+        uint32_t nlist = 64;
+        uint32_t nprobe = 10;
     };
 
     struct DBOptions
@@ -31,7 +29,14 @@ namespace pomai
         std::string path;
         uint32_t shard_count = 4;
         uint32_t dim = 512;
+        uint32_t search_threads = 0; // 0 => auto
         FsyncPolicy fsync = FsyncPolicy::kNever;
+        IndexParams index_params;
+        bool routing_enabled = false;
+        uint32_t routing_k = 0;
+        uint32_t routing_probe = 0;
+        uint32_t routing_warmup_mult = 20;
+        uint32_t routing_keep_prev = 1;
     };
 
     // One membrane = one logical collection.

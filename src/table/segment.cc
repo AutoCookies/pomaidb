@@ -1,5 +1,6 @@
 #include "table/segment.h"
 #include "util/crc32c.h"
+#include "core/index/ivf_flat.h" 
 
 #include <algorithm>
 #include <cstring>
@@ -25,31 +26,36 @@ namespace pomai::table
     // CRC: Computed on the fly (incremental)
     
     SegmentBuilder::SegmentBuilder(std::string path, uint32_t dim)
-        : path_(std::move(path)), dim_(dim)
+        : path_(std::move(path)), dim_(dim), zero_buffer_(dim, 0.0f)
     {
     }
 
-    pomai::Status SegmentBuilder::Add(pomai::VectorId id, std::span<const float> vec, bool is_deleted)
+    pomai::Status SegmentBuilder::Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted, const pomai::Metadata& meta)
     {
         Entry e;
         e.id = id;
         e.is_deleted = is_deleted;
+        e.meta = meta;
 
         if (is_deleted)
         {
-            // Tombstone: store zeros (deterministic, compressible)
-            e.vec.resize(dim_, 0.0f);
+            e.vec = pomai::VectorView{nullptr, dim_};
         }
         else
         {
-            if (vec.size() != dim_)
+            if (vec.dim != dim_)
                 return pomai::Status::InvalidArgument("dimension mismatch");
-            e.vec.assign(vec.begin(), vec.end());
+            e.vec = vec;
         }
         
         // Buffer locally for sorting (unavoidable for binary search)
         entries_.push_back(std::move(e));
         return pomai::Status::Ok();
+    }
+
+    pomai::Status SegmentBuilder::Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted)
+    {
+        return Add(id, vec, is_deleted, pomai::Metadata());
     }
 
     pomai::Status SegmentBuilder::Finish()
@@ -64,13 +70,18 @@ namespace pomai::table
         auto st = pomai::util::PosixFile::CreateTrunc(tmp_path, &file);
         if (!st.ok()) return st;
 
-        // Prepare header (write later after we know final count)
+        // Prepare header
         SegmentHeader h{};
         std::memset(&h, 0, sizeof(h));
         std::memcpy(h.magic, kMagic, sizeof(h.magic));
-        h.version = 2; // V2
+        h.version = 3; // V3
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
+        
+        // Calculate Metadata Offset upfront
+        // Header + (Count * EntrySize)
+        size_t entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(float);
+        h.metadata_offset = static_cast<uint32_t>(sizeof(SegmentHeader) + entries_.size() * entry_size);
 
         // Write header
         st = file.PWrite(0, &h, sizeof(h));
@@ -84,7 +95,6 @@ namespace pomai::table
         crc = pomai::util::Crc32c(header_bytes, sizeof(h), crc);
 
         // Stream entries to disk (one at a time)
-        size_t entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(float);
         std::vector<uint8_t> entry_buffer;
         entry_buffer.reserve(entry_size);
 
@@ -103,7 +113,8 @@ namespace pomai::table
             entry_buffer.push_back(0);
 
             // Vector (dim * 4 bytes)
-            const uint8_t* p_vec = reinterpret_cast<const uint8_t*>(e.vec.data());
+            const float* vec_ptr = e.is_deleted ? zero_buffer_.data() : e.vec.data;
+            const uint8_t* p_vec = reinterpret_cast<const uint8_t*>(vec_ptr);
             entry_buffer.insert(entry_buffer.end(), p_vec, p_vec + (dim_ * sizeof(float)));
 
             // Write entry
@@ -116,6 +127,34 @@ namespace pomai::table
             offset += entry_buffer.size();
         }
 
+        // Write Metadata Block
+        // Prepare metadata arrays
+        std::vector<uint64_t> offsets;
+        std::vector<char> blob;
+        offsets.reserve(entries_.size() + 1);
+        
+        for (const auto& e : entries_) {
+            offsets.push_back(blob.size());
+            if (!e.meta.tenant.empty()) {
+                blob.insert(blob.end(), e.meta.tenant.begin(), e.meta.tenant.end());
+            }
+        }
+        offsets.push_back(blob.size()); // Final sentinel
+
+        // Serialize offsets
+        st = file.PWrite(offset, offsets.data(), offsets.size() * sizeof(uint64_t));
+        if (!st.ok()) return st;
+        crc = pomai::util::Crc32c(reinterpret_cast<const uint8_t*>(offsets.data()), offsets.size() * sizeof(uint64_t), crc);
+        offset += offsets.size() * sizeof(uint64_t);
+
+        // Serialize blob
+        if (!blob.empty()) {
+            st = file.PWrite(offset, blob.data(), blob.size());
+            if (!st.ok()) return st;
+            crc = pomai::util::Crc32c(reinterpret_cast<const uint8_t*>(blob.data()), blob.size(), crc);
+            offset += blob.size();
+        }
+        
         // Write CRC footer
         st = file.PWrite(offset, &crc, sizeof(crc));
         if (!st.ok()) return st;
@@ -133,6 +172,51 @@ namespace pomai::table
         }
 
         return pomai::Status::Ok();
+    }
+
+    pomai::Status SegmentBuilder::BuildIndex(uint32_t nlist) {
+         // Gather valid vectors for training
+         std::vector<float> training_data;
+         training_data.reserve(entries_.size() * dim_);
+         size_t num_live = 0;
+         
+         for(const auto& e : entries_) {
+             if (!e.is_deleted) {
+                 training_data.insert(training_data.end(), e.vec.data, e.vec.data + dim_);
+                 num_live++;
+             }
+         }
+         
+         pomai::index::IvfFlatIndex::Options opt;
+         opt.nlist = nlist;
+         if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1U, static_cast<uint32_t>(num_live));
+
+         auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
+         auto st = idx->Train(training_data, num_live);
+         if (!st.ok()) return st;
+         
+         for(const auto& e : entries_) {
+             if (!e.is_deleted) {
+                 st = idx->Add(e.id, e.vec.span());
+                 if (!st.ok()) return st;
+             }
+         }
+         
+         std::string idx_path = path_ + ".idx.tmp";
+         st = idx->Save(idx_path);
+         if (!st.ok()) return st;
+         
+         std::string final_idx_path = path_;
+         if (final_idx_path.size() > 4 && final_idx_path.substr(final_idx_path.size()-4) == ".dat") {
+             final_idx_path = final_idx_path.substr(0, final_idx_path.size()-4);
+         }
+         final_idx_path += ".idx";
+         
+         if (rename(idx_path.c_str(), final_idx_path.c_str()) != 0) {
+             return pomai::Status::IOError("rename idx failed");
+         }
+         
+         return pomai::Status::Ok();
     }
 
 
@@ -163,12 +247,22 @@ namespace pomai::table
         const SegmentHeader* h = static_cast<const SegmentHeader*>(data);
 
         if (strncmp(h->magic, kMagic, 12) != 0) return pomai::Status::Corruption("bad magic");
-        if (h->version != 2) return pomai::Status::Corruption("unsupported version");
+        
+        // Support V2 and V3
+        if (h->version != 2 && h->version != 3) {
+            return pomai::Status::Corruption("unsupported version");
+        }
         
         reader->count_ = h->count;
         reader->dim_ = h->dim;
         reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float); // ID + Flags/Pad + Vec
         
+        if (h->version == 3) {
+            reader->metadata_offset_ = h->metadata_offset;
+        } else {
+            reader->metadata_offset_ = 0;
+        }
+
         reader->base_addr_ = static_cast<const uint8_t*>(data);
         reader->file_size_ = size;
 
@@ -176,19 +270,64 @@ namespace pomai::table
         size_t expected_min = sizeof(SegmentHeader) + reader->count_ * reader->entry_size_ + 4; // + CRC
         if (size < expected_min) return pomai::Status::Corruption("segment truncated");
 
+        // Try load index (best effort)
+        std::string idx_path = path;
+        if (idx_path.size() > 4 && idx_path.substr(idx_path.size()-4) == ".dat") {
+             idx_path = idx_path.substr(0, idx_path.size()-4);
+        }
+        idx_path += ".idx";
+        
+        // Ignore error if not found (fallback to scan)
+        (void)pomai::index::IvfFlatIndex::Load(idx_path, &reader->index_);
+
         *out = std::move(reader);
         return pomai::Status::Ok();
     }
 
-    pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec) const
+    pomai::Status SegmentReader::Search(std::span<const float> query, uint32_t nprobe, 
+                                        std::vector<pomai::VectorId>* out_candidates) const
     {
-         auto res = Find(id, out_vec);
+        if (!index_) return pomai::Status::Ok(); // Empty candidates -> Fallback
+        return index_->Search(query, nprobe, out_candidates);
+    }
+
+    void SegmentReader::GetMetadata(uint32_t index, pomai::Metadata* out) const
+    {
+        if (metadata_offset_ == 0 || index >= count_) return;
+        
+        const uint8_t* meta_offsets_base = base_addr_ + metadata_offset_;
+        // Blob starts after (count_ + 1) offsets
+        const char* meta_blob = reinterpret_cast<const char*>(meta_offsets_base + (count_ + 1) * sizeof(uint64_t));
+
+        uint64_t start = 0;
+        uint64_t end = 0;
+        std::memcpy(&start, meta_offsets_base + index * sizeof(uint64_t), sizeof(start));
+        std::memcpy(&end, meta_offsets_base + (index + 1) * sizeof(uint64_t), sizeof(end));
+        
+        if (end > start) {
+            out->tenant = std::string(meta_blob + start, end - start);
+        }
+    }
+
+    pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const
+    {
+         auto res = Find(id, out_vec, out_meta);
          if (res == FindResult::kFound) return pomai::Status::Ok();
          if (res == FindResult::kFoundTombstone) return pomai::Status::NotFound("tombstone");
          return pomai::Status::NotFound("id not found in segment");
     }
 
-    SegmentReader::FindResult SegmentReader::Find(pomai::VectorId id, std::span<const float> *out_vec) const
+    // Backward compat overload
+    pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec) const {
+        return Get(id, out_vec, nullptr);
+    }
+    
+    // Backward compat overload
+    SegmentReader::FindResult SegmentReader::Find(pomai::VectorId id, std::span<const float> *out_vec) const {
+        return Find(id, out_vec, nullptr);
+    }
+
+    SegmentReader::FindResult SegmentReader::Find(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const
     {
         if (count_ == 0) return FindResult::kNotFound;
 
@@ -211,12 +350,20 @@ namespace pomai::table
                 uint8_t flags = *(p + 8);
                 if (flags & kFlagTombstone) {
                     if(out_vec) *out_vec = {}; // Deleted
+                    // Should we return metadata for tombstone? 
+                    // Usually tombstones don't have metadata updates attached to them for filtering,
+                    // BUT they might hide earlier versions.
+                    // Implementation choice: Metadata on tombstone can be useful (e.g. timestamp).
+                    // In current Builder, tombstone stores given metadata.
+                    if(out_meta) GetMetadata(static_cast<uint32_t>(mid), out_meta);
                     return FindResult::kFoundTombstone;
                 }
                 
                 // Vector starts at offset 8 (ID) + 4 (Flags+Pad) = 12
                 const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
                 if (out_vec) *out_vec = std::span<const float>(vec_ptr, dim_);
+                if(out_meta) GetMetadata(static_cast<uint32_t>(mid), out_meta);
+                
                 return FindResult::kFound;
             }
 
@@ -229,7 +376,7 @@ namespace pomai::table
         return FindResult::kNotFound;
     }
 
-    pomai::Status SegmentReader::ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const
+    pomai::Status SegmentReader::ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted, pomai::Metadata* out_meta) const
     {
         if (index >= count_) return pomai::Status::InvalidArgument("index out of range");
 
@@ -251,7 +398,17 @@ namespace pomai::table
                  *out_vec = std::span<const float>(vec_ptr, dim_);
              }
         }
+        
+        if (out_meta) {
+            GetMetadata(index, out_meta);
+        }
+        
         return pomai::Status::Ok();
+    }
+    
+    // Backward compat overload
+    pomai::Status SegmentReader::ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const {
+        return ReadAt(index, out_id, out_vec, out_deleted, nullptr);
     }
 
 } // namespace pomai::table

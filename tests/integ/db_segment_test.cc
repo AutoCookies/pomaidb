@@ -4,10 +4,12 @@
 #include <filesystem>
 #include <vector>
 #include <fstream>
+#include <span>
 
 #include "pomai/pomai.h"
 #include "pomai/options.h"
 #include "pomai/search.h"
+#include "pomai/types.h"
 #include "table/segment.h"
 #include "storage/manifest/manifest.h"
 #include "core/shard/manifest.h"
@@ -41,8 +43,8 @@ POMAI_TEST(DB_SegmentLoading_ReadTest) {
     std::vector<float> vec1 = {1.0f, 0.0f, 0.0f, 0.0f};
     std::vector<float> vec2 = {0.0f, 1.0f, 0.0f, 0.0f};
     
-    POMAI_EXPECT_OK(builder.Add(10, vec1, false));
-    POMAI_EXPECT_OK(builder.Add(20, vec2, false));
+    POMAI_EXPECT_OK(builder.Add(10, pomai::VectorView(std::span<const float>(vec1)), false));
+    POMAI_EXPECT_OK(builder.Add(20, pomai::VectorView(std::span<const float>(vec2)), false));
     POMAI_EXPECT_OK(builder.Finish());
     
     // Create manifest.current for this segment
@@ -56,8 +58,9 @@ POMAI_TEST(DB_SegmentLoading_ReadTest) {
     std::unique_ptr<pomai::DB> db;
     POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
     
-    // Register "default" membrane in Manager (since Manager doesn't scan Manifest yet)
-    POMAI_EXPECT_OK(db->CreateMembrane(spec));
+    // Register "default" membrane in Manager (allow pre-existing on-disk membrane)
+    auto create_st = db->CreateMembrane(spec);
+    POMAI_EXPECT_TRUE(create_st.ok() || create_st.code() == pomai::ErrorCode::kAlreadyExists);
     
     // Must open membrane to load shards
     POMAI_EXPECT_OK(db->OpenMembrane(membrane));

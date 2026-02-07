@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "pomai/metadata.h"
 #include "pomai/options.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
@@ -24,15 +25,20 @@ namespace pomai::storage
             std::uint32_t shard_id,
             std::size_t segment_bytes,
             pomai::FsyncPolicy fsync);
+        ~Wal();
+
+        Wal(const Wal &) = delete;
+        Wal &operator=(const Wal &) = delete;
 
         pomai::Status Open();
 
-        pomai::Status AppendPut(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status AppendPut(pomai::VectorId id, pomai::VectorView vec);
+        pomai::Status AppendPut(pomai::VectorId id, pomai::VectorView vec, const pomai::Metadata& meta); // Added
         pomai::Status AppendDelete(pomai::VectorId id);
         
         // Batch append: Write multiple Put records with single fsync (5-10x faster)
         pomai::Status AppendBatch(const std::vector<pomai::VectorId>& ids,
-                                  const std::vector<std::span<const float>>& vectors);
+                                  const std::vector<pomai::VectorView>& vectors);
 
         pomai::Status Flush();
         pomai::Status ReplayInto(pomai::table::MemTable &mem);
@@ -59,6 +65,7 @@ namespace pomai::storage
         // POSIX file (append by pwrite at tracked offset)
         class Impl;
         Impl *impl_ = nullptr;
+        std::vector<std::uint8_t> scratch_;
     };
 
 } // namespace pomai::storage

@@ -1,6 +1,10 @@
 # PomaiDB
 
-## Executive summary (20–30 lines)
+<p align="center">
+  <img src="./assets/logo.png" width="200" alt="Demo">
+</p>
+
+## Executive summary
 PomaiDB is a single-process, embedded vector database implemented in C++20. 
 It targets applications that need local vector search without external services. 
 Data is partitioned into shards; each shard has a single writer thread. 
@@ -101,9 +105,9 @@ int main() {
 ## Guarantee matrix
 | Operation | Durability | Visibility | Isolation | Ordering | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Upsert (Put/PutBatch/Delete) | WAL appended; durable if WAL `fsync=kAlways` or after `Flush` | **Visible immediately** via Active MemTable | Snapshot isolation per shard | Per-shard order via mailbox | Active MemTable IS included in snapshot. |
-| Search | Reads a single immutable snapshot | Snapshot state + Active MemTable | Snapshot isolation | Per-shard snapshot ordering only | Brute-force scan over frozen + segments + active. |
-| Get/Exists | Reads a single immutable snapshot | Snapshot state + Active MemTable | Snapshot isolation | Per-shard snapshot ordering only | Active MemTable IS included in snapshot. |
+| Upsert (Put/PutBatch/Delete) | WAL appended; durable if WAL `fsync=kAlways` or after `Flush` | Not visible until soft freeze (5000 items/shard) or explicit `Freeze` | Snapshot isolation per shard | Per-shard order via mailbox | Active MemTable is mutable and not yet published to readers. |
+| Search | Reads a single immutable snapshot | Snapshot state only (published frozen + segments) | Snapshot isolation | Per-shard snapshot ordering only | Brute-force scan over published snapshot data. |
+| Get/Exists | Reads a single immutable snapshot | Snapshot state only (published frozen + segments) | Snapshot isolation | Per-shard snapshot ordering only | Read-your-writes requires waiting for/pushing Freeze. |
 | Freeze | Segment files + shard manifest updated; WAL reset | Publishes a new snapshot after segment update | Readers move to new snapshot atomically | Per-shard only | Segment rename + manifest fsync; no global barrier. |
 | Flush | WAL `fdatasync` if `fsync != kNever` | No visibility change | N/A | N/A | Flush is a durability boundary only. |
 | Recovery | WAL replay into MemTable + rotate to frozen | Replayed data visible after startup rotation | Snapshot isolation post-open | Per-shard only | Truncated WAL tail tolerated. |
@@ -155,6 +159,31 @@ ACCURACY:
 ```
 
 See [docs/BENCHMARKING.md](docs/BENCHMARKING.md) for full guide and comparison with other systems.
+
+
+## Docker (Ubuntu/Linux)
+
+PomaiDB is an embedded library, so the container image is designed for **build + test** workflows (not running a standalone DB server):
+
+```bash
+# Build image
+docker build -t pomaidb/dev:local .
+
+# Run tests in container
+docker run --rm pomaidb/dev:local
+
+# Or via docker compose
+docker compose up --build pomaidb-dev
+```
+
+Compose files provided:
+- `docker-compose.yml` (primary)
+- `docker-compose.yaml` (compatibility copy)
+
+## CI platform policy
+
+GitHub Actions CI is Linux-only (`ubuntu-latest`) for this branch.
+Windows/macOS build jobs were removed intentionally to match the current support target and keep CI signal focused.
 
 ## Known limitations (current code)
 1. **Bounded staleness via soft freeze** (5000 items per shard) or explicit `Freeze`.

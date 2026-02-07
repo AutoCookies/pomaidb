@@ -3,10 +3,13 @@
 #include <vector>
 #include <memory>
 #include <cmath>
+#include <span>
 
 #include "tests/common/bruteforce_oracle.h"
+#include "pomai/metadata.h"
 #include "table/memtable.h"
 #include "pomai/status.h"
+#include "pomai/types.h"
 
 using namespace pomai;
 using namespace pomai::table;
@@ -26,9 +29,10 @@ POMAI_TEST(BruteForceOracle_Basic)
     std::vector<float> v2 = {0.0f, 1.0f};
     std::vector<float> v3 = {1.0f, 1.0f};
 
-    POMAI_EXPECT_OK(mem->Put(1, v1));
-    POMAI_EXPECT_OK(mem->Put(2, v2));
-    POMAI_EXPECT_OK(mem->Put(3, v3));
+    pomai::Metadata meta;
+    POMAI_EXPECT_OK(mem->Put(1, pomai::VectorView(std::span<const float>(v1)), meta));
+    POMAI_EXPECT_OK(mem->Put(2, pomai::VectorView(std::span<const float>(v2)), meta));
+    POMAI_EXPECT_OK(mem->Put(3, pomai::VectorView(std::span<const float>(v3)), meta));
 
     // Query: (1, 0)
     // Expected scores (Dot): 

@@ -71,7 +71,7 @@ namespace
         // ForEach
         int count = 0;
         int tombstones = 0;
-        reader->ForEach([&](pomai::VectorId id, std::span<const float> vec, bool is_deleted) {
+        reader->ForEach([&](pomai::VectorId id, std::span<const float> /*vec*/, bool is_deleted, const pomai::Metadata*) {
              count++;
              if (is_deleted) tombstones++;
              if (id == 30) POMAI_EXPECT_TRUE(is_deleted);

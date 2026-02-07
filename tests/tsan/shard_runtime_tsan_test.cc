@@ -42,7 +42,7 @@ namespace
     // replay nếu có dữ liệu cũ (test idempotent)
     POMAI_EXPECT_OK(wal->ReplayInto(*mem));
 
-    pomai::core::ShardRuntime rt(shard_id, path, dim, std::move(wal), std::move(mem), /*mailbox_cap*/ (1u << 14));
+    pomai::core::ShardRuntime rt(shard_id, path, dim, std::move(wal), std::move(mem), /*mailbox_cap*/ (1u << 14), pomai::IndexParams{});
     POMAI_EXPECT_OK(rt.Start());
 
     constexpr int kThreads = 4;
@@ -62,8 +62,7 @@ namespace
 
                     pomai::core::PutCmd c;
                     c.id = id;
-                    c.vec = v.data();
-                    c.dim = dim;
+                    c.vec = pomai::VectorView(v.data(), dim);
 
                     auto fut = c.done.get_future();
                     POMAI_EXPECT_OK(rt.Enqueue(pomai::core::Command{std::move(c)}));

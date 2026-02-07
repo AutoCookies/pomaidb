@@ -135,4 +135,61 @@ namespace
         POMAI_EXPECT_OK(db->Close());
     }
 
+    POMAI_TEST(Membrane_Persists_After_Restart)
+    {
+        pomai::DBOptions opt;
+        opt.path = pomai::test::TempDir("pomai-membrane-persist");
+        opt.dim = 8;
+        opt.shard_count = 2;
+        opt.fsync = pomai::FsyncPolicy::kAlways;
+
+        // 1. Create Membrane
+        {
+            std::unique_ptr<pomai::DB> db;
+            POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
+            
+            pomai::MembraneSpec s;
+            s.name = "persistent_memb";
+            s.dim = 8;
+            s.shard_count = 2;
+            POMAI_EXPECT_OK(db->CreateMembrane(s));
+            POMAI_EXPECT_OK(db->Close());
+        }
+
+        // 2. Restart and List
+        {
+            std::unique_ptr<pomai::DB> db;
+            POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
+            
+            std::vector<std::string> names;
+            POMAI_EXPECT_OK(db->ListMembranes(&names));
+            
+            POMAI_EXPECT_EQ(names.size(), static_cast<std::size_t>(2)); // default + persistent_memb
+            POMAI_EXPECT_EQ(names[1], std::string("persistent_memb"));
+            
+            // Verify we can Open it
+            POMAI_EXPECT_OK(db->OpenMembrane("persistent_memb"));
+            
+            POMAI_EXPECT_OK(db->Close());
+        }
+
+        // 3. Drop and Restart
+        {
+            std::unique_ptr<pomai::DB> db;
+            POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
+            POMAI_EXPECT_OK(db->DropMembrane("persistent_memb"));
+            POMAI_EXPECT_OK(db->Close());
+        }
+
+        // 4. Restart again - should be gone
+        {
+            std::unique_ptr<pomai::DB> db;
+            POMAI_EXPECT_OK(pomai::DB::Open(opt, &db));
+             std::vector<std::string> names;
+            POMAI_EXPECT_OK(db->ListMembranes(&names));
+            POMAI_EXPECT_EQ(names.size(), static_cast<std::size_t>(1)); // default only
+            POMAI_EXPECT_OK(db->Close());
+        }
+    }
+
 } // namespace

@@ -1,47 +1,25 @@
-FROM ubuntu:22.04 AS builder
-
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    g++ \
-    cmake \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY src ./src
-
-RUN mkdir -p build
-
-RUN g++ -O3 -ffast-math -pthread \
-    src/main.cc \
-    src/core/*.cc \
-    src/ai/*.cc \
-    src/memory/*.cc \
-    src/utils/*.cc \
-    src/external/*.cc \
-    src/facade/*.cc \
-    src/tools/*.cc \
-    -o build/pomai_server
-
 FROM ubuntu:22.04
 
-RUN apt-get update && apt-get install -y \
-    libstdc++6 \
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    clang \
+    git \
+    python3 \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -s /bin/bash pomai
-USER pomai
+WORKDIR /workspace/pomaidb
 
-WORKDIR /app
+# Copy full source tree so Docker builds are reproducible in CI/dev.
+COPY . .
 
-COPY --from=builder /app/build/pomai_server .
+# Default to a release build that includes tests.
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPOMAI_BUILD_TESTS=ON \
+    && cmake --build build --parallel
 
-USER root
-RUN mkdir -p /data && chown pomai:pomai /data
-USER pomai
-
-ENV POMAI_DB_DIR=/data
-ENV POMAI_PORT=7777
-
-EXPOSE 7777
-
-CMD ["./pomai_server"]
+# Useful default for local container runs.
+CMD ["ctest", "--test-dir", "build", "--output-on-failure"]

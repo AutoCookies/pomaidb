@@ -14,10 +14,12 @@ namespace pomai
     class DbImpl final : public DB
     {
     public:
-        explicit DbImpl(DBOptions opt) : mgr_(std::move(opt))
-        {
-            // Keep behavior simple: open manager (creates default membrane if needed).
-            (void)mgr_.Open();
+        explicit DbImpl(DBOptions opt) : mgr_(std::move(opt)) {}
+
+        Status Init() {
+            auto st = mgr_.Open();
+            if (!st.ok()) return st;
+            return Status::Ok();
         }
 
         // ---- DB lifetime ----
@@ -30,6 +32,13 @@ namespace pomai
             return mgr_.Put(core::MembraneManager::kDefaultMembrane, id, vec);
         }
 
+        Status Put(VectorId id, std::span<const float> vec, const Metadata& meta) override
+        {
+            return mgr_.Put(core::MembraneManager::kDefaultMembrane, id, vec, meta);
+        }
+
+
+
         Status PutBatch(const std::vector<VectorId>& ids,
                         const std::vector<std::span<const float>>& vectors) override
         {
@@ -39,6 +48,11 @@ namespace pomai
         Status Get(VectorId id, std::vector<float> *out) override
         {
             return mgr_.Get(core::MembraneManager::kDefaultMembrane, id, out);
+        }
+
+        Status Get(VectorId id, std::vector<float> *out, Metadata* out_meta) override
+        {
+            return mgr_.Get(core::MembraneManager::kDefaultMembrane, id, out, out_meta);
         }
 
         Status Exists(VectorId id, bool *exists) override
@@ -51,10 +65,7 @@ namespace pomai
             return mgr_.Delete(core::MembraneManager::kDefaultMembrane, id);
         }
 
-        Status Search(std::span<const float> query, uint32_t topk, SearchResult *out) override
-        {
-            return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, out);
-        }
+
 
         // ---- Membrane API ----
         Status CreateMembrane(const MembraneSpec &spec) override
@@ -88,9 +99,19 @@ namespace pomai
             return mgr_.Put(membrane, id, vec);
         }
 
+        Status Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta) override
+        {
+            return mgr_.Put(membrane, id, vec, meta);
+        }
+
         Status Get(std::string_view membrane, VectorId id, std::vector<float> *out) override
         {
             return mgr_.Get(membrane, id, out);
+        }
+
+        Status Get(std::string_view membrane, VectorId id, std::vector<float> *out, Metadata* out_meta) override
+        {
+            return mgr_.Get(membrane, id, out, out_meta);
         }
 
         Status Exists(std::string_view membrane, VectorId id, bool *exists) override
@@ -103,10 +124,28 @@ namespace pomai
             return mgr_.Delete(membrane, id);
         }
 
+        Status Search(std::span<const float> query, uint32_t topk, SearchResult *out) override
+        {
+            return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, out);
+        }
+
+        Status Search(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult *out) override
+        {
+            return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, opts, out);
+        }
+
+        // ...
+
         Status Search(std::string_view membrane, std::span<const float> query,
                       uint32_t topk, SearchResult *out) override
         {
             return mgr_.Search(membrane, query, topk, out);
+        }
+
+        Status Search(std::string_view membrane, std::span<const float> query,
+                      uint32_t topk, const SearchOptions& opts, SearchResult *out) override
+        {
+            return mgr_.Search(membrane, query, topk, opts, out);
         }
 
         Status Freeze(std::string_view membrane) override
@@ -124,6 +163,16 @@ namespace pomai
             return mgr_.NewIterator(membrane, out);
         }
 
+        Status GetSnapshot(std::string_view membrane, std::shared_ptr<Snapshot>* out) override
+        {
+            return mgr_.GetSnapshot(membrane, out);
+        }
+
+        Status NewIterator(std::string_view membrane, const std::shared_ptr<Snapshot>& snap, std::unique_ptr<SnapshotIterator> *out) override
+        {
+            return mgr_.NewIterator(membrane, snap, out);
+        }
+
     private:
         core::MembraneManager mgr_;
     };
@@ -132,7 +181,19 @@ namespace pomai
     {
         if (!out)
             return Status::InvalidArgument("out=null");
-        *out = std::make_unique<DbImpl>(options);
+        if (options.path.empty())
+            return Status::InvalidArgument("path empty");
+        if (options.dim == 0)
+            return Status::InvalidArgument("dim must be > 0");
+        if (options.shard_count == 0)
+            return Status::InvalidArgument("shard_count must be > 0");
+        
+        auto impl = std::make_unique<DbImpl>(options);
+        auto st = impl->Init();
+        if (!st.ok()) {
+             return st;
+        }
+        *out = std::move(impl);
         return Status::Ok();
     }
 

@@ -14,6 +14,7 @@ namespace pomai::util
     {
     public:
         explicit ThreadPool(size_t threads)
+            : thread_count_(threads)
         {
             for (size_t i = 0; i < threads; ++i)
             {
@@ -58,12 +59,19 @@ namespace pomai::util
                 if (stop_)
                     throw std::runtime_error("enqueue on stopped ThreadPool");
 
-                tasks_.emplace([task]()
-                               { (*task)(); });
+                pending_.fetch_add(1, std::memory_order_relaxed);
+                tasks_.emplace([task, this]()
+                               {
+                    (*task)();
+                    pending_.fetch_sub(1, std::memory_order_relaxed);
+                });
             }
             condition_.notify_one();
             return res;
         }
+
+        size_t Size() const { return thread_count_; }
+        size_t Pending() const { return pending_.load(std::memory_order_relaxed); }
 
     private:
         std::vector<std::jthread> workers_;
@@ -71,5 +79,7 @@ namespace pomai::util
         std::mutex queue_mutex_;
         std::condition_variable condition_;
         bool stop_ = false;
+        size_t thread_count_ = 0;
+        std::atomic<size_t> pending_{0};
     };
 } // namespace pomai::util

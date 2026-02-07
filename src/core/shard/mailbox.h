@@ -4,6 +4,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <chrono>
 
 namespace pomai::core
 {
@@ -43,6 +44,20 @@ namespace pomai::core
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&]
                      { return closed_ || !q_.empty(); });
+            if (q_.empty())
+                return std::nullopt;
+            T v = std::move(q_.front());
+            q_.pop_front();
+            size_atomic_.fetch_sub(1, std::memory_order_relaxed);
+            cv_space_.notify_one();
+            return v;
+        }
+
+        std::optional<T> PopFor(std::chrono::milliseconds timeout)
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait_for(lk, timeout, [&]
+                         { return closed_ || !q_.empty(); });
             if (q_.empty())
                 return std::nullopt;
             T v = std::move(q_.front());

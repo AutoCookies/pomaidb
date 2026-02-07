@@ -2,20 +2,24 @@
 
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 #include <future>
 #include <memory>
+#include <optional>
 #include <span>
 #include <thread>
 #include <variant>
 #include <vector>
 
 #include "core/shard/mailbox.h"
-#include "core/shard/seen_tracker.h"
 #include "core/shard/snapshot.h"
-#include "pomai/search.h"
+#include "pomai/metadata.h"
+#include "pomai/search.h" // Restored
 #include "pomai/iterator.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/options.h" 
+#include "util/thread_pool.h" 
 
 namespace pomai::storage
 {
@@ -39,8 +43,8 @@ namespace pomai::core
     struct PutCmd
     {
         VectorId id{};
-        const float *vec{};
-        std::uint32_t dim{};
+        pomai::VectorView vec{};
+        pomai::Metadata meta{}; // Added
         std::promise<pomai::Status> done;
     };
 
@@ -53,7 +57,7 @@ namespace pomai::core
     struct BatchPutCmd
     {
         std::vector<pomai::VectorId> ids;
-        std::vector<std::vector<float>> vectors;  // Owned copies
+        std::vector<pomai::VectorView> vectors;  // Borrowed views, valid until command completes
         std::promise<pomai::Status> done;
     };
 
@@ -81,24 +85,6 @@ namespace pomai::core
         std::promise<void> done;
     };
 
-    struct GetReply
-    {
-        pomai::Status st;
-        std::vector<float> vec;
-    };
-
-    struct GetCmd
-    {
-        VectorId id{};
-        std::promise<GetReply> done;
-    };
-
-    struct ExistsCmd
-    {
-        VectorId id{};
-        std::promise<std::pair<pomai::Status, bool>> done;
-    };
-
     struct FreezeCmd
     {
         std::promise<pomai::Status> done;
@@ -120,7 +106,7 @@ namespace pomai::core
         std::promise<IteratorReply> done;
     };
 
-    using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, StopCmd, GetCmd, ExistsCmd, FreezeCmd, CompactCmd, IteratorCmd>;
+    using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, StopCmd, FreezeCmd, CompactCmd, IteratorCmd>;
 
     class ShardRuntime
     {
@@ -130,7 +116,10 @@ namespace pomai::core
                      std::uint32_t dim,
                      std::unique_ptr<storage::Wal> wal,
                      std::unique_ptr<table::MemTable> mem,
-                     std::size_t mailbox_cap);
+                     std::size_t mailbox_cap,
+                     const pomai::IndexParams& index_params,
+                     pomai::util::ThreadPool* thread_pool = nullptr,
+                     pomai::util::ThreadPool* segment_pool = nullptr); // Added
                      
         ~ShardRuntime();
 
@@ -141,9 +130,11 @@ namespace pomai::core
         pomai::Status Enqueue(Command &&cmd);
 
         pomai::Status Put(pomai::VectorId id, std::span<const float> vec);
+        pomai::Status Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta); // Overload
         pomai::Status PutBatch(const std::vector<pomai::VectorId>& ids,
                                const std::vector<std::span<const float>>& vectors);
         pomai::Status Get(pomai::VectorId id, std::vector<float> *out);
+        pomai::Status Get(pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta); // Added
         pomai::Status Exists(pomai::VectorId id, bool *exists);
         pomai::Status Delete(pomai::VectorId id);
 
@@ -152,18 +143,30 @@ namespace pomai::core
         pomai::Status Compact(); // Compact Segments
 
         pomai::Status NewIterator(std::unique_ptr<pomai::SnapshotIterator>* out); // Create snapshot iterator
+        pomai::Status NewIterator(std::shared_ptr<ShardSnapshot> snap, std::unique_ptr<pomai::SnapshotIterator>* out); // Added
+        
+        std::shared_ptr<ShardSnapshot> GetSnapshot() {
+             return current_snapshot_.load(std::memory_order_acquire);
+        }
 
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
                              std::vector<pomai::SearchHit> *out);
+        pomai::Status Search(std::span<const float> query,
+                             std::uint32_t topk,
+                             const SearchOptions& opts,
+                             std::vector<pomai::SearchHit> *out); // Overload
 
         // Non-blocking enqueue. Returns ResourceExhausted if full.
         pomai::Status TryEnqueue(Command &&cmd);
 
         std::size_t GetQueueDepth() const { return mailbox_.Size(); }
         std::uint64_t GetOpsProcessed() const { return ops_processed_.load(std::memory_order_relaxed); }
+        std::uint64_t LastQueryCandidatesScanned() const { return last_query_candidates_scanned_.load(std::memory_order_relaxed); }
 
     private:
+        struct BackgroundJob;
+
         void RunLoop();
 
         // Internal helpers
@@ -171,40 +174,43 @@ namespace pomai::core
         pomai::Status HandleBatchPut(BatchPutCmd &c);
         pomai::Status HandleDel(DelCmd &c);
         pomai::Status HandleFlush(FlushCmd &c);
-        pomai::Status HandleFreeze(FreezeCmd &c);
-        pomai::Status HandleCompact(CompactCmd &c);
+        std::optional<pomai::Status> HandleFreeze(FreezeCmd &c);
+        std::optional<pomai::Status> HandleCompact(CompactCmd &c);
         IteratorReply HandleIterator(IteratorCmd &c);
         SearchReply HandleSearch(SearchCmd &c);
         // GetReply HandleGet(GetCmd &c); // Deprecated
         // std::pair<pomai::Status, bool> HandleExists(ExistsCmd &c); // Deprecated
 
         // Lock-free internal helpers
-        pomai::Status GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out);
+        pomai::Status GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta = nullptr);
         std::pair<pomai::Status, bool> ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id);
 
-        pomai::Status SearchLocalInternal(std::shared_ptr<ShardSnapshot> snap, 
+        pomai::Status SearchLocalInternal(std::shared_ptr<table::MemTable> active,
+                                          std::shared_ptr<ShardSnapshot> snap, 
                                           std::span<const float> query,
                                           std::uint32_t topk,
+                                          const SearchOptions& opts,
                                           std::vector<pomai::SearchHit> *out);
+
                                           
         // Helper to load segments
         pomai::Status LoadSegments();
 
         // Snapshot management
         void PublishSnapshot();
-        std::shared_ptr<ShardSnapshot> GetSnapshot() {
-             return current_snapshot_.load(std::memory_order_acquire);
-        }
         
         // Soft Freeze: Move active memtable to frozen.
         pomai::Status RotateMemTable();
+
+        void PumpBackgroundWork(std::chrono::milliseconds budget);
+        void CancelBackgroundJob(const std::string& reason);
 
         const std::uint32_t shard_id_;
         const std::string shard_dir_;
         const std::uint32_t dim_;
 
         std::unique_ptr<storage::Wal> wal_;
-        std::unique_ptr<table::MemTable> mem_;
+        std::atomic<std::shared_ptr<table::MemTable>> mem_;
         // New: Frozen memtables (awaiting flush to disk)
         std::vector<std::shared_ptr<table::MemTable>> frozen_mem_;
         
@@ -216,16 +222,21 @@ namespace pomai::core
 
         // IVF coarse index for candidate selection (centroid routing).
         std::unique_ptr<pomai::index::IvfCoarse> ivf_;
-        std::vector<pomai::VectorId> candidates_scratch_;
-        // Shard-local reusable structure for search visibility tracking (DB-grade)
-        SeenTracker seen_tracker_;
-
 
         BoundedMpscQueue<Command> mailbox_;
         std::atomic<std::uint64_t> ops_processed_{0};
+        std::atomic<std::uint64_t> last_query_candidates_scanned_{0};
+
+        std::atomic<bool> started_{false};
+
+        pomai::util::ThreadPool* thread_pool_{nullptr};
+        pomai::util::ThreadPool* segment_pool_{nullptr}; // Added
+        pomai::IndexParams index_params_;
+
+        std::unique_ptr<BackgroundJob> background_job_;
+        std::uint64_t wal_epoch_{0};
 
         std::jthread worker_;
-        std::atomic<bool> started_{false};
     };
 
 } // namespace pomai::core

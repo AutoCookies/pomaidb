@@ -247,6 +247,31 @@ python3 scripts/check_benchmark.py ci_results.json \
 
 ---
 
+
+## Python End-to-End CIFAR-10 Benchmark
+
+For a realistic application-style benchmark (feature extraction + ingest + search + iterator analytics), run:
+
+```bash
+# Build shared library for Python ctypes
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target pomai_c
+
+# Run end-to-end benchmark (uses CIFAR-10 if available)
+python3 benchmarks/python_cifar10_feature_bench.py --images 6000 --queries 200 --download
+```
+
+What this benchmark measures:
+- CIFAR-10 image feature extraction throughput.
+- Batch ingestion throughput into PomaiDB via C ABI.
+- Search latency percentiles (P50/P95/P99) and QPS.
+- kNN label agreement as an application-level quality signal.
+- Full snapshot scan throughput using `pomai_scan` iterator.
+
+If CIFAR-10 cannot be downloaded or is unavailable locally, the script falls back to deterministic CIFAR-like synthetic data so the benchmark still completes in offline environments.
+
+---
+
 ## Troubleshooting
 
 ### Low Throughput
