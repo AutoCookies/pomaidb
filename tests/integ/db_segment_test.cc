@@ -4,10 +4,12 @@
 #include <filesystem>
 #include <vector>
 #include <fstream>
+#include <span>
 
 #include "pomai/pomai.h"
 #include "pomai/options.h"
 #include "pomai/search.h"
+#include "pomai/types.h"
 #include "table/segment.h"
 #include "storage/manifest/manifest.h"
 #include "core/shard/manifest.h"
@@ -41,8 +43,8 @@ POMAI_TEST(DB_SegmentLoading_ReadTest) {
     std::vector<float> vec1 = {1.0f, 0.0f, 0.0f, 0.0f};
     std::vector<float> vec2 = {0.0f, 1.0f, 0.0f, 0.0f};
     
-    POMAI_EXPECT_OK(builder.Add(10, vec1, false));
-    POMAI_EXPECT_OK(builder.Add(20, vec2, false));
+    POMAI_EXPECT_OK(builder.Add(10, pomai::VectorView(std::span<const float>(vec1)), false));
+    POMAI_EXPECT_OK(builder.Add(20, pomai::VectorView(std::span<const float>(vec2)), false));
     POMAI_EXPECT_OK(builder.Finish());
     
     // Create manifest.current for this segment

@@ -1,7 +1,9 @@
 #include "tests/common/test_main.h"
 #include <cstdint>
+#include <span>
 #include <vector>
 
+#include "pomai/metadata.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
 #include "table/memtable.h"
@@ -14,8 +16,9 @@ POMAI_TEST(MemTable_PutDeleteForEach)
     std::vector<float> v1 = {1, 2, 3, 4};
     std::vector<float> v2 = {4, 3, 2, 1};
 
-    POMAI_EXPECT_OK(mem.Put(10, v1));
-    POMAI_EXPECT_OK(mem.Put(20, v2));
+    pomai::Metadata meta;
+    POMAI_EXPECT_OK(mem.Put(10, pomai::VectorView(std::span<const float>(v1)), meta));
+    POMAI_EXPECT_OK(mem.Put(20, pomai::VectorView(std::span<const float>(v2)), meta));
     POMAI_EXPECT_OK(mem.Delete(10));
 
     std::size_t seen = 0;
