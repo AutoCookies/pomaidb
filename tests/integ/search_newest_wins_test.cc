@@ -3,11 +3,13 @@
 
 #include <filesystem>
 #include <vector>
+#include <span>
 
 #include "core/shard/manifest.h"
 #include "pomai/options.h"
 #include "pomai/pomai.h"
 #include "pomai/search.h"
+#include "pomai/types.h"
 #include "storage/manifest/manifest.h"
 #include "table/segment.h"
 
@@ -41,8 +43,8 @@ POMAI_TEST(SearchNewestWins_DeterministicAndTombstone) {
 
     std::string old_path = (shard_dir / "seg_old.dat").string();
     pomai::table::SegmentBuilder old_builder(old_path, dim);
-    POMAI_EXPECT_OK(old_builder.Add(target_id, vec_old, false));
-    POMAI_EXPECT_OK(old_builder.Add(tomb_id, vec_tomb, false));
+    POMAI_EXPECT_OK(old_builder.Add(target_id, pomai::VectorView(std::span<const float>(vec_old)), false));
+    POMAI_EXPECT_OK(old_builder.Add(tomb_id, pomai::VectorView(std::span<const float>(vec_tomb)), false));
     POMAI_EXPECT_OK(old_builder.Finish());
 
     std::string new_path = (shard_dir / "seg_new.dat").string();
@@ -51,10 +53,10 @@ POMAI_TEST(SearchNewestWins_DeterministicAndTombstone) {
         if (id == tomb_id) {
             continue;
         }
-        POMAI_EXPECT_OK(new_builder.Add(id, vec_filler, false));
+        POMAI_EXPECT_OK(new_builder.Add(id, pomai::VectorView(std::span<const float>(vec_filler)), false));
     }
-    POMAI_EXPECT_OK(new_builder.Add(target_id, vec_new, false));
-    POMAI_EXPECT_OK(new_builder.Add(tomb_id, vec_tomb, true));
+    POMAI_EXPECT_OK(new_builder.Add(target_id, pomai::VectorView(std::span<const float>(vec_new)), false));
+    POMAI_EXPECT_OK(new_builder.Add(tomb_id, pomai::VectorView(std::span<const float>(vec_tomb)), true));
     POMAI_EXPECT_OK(new_builder.Finish());
 
     std::vector<std::string> segs = {"seg_new.dat", "seg_old.dat"};
