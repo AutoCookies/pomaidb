@@ -227,7 +227,6 @@ namespace pomai::core
         std::atomic<std::uint64_t> ops_processed_{0};
         std::atomic<std::uint64_t> last_query_candidates_scanned_{0};
 
-        std::jthread worker_;
         std::atomic<bool> started_{false};
 
         pomai::util::ThreadPool* thread_pool_{nullptr};
@@ -236,6 +235,8 @@ namespace pomai::core
 
         std::unique_ptr<BackgroundJob> background_job_;
         std::uint64_t wal_epoch_{0};
+
+        std::jthread worker_;
     };
 
 } // namespace pomai::core
