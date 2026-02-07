@@ -3,9 +3,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <queue>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -17,6 +17,7 @@
 #include "core/snapshot_wrapper.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
+#include "util/logging.h"
 
 namespace pomai::core {
 namespace {
@@ -122,16 +123,25 @@ Status Engine::OpenLocked() {
 
     size_t threads = opt_.search_threads;
     if (threads == 0) {
-        threads = std::thread::hardware_concurrency();
+        size_t hw = std::thread::hardware_concurrency();
+        if (hw == 0) {
+            hw = 1;
+        }
+        size_t target = hw > 1 ? (hw - 1) : 1;
+        threads = std::min(target, static_cast<size_t>(opt_.shard_count));
+        if (threads == 0) {
+            threads = 1;
+        }
     }
-    if (threads == 0) {
-        threads = 1;
-    }
+    size_t segment_threads = std::max<size_t>(1, threads / 2);
     if (threads > 1) {
         search_pool_ = std::make_unique<util::ThreadPool>(threads);
-        segment_pool_ = std::make_unique<util::ThreadPool>(threads);
     } else {
         search_pool_.reset();
+    }
+    if (segment_threads > 1) {
+        segment_pool_ = std::make_unique<util::ThreadPool>(segment_threads);
+    } else {
         segment_pool_.reset();
     }
 
@@ -186,8 +196,9 @@ Status Engine::Close() {
         std::lock_guard<std::mutex> lg(routing_mu_);
         (void)routing::SaveRoutingTableAtomic(opt_.path, *routing_mutable_, opt_.routing_keep_prev != 0);
     }
-    search_pool_.reset();
     shards_.clear();
+    search_pool_.reset();
+    segment_pool_.reset();
     opened_ = false;
     return Status::Ok();
 }
@@ -210,7 +221,9 @@ void Engine::MaybeWarmupAndInitRouting(std::span<const float> vec) {
     routing_current_ = routing_mutable_;
     routing_mode_.store(routing::RoutingMode::kReady);
     (void)routing::SaveRoutingTableAtomic(opt_.path, built, opt_.routing_keep_prev != 0);
-    std::cout << "[routing] mode=READY warmup_size=" << warmup_count_ << " k=" << built.k << "\n";
+    util::Log(util::LogLevel::kInfo,
+              "[routing] mode=READY warmup_size=" + std::to_string(warmup_count_) +
+                  " k=" + std::to_string(built.k));
 }
 
 std::uint32_t Engine::RouteShardForVector(VectorId id, std::span<const float> vec) {
@@ -242,7 +255,7 @@ void Engine::MaybePersistRoutingAsync() {
         (void)search_pool_->Enqueue([this, snapshot]() {
             auto st = routing::SaveRoutingTableAtomic(opt_.path, *snapshot, opt_.routing_keep_prev != 0);
             if (!st.ok()) {
-                std::cout << "[routing] persist failed: " << st.message() << "\n";
+                util::Log(util::LogLevel::kWarn, "[routing] persist failed: " + st.message());
             }
             std::lock_guard<std::mutex> lk(routing_mu_);
             routing_persist_inflight_ = false;

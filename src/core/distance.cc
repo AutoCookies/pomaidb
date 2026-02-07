@@ -1,5 +1,12 @@
 #include "core/distance.h"
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define POMAI_X86_SIMD 1
+#else
+#define POMAI_X86_SIMD 0
+#endif
+#if POMAI_X86_SIMD
 #include <immintrin.h>
+#endif
 #include <mutex>
 #include <memory>
 
@@ -60,7 +67,7 @@ namespace pomai::core
             return s;
         }
 
-#if defined(__GNUC__) || defined(__clang__)
+#if POMAI_X86_SIMD && (defined(__GNUC__) || defined(__clang__))
         __attribute__((target("avx2,fma")))
         float DotAvx(std::span<const float> a, std::span<const float> b)
         {
@@ -157,7 +164,7 @@ namespace pomai::core
 
         void InitOnce()
         {
-#if defined(__GNUC__) || defined(__clang__)
+#if POMAI_X86_SIMD && (defined(__GNUC__) || defined(__clang__))
             if (__builtin_cpu_supports("avx2"))
             {
                 dot_fn = DotAvx;

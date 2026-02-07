@@ -40,6 +40,7 @@ add_library(pomai STATIC
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
   src/util/crc32c.cc
+  src/util/logging.cc
 )
 
 target_include_directories(pomai

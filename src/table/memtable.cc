@@ -29,7 +29,6 @@ namespace pomai::table
     MemTable::MemTable(std::uint32_t dim, std::size_t arena_block_bytes)
         : dim_(dim), arena_(arena_block_bytes)
     {
-        map_.reserve(1u << 20);
     }
 
     pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec)
