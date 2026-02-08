@@ -25,7 +25,7 @@ namespace pomai::core
     class Engine
     {
     public:
-        explicit Engine(pomai::DBOptions opt);
+        explicit Engine(pomai::DBOptions opt, pomai::MembraneKind kind);
         ~Engine();
 
         Engine(const Engine &) = delete;
@@ -53,6 +53,7 @@ namespace pomai::core
         Status Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
 
         const pomai::DBOptions &options() const { return opt_; }
+        pomai::MembraneKind kind() const { return kind_; }
 
     private:
         Status OpenLocked();
@@ -63,6 +64,7 @@ namespace pomai::core
         std::vector<std::uint32_t> BuildProbeShards(std::span<const float> query, const SearchOptions& opts);
 
         pomai::DBOptions opt_;
+        pomai::MembraneKind kind_;
         bool opened_ = false;
 
         std::vector<std::unique_ptr<Shard>> shards_;

@@ -37,6 +37,21 @@ namespace pomai
             return mgr_.Put(core::MembraneManager::kDefaultMembrane, id, vec, meta);
         }
 
+        Status PutVector(VectorId id, std::span<const float> vec) override
+        {
+            return mgr_.PutVector(core::MembraneManager::kDefaultMembrane, id, vec);
+        }
+
+        Status PutVector(VectorId id, std::span<const float> vec, const Metadata& meta) override
+        {
+            return mgr_.PutVector(core::MembraneManager::kDefaultMembrane, id, vec, meta);
+        }
+
+        Status PutChunk(const RagChunk& chunk) override
+        {
+            return mgr_.PutChunk(core::MembraneManager::kDefaultMembrane, chunk);
+        }
+
 
 
         Status PutBatch(const std::vector<VectorId>& ids,
@@ -104,6 +119,21 @@ namespace pomai
             return mgr_.Put(membrane, id, vec, meta);
         }
 
+        Status PutVector(std::string_view membrane, VectorId id, std::span<const float> vec) override
+        {
+            return mgr_.PutVector(membrane, id, vec);
+        }
+
+        Status PutVector(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta) override
+        {
+            return mgr_.PutVector(membrane, id, vec, meta);
+        }
+
+        Status PutChunk(std::string_view membrane, const RagChunk& chunk) override
+        {
+            return mgr_.PutChunk(membrane, chunk);
+        }
+
         Status Get(std::string_view membrane, VectorId id, std::vector<float> *out) override
         {
             return mgr_.Get(membrane, id, out);
@@ -134,6 +164,21 @@ namespace pomai
             return mgr_.Search(core::MembraneManager::kDefaultMembrane, query, topk, opts, out);
         }
 
+        Status SearchVector(std::span<const float> query, uint32_t topk, SearchResult *out) override
+        {
+            return mgr_.SearchVector(core::MembraneManager::kDefaultMembrane, query, topk, out);
+        }
+
+        Status SearchVector(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult *out) override
+        {
+            return mgr_.SearchVector(core::MembraneManager::kDefaultMembrane, query, topk, opts, out);
+        }
+
+        Status SearchRag(const RagQuery& query, const RagSearchOptions& opts, RagSearchResult *out) override
+        {
+            return mgr_.SearchRag(core::MembraneManager::kDefaultMembrane, query, opts, out);
+        }
+
         // ...
 
         Status Search(std::string_view membrane, std::span<const float> query,
@@ -146,6 +191,24 @@ namespace pomai
                       uint32_t topk, const SearchOptions& opts, SearchResult *out) override
         {
             return mgr_.Search(membrane, query, topk, opts, out);
+        }
+
+        Status SearchVector(std::string_view membrane, std::span<const float> query,
+                            uint32_t topk, SearchResult *out) override
+        {
+            return mgr_.SearchVector(membrane, query, topk, out);
+        }
+
+        Status SearchVector(std::string_view membrane, std::span<const float> query,
+                            uint32_t topk, const SearchOptions& opts, SearchResult *out) override
+        {
+            return mgr_.SearchVector(membrane, query, topk, opts, out);
+        }
+
+        Status SearchRag(std::string_view membrane, const RagQuery& query,
+                         const RagSearchOptions& opts, RagSearchResult *out) override
+        {
+            return mgr_.SearchRag(membrane, query, opts, out);
         }
 
         Status Freeze(std::string_view membrane) override

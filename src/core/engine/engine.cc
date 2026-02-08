@@ -72,7 +72,7 @@ static std::vector<pomai::SearchHit> MergeTopK(const std::vector<std::vector<pom
 }
 } // namespace
 
-Engine::Engine(pomai::DBOptions opt) : opt_(std::move(opt)) {}
+Engine::Engine(pomai::DBOptions opt, pomai::MembraneKind kind) : opt_(std::move(opt)), kind_(kind) {}
 Engine::~Engine() = default;
 
 std::uint32_t Engine::ShardOf(VectorId id, std::uint32_t shard_count) {
@@ -85,6 +85,9 @@ Status Engine::Open() {
 }
 
 Status Engine::OpenLocked() {
+    if (kind_ != pomai::MembraneKind::kVector) {
+        return Status::InvalidArgument("engine only supports VECTOR membranes");
+    }
     if (opt_.dim == 0) return Status::InvalidArgument("dim must be > 0");
     if (opt_.shard_count == 0) return Status::InvalidArgument("shard_count must be > 0");
 
@@ -162,7 +165,7 @@ Status Engine::OpenLocked() {
         auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
         std::filesystem::create_directories(shard_dir, ec);
 
-        auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, std::move(wal), std::move(mem),
+        auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, kind_, std::move(wal), std::move(mem),
                                                  kMailboxCap, opt_.index_params, search_pool_.get(),
                                                  segment_pool_.get());
         auto shard = std::make_unique<Shard>(std::move(rt));
@@ -268,6 +271,7 @@ void Engine::MaybePersistRoutingAsync() {
 
 Status Engine::Put(VectorId id, std::span<const float> vec) {
     if (!opened_) return Status::InvalidArgument("engine not opened");
+    if (kind_ != pomai::MembraneKind::kVector) return Status::InvalidArgument("VECTOR membrane required for Put");
     if (static_cast<std::uint32_t>(vec.size()) != opt_.dim) return Status::InvalidArgument("dim mismatch");
     const auto sid = RouteShardForVector(id, vec);
     return shards_[sid]->Put(id, vec);
@@ -275,6 +279,7 @@ Status Engine::Put(VectorId id, std::span<const float> vec) {
 
 Status Engine::Put(VectorId id, std::span<const float> vec, const pomai::Metadata& meta) {
     if (!opened_) return Status::InvalidArgument("engine not opened");
+    if (kind_ != pomai::MembraneKind::kVector) return Status::InvalidArgument("VECTOR membrane required for Put");
     if (static_cast<std::uint32_t>(vec.size()) != opt_.dim) return Status::InvalidArgument("dim mismatch");
     const auto sid = RouteShardForVector(id, vec);
     return shards_[sid]->Put(id, vec, meta);
@@ -282,6 +287,7 @@ Status Engine::Put(VectorId id, std::span<const float> vec, const pomai::Metadat
 
 Status Engine::PutBatch(const std::vector<VectorId>& ids, const std::vector<std::span<const float>>& vectors) {
     if (!opened_) return Status::InvalidArgument("engine not opened");
+    if (kind_ != pomai::MembraneKind::kVector) return Status::InvalidArgument("VECTOR membrane required for PutBatch");
     if (ids.size() != vectors.size()) return Status::InvalidArgument("size mismatch");
     if (ids.empty()) return Status::Ok();
 

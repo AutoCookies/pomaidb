@@ -247,13 +247,25 @@ namespace pomai::storage
             return out;
         }
 
+        static std::string MembraneKindToString(pomai::MembraneKind kind)
+        {
+            return kind == pomai::MembraneKind::kRag ? "RAG" : "VECTOR";
+        }
+
+        static pomai::MembraneKind ParseMembraneKind(std::string_view tok)
+        {
+            if (tok == "RAG") return pomai::MembraneKind::kRag;
+            return pomai::MembraneKind::kVector;
+        }
+
         static pomai::Status WriteMembraneManifest(std::string_view root_path, const pomai::MembraneSpec &spec)
         {
             std::string out;
-            out += "pomai.membrane.v2\n";
+            out += "pomai.membrane.v3\n";
             out += "name " + spec.name + "\n";
             out += "shards " + std::to_string(spec.shard_count) + "\n";
             out += "dim " + std::to_string(spec.dim) + "\n";
+            out += "kind " + MembraneKindToString(spec.kind) + "\n";
             
             std::string mtype = "L2";
             if (spec.metric == pomai::MetricType::kInnerProduct) mtype = "IP";
@@ -274,10 +286,11 @@ namespace pomai::storage
             std::string_view sv(content);
             std::size_t p = sv.find('\n');
             std::string_view header = (p == std::string_view::npos) ? sv : sv.substr(0, p);
-            
-             // Allow v2
-            if (header != "pomai.membrane.v2")
-                 return pomai::Status::Corruption("bad membrane manifest header: expected v2");
+
+            const bool v2 = header == "pomai.membrane.v2";
+            const bool v3 = header == "pomai.membrane.v3";
+            if (!v2 && !v3)
+                 return pomai::Status::Corruption("bad membrane manifest header: expected v2/v3");
 
             sv = (p == std::string_view::npos) ? std::string_view{} : sv.substr(p + 1);
             
@@ -286,6 +299,7 @@ namespace pomai::storage
             spec->shard_count = 0;
             spec->dim = 0;
             spec->metric = pomai::MetricType::kL2;
+            spec->kind = pomai::MembraneKind::kVector;
 
             while (!sv.empty()) {
                 std::size_t eol = sv.find('\n');
@@ -307,6 +321,10 @@ namespace pomai::storage
                         if (toks[1] == "IP") spec->metric = pomai::MetricType::kInnerProduct;
                         else if (toks[1] == "COS") spec->metric = pomai::MetricType::kCosine;
                         else spec->metric = pomai::MetricType::kL2;
+                    }
+                } else if (toks[0] == "kind") {
+                    if (toks.size() > 1) {
+                        spec->kind = ParseMembraneKind(toks[1]);
                     }
                 } else if (toks[0] == "index_params") {
                     if (toks.size() > 2) {

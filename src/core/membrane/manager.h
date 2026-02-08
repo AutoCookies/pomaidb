@@ -12,11 +12,13 @@
 #include "pomai/iterator.h"
 #include "pomai/metadata.h"
 #include "pomai/snapshot.h"
+#include "pomai/rag.h"
 
 namespace pomai::core
 {
 
     class Engine;
+    class RagEngine;
 
     class MembraneManager
     {
@@ -42,6 +44,9 @@ namespace pomai::core
 
         Status Put(std::string_view membrane, VectorId id, std::span<const float> vec);
         Status Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta); // Overload
+        Status PutVector(std::string_view membrane, VectorId id, std::span<const float> vec);
+        Status PutVector(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta);
+        Status PutChunk(std::string_view membrane, const pomai::RagChunk& chunk);
         Status PutBatch(std::string_view membrane,
                         const std::vector<VectorId>& ids,
                         const std::vector<std::span<const float>>& vectors);
@@ -51,6 +56,9 @@ namespace pomai::core
         Status Delete(std::string_view membrane, VectorId id);
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
+        Status SearchVector(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
+        Status SearchVector(std::string_view membrane, std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
+        Status SearchRag(std::string_view membrane, const pomai::RagQuery& query, const pomai::RagSearchOptions& opts, pomai::RagSearchResult *out);
 
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);
@@ -62,13 +70,21 @@ namespace pomai::core
         static constexpr std::string_view kDefaultMembrane = "__default__";
 
     private:
-        Engine *GetEngineOrNull(std::string_view name) const;
+        struct MembraneState
+        {
+            pomai::MembraneSpec spec;
+            std::unique_ptr<Engine> vector_engine;
+            std::unique_ptr<RagEngine> rag_engine;
+        };
+
+        MembraneState *GetMembraneOrNull(std::string_view name);
+        const MembraneState *GetMembraneOrNull(std::string_view name) const;
 
         pomai::DBOptions base_;
         bool opened_ = false;
 
         // For now: keep engines in-memory; later you can add lazy-open by manifest.
-        std::unordered_map<std::string, std::unique_ptr<Engine>> engines_;
+        std::unordered_map<std::string, MembraneState> membranes_;
     };
 
 } // namespace pomai::core

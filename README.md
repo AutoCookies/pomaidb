@@ -25,8 +25,8 @@ IVF is present in code but bypassed in the read path today.
 Metrics are not yet exposed; operators must instrument externally. 
 PomaiDB is not distributed and does not implement replication. 
 It is intended for embedded, single-tenant deployments only. 
-Membranes provide logical separation but are currently in-memory only. 
-On-disk membrane manifests exist but are not wired into DB::Open. 
+Membranes provide logical separation with persisted manifests. 
+Membranes are now typed: VECTOR for embeddings and RAG for chunk/token storage. 
 The API exposes explicit Freeze and Flush for visibility and durability control. 
 Documentation is written to match the current code on branch `pomai-embeded`. 
 
@@ -49,6 +49,7 @@ Documentation is written to match the current code on branch `pomai-embeded`.
 - Performance: [docs/PERFORMANCE.md](docs/PERFORMANCE.md)
 - Performance tuning: [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md)
 - Benchmarking: [docs/BENCHMARKING.md](docs/BENCHMARKING.md)
+- RAG membrane SOT: [docs/SOT_RAG_MEMBRANE.md](docs/SOT_RAG_MEMBRANE.md)
 - Roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
 - Glossary: [docs/GLOSSARY.md](docs/GLOSSARY.md)
 - FAQ: [docs/FAQ.md](docs/FAQ.md)
@@ -96,8 +97,8 @@ int main() {
 
 ## API overview
 - **Create/Open**: `pomai::DB::Open(DBOptions, ...)`
-- **Upsert/Delete**: `Put`, `Delete` (per-membrane and default membrane overloads)
-- **Read**: `Get`, `Exists`, `Search`
+- **Upsert/Delete**: `PutVector`, `PutChunk`, `Delete` (per-membrane and default membrane overloads)
+- **Read**: `Get`, `Exists`, `SearchVector`, `SearchRag`
 - **Freeze**: publish visibility + flush frozen tables to segments
 - **Flush**: WAL durability boundary (subject to fsync policy)
 - **Close**: `Close` closes all membranes and shards

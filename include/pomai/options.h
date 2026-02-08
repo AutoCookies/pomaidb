@@ -18,6 +18,12 @@ namespace pomai
         kCosine = 2,
     };
 
+    enum class MembraneKind : uint8_t
+    {
+        kVector = 0,
+        kRag = 1,
+    };
+
     struct IndexParams
     {
         uint32_t nlist = 64;
@@ -47,6 +53,7 @@ namespace pomai
         uint32_t dim = 0;         // 0 => inherit DBOptions.dim
         MetricType metric = MetricType::kL2;
         IndexParams index_params;
+        MembraneKind kind = MembraneKind::kVector;
     };
 
 } // namespace pomai

@@ -114,6 +114,7 @@ namespace pomai::core
         ShardRuntime(std::uint32_t shard_id,
                      std::string shard_dir,
                      std::uint32_t dim,
+                     pomai::MembraneKind kind,
                      std::unique_ptr<storage::Wal> wal,
                      std::unique_ptr<table::MemTable> mem,
                      std::size_t mailbox_cap,
@@ -208,6 +209,7 @@ namespace pomai::core
         const std::uint32_t shard_id_;
         const std::string shard_dir_;
         const std::uint32_t dim_;
+        const pomai::MembraneKind kind_;
 
         std::unique_ptr<storage::Wal> wal_;
         std::atomic<std::shared_ptr<table::MemTable>> mem_;
