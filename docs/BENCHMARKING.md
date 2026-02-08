@@ -5,6 +5,13 @@ This guide explains how to run comprehensive benchmarks on PomaiDB using industr
 ## Quick Start
 
 ```bash
+# Trust benchmarks (recall, tail latency, crash recovery, low-end, explain)
+./scripts/pomai-bench recall
+./scripts/pomai-bench mixed-load
+./scripts/pomai-bench crash-recovery
+./scripts/pomai-bench low-end --machine "i5-8250U, 4c/8t, 8GB RAM"
+./scripts/pomai-bench explain
+
 # Build benchmark
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target comprehensive_bench

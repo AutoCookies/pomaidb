@@ -1,0 +1,21 @@
+Sample output (format reference; values vary by hardware)
+
+Recall Benchmark
+----------------
+Dataset: clustered_512d_seed42
+N=200000, Q=1000, topk=10
+
+Recall@1   = 0.956
+Recall@10  = 0.978
+Recall@100 = 0.995
+
+{
+  "benchmark": "recall",
+  "dataset": "clustered_512d_seed42",
+  "N": 200000,
+  "Q": 1000,
+  "ingest_s": 18.41,
+  "recall_at_1": 0.956,
+  "recall_at_10": 0.978,
+  "recall_at_100": 0.995
+}

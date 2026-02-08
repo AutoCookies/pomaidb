@@ -1,0 +1,16 @@
+Sample output (format reference; values vary by hardware)
+
+SEARCH PLAN
+-----------
+Mode: VectorSearch
+Shards visited: 2 / 4
+Candidates gathered: 10
+Exact rerank: not_exposed
+
+{
+  "benchmark": "explain",
+  "mode": "VectorSearch",
+  "shards_visited": 2,
+  "candidates_gathered": 10,
+  "exact_rerank": "not_exposed"
+}

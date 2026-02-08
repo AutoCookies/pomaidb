@@ -1,0 +1,15 @@
+Sample output (format reference; values vary by hardware)
+
+Crash Recovery Benchmark
+------------------------
+Crash at 73% ingest
+
+Recovered vectors: 200000 / 200000
+Recall@10 after recovery: 0.978
+
+{
+  "benchmark": "crash-recovery",
+  "recovered": 200000,
+  "total": 200000,
+  "recall_at_10": 0.978
+}
