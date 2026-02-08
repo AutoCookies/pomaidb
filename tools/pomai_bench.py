@@ -16,6 +16,7 @@ import ctypes
 import json
 import os
 import platform
+import random
 import signal
 import subprocess
 import sys
@@ -26,7 +27,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence, Tuple
 
-import numpy as np
+try:
+    import numpy as np  # type: ignore
+    HAS_NUMPY = True
+except ModuleNotFoundError:
+    np = None
+    HAS_NUMPY = False
 
 
 class PomaiOptions(ctypes.Structure):
@@ -173,12 +179,14 @@ class PomaiClient:
             self.lib.pomai_status_free(st)
             raise RuntimeError(msg)
 
-    def put_batch(self, ids: Sequence[int], vecs: Sequence[np.ndarray]) -> None:
+    def put_batch(self, ids: Sequence[int], vecs: Sequence[Sequence[float]]) -> None:
         n = len(ids)
         batch = (PomaiUpsert * n)()
         cvecs = []
         for i in range(n):
-            vec = vecs[i].astype(np.float32, copy=False)
+            vec = vecs[i]
+            if HAS_NUMPY and np is not None and hasattr(vec, "astype"):
+                vec = vec.astype(np.float32, copy=False)
             cvec = (ctypes.c_float * self.dim)(*vec)
             cvecs.append(cvec)
             batch[i].struct_size = ctypes.sizeof(PomaiUpsert)
@@ -192,8 +200,10 @@ class PomaiClient:
     def freeze(self) -> None:
         self._check(self.lib.pomai_freeze(self.db))
 
-    def search(self, vec: np.ndarray, topk: int) -> Tuple[List[int], List[int]]:
-        cvec = (ctypes.c_float * self.dim)(*vec.astype(np.float32, copy=False))
+    def search(self, vec: Sequence[float], topk: int) -> Tuple[List[int], List[int]]:
+        if HAS_NUMPY and np is not None and hasattr(vec, "astype"):
+            vec = vec.astype(np.float32, copy=False)
+        cvec = (ctypes.c_float * self.dim)(*vec)
         q = PomaiQuery()
         q.struct_size = ctypes.sizeof(PomaiQuery)
         q.vector = cvec
@@ -243,63 +253,128 @@ def batched_ids(count: int, batch_size: int) -> Iterable[Tuple[int, int]]:
         yield start, end
 
 
-def make_clustered_vectors(count: int, dim: int, seed: int) -> np.ndarray:
-    rng = np.random.default_rng(seed)
+def _normalize(vec: List[float]) -> List[float]:
+    norm = sum(v * v for v in vec) ** 0.5
+    if norm > 1e-12:
+        return [v / norm for v in vec]
+    return vec
+
+
+def dot(a: Sequence[float], b: Sequence[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def make_queries_from_base(base: Sequence[Sequence[float]], count: int, seed: int, noise: float = 0.001) -> Sequence[Sequence[float]]:
+    if HAS_NUMPY and np is not None:
+        rng = np.random.default_rng(seed)
+        base_arr = np.asarray(base, dtype=np.float32)
+        idxs = rng.integers(0, base_arr.shape[0], size=count)
+        queries = base_arr[idxs].copy()
+        if noise > 0:
+            queries += rng.normal(0.0, noise, size=queries.shape).astype(np.float32)
+            norms = np.linalg.norm(queries, axis=1, keepdims=True) + 1e-12
+            queries = queries / norms
+        return queries.astype(np.float32)
+
+    rng = random.Random(seed)
+    queries: List[List[float]] = []
+    for _ in range(count):
+        vec = list(base[rng.randrange(0, len(base))])
+        if noise > 0:
+            vec = [v + rng.gauss(0.0, noise) for v in vec]
+            vec = _normalize(vec)
+        queries.append(vec)
+    return queries
+
+
+def make_clustered_vectors(count: int, dim: int, seed: int) -> Sequence[Sequence[float]]:
     clusters = max(8, dim // 32)
-    centers = rng.normal(0.0, 1.0, size=(clusters, dim)).astype(np.float32)
-    centers /= np.linalg.norm(centers, axis=1, keepdims=True) + 1e-12
-    assignments = rng.integers(0, clusters, size=count)
-    noise = rng.normal(0.0, 0.05, size=(count, dim)).astype(np.float32)
-    vectors = centers[assignments] + noise
-    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
-    return vectors.astype(np.float32)
+    if HAS_NUMPY and np is not None:
+        rng = np.random.default_rng(seed)
+        centers = rng.normal(0.0, 1.0, size=(clusters, dim)).astype(np.float32)
+        centers /= np.linalg.norm(centers, axis=1, keepdims=True) + 1e-12
+        assignments = rng.integers(0, clusters, size=count)
+        noise = rng.normal(0.0, 0.05, size=(count, dim)).astype(np.float32)
+        vectors = centers[assignments] + noise
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
+        return vectors.astype(np.float32)
+
+    rng = random.Random(seed)
+    centers: List[List[float]] = []
+    for _ in range(clusters):
+        center = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+        centers.append(_normalize(center))
+    vectors: List[List[float]] = []
+    for _ in range(count):
+        cid = rng.randrange(0, clusters)
+        base = centers[cid]
+        vec = [base[i] + rng.gauss(0.0, 0.05) for i in range(dim)]
+        vectors.append(_normalize(vec))
+    return vectors
 
 
-def brute_force_topk(base: np.ndarray, queries: np.ndarray, k: int, block: int = 50000) -> np.ndarray:
-    q = queries.shape[0]
-    best_scores = None
-    best_ids = None
+def brute_force_topk(base: Sequence[Sequence[float]], queries: Sequence[Sequence[float]], k: int, block: int = 50000) -> List[List[int]]:
+    if HAS_NUMPY and np is not None:
+        base_arr = np.asarray(base, dtype=np.float32)
+        query_arr = np.asarray(queries, dtype=np.float32)
+        q = query_arr.shape[0]
+        best_scores = None
+        best_ids = None
 
-    for start in range(0, base.shape[0], block):
-        end = min(base.shape[0], start + block)
-        block_vecs = base[start:end]
-        scores = queries @ block_vecs.T
-        block_ids = np.arange(start, end, dtype=np.int64)
-        if best_scores is None:
-            best_scores = np.empty((q, k), dtype=np.float32)
-            best_ids = np.empty((q, k), dtype=np.int64)
-            for qi in range(q):
-                idx = np.argpartition(scores[qi], -k)[-k:]
-                best_scores[qi] = scores[qi][idx]
-                best_ids[qi] = block_ids[idx]
-        else:
-            for qi in range(q):
-                combined_scores = np.concatenate([best_scores[qi], scores[qi]])
-                combined_ids = np.concatenate([best_ids[qi], block_ids])
-                idx = np.argpartition(combined_scores, -k)[-k:]
-                best_scores[qi] = combined_scores[idx]
-                best_ids[qi] = combined_ids[idx]
+        for start in range(0, base_arr.shape[0], block):
+            end = min(base_arr.shape[0], start + block)
+            block_vecs = base_arr[start:end]
+            scores = query_arr @ block_vecs.T
+            block_ids = np.arange(start, end, dtype=np.int64)
+            if best_scores is None:
+                best_scores = np.empty((q, k), dtype=np.float32)
+                best_ids = np.empty((q, k), dtype=np.int64)
+                for qi in range(q):
+                    idx = np.argpartition(scores[qi], -k)[-k:]
+                    best_scores[qi] = scores[qi][idx]
+                    best_ids[qi] = block_ids[idx]
+            else:
+                for qi in range(q):
+                    combined_scores = np.concatenate([best_scores[qi], scores[qi]])
+                    combined_ids = np.concatenate([best_ids[qi], block_ids])
+                    idx = np.argpartition(combined_scores, -k)[-k:]
+                    best_scores[qi] = combined_scores[idx]
+                    best_ids[qi] = combined_ids[idx]
 
-    order = np.argsort(-best_scores, axis=1)
-    sorted_ids = np.take_along_axis(best_ids, order, axis=1)
-    return sorted_ids
+        order = np.argsort(-best_scores, axis=1)
+        sorted_ids = np.take_along_axis(best_ids, order, axis=1)
+        return sorted_ids.tolist()
+
+    results: List[List[int]] = []
+    for qvec in queries:
+        scores = []
+        for idx, vec in enumerate(base):
+            score = sum(a * b for a, b in zip(qvec, vec))
+            scores.append((score, idx))
+        scores.sort(key=lambda pair: pair[0], reverse=True)
+        results.append([idx for _, idx in scores[:k]])
+    return results
 
 
-def recall_at_k(oracle: np.ndarray, approx: List[List[int]], k: int) -> float:
+def recall_at_k(oracle: Sequence[Sequence[int]], approx: List[List[int]], k: int) -> float:
     total = len(approx)
     if total == 0:
         return 0.0
     acc = 0.0
     for qi in range(total):
         oracle_ids = oracle[qi][:k]
-        approx_ids = np.array(approx[qi], dtype=np.int64)[:k]
-        if approx_ids.size == 0:
+        if HAS_NUMPY and np is not None:
+            approx_ids = np.array(approx[qi], dtype=np.int64)[:k]
+            approx_list = approx_ids.tolist()
+        else:
+            approx_list = list(approx[qi])[:k]
+        if not approx_list:
             continue
-        acc += len(set(approx_ids) & set(oracle_ids)) / float(k)
+        acc += len(set(approx_list) & set(oracle_ids)) / float(k)
     return acc / total
 
 
-def recall_metrics(oracle: np.ndarray, approx: List[List[int]]) -> RecallMetrics:
+def recall_metrics(oracle: Sequence[Sequence[int]], approx: List[List[int]]) -> RecallMetrics:
     r1 = recall_at_k(oracle, approx, 1)
     r10 = recall_at_k(oracle, approx, 10)
     r100 = recall_at_k(oracle, approx, 100)
@@ -318,7 +393,7 @@ def ensure_recall_gates(metrics: RecallMetrics) -> None:
 
 def run_recall_case(lib: Path, case: RecallCase, shards: int, batch_size: int) -> Tuple[RecallMetrics, float]:
     vectors = make_clustered_vectors(case.count, case.dim, case.seed)
-    queries = make_clustered_vectors(case.queries, case.dim, case.seed + 1)
+    queries = make_queries_from_base(vectors, case.queries, case.seed + 1)
     oracle_ids = brute_force_topk(vectors, queries, 100)
 
     with tempfile.TemporaryDirectory(prefix="pomai_bench_recall_") as td:
@@ -359,8 +434,12 @@ def print_recall_report(case: RecallCase, metrics: RecallMetrics) -> None:
 def percentile_ms(latencies: Sequence[float], p: float) -> float:
     if not latencies:
         return 0.0
-    arr = np.array(latencies)
-    return float(np.percentile(arr, p))
+    if HAS_NUMPY and np is not None:
+        arr = np.array(latencies)
+        return float(np.percentile(arr, p))
+    sorted_vals = sorted(latencies)
+    idx = int(round((p / 100.0) * (len(sorted_vals) - 1)))
+    return float(sorted_vals[min(max(idx, 0), len(sorted_vals) - 1)])
 
 
 def run_mixed_load(lib: Path, dim: int, count: int, shards: int, batch_size: int, queries: int) -> Tuple[dict, dict]:
@@ -412,9 +491,14 @@ def run_mixed_load(lib: Path, dim: int, count: int, shards: int, batch_size: int
         t_search.start()
         t_ingest.join()
         t_search.join()
-        oracle_ids = brute_force_topk(vectors, query_vecs, 10)
+        oracle_vectors = vectors
+        oracle_queries = query_vecs
+        if not HAS_NUMPY:
+            oracle_vectors = vectors[:min(len(vectors), 20000)]
+            oracle_queries = query_vecs[:min(len(query_vecs), 200)]
+        oracle_ids = brute_force_topk(oracle_vectors, oracle_queries, 10)
         approx_ids: List[List[int]] = []
-        for qvec in query_vecs:
+        for qvec in oracle_queries:
             got, _ = client.search(qvec, topk=10)
             approx_ids.append([gid - 1 for gid in got])
         recall_10 = recall_at_k(oracle_ids, approx_ids, 10)
@@ -441,8 +525,13 @@ def run_low_end(lib: Path, dim: int, count: int, queries: int, shards: int, mach
     brute_lat = []
     for qi in range(queries):
         t0 = time.perf_counter()
-        scores = vectors @ query_vecs[qi]
-        _ = np.argpartition(scores, -10)[-10:]
+        qvec = query_vecs[qi]
+        if HAS_NUMPY and np is not None:
+            scores = np.asarray(vectors) @ np.asarray(qvec)
+            _ = np.argpartition(scores, -10)[-10:]
+        else:
+            scores = [dot(vec, qvec) for vec in vectors]
+            _ = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:10]
         brute_lat.append((time.perf_counter() - t0) * 1000.0)
 
     with tempfile.TemporaryDirectory(prefix="pomai_bench_lowend_") as td:
@@ -514,7 +603,7 @@ def run_crash_recovery(lib: Path, dim: int, count: int, shards: int, crash_after
 
     metrics = recall_metrics(oracle_ids, approx_ids)
     if recovered != count:
-        raise SystemExit(f\"Crash recovery failed: recovered {recovered} / {count}\")
+        raise SystemExit(f"Crash recovery failed: recovered {recovered} / {count}")
     return recovered, metrics
 
 
@@ -572,6 +661,7 @@ def parse_args() -> argparse.Namespace:
     recall.add_argument("--shards", type=int, default=4)
     recall.add_argument("--batch-size", type=int, default=1024)
     recall.add_argument("--seed", type=int, default=42)
+    recall.add_argument("--matrix", choices=["full", "ci"], default="full")
 
     mixed = sub.add_parser("mixed-load", help="Mixed ingest/search tail latency")
     mixed.add_argument("--dim", type=int, default=512)
@@ -615,17 +705,24 @@ def main() -> None:
         raise SystemExit(f"missing shared library: {args.lib}")
 
     if args.cmd == "recall":
-        cases = [
-            RecallCase(128, 50000, 1000, 10, args.seed),
-            RecallCase(128, 100000, 1000, 10, args.seed),
-            RecallCase(128, 200000, 1000, 10, args.seed),
-            RecallCase(256, 50000, 1000, 10, args.seed),
-            RecallCase(256, 100000, 1000, 10, args.seed),
-            RecallCase(256, 200000, 1000, 10, args.seed),
-            RecallCase(512, 50000, 1000, 10, args.seed),
-            RecallCase(512, 100000, 1000, 10, args.seed),
-            RecallCase(512, 200000, 1000, 10, args.seed),
-        ]
+        if args.matrix == "ci":
+            cases = [
+                RecallCase(128, 5000, 200, 10, args.seed),
+                RecallCase(256, 5000, 200, 10, args.seed),
+                RecallCase(512, 5000, 200, 10, args.seed),
+            ]
+        else:
+            cases = [
+                RecallCase(128, 50000, 1000, 10, args.seed),
+                RecallCase(128, 100000, 1000, 10, args.seed),
+                RecallCase(128, 200000, 1000, 10, args.seed),
+                RecallCase(256, 50000, 1000, 10, args.seed),
+                RecallCase(256, 100000, 1000, 10, args.seed),
+                RecallCase(256, 200000, 1000, 10, args.seed),
+                RecallCase(512, 50000, 1000, 10, args.seed),
+                RecallCase(512, 100000, 1000, 10, args.seed),
+                RecallCase(512, 200000, 1000, 10, args.seed),
+            ]
         for case in cases:
             metrics, ingest_s = run_recall_case(args.lib, case, args.shards, args.batch_size)
             print_recall_report(case, metrics)

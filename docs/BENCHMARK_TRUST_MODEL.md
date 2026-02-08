@@ -43,6 +43,7 @@ PomaiDB benchmarks exist to earn **trust**, not to market speed. This document i
 - **Deterministic generators** (clustered, normalized vectors).
 - **Documented commands** for every benchmark (see `scripts/pomai-bench` and `scripts/benchmark_trust.sh`).
 - **Machine-readable output** is emitted as JSON alongside human-readable text.
+- **Dependency-aware runs**: the benchmark suite can run without NumPy, but CI falls back to a reduced recall matrix when NumPy is unavailable.
 
 ## Known Limitations (Transparent by Design)
 
@@ -63,7 +64,7 @@ PomaiDB benchmarks exist to earn **trust**, not to market speed. This document i
 
 CI runs `scripts/benchmark_trust.sh`, which:
 
-1. Executes the full recall benchmark and enforces recall gates.
+1. Executes the full recall benchmark and enforces recall gates (or the CI-sized matrix if NumPy is unavailable).
 2. Executes a mixed-load smoke test and reports p999.
 
 Failures are treated as regressions and fail the CI job.
