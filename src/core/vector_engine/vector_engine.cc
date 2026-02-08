@@ -1,4 +1,4 @@
-#include "core/engine/engine.h"
+#include "core/vector_engine/vector_engine.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -72,32 +72,34 @@ static std::vector<pomai::SearchHit> MergeTopK(const std::vector<std::vector<pom
 }
 } // namespace
 
-Engine::Engine(pomai::DBOptions opt, pomai::MembraneKind kind) : opt_(std::move(opt)), kind_(kind) {}
-Engine::~Engine() = default;
+VectorEngine::VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind) : opt_(std::move(opt)), kind_(kind) {}
+VectorEngine::~VectorEngine() = default;
 
-std::uint32_t Engine::ShardOf(VectorId id, std::uint32_t shard_count) {
+std::uint32_t VectorEngine::ShardOf(VectorId id, std::uint32_t shard_count) {
     return shard_count == 0 ? 0u : static_cast<std::uint32_t>(id % shard_count);
 }
 
-Status Engine::Open() {
+Status VectorEngine::Open() {
     if (opened_) return Status::Ok();
     return OpenLocked();
 }
 
-Status Engine::OpenLocked() {
+Status VectorEngine::OpenLocked() {
     if (kind_ != pomai::MembraneKind::kVector) {
-        return Status::InvalidArgument("engine only supports VECTOR membranes");
+        return Status::InvalidArgument("vector_engine only supports VECTOR membranes");
     }
-    if (opt_.dim == 0) return Status::InvalidArgument("dim must be > 0");
-    if (opt_.shard_count == 0) return Status::InvalidArgument("shard_count must be > 0");
+    if (opt_.dim == 0) return Status::InvalidArgument("vector_engine requires dim > 0");
+    if (opt_.shard_count == 0) return Status::InvalidArgument("vector_engine requires shard_count > 0");
 
     std::error_code ec;
     bool created_root_dir = false;
     if (!std::filesystem::exists(opt_.path, ec)) {
-        if (!std::filesystem::create_directories(opt_.path, ec)) return Status::IOError("create_directories failed");
+        if (!std::filesystem::create_directories(opt_.path, ec)) {
+            return Status::IOError("vector_engine create_directories failed");
+        }
         created_root_dir = true;
     } else if (ec) {
-        return Status::IOError("stat failed: " + ec.message());
+        return Status::IOError("vector_engine stat failed: " + ec.message());
     }
 
     if (!opt_.routing_enabled) {
@@ -153,13 +155,13 @@ Status Engine::OpenLocked() {
         auto wal = std::make_unique<storage::Wal>(opt_.path, i, kWalSegmentBytes, opt_.fsync);
         auto st = wal->Open();
         if (!st.ok()) {
-            first_error = st;
+            first_error = Status(st.code(), "vector_engine wal open failed: " + st.message());
             break;
         }
         auto mem = std::make_unique<table::MemTable>(opt_.dim, kArenaBlockBytes);
         st = wal->ReplayInto(*mem);
         if (!st.ok()) {
-            first_error = st;
+            first_error = Status(st.code(), "vector_engine wal replay failed: " + st.message());
             break;
         }
         auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
@@ -172,7 +174,7 @@ Status Engine::OpenLocked() {
 
         st = shard->Start();
         if (!st.ok()) {
-            first_error = st;
+            first_error = Status(st.code(), "vector_engine shard start failed: " + st.message());
             break;
         }
         shards_.push_back(std::move(shard));
@@ -193,7 +195,7 @@ Status Engine::OpenLocked() {
     return Status::Ok();
 }
 
-Status Engine::Close() {
+Status VectorEngine::Close() {
     if (!opened_) return Status::Ok();
     if (routing_mode_.load() == routing::RoutingMode::kReady && routing_mutable_) {
         std::lock_guard<std::mutex> lg(routing_mu_);
@@ -206,7 +208,7 @@ Status Engine::Close() {
     return Status::Ok();
 }
 
-void Engine::MaybeWarmupAndInitRouting(std::span<const float> vec) {
+void VectorEngine::MaybeWarmupAndInitRouting(std::span<const float> vec) {
     if (routing_mode_.load() != routing::RoutingMode::kWarmup) return;
     if (warmup_count_ < warmup_target_) {
         warmup_reservoir_.insert(warmup_reservoir_.end(), vec.begin(), vec.end());
@@ -229,7 +231,7 @@ void Engine::MaybeWarmupAndInitRouting(std::span<const float> vec) {
                   " k=" + std::to_string(built.k));
 }
 
-std::uint32_t Engine::RouteShardForVector(VectorId id, std::span<const float> vec) {
+std::uint32_t VectorEngine::RouteShardForVector(VectorId id, std::span<const float> vec) {
     if (!opt_.routing_enabled || routing_mode_.load() != routing::RoutingMode::kReady || !routing_current_) {
         if (opt_.routing_enabled) MaybeWarmupAndInitRouting(vec);
         return ShardOf(id, opt_.shard_count);
@@ -247,7 +249,7 @@ std::uint32_t Engine::RouteShardForVector(VectorId id, std::span<const float> ve
     return sid;
 }
 
-void Engine::MaybePersistRoutingAsync() {
+void VectorEngine::MaybePersistRoutingAsync() {
     if (puts_since_persist_ < kPersistEveryPuts) return;
     std::lock_guard<std::mutex> lg(routing_mu_);
     if (routing_persist_inflight_ || !routing_mutable_) return;
@@ -269,26 +271,38 @@ void Engine::MaybePersistRoutingAsync() {
     }
 }
 
-Status Engine::Put(VectorId id, std::span<const float> vec) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (kind_ != pomai::MembraneKind::kVector) return Status::InvalidArgument("VECTOR membrane required for Put");
-    if (static_cast<std::uint32_t>(vec.size()) != opt_.dim) return Status::InvalidArgument("dim mismatch");
+Status VectorEngine::Put(VectorId id, std::span<const float> vec) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (kind_ != pomai::MembraneKind::kVector) {
+        return Status::InvalidArgument("vector_engine requires VECTOR membrane");
+    }
+    if (static_cast<std::uint32_t>(vec.size()) != opt_.dim) {
+        return Status::InvalidArgument("vector_engine dim mismatch");
+    }
     const auto sid = RouteShardForVector(id, vec);
     return shards_[sid]->Put(id, vec);
 }
 
-Status Engine::Put(VectorId id, std::span<const float> vec, const pomai::Metadata& meta) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (kind_ != pomai::MembraneKind::kVector) return Status::InvalidArgument("VECTOR membrane required for Put");
-    if (static_cast<std::uint32_t>(vec.size()) != opt_.dim) return Status::InvalidArgument("dim mismatch");
+Status VectorEngine::Put(VectorId id, std::span<const float> vec, const pomai::Metadata& meta) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (kind_ != pomai::MembraneKind::kVector) {
+        return Status::InvalidArgument("vector_engine requires VECTOR membrane");
+    }
+    if (static_cast<std::uint32_t>(vec.size()) != opt_.dim) {
+        return Status::InvalidArgument("vector_engine dim mismatch");
+    }
     const auto sid = RouteShardForVector(id, vec);
     return shards_[sid]->Put(id, vec, meta);
 }
 
-Status Engine::PutBatch(const std::vector<VectorId>& ids, const std::vector<std::span<const float>>& vectors) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (kind_ != pomai::MembraneKind::kVector) return Status::InvalidArgument("VECTOR membrane required for PutBatch");
-    if (ids.size() != vectors.size()) return Status::InvalidArgument("size mismatch");
+Status VectorEngine::PutBatch(const std::vector<VectorId>& ids, const std::vector<std::span<const float>>& vectors) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (kind_ != pomai::MembraneKind::kVector) {
+        return Status::InvalidArgument("vector_engine requires VECTOR membrane");
+    }
+    if (ids.size() != vectors.size()) {
+        return Status::InvalidArgument("vector_engine ids/vectors size mismatch");
+    }
     if (ids.empty()) return Status::Ok();
 
     uint32_t shard_count = opt_.shard_count;
@@ -301,7 +315,9 @@ Status Engine::PutBatch(const std::vector<VectorId>& ids, const std::vector<std:
     }
 
     for (size_t i = 0; i < ids.size(); ++i) {
-        if (static_cast<uint32_t>(vectors[i].size()) != opt_.dim) return Status::InvalidArgument("dim mismatch");
+        if (static_cast<uint32_t>(vectors[i].size()) != opt_.dim) {
+            return Status::InvalidArgument("vector_engine dim mismatch");
+        }
         const uint32_t s = RouteShardForVector(ids[i], vectors[i]);
         shard_ids[s].push_back(ids[i]);
         shard_vecs[s].push_back(vectors[i]);
@@ -315,11 +331,11 @@ Status Engine::PutBatch(const std::vector<VectorId>& ids, const std::vector<std:
     return Status::Ok();
 }
 
-Status Engine::Get(VectorId id, std::vector<float>* out) { return Get(id, out, nullptr); }
+Status VectorEngine::Get(VectorId id, std::vector<float>* out) { return Get(id, out, nullptr); }
 
-Status Engine::Get(VectorId id, std::vector<float>* out, pomai::Metadata* out_meta) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (!out) return Status::InvalidArgument("out=null");
+Status VectorEngine::Get(VectorId id, std::vector<float>* out, pomai::Metadata* out_meta) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (!out) return Status::InvalidArgument("vector_engine output is null");
 
     Status last = Status::NotFound("id not found");
     for (auto& s : shards_) {
@@ -336,9 +352,9 @@ Status Engine::Get(VectorId id, std::vector<float>* out, pomai::Metadata* out_me
     return last;
 }
 
-Status Engine::Exists(VectorId id, bool* exists) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (!exists) return Status::InvalidArgument("exists=null");
+Status VectorEngine::Exists(VectorId id, bool* exists) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (!exists) return Status::InvalidArgument("vector_engine exists output is null");
     *exists = false;
     for (auto& s : shards_) {
         bool e = false;
@@ -352,8 +368,8 @@ Status Engine::Exists(VectorId id, bool* exists) {
     return Status::Ok();
 }
 
-Status Engine::Delete(VectorId id) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
+Status VectorEngine::Delete(VectorId id) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
     Status first_error = Status::Ok();
     for (auto& s : shards_) {
         auto st = s->Delete(id);
@@ -368,8 +384,8 @@ Status Engine::Delete(VectorId id) {
     return Status::Ok();
 }
 
-Status Engine::Flush() {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
+Status VectorEngine::Flush() {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
     for (auto& s : shards_) {
         auto st = s->Flush();
         if (!st.ok()) return st;
@@ -377,8 +393,8 @@ Status Engine::Flush() {
     return Status::Ok();
 }
 
-Status Engine::Freeze() {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
+Status VectorEngine::Freeze() {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
     for (auto& s : shards_) {
         Status st = s->Freeze();
         if (!st.ok()) return st;
@@ -386,8 +402,8 @@ Status Engine::Freeze() {
     return Status::Ok();
 }
 
-Status Engine::Compact() {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
+Status VectorEngine::Compact() {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
     for (auto& s : shards_) {
         Status st = s->Compact();
         if (!st.ok()) return st;
@@ -395,39 +411,40 @@ Status Engine::Compact() {
     return Status::Ok();
 }
 
-Status Engine::NewIterator(std::unique_ptr<pomai::SnapshotIterator>* out) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (!out) return Status::InvalidArgument("out is null");
+Status VectorEngine::NewIterator(std::unique_ptr<pomai::SnapshotIterator>* out) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (!out) return Status::InvalidArgument("vector_engine output is null");
     if (shards_.empty()) return Status::Internal("no shards available");
     return shards_[0]->NewIterator(out);
 }
 
-Status Engine::GetSnapshot(std::shared_ptr<pomai::Snapshot>* out) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (!out) return Status::InvalidArgument("out is null");
+Status VectorEngine::GetSnapshot(std::shared_ptr<pomai::Snapshot>* out) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (!out) return Status::InvalidArgument("vector_engine output is null");
     if (shards_.empty()) return Status::Internal("no shards available");
     auto s = shards_[0]->GetSnapshot();
     *out = std::make_shared<SnapshotWrapper>(std::move(s));
     return Status::Ok();
 }
 
-Status Engine::NewIterator(const std::shared_ptr<pomai::Snapshot>& snap,
+Status VectorEngine::NewIterator(const std::shared_ptr<pomai::Snapshot>& snap,
                            std::unique_ptr<pomai::SnapshotIterator>* out) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (!out) return Status::InvalidArgument("out is null");
-    if (!snap) return Status::InvalidArgument("snap is null");
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (!out) return Status::InvalidArgument("vector_engine output is null");
+    if (!snap) return Status::InvalidArgument("vector_engine snapshot is null");
 
     auto wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(snap);
-    if (!wrapper) return Status::InvalidArgument("invalid snapshot type");
+    if (!wrapper) return Status::InvalidArgument("vector_engine invalid snapshot type");
     if (shards_.empty()) return Status::Internal("no shards available");
     return shards_[0]->NewIterator(wrapper->GetInternal(), out);
 }
 
-Status Engine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult* out) {
+Status VectorEngine::Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult* out) {
     return Search(query, topk, SearchOptions{}, out);
 }
 
-std::vector<std::uint32_t> Engine::BuildProbeShards(std::span<const float> query, const SearchOptions& opts) {
+std::vector<std::uint32_t> VectorEngine::BuildProbeShards(std::span<const float> query,
+                                                          const SearchOptions& opts) {
     if (opts.force_fanout || routing_mode_.load() != routing::RoutingMode::kReady || !routing_current_) {
         std::vector<std::uint32_t> all(opt_.shard_count);
         for (std::uint32_t i = 0; i < opt_.shard_count; ++i) all[i] = i;
@@ -468,15 +485,17 @@ std::vector<std::uint32_t> Engine::BuildProbeShards(std::span<const float> query
     return out;
 }
 
-Status Engine::Search(std::span<const float> query,
-                      std::uint32_t topk,
-                      const SearchOptions& opts,
-                      pomai::SearchResult* out) {
-    if (!opened_) return Status::InvalidArgument("engine not opened");
-    if (!out) return Status::InvalidArgument("out=null");
+Status VectorEngine::Search(std::span<const float> query,
+                            std::uint32_t topk,
+                            const SearchOptions& opts,
+                            pomai::SearchResult* out) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (!out) return Status::InvalidArgument("vector_engine output is null");
 
     out->Clear();
-    if (static_cast<std::uint32_t>(query.size()) != opt_.dim) return Status::InvalidArgument("dim mismatch");
+    if (static_cast<std::uint32_t>(query.size()) != opt_.dim) {
+        return Status::InvalidArgument("vector_engine dim mismatch");
+    }
     if (topk == 0) return Status::Ok();
 
     const auto probe_shards = BuildProbeShards(query, opts);

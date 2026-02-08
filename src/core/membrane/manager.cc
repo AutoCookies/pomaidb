@@ -4,10 +4,10 @@
 #include <utility>
 #include <vector>
 
-#include "core/engine/engine.h"
-#include "storage/manifest/manifest.h"
+#include "core/vector_engine/vector_engine.h"
+#include "core/rag/rag_engine.h"
 #include "pomai/iterator.h"  // For SnapshotIterator
-#include "core/rag/engine.h"
+#include "storage/manifest/manifest.h"
 
 
 namespace pomai::core
@@ -43,7 +43,7 @@ namespace pomai::core
             MembraneState state;
             state.spec = loaded_spec;
             if (loaded_spec.kind == pomai::MembraneKind::kVector) {
-                state.vector_engine = std::make_unique<Engine>(opt, loaded_spec.kind);
+                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind);
             } else {
                 state.rag_engine = std::make_unique<RagEngine>(opt, loaded_spec);
             }
@@ -85,7 +85,7 @@ namespace pomai::core
                 MembraneState state;
                 state.spec = mspec;
                 if (mspec.kind == pomai::MembraneKind::kVector) {
-                    state.vector_engine = std::make_unique<Engine>(opt, mspec.kind);
+                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind);
                 } else {
                     state.rag_engine = std::make_unique<RagEngine>(opt, mspec);
                 }
@@ -176,7 +176,7 @@ namespace pomai::core
         MembraneState state;
         state.spec = spec;
         if (spec.kind == pomai::MembraneKind::kVector) {
-            state.vector_engine = std::make_unique<Engine>(opt, spec.kind);
+            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind);
         } else {
             state.rag_engine = std::make_unique<RagEngine>(opt, spec);
         }

@@ -17,7 +17,7 @@ option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
 # =========================
 add_library(pomai STATIC
   src/api/db.cc
-  src/core/engine/engine.cc
+  src/core/vector_engine/vector_engine.cc
   src/core/shard/shard.cc
   src/core/shard/runtime.cc
   src/core/shard/layer_lookup.cc
@@ -36,7 +36,7 @@ add_library(pomai STATIC
   src/core/routing/routing_table.cc
   src/core/routing/kmeans_lite.cc
   src/core/routing/routing_persist.cc
-  src/core/rag/engine.cc
+  src/core/rag/rag_engine.cc
 
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc

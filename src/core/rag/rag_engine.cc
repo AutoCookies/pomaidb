@@ -1,4 +1,4 @@
-#include "core/rag/engine.h"
+#include "core/rag/rag_engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -51,10 +51,10 @@ namespace pomai::core
     {
         if (opened_) return Status::Ok();
         if (spec_.kind != pomai::MembraneKind::kRag) {
-            return Status::InvalidArgument("RAG engine requires RAG membrane kind");
+            return Status::InvalidArgument("rag_engine requires RAG membrane kind");
         }
-        if (spec_.shard_count == 0) return Status::InvalidArgument("shard_count must be > 0");
-        if (spec_.dim == 0) return Status::InvalidArgument("dim must be > 0");
+        if (spec_.shard_count == 0) return Status::InvalidArgument("rag_engine requires shard_count > 0");
+        if (spec_.dim == 0) return Status::InvalidArgument("rag_engine requires dim > 0");
         shards_.clear();
         shards_.reserve(spec_.shard_count);
         for (std::uint32_t i = 0; i < spec_.shard_count; ++i) {
@@ -73,12 +73,12 @@ namespace pomai::core
 
     Status RagEngine::PutChunk(const pomai::RagChunk& chunk)
     {
-        if (!opened_) return Status::InvalidArgument("rag engine not opened");
+        if (!opened_) return Status::InvalidArgument("rag_engine not opened");
         if (chunk.tokens.empty()) {
-            return Status::InvalidArgument("RAG membrane requires token_blob; vector-only payload rejected");
+            return Status::InvalidArgument("rag_engine requires token_blob; vector-only payload rejected");
         }
         if (chunk.vec.has_value() && chunk.vec->dim != spec_.dim) {
-            return Status::InvalidArgument("embedding dim mismatch");
+            return Status::InvalidArgument("rag_engine embedding dim mismatch");
         }
 
         auto& shard = ShardFor(chunk.chunk_id);
@@ -117,10 +117,10 @@ namespace pomai::core
                              const pomai::RagSearchOptions& opts,
                              pomai::RagSearchResult* out) const
     {
-        if (!out) return Status::InvalidArgument("out is null");
+        if (!out) return Status::InvalidArgument("rag_engine search output is null");
         out->Clear();
         if (query.tokens.empty() && !query.vec.has_value()) {
-            return Status::InvalidArgument("query requires tokens or vector");
+            return Status::InvalidArgument("rag_engine query requires tokens or vector");
         }
 
         const auto start = std::chrono::steady_clock::now();

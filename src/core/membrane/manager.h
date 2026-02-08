@@ -17,7 +17,7 @@
 namespace pomai::core
 {
 
-    class Engine;
+    class VectorEngine;
     class RagEngine;
 
     class MembraneManager
@@ -73,7 +73,7 @@ namespace pomai::core
         struct MembraneState
         {
             pomai::MembraneSpec spec;
-            std::unique_ptr<Engine> vector_engine;
+            std::unique_ptr<VectorEngine> vector_engine;
             std::unique_ptr<RagEngine> rag_engine;
         };
 
