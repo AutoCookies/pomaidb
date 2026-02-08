@@ -1,0 +1,23 @@
+Sample output (format reference; values vary by hardware)
+
+Low-End Laptop Benchmark
+------------------------
+Machine: i5-8250U, 4c/8t, 8GB RAM
+
+Bruteforce:
+  p99 = 412.0 ms
+
+PomaiDB:
+  p99 = 17.9 ms
+  Recall@10 = 0.964
+
+{
+  "benchmark": "low-end",
+  "dim": 256,
+  "N": 50000,
+  "shards": 2,
+  "machine": "i5-8250U, 4c/8t, 8GB RAM",
+  "bruteforce_p99_ms": 412.0,
+  "pomai_p99_ms": 17.9,
+  "recall_at_10": 0.964
+}

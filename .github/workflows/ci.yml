@@ -69,3 +69,17 @@ jobs:
         run: cmake --build build --target ci_perf_bench --parallel
       - name: Run perf guardrail
         run: python3 tools/perf_gate.py --build-dir build --baseline benchmarks/perf_baseline.json --threshold 0.10
+
+  benchmark-trust:
+    name: benchmark-trust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python deps
+        run: python3 -m pip install numpy
+      - name: Configure
+        run: cmake -S . -B build -DPOMAI_BUILD_TESTS=OFF
+      - name: Build shared C ABI
+        run: cmake --build build --target pomai_c --parallel
+      - name: Run trust benchmark gates
+        run: scripts/benchmark_trust.sh
