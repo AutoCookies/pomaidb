@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,6 @@ namespace pomai::core
         pomai::DBOptions opt_;
         pomai::MembraneSpec spec_;
         bool opened_ = false;
-        std::vector<RagShard> shards_;
+        std::vector<std::unique_ptr<RagShard>> shards_;
     };
 } // namespace pomai::core

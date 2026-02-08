@@ -39,12 +39,12 @@ namespace pomai::core
 
     RagEngine::RagShard& RagEngine::ShardFor(pomai::ChunkId id)
     {
-        return shards_[ShardOf(id, static_cast<std::uint32_t>(shards_.size()))];
+        return *shards_[ShardOf(id, static_cast<std::uint32_t>(shards_.size()))];
     }
 
     const RagEngine::RagShard& RagEngine::ShardFor(pomai::ChunkId id) const
     {
-        return shards_[ShardOf(id, static_cast<std::uint32_t>(shards_.size()))];
+        return *shards_[ShardOf(id, static_cast<std::uint32_t>(shards_.size()))];
     }
 
     Status RagEngine::Open()
@@ -55,7 +55,11 @@ namespace pomai::core
         }
         if (spec_.shard_count == 0) return Status::InvalidArgument("shard_count must be > 0");
         if (spec_.dim == 0) return Status::InvalidArgument("dim must be > 0");
-        shards_.assign(spec_.shard_count, RagShard{});
+        shards_.clear();
+        shards_.reserve(spec_.shard_count);
+        for (std::uint32_t i = 0; i < spec_.shard_count; ++i) {
+            shards_.push_back(std::make_unique<RagShard>());
+        }
         opened_ = true;
         return Status::Ok();
     }
@@ -122,7 +126,8 @@ namespace pomai::core
         const auto start = std::chrono::steady_clock::now();
         std::unordered_map<pomai::ChunkId, std::uint32_t> match_counts;
 
-        for (const auto& shard : shards_) {
+        for (const auto& shard_ptr : shards_) {
+            const auto& shard = *shard_ptr;
             std::lock_guard<std::mutex> lock(shard.mu);
             for (auto token : query.tokens) {
                 auto it = shard.postings.find(token);
