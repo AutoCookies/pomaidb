@@ -206,6 +206,7 @@ namespace pomai::core
     ShardRuntime::ShardRuntime(std::uint32_t shard_id,
                                std::string shard_dir, // Added
                                std::uint32_t dim,
+                               pomai::MembraneKind kind,
                                std::unique_ptr<storage::Wal> wal,
                                std::unique_ptr<table::MemTable> mem,
                                std::size_t mailbox_cap,
@@ -215,6 +216,7 @@ namespace pomai::core
         : shard_id_(shard_id),
           shard_dir_(std::move(shard_dir)), // Added
           dim_(dim),
+          kind_(kind),
           wal_(std::move(wal)),
           mem_(std::move(mem)),
           mailbox_(mailbox_cap),
@@ -356,6 +358,9 @@ namespace pomai::core
 
     pomai::Status ShardRuntime::Put(pomai::VectorId id, std::span<const float> vec, const pomai::Metadata& meta)
     {
+        if (kind_ != pomai::MembraneKind::kVector) {
+            return pomai::Status::InvalidArgument("VECTOR membrane required for Put");
+        }
         if (vec.size() != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
 
@@ -374,6 +379,9 @@ namespace pomai::core
 
     pomai::Status ShardRuntime::HandlePut(PutCmd &c)
     {
+        if (kind_ != pomai::MembraneKind::kVector) {
+            return pomai::Status::InvalidArgument("VECTOR membrane required for Put");
+        }
         if (c.vec.dim != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
 
@@ -402,6 +410,9 @@ namespace pomai::core
     pomai::Status ShardRuntime::PutBatch(const std::vector<pomai::VectorId>& ids,
                                           const std::vector<std::span<const float>>& vectors)
     {
+        if (kind_ != pomai::MembraneKind::kVector) {
+            return pomai::Status::InvalidArgument("VECTOR membrane required for PutBatch");
+        }
         // Validation
         if (ids.size() != vectors.size())
             return pomai::Status::InvalidArgument("ids and vectors size mismatch");
@@ -698,6 +709,9 @@ namespace pomai::core
 
     pomai::Status ShardRuntime::HandleBatchPut(BatchPutCmd &c)
     {
+        if (kind_ != pomai::MembraneKind::kVector) {
+            return pomai::Status::InvalidArgument("VECTOR membrane required for PutBatch");
+        }
         // Validation (already done in PutBatch, but belt-and-suspenders)
         if (c.ids.size() != c.vectors.size())
             return pomai::Status::InvalidArgument("ids and vectors size mismatch");

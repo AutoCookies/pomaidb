@@ -1,4 +1,5 @@
 #include "pomai/pomai.h"
+#include "storage/manifest/manifest.h"
 #include "pomai/iterator.h"
 #include "util/crc32c.h"
 #include <iostream>
@@ -109,17 +110,27 @@ int CmdMembranes(const std::vector<std::string>& args) {
     
     for (const auto& membrane_name : membranes) {
         std::cout << "\nMembrane: " << membrane_name << "\n";
-        
-        // Try to get iterator to count vectors
-        std::unique_ptr<pomai::SnapshotIterator> it;
-        st = db->NewIterator(membrane_name, &it);
-        if (st.ok()) {
-            size_t count = 0;
-            while (it->Valid()) {
-                count++;
-                it->Next();
+
+        pomai::MembraneSpec spec;
+        auto spec_st = pomai::storage::Manifest::GetMembrane(opt.path, membrane_name, &spec);
+        if (spec_st.ok()) {
+            std::cout << "  Kind: " << (spec.kind == pomai::MembraneKind::kRag ? "RAG" : "VECTOR") << "\n";
+        }
+
+        if (!spec_st.ok() || spec.kind == pomai::MembraneKind::kVector) {
+            // Try to get iterator to count vectors
+            std::unique_ptr<pomai::SnapshotIterator> it;
+            st = db->NewIterator(membrane_name, &it);
+            if (st.ok()) {
+                size_t count = 0;
+                while (it->Valid()) {
+                    count++;
+                    it->Next();
+                }
+                std::cout << "  Vectors: " << count << "\n";
             }
-            std::cout << "  Vectors: " << count << "\n";
+        } else {
+            std::cout << "  Chunks: (use rag tooling)\n";
         }
     }
     

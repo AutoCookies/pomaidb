@@ -6,6 +6,7 @@
 
 #include "metadata.h"
 #include "options.h"
+#include "rag.h"
 #include "search.h"
 #include "status.h"
 #include "types.h"
@@ -26,6 +27,9 @@ namespace pomai
         // Default membrane (optional semantic; can map to "default")
         virtual Status Put(VectorId id, std::span<const float> vec) = 0;
         virtual Status Put(VectorId id, std::span<const float> vec, const Metadata& meta) = 0; // Added
+        virtual Status PutVector(VectorId id, std::span<const float> vec) = 0;
+        virtual Status PutVector(VectorId id, std::span<const float> vec, const Metadata& meta) = 0;
+        virtual Status PutChunk(const RagChunk& chunk) = 0;
 
         // ... existing PutBatch ...
         // Batch upsert (5-10x faster than sequential Put for large batches)
@@ -42,6 +46,11 @@ namespace pomai
 
         virtual Status Search(std::span<const float> query, uint32_t topk,
                               const SearchOptions& opts, SearchResult *out) = 0;
+        virtual Status SearchVector(std::span<const float> query, uint32_t topk,
+                                    SearchResult *out) = 0;
+        virtual Status SearchVector(std::span<const float> query, uint32_t topk,
+                                    const SearchOptions& opts, SearchResult *out) = 0;
+        virtual Status SearchRag(const RagQuery& query, const RagSearchOptions& opts, RagSearchResult *out) = 0;
 
         // Membrane API
         virtual Status CreateMembrane(const MembraneSpec &spec) = 0;
@@ -54,6 +63,11 @@ namespace pomai
                            std::span<const float> vec) = 0;
         virtual Status Put(std::string_view membrane, VectorId id,
                            std::span<const float> vec, const Metadata& meta) = 0; // Added
+        virtual Status PutVector(std::string_view membrane, VectorId id,
+                                 std::span<const float> vec) = 0;
+        virtual Status PutVector(std::string_view membrane, VectorId id,
+                                 std::span<const float> vec, const Metadata& meta) = 0;
+        virtual Status PutChunk(std::string_view membrane, const RagChunk& chunk) = 0;
         virtual Status Get(std::string_view membrane, VectorId id,
                            std::vector<float> *out) = 0;
         virtual Status Get(std::string_view membrane, VectorId id,
@@ -67,6 +81,12 @@ namespace pomai
         // Search with filtering options
         virtual Status Search(std::string_view membrane, std::span<const float> query,
                               uint32_t topk, const SearchOptions& opts, SearchResult *out) = 0;
+        virtual Status SearchVector(std::string_view membrane, std::span<const float> query,
+                                    uint32_t topk, SearchResult *out) = 0;
+        virtual Status SearchVector(std::string_view membrane, std::span<const float> query,
+                                    uint32_t topk, const SearchOptions& opts, SearchResult *out) = 0;
+        virtual Status SearchRag(std::string_view membrane, const RagQuery& query,
+                                 const RagSearchOptions& opts, RagSearchResult *out) = 0;
 
         virtual Status Freeze(std::string_view membrane) = 0;
         virtual Status Compact(std::string_view membrane) = 0;

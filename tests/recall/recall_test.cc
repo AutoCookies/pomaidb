@@ -74,7 +74,8 @@ POMAI_TEST(Recall_Clustered_Basic) {
     pomai::util::ThreadPool pool(4);
     
     pomai::IndexParams index_opts;
-    ShardRuntime rt(shard_id, path, dopt.dim, std::move(wal), std::move(mem), 1024, index_opts, &pool);
+    ShardRuntime rt(shard_id, path, dopt.dim, pomai::MembraneKind::kVector, std::move(wal),
+                    std::move(mem), 1024, index_opts, &pool);
     POMAI_EXPECT_OK(rt.Start());
     
     // Keep a separate MemTable for Oracle that is NOT managed by ShardRuntime
@@ -173,7 +174,8 @@ POMAI_TEST(Recall_Uniform_Hard) {
     
     auto mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);
     
-    ShardRuntime rt(shard_id, path, dopt.dim, std::move(wal), std::move(mem), 1024, pomai::IndexParams{});
+    ShardRuntime rt(shard_id, path, dopt.dim, pomai::MembraneKind::kVector, std::move(wal),
+                    std::move(mem), 1024, pomai::IndexParams{});
     POMAI_EXPECT_OK(rt.Start());
     
     auto oracle_mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);

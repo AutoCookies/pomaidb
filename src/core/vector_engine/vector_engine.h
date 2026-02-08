@@ -22,14 +22,14 @@ namespace pomai::core
 
     class Shard;
 
-    class Engine
+    class VectorEngine
     {
     public:
-        explicit Engine(pomai::DBOptions opt);
-        ~Engine();
+        explicit VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind);
+        ~VectorEngine();
 
-        Engine(const Engine &) = delete;
-        Engine &operator=(const Engine &) = delete;
+        VectorEngine(const VectorEngine &) = delete;
+        VectorEngine &operator=(const VectorEngine &) = delete;
 
         Status Open();
         Status Close();
@@ -50,9 +50,11 @@ namespace pomai::core
         Status NewIterator(const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out);
 
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
-        Status Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
+        Status Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts,
+                      pomai::SearchResult *out);
 
         const pomai::DBOptions &options() const { return opt_; }
+        pomai::MembraneKind kind() const { return kind_; }
 
     private:
         Status OpenLocked();
@@ -63,6 +65,7 @@ namespace pomai::core
         std::vector<std::uint32_t> BuildProbeShards(std::span<const float> query, const SearchOptions& opts);
 
         pomai::DBOptions opt_;
+        pomai::MembraneKind kind_;
         bool opened_ = false;
 
         std::vector<std::unique_ptr<Shard>> shards_;

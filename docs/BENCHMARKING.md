@@ -9,6 +9,10 @@ This guide explains how to run comprehensive benchmarks on PomaiDB using industr
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target comprehensive_bench
 
+# RAG benchmark (token + optional vector search)
+cmake --build build --target rag_bench
+./build/rag_bench
+
 # Run small dataset (10K vectors)
 ./build/comprehensive_bench
 

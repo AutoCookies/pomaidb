@@ -4,9 +4,10 @@
 #include <utility>
 #include <vector>
 
-#include "core/engine/engine.h"
-#include "storage/manifest/manifest.h"
+#include "core/vector_engine/vector_engine.h"
+#include "core/rag/rag_engine.h"
 #include "pomai/iterator.h"  // For SnapshotIterator
+#include "storage/manifest/manifest.h"
 
 
 namespace pomai::core
@@ -39,7 +40,14 @@ namespace pomai::core
             opt.index_params = loaded_spec.index_params;
             opt.path = base_.path + "/membranes/" + spec.name;
 
-            engines_.emplace(spec.name, std::make_unique<Engine>(opt));
+            MembraneState state;
+            state.spec = loaded_spec;
+            if (loaded_spec.kind == pomai::MembraneKind::kVector) {
+                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind);
+            } else {
+                state.rag_engine = std::make_unique<RagEngine>(opt, loaded_spec);
+            }
+            membranes_.emplace(spec.name, std::move(state));
             st = Status::Ok(); // clear error
         }
         else if (!st.ok())
@@ -67,13 +75,21 @@ namespace pomai::core
             if (!st.ok()) return st;
 
             // Register engine in manager
-            if (engines_.find(name) == engines_.end()) {
+            if (membranes_.find(name) == membranes_.end()) {
                 pomai::DBOptions opt = base_;
                 opt.dim = mspec.dim;
                 opt.shard_count = mspec.shard_count;
                 opt.index_params = mspec.index_params;
                 opt.path = base_.path + "/membranes/" + name;
-                engines_.emplace(name, std::make_unique<Engine>(opt));
+
+                MembraneState state;
+                state.spec = mspec;
+                if (mspec.kind == pomai::MembraneKind::kVector) {
+                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind);
+                } else {
+                    state.rag_engine = std::make_unique<RagEngine>(opt, mspec);
+                }
+                membranes_.emplace(name, std::move(state));
             }
 
             st = OpenMembrane(name);
@@ -90,30 +106,46 @@ namespace pomai::core
 
     Status MembraneManager::FlushAll()
     {
-        for (auto &kv : engines_)
+        for (auto &kv : membranes_)
         {
-            auto st = kv.second->Flush();
-            if (!st.ok())
-                return st;
+            if (kv.second.vector_engine) {
+                auto st = kv.second.vector_engine->Flush();
+                if (!st.ok())
+                    return st;
+            }
         }
         return Status::Ok();
     }
 
     Status MembraneManager::CloseAll()
     {
-        for (auto &kv : engines_)
-            (void)kv.second->Close();
-        engines_.clear();
+        for (auto &kv : membranes_) {
+            if (kv.second.vector_engine) {
+                (void)kv.second.vector_engine->Close();
+            }
+            if (kv.second.rag_engine) {
+                (void)kv.second.rag_engine->Close();
+            }
+        }
+        membranes_.clear();
         opened_ = false;
         return Status::Ok();
     }
 
-    Engine *MembraneManager::GetEngineOrNull(std::string_view name) const
+    MembraneManager::MembraneState *MembraneManager::GetMembraneOrNull(std::string_view name)
     {
-        auto it = engines_.find(std::string(name));
-        if (it == engines_.end())
+        auto it = membranes_.find(std::string(name));
+        if (it == membranes_.end())
             return nullptr;
-        return it->second.get();
+        return &it->second;
+    }
+
+    const MembraneManager::MembraneState *MembraneManager::GetMembraneOrNull(std::string_view name) const
+    {
+        auto it = membranes_.find(std::string(name));
+        if (it == membranes_.end())
+            return nullptr;
+        return &it->second;
     }
 
     Status MembraneManager::CreateMembrane(const pomai::MembraneSpec &spec)
@@ -125,7 +157,7 @@ namespace pomai::core
         if (spec.shard_count == 0)
             return Status::InvalidArgument("membrane shard_count must be > 0");
 
-        if (engines_.find(spec.name) != engines_.end())
+        if (membranes_.find(spec.name) != membranes_.end())
             return Status::AlreadyExists("membrane already exists");
 
         // 1. Persist to Manifest
@@ -141,14 +173,21 @@ namespace pomai::core
         // Keep simple on-disk layout (no manifest integration yet here).
         opt.path = base_.path + "/membranes/" + spec.name;
 
-        engines_.emplace(spec.name, std::make_unique<Engine>(opt));
+        MembraneState state;
+        state.spec = spec;
+        if (spec.kind == pomai::MembraneKind::kVector) {
+            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind);
+        } else {
+            state.rag_engine = std::make_unique<RagEngine>(opt, spec);
+        }
+        membranes_.emplace(spec.name, std::move(state));
         return Status::Ok();
     }
 
     Status MembraneManager::DropMembrane(std::string_view name)
     {
-        auto it = engines_.find(std::string(name));
-        if (it == engines_.end())
+        auto it = membranes_.find(std::string(name));
+        if (it == membranes_.end())
             return Status::NotFound("membrane not found");
 
         // 1. Persist to Manifest
@@ -156,25 +195,36 @@ namespace pomai::core
         if (!st.ok()) return st;
 
         // 2. Remove from Memory
-        (void)it->second->Close();
-        engines_.erase(it);
+        if (it->second.vector_engine) {
+            (void)it->second.vector_engine->Close();
+        }
+        if (it->second.rag_engine) {
+            (void)it->second.rag_engine->Close();
+        }
+        membranes_.erase(it);
         return Status::Ok();
     }
 
     Status MembraneManager::OpenMembrane(std::string_view name)
     {
-        auto *e = GetEngineOrNull(name);
-        if (!e)
+        auto *state = GetMembraneOrNull(name);
+        if (!state)
             return Status::NotFound("membrane not found");
-        return e->Open();
+        if (state->spec.kind == pomai::MembraneKind::kVector) {
+            return state->vector_engine->Open();
+        }
+        return state->rag_engine->Open();
     }
 
     Status MembraneManager::CloseMembrane(std::string_view name)
     {
-        auto *e = GetEngineOrNull(name);
-        if (!e)
+        auto *state = GetMembraneOrNull(name);
+        if (!state)
             return Status::NotFound("membrane not found");
-        return e->Close();
+        if (state->spec.kind == pomai::MembraneKind::kVector) {
+            return state->vector_engine->Close();
+        }
+        return state->rag_engine->Close();
     }
 
     Status MembraneManager::ListMembranes(std::vector<std::string> *out) const
@@ -182,8 +232,8 @@ namespace pomai::core
         if (!out)
             return Status::InvalidArgument("out is null");
         out->clear();
-        out->reserve(engines_.size());
-        for (const auto &kv : engines_)
+        out->reserve(membranes_.size());
+        for (const auto &kv : membranes_)
             out->push_back(kv.first);
         std::sort(out->begin(), out->end());
         return Status::Ok();
@@ -191,27 +241,56 @@ namespace pomai::core
 
     Status MembraneManager::Put(std::string_view membrane, VectorId id, std::span<const float> vec)
     {
-        auto *e = GetEngineOrNull(membrane);
-        if (!e)
-            return Status::NotFound("membrane not found");
-        return e->Put(id, vec);
+        return PutVector(membrane, id, vec);
     }
 
     Status MembraneManager::Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta)
     {
-        auto *e = GetEngineOrNull(membrane);
-        if (!e)
+        return PutVector(membrane, id, vec, meta);
+    }
+
+    Status MembraneManager::PutVector(std::string_view membrane, VectorId id, std::span<const float> vec)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
             return Status::NotFound("membrane not found");
-        return e->Put(id, vec, meta);
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for PutVector");
+        return state->vector_engine->Put(id, vec);
+    }
+
+    Status MembraneManager::PutVector(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
+            return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for PutVector");
+        return state->vector_engine->Put(id, vec, meta);
+    }
+
+    Status MembraneManager::PutChunk(std::string_view membrane, const pomai::RagChunk& chunk)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
+            return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kRag)
+            return Status::InvalidArgument("RAG membrane required for PutChunk");
+        if (chunk.tokens.empty()) {
+            return Status::InvalidArgument("RAG membrane requires token_blob; vector-only payload rejected");
+        }
+        return state->rag_engine->PutChunk(chunk);
     }
 
     Status MembraneManager::PutBatch(std::string_view membrane,
                                      const std::vector<VectorId>& ids,
                                      const std::vector<std::span<const float>>& vectors)
     {
-        auto *e = GetEngineOrNull(membrane);
-        if (!e) return Status::NotFound("membrane not found");
-        return e->PutBatch(ids, vectors);
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for PutBatch");
+        return state->vector_engine->PutBatch(ids, vectors);
     }
 
     Status MembraneManager::Get(std::string_view membrane, VectorId id, std::vector<float> *out)
@@ -223,28 +302,34 @@ namespace pomai::core
     {
         if (!out)
             return Status::InvalidArgument("out is null");
-        auto *e = GetEngineOrNull(membrane);
-        if (!e)
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
             return Status::NotFound("membrane not found");
-        return e->Get(id, out, out_meta);
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for Get");
+        return state->vector_engine->Get(id, out, out_meta);
     }
 
     Status MembraneManager::Exists(std::string_view membrane, VectorId id, bool *exists)
     {
         if (!exists)
             return Status::InvalidArgument("exists is null");
-        auto *e = GetEngineOrNull(membrane);
-        if (!e)
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
             return Status::NotFound("membrane not found");
-        return e->Exists(id, exists);
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for Exists");
+        return state->vector_engine->Exists(id, exists);
     }
 
     Status MembraneManager::Delete(std::string_view membrane, VectorId id)
     {
-        auto *e = GetEngineOrNull(membrane);
-        if (!e)
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
             return Status::NotFound("membrane not found");
-        return e->Delete(id);
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for Delete");
+        return state->vector_engine->Delete(id);
     }
 
     Status MembraneManager::Search(std::string_view membrane, std::span<const float> query,
@@ -257,50 +342,87 @@ namespace pomai::core
     Status MembraneManager::Search(std::string_view membrane, std::span<const float> query,
                                    std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out)
     {
+        return SearchVector(membrane, query, topk, opts, out);
+    }
+
+    Status MembraneManager::SearchVector(std::string_view membrane, std::span<const float> query,
+                                         std::uint32_t topk, pomai::SearchResult *out)
+    {
+        return SearchVector(membrane, query, topk, SearchOptions{}, out);
+    }
+
+    Status MembraneManager::SearchVector(std::string_view membrane, std::span<const float> query,
+                                         std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out)
+    {
         if (!out)
             return Status::InvalidArgument("out is null");
-        auto *e = GetEngineOrNull(membrane);
-        if (!e)
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
             return Status::NotFound("membrane not found");
-        return e->Search(query, topk, opts, out);
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for Search");
+        return state->vector_engine->Search(query, topk, opts, out);
+    }
+
+    Status MembraneManager::SearchRag(std::string_view membrane, const pomai::RagQuery& query,
+                                      const pomai::RagSearchOptions& opts, pomai::RagSearchResult *out)
+    {
+        if (!out)
+            return Status::InvalidArgument("out is null");
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
+            return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kRag)
+            return Status::InvalidArgument("RAG membrane required for SearchRag");
+        return state->rag_engine->Search(query, opts, out);
     }
 
     Status MembraneManager::Freeze(std::string_view membrane)
     {
-        auto *e = GetEngineOrNull(membrane);
-        if (!e) return Status::NotFound("membrane not found");
-        return e->Freeze();
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for Freeze");
+        return state->vector_engine->Freeze();
     }
 
     Status MembraneManager::Compact(std::string_view membrane)
     {
-        auto *e = GetEngineOrNull(membrane);
-        if (!e) return Status::NotFound("membrane not found");
-        return e->Compact();
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for Compact");
+        return state->vector_engine->Compact();
     }
 
     Status MembraneManager::NewIterator(std::string_view membrane, std::unique_ptr<pomai::SnapshotIterator> *out)
     {
         if (!out) return Status::InvalidArgument("out is null");
-        auto *e = GetEngineOrNull(membrane);
-        if (!e) return Status::NotFound("membrane not found");
-        return e->NewIterator(out);
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for iterator");
+        return state->vector_engine->NewIterator(out);
     }
 
     Status MembraneManager::GetSnapshot(std::string_view membrane, std::shared_ptr<pomai::Snapshot>* out)
     {
         if (!out) return Status::InvalidArgument("out is null");
-        auto *e = GetEngineOrNull(membrane);
-        if (!e) return Status::NotFound("membrane not found");
-        return e->GetSnapshot(out);
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for snapshot");
+        return state->vector_engine->GetSnapshot(out);
     }
 
     Status MembraneManager::NewIterator(std::string_view membrane, const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out)
     {
         if (!out) return Status::InvalidArgument("out is null");
-        auto *e = GetEngineOrNull(membrane);
-        if (!e) return Status::NotFound("membrane not found");
-        return e->NewIterator(snap, out);
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for iterator");
+        return state->vector_engine->NewIterator(snap, out);
     }
 
 } // namespace pomai::core

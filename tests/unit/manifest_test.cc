@@ -68,6 +68,7 @@ namespace
         b.metric = pomai::MetricType::kCosine;
         b.index_params.nlist = 99;
         b.index_params.nprobe = 10;
+        b.kind = pomai::MembraneKind::kRag;
 
         POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, a));
         POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, b));
@@ -86,6 +87,7 @@ namespace
         POMAI_EXPECT_TRUE(got.metric == pomai::MetricType::kCosine);
         POMAI_EXPECT_EQ(got.index_params.nlist, static_cast<std::uint32_t>(99));
         POMAI_EXPECT_EQ(got.index_params.nprobe, static_cast<std::uint32_t>(10));
+        POMAI_EXPECT_TRUE(got.kind == pomai::MembraneKind::kRag);
 
         // Create again => AlreadyExists.
         auto st = pomai::storage::Manifest::CreateMembrane(root, a);
@@ -96,8 +98,8 @@ namespace
         const auto b_manifest = (fs::path(root) / "membranes" / "beta" / "MANIFEST").string();
         POMAI_EXPECT_TRUE(fs::exists(b_manifest));
         const std::string mcontent = ReadAllOrDie(b_manifest);
-        // Expect v2 header
-        POMAI_EXPECT_TRUE(mcontent.rfind("pomai.membrane.v2\n", 0) == 0);
+        // Expect v3 header
+        POMAI_EXPECT_TRUE(mcontent.rfind("pomai.membrane.v3\n", 0) == 0);
 
         POMAI_EXPECT_OK(pomai::storage::Manifest::DropMembrane(root, "alpha"));
 
