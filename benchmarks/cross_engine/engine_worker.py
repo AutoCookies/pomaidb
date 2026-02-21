@@ -21,6 +21,12 @@ def load_f32bin(path: Path):
     return arr
 
 
+def normalize_rows(x: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    return x / norms
+
+
 def recall_at_k(pred_ids: np.ndarray, gt_ids: np.ndarray, k: int = 10) -> float:
     hits = 0
     for i in range(pred_ids.shape[0]):
@@ -173,10 +179,10 @@ def run_pomai(base, queries, gt, lib_path: Path, repeats: int):
     }
 
 
-def run_hnswlib(base, queries, gt, repeats: int):
+def run_hnswlib(base, queries, gt, repeats: int, metric: str):
     import hnswlib
 
-    idx = hnswlib.Index(space="l2", dim=base.shape[1])
+    idx = hnswlib.Index(space="l2" if metric == "l2" else "ip", dim=base.shape[1])
     t0 = time.perf_counter()
     idx.init_index(max_elements=base.shape[0], M=16, ef_construction=200)
     build_base = time.perf_counter() - t0
@@ -214,10 +220,15 @@ def run_hnswlib(base, queries, gt, repeats: int):
     }
 
 
-def run_faiss_flat(base, queries, gt, repeats: int):
+def run_faiss_flat(base, queries, gt, repeats: int, metric: str):
     import faiss
 
-    idx = faiss.IndexFlatL2(base.shape[1])
+    if metric == "l2":
+        idx = faiss.IndexFlatL2(base.shape[1])
+        engine_name = "faiss.IndexFlatL2"
+    else:
+        idx = faiss.IndexFlatIP(base.shape[1])
+        engine_name = "faiss.IndexFlatIP"
     t0 = time.perf_counter()
     idx.add(base)
     ingest = time.perf_counter() - t0
@@ -238,7 +249,7 @@ def run_faiss_flat(base, queries, gt, repeats: int):
     shutil.rmtree(tmp, ignore_errors=True)
 
     return {
-        "engine": "faiss.IndexFlatL2",
+        "engine": engine_name,
         "params": {"topk": 10},
         "ingestion_time_s": ingest,
         "index_build_time_s": 0.0,
@@ -249,10 +260,15 @@ def run_faiss_flat(base, queries, gt, repeats: int):
     }
 
 
-def run_faiss_hnsw(base, queries, gt, repeats: int):
+def run_faiss_hnsw(base, queries, gt, repeats: int, metric: str):
     import faiss
 
-    idx = faiss.IndexHNSWFlat(base.shape[1], 32)
+    if metric == "l2":
+        idx = faiss.IndexHNSWFlat(base.shape[1], 32)
+        engine_name = "faiss.IndexHNSWFlat(L2)"
+    else:
+        idx = faiss.IndexHNSWFlat(base.shape[1], 32, faiss.METRIC_INNER_PRODUCT)
+        engine_name = "faiss.IndexHNSWFlat(IP)"
     idx.hnsw.efConstruction = 200
     idx.hnsw.efSearch = 64
     t0 = time.perf_counter()
@@ -275,7 +291,7 @@ def run_faiss_hnsw(base, queries, gt, repeats: int):
     shutil.rmtree(tmp, ignore_errors=True)
 
     return {
-        "engine": "faiss.IndexHNSWFlat",
+        "engine": engine_name,
         "params": {"M": 32, "efConstruction": 200, "efSearch": 64, "topk": 10},
         "ingestion_time_s": ingest,
         "index_build_time_s": 0.0,
@@ -295,25 +311,30 @@ def main():
     p.add_argument("--libpomai", default="")
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--output", required=True)
+    p.add_argument("--metric", choices=["l2", "ip", "cosine"], default="ip")
     args = p.parse_args()
 
     base = load_f32bin(Path(args.dataset))
     queries = load_f32bin(Path(args.queries))
+    if args.metric == "cosine":
+        base = normalize_rows(base)
+        queries = normalize_rows(queries)
     gt = np.load(args.ground_truth)
 
     if args.engine == "pomai":
         result = run_pomai(base, queries, gt, Path(args.libpomai), args.repeats)
     elif args.engine == "hnswlib":
-        result = run_hnswlib(base, queries, gt, args.repeats)
+        result = run_hnswlib(base, queries, gt, args.repeats, args.metric)
     elif args.engine == "faiss_flat":
-        result = run_faiss_flat(base, queries, gt, args.repeats)
+        result = run_faiss_flat(base, queries, gt, args.repeats, args.metric)
     elif args.engine == "faiss_hnsw":
-        result = run_faiss_hnsw(base, queries, gt, args.repeats)
+        result = run_faiss_hnsw(base, queries, gt, args.repeats, args.metric)
     else:
         raise ValueError(f"Unsupported engine: {args.engine}")
 
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     result["peak_rss_mb"] = float(rss_kb / 1024.0)
+    result["metric"] = args.metric
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)

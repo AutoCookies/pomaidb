@@ -41,12 +41,46 @@ def gather_system_info():
     return {"cpu_model": cpu_model, "ram": mem_total, "os_version": os_version}
 
 
-def build_ground_truth(base: np.ndarray, queries: np.ndarray, k: int = 10):
-    dists = np.sum((queries[:, None, :] - base[None, :, :]) ** 2, axis=2)
-    return np.argpartition(dists, kth=k - 1, axis=1)[:, :k]
+def normalize_rows(x: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-12)
+    return x / norms
 
 
-def run_worker(py, worker, engine, out_json, dataset, queries, gt, libpomai=None):
+def build_ground_truth(base: np.ndarray, queries: np.ndarray, k: int, metric: str):
+    if metric == "l2":
+        dists = np.sum((queries[:, None, :] - base[None, :, :]) ** 2, axis=2)
+        return np.argpartition(dists, kth=k - 1, axis=1)[:, :k]
+    if metric in ("ip", "cosine"):
+        scores = queries @ base.T
+        return np.argpartition(-scores, kth=k - 1, axis=1)[:, :k]
+    raise ValueError(f"Unsupported metric: {metric}")
+
+
+def assert_exact_recall(base: np.ndarray, queries: np.ndarray, gt: np.ndarray, metric: str, k: int = 10):
+    import faiss
+
+    if metric == "l2":
+        idx = faiss.IndexFlatL2(base.shape[1])
+        baseline_name = "faiss.IndexFlatL2"
+    else:
+        idx = faiss.IndexFlatIP(base.shape[1])
+        baseline_name = "faiss.IndexFlatIP"
+    idx.add(base)
+    _, pred = idx.search(queries, k)
+
+    hits = 0
+    for i in range(pred.shape[0]):
+        hits += len(set(pred[i, :k].tolist()).intersection(set(gt[i, :k].tolist())))
+    recall = hits / float(pred.shape[0] * k)
+    if recall < 0.999:
+        raise RuntimeError(
+            f"Ground-truth sanity check failed for metric={metric}: "
+            f"{baseline_name} recall={recall:.6f} (expected >= 0.999)."
+        )
+
+
+def run_worker(py, worker, engine, out_json, dataset, queries, gt, metric, libpomai=None):
     cmd = [
         py,
         str(worker),
@@ -62,6 +96,8 @@ def run_worker(py, worker, engine, out_json, dataset, queries, gt, libpomai=None
         "3",
         "--output",
         str(out_json),
+        "--metric",
+        str(metric),
     ]
     if libpomai:
         cmd += ["--libpomai", str(libpomai)]
@@ -106,6 +142,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--output-dir", default="benchmarks/cross_engine/output")
     p.add_argument("--libpomai", default="build/libpomai_c.so")
+    p.add_argument("--metric", choices=["l2", "ip", "cosine"], default="ip")
     args = p.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -116,12 +153,17 @@ def main():
     base = np.random.uniform(0.0, 1.0, size=(n, dim)).astype(np.float32)
     queries = np.random.uniform(0.0, 1.0, size=(nq, dim)).astype(np.float32)
 
+    if args.metric == "cosine":
+        base = normalize_rows(base)
+        queries = normalize_rows(queries)
+
     dataset_path = out_dir / "dataset_base.f32bin"
     query_path = out_dir / "dataset_queries.f32bin"
     gt_path = out_dir / "ground_truth_top10.npy"
     save_f32bin(dataset_path, base)
     save_f32bin(query_path, queries)
-    gt = build_ground_truth(base, queries, 10)
+    gt = build_ground_truth(base, queries, 10, args.metric)
+    assert_exact_recall(base, queries, gt, args.metric, 10)
     np.save(gt_path, gt)
 
     worker = Path(__file__).with_name("engine_worker.py")
@@ -145,6 +187,7 @@ def main():
             dataset_path,
             query_path,
             gt_path,
+            args.metric,
             libpomai=extra.get("libpomai"),
         )
         with open(out_json, "r", encoding="utf-8") as f:
@@ -157,14 +200,23 @@ def main():
     system_info = gather_system_info()
     payload = {
         "seed": 42,
-        "dataset": {"vectors": n, "queries": nq, "dimension": dim, "distribution": "uniform[0,1]", "dtype": "float32"},
+        "metric": args.metric,
+        "dataset": {
+            "vectors": n,
+            "queries": nq,
+            "dimension": dim,
+            "distribution": "uniform[0,1]",
+            "dtype": "float32",
+            "normalized": args.metric == "cosine",
+            "similarity": "ip" if args.metric in ("ip", "cosine") else "l2",
+        },
         "system": system_info,
         "results": outputs,
         "skipped_optional": skipped,
         "commands": [
             "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release",
             "cmake --build build -j",
-            "python3 benchmarks/cross_engine/run_benchmark.py --output-dir benchmarks/cross_engine/output --libpomai build/libpomai_c.so",
+            f"python3 benchmarks/cross_engine/run_benchmark.py --output-dir benchmarks/cross_engine/output --libpomai build/libpomai_c.so --metric {args.metric}",
         ],
     }
 
@@ -185,6 +237,8 @@ def main():
         "- Seed: 42",
         "- Dataset: 100,000 base vectors, 1,000 query vectors, dim=128, float32, uniform [0,1]",
         "- K: 10",
+        f"- Metric: {args.metric}",
+        f"- Normalization applied: {args.metric == 'cosine'}",
         "",
         "## Commands Used",
     ]
@@ -222,10 +276,13 @@ def main():
     lines += [
         "",
         "## Analysis",
+        f"- Exact baseline (Faiss {'IndexFlatL2' if args.metric == 'l2' else 'IndexFlatIP'}) provides recall=1.0 for the chosen metric.",
+        f"- Metric used: **{args.metric}**.",
+        f"- Input normalization applied: **{args.metric == 'cosine'}**.",
         f"- Fastest throughput: **{best_qps['engine']}** ({best_qps['query_throughput_qps']:.2f} QPS).",
         f"- Lowest latency: **{best_lat['engine']}** ({best_lat['avg_latency_ms']:.3f} ms/query).",
         f"- Lowest memory: **{best_mem['engine']}** ({best_mem['peak_rss_mb']:.2f} MB peak RSS).",
-        "- Accuracy/performance tradeoff: exact methods (Faiss IndexFlatL2) are expected to have strongest recall at higher compute cost; graph methods (hnswlib/Faiss HNSW/PomaiDB's current indexing path) trade some recall for speed and memory depending on parameters.",
+        "- Accuracy/performance tradeoff: exact methods provide strongest recall at higher compute cost; graph methods (hnswlib/Faiss HNSW/PomaiDB's current indexing path) trade some recall for speed and memory depending on parameters.",
         "- PomaiDB standing: compare its table row with graph-based peers and exact baseline to assess whether it is closer to high-recall or high-throughput operation under default safe durability settings.",
         "",
         "## Plot Artifacts",
