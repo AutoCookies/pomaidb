@@ -11,6 +11,7 @@
 #include "pomai/status.h"
 #include "pomai/types.h"
 #include "pomai/metadata.h"
+#include "pomai/quantization/scalar_quantizer.h"
 #include "util/posix_file.h"
 
 // Forward declare in correct namespace
@@ -19,9 +20,9 @@ namespace pomai::index { class IvfFlatIndex; }
 namespace pomai::table
 {
 
-    // On-disk format V3 (Metadata support):
+    // On-disk format V4 (Metadata & Quantization support):
     // [Header]
-    // [Entry 0: ID (8 bytes) | Flags (1 byte) | Vector (dim * 4 bytes)]
+    // [Entry 0: ID (8 bytes) | Flags (1 byte) | Vector (dim * 4 bytes if V3, dim * 1 bytes if V4 quantized)]
     // ...
     // [Entry N-1]
     // [Metadata Block (Optional, V3+)]
@@ -32,11 +33,15 @@ namespace pomai::table
     struct SegmentHeader
     {
         char magic[12]; // "pomai.seg.v1"
-        uint32_t version; // 3
+        uint32_t version; // 4
         uint32_t count;
         uint32_t dim;
-        uint32_t metadata_offset; // V3: Offset to metadata block (0 if none)
-        uint32_t reserved[7];
+        uint32_t metadata_offset; // V3+: Offset to metadata block (0 if none)
+        uint8_t  is_quantized;    // V4+: 1 if vectors are SQ8 (uint8_t)
+        uint8_t  reserved1[3];
+        float    quant_min;       // SQ8 minimum bound
+        float    quant_inv_scale; // SQ8 global inverse scale
+        uint32_t reserved2[4];
     };
 
     // Flags
@@ -53,6 +58,11 @@ namespace pomai::table
         // Looks up a vector by ID. 
         pomai::Status Get(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const;
         pomai::Status Get(pomai::VectorId id, std::span<const float> *out_vec) const;
+        
+        // V4: Quantized raw lookup
+        bool IsQuantized() const { return is_quantized_; }
+        const core::ScalarQuantizer8Bit* GetQuantizer() const { return quantizer_.get(); }
+        pomai::Status GetQuantized(pomai::VectorId id, std::span<const uint8_t>* out_codes, pomai::Metadata* out_meta) const;
 
         enum class FindResult {
             kFound,
@@ -61,6 +71,12 @@ namespace pomai::table
         };
         FindResult Find(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const;
         FindResult Find(pomai::VectorId id, std::span<const float> *out_vec) const;
+        
+        // Internal raw search helper
+        FindResult FindRaw(pomai::VectorId id, const uint8_t** raw_payload, pomai::Metadata* out_meta) const;
+
+        // Decodes a quantized vector on-the-fly, or returns mapped float vec
+        FindResult FindAndDecode(pomai::VectorId id, std::span<const float>* out_vec_mapped, std::vector<float>* out_vec_decoded, pomai::Metadata* out_meta) const;
         
         // Approximate Search via IVF Index.
         pomai::Status Search(std::span<const float> query, uint32_t nprobe, 
@@ -95,9 +111,8 @@ namespace pomai::table
                  uint64_t id = 0;
                  std::memcpy(&id, p, sizeof(id));
                  uint8_t flags = *(p + 8);
-                 const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
+                 const void* vec_ptr = reinterpret_cast<const void*>(p + 12);
                  
-                 std::span<const float> vec(vec_ptr, dim_);
                  bool is_deleted = (flags & kFlagTombstone);
                  
                  pomai::Metadata meta_obj;
@@ -114,7 +129,20 @@ namespace pomai::table
                      }
                  }
                  
-                 func(static_cast<pomai::VectorId>(id), vec, is_deleted, meta_ptr);
+                 std::vector<float> decoded;
+                 std::span<const float> vec_span;
+                 
+                 if (!is_deleted) {
+                     if (is_quantized_) {
+                         std::span<const uint8_t> codes(static_cast<const uint8_t*>(vec_ptr), dim_);
+                         decoded = quantizer_->Decode(codes);
+                         vec_span = decoded;
+                     } else {
+                         vec_span = std::span<const float>(static_cast<const float*>(vec_ptr), dim_);
+                     }
+                 }
+                 
+                 func(static_cast<pomai::VectorId>(id), vec_span, is_deleted, meta_ptr);
                  
                  p += entry_size_;
             }
@@ -133,6 +161,10 @@ namespace pomai::table
         uint32_t dim_ = 0;
         std::size_t entry_size_ = 0;
         uint32_t metadata_offset_ = 0;
+        
+        // V4: Quantization properties
+        bool is_quantized_{false};
+        std::unique_ptr<core::ScalarQuantizer8Bit> quantizer_;
         
         const uint8_t* base_addr_ = nullptr;
         std::size_t file_size_ = 0;

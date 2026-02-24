@@ -29,6 +29,7 @@ add_library(pomai STATIC
   src/storage/manifest/manifest.cc
   src/table/segment.cc
 
+  src/core/quantization/scalar_quantizer.cc
   src/core/index/ivf_coarse.cc
   src/core/index/ivf_flat.cc
   src/core/distance.cc

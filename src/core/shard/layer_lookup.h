@@ -20,6 +20,7 @@ enum class LookupState {
 struct LookupResult {
     LookupState state{LookupState::kNotFound};
     std::span<const float> vec{};
+    std::vector<float> decoded_vec;
     pomai::Metadata meta{};
 };
 

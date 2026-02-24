@@ -1294,16 +1294,35 @@ namespace pomai::core
                         if (!entry || entry->source != source || entry->is_tombstone) {
                             continue;
                         }
-                        std::span<const float> vec;
-                        pomai::Metadata meta;
-                        auto st = seg->Get(id, &vec, &meta);
-                        if (!st.ok() || vec.empty()) {
-                            continue;
+
+                        float score = 0.0f;
+                        if (seg->IsQuantized()) {
+                            std::span<const uint8_t> codes;
+                            pomai::Metadata meta;
+                            auto st = seg->GetQuantized(id, &codes, &meta);
+                            if (!st.ok() || codes.empty()) {
+                                continue;
+                            }
+                            if (!core::FilterEvaluator::Matches(meta, opts)) {
+                                continue;
+                            }
+                            // The task requested Dot/L2 directly. TopK in PomaiDB max-heaps the "score". 
+                            // Since ComputeDistance calculates Inner Product (Dot), we use it natively as score.
+                            score = seg->GetQuantizer()->ComputeDistance(query, codes);
+                        } else {
+                            std::span<const float> vec;
+                            pomai::Metadata meta;
+                            auto st = seg->Get(id, &vec, &meta);
+                            if (!st.ok() || vec.empty()) {
+                                continue;
+                            }
+                            if (!core::FilterEvaluator::Matches(meta, opts)) {
+                                continue;
+                            }
+                            // Assuming original handles L2 as negative score natively or defaults to dot product.
+                            score = pomai::core::Dot(query, vec);
                         }
-                        if (!core::FilterEvaluator::Matches(meta, opts)) {
-                            continue;
-                        }
-                        float score = pomai::core::Dot(query, vec);
+                        
                         local.Push(id, score);
                     }
                 }
