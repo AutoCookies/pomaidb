@@ -1,4 +1,5 @@
 #include "pomai/quantization/scalar_quantizer.h"
+#include "core/distance.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,20 +104,8 @@ float ScalarQuantizer8Bit::ComputeDistance(std::span<const float> query, std::sp
         return -1.0f; // Soft error state since exceptions are disallowed
     }
 
-    float distance = 0.0f;
-    const float min_val = global_min_;
-    const float inv_scale = global_inv_scale_;
-
-    // Asymmetric distance calculation:
-    // Instead of allocating a full decoded array, we decode iteratively in the same loop 
-    // where we compute the L2 distance. This keeps data strictly in L1 cache and registers.
-    // The pipeline uses floating point Multiply-Add streams with no conditionals.
-    for (size_t i = 0; i < dim_; ++i) {
-        const float approx_val = min_val + static_cast<float>(codes[i]) * inv_scale;
-        distance += query[i] * approx_val;
-    }
-
-    return distance; // Returns Inner Product (Dot product)
+    // Call out to the optimized global dispatcher which dynamically employs AVX2 if supported
+    return pomai::core::DotSq8(query, codes, global_min_, global_inv_scale_);
 }
 
 void ScalarQuantizer8Bit::LoadState(float min_val, float inv_scale) {
