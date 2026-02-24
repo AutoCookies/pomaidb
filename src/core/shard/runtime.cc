@@ -1285,9 +1285,7 @@ namespace pomai::core
             if (cand_status.ok() && !cand_ids.empty()) {
                 std::sort(cand_ids.begin(), cand_ids.end());
                 cand_ids.erase(std::unique(cand_ids.begin(), cand_ids.end()), cand_ids.end());
-                if (cand_ids.size() > max_candidates) {
-                    cand_ids.resize(max_candidates);
-                }
+// Removed arbitrary truncation by VectorId to preserve recall.
                 if (cand_ids.size() >= min_candidates || !allow_fallback) {
                     used_candidates = true;
                     for (const auto id : cand_ids) {

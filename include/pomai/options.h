@@ -27,7 +27,7 @@ namespace pomai
     struct IndexParams
     {
         uint32_t nlist = 64;
-        uint32_t nprobe = 10;
+        uint32_t nprobe = 16;
     };
 
     struct DBOptions
