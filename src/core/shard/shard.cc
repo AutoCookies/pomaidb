@@ -46,6 +46,11 @@ namespace pomai::core
         return rt_->Delete(id);
     }
 
+    pomai::Status Shard::GetSemanticPointer(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out)
+    {
+        return rt_->GetSemanticPointer(std::move(snap), id, out);
+    }
+
     pomai::Status Shard::Flush()
     {
         return rt_->Flush();

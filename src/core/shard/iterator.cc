@@ -148,7 +148,13 @@ namespace pomai::core
             if (st.ok()) {
                 current_id_ = id;
                 if (!is_deleted) {
-                    current_vec_.assign(vec.begin(), vec.end());
+                    if (seg->IsQuantized()) {
+                        std::vector<float> decoded;
+                        seg->FindAndDecode(id, nullptr, &decoded, nullptr);
+                        current_vec_.assign(decoded.begin(), decoded.end());
+                    } else {
+                        current_vec_.assign(vec.begin(), vec.end());
+                    }
                 } else {
                     current_vec_.clear(); // Tombstone: clear vector
                 }

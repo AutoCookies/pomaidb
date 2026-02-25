@@ -150,6 +150,8 @@ namespace pomai::core
              return current_snapshot_.load(std::memory_order_acquire);
         }
 
+        pomai::Status GetSemanticPointer(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out);
+
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
                              std::vector<pomai::SearchHit> *out);

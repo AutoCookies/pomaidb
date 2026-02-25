@@ -69,7 +69,8 @@ POMAI_TEST(ShardConcurrency_ParallelPuts) {
             POMAI_EXPECT_OK(st);
             POMAI_EXPECT_EQ(out.size(), 4u);
             if (out.size() == 4) {
-                POMAI_EXPECT_EQ(out[0], static_cast<float>(id));
+                // SQ8 across 4000 elements can mean max diff of ~15.0
+                POMAI_EXPECT_TRUE(std::abs(out[0] - static_cast<float>(id)) < 20.0f);
             }
         }
     }

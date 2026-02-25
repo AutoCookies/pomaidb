@@ -41,7 +41,9 @@ namespace pomai::table
         uint8_t  reserved1[3];
         float    quant_min;       // SQ8 minimum bound
         float    quant_inv_scale; // SQ8 global inverse scale
-        uint32_t reserved2[4];
+        uint32_t entries_start_offset; // V5+: Start of entries block (must be 4096-aligned)
+        uint32_t entry_size;           // V5+: Padded entry size
+        uint32_t reserved2[2];
     };
 
     // Flags
@@ -96,7 +98,7 @@ namespace pomai::table
         void ForEach(F &&func) const
         {
             if (count_ == 0) return;
-            const uint8_t* p = base_addr_ + sizeof(SegmentHeader);
+            const uint8_t* p = base_addr_ + entries_start_offset_;
             const uint8_t* meta_offsets_base = nullptr;
             const char* meta_blob = nullptr;
             
@@ -160,6 +162,7 @@ namespace pomai::table
         uint32_t count_ = 0;
         uint32_t dim_ = 0;
         std::size_t entry_size_ = 0;
+        uint32_t entries_start_offset_ = 0;
         uint32_t metadata_offset_ = 0;
         
         // V4: Quantization properties

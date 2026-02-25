@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "capi_utils.h"
+#include "core/memory/pin_manager.h"
 #include "pomai/version.h"
 
 namespace {
@@ -273,6 +274,9 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     if (!ParseTenantFilter(query->filter_expression, &opts)) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "filter_expression must use tenant=<value>");
     }
+    if (query->flags & POMAI_QUERY_FLAG_ZERO_COPY) {
+        opts.zero_copy = true;
+    }
 
     auto st = db->db->Search(std::span<const float>(query->vector, query->dim), query->topk, opts, &res);
     if (!st.ok() && st.code() != pomai::ErrorCode::kPartial) {
@@ -298,6 +302,19 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     w->pub.ids = w->ids.data();
     w->pub.scores = w->scores.data();
     w->pub.shard_ids = w->shard_ids.data();
+    if (opts.zero_copy && !res.zero_copy_pointers.empty()) {
+        w->pub.zero_copy_pointers = new pomai_semantic_pointer_t[res.zero_copy_pointers.size()];
+        for (size_t i = 0; i < res.zero_copy_pointers.size(); ++i) {
+            w->pub.zero_copy_pointers[i].struct_size = sizeof(pomai_semantic_pointer_t);
+            w->pub.zero_copy_pointers[i].raw_data_ptr = res.zero_copy_pointers[i].raw_data_ptr;
+            w->pub.zero_copy_pointers[i].dim = res.zero_copy_pointers[i].dim;
+            w->pub.zero_copy_pointers[i].quant_min = res.zero_copy_pointers[i].quant_min;
+            w->pub.zero_copy_pointers[i].quant_inv_scale = res.zero_copy_pointers[i].quant_inv_scale;
+            w->pub.zero_copy_pointers[i].session_id = res.zero_copy_pointers[i].session_id;
+        }
+    } else {
+        w->pub.zero_copy_pointers = nullptr;
+    }
     *out = &w->pub;
 
     if (st.code() == pomai::ErrorCode::kPartial) {
@@ -310,7 +327,14 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
 }
 
 void pomai_search_results_free(pomai_search_results_t* results) {
+    if (results && results->zero_copy_pointers) {
+        delete[] results->zero_copy_pointers;
+    }
     delete reinterpret_cast<SearchResultsWrapper*>(results);
+}
+
+void pomai_release_pointer(uint64_t session_id) {
+    pomai::core::MemoryPinManager::Instance().Unpin(session_id);
 }
 
 void pomai_free(void* p) {

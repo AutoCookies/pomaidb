@@ -15,6 +15,7 @@
 #include "core/shard/runtime.h"
 #include "core/shard/shard.h"
 #include "core/snapshot_wrapper.h"
+#include "core/memory/pin_manager.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 #include "util/logging.h"
@@ -528,6 +529,34 @@ Status VectorEngine::Search(std::span<const float> query,
     out->routed_shards_count = routed_shards_last_query_count_.load();
     out->routing_probe_centroids = routed_probe_centroids_last_query_.load();
     out->routed_buckets_count = candidates_scanned;
+
+    if (opts.zero_copy) {
+        std::shared_ptr<pomai::Snapshot> active_snap;
+        GetSnapshot(&active_snap);
+        auto snap_wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(active_snap);
+        if (snap_wrapper) {
+            auto internal_snap = snap_wrapper->GetInternal();
+            out->zero_copy_session_id = core::MemoryPinManager::Instance().Pin(active_snap);
+            out->zero_copy_pointers.reserve(out->hits.size());
+            
+            for (const auto& hit : out->hits) {
+                pomai::SemanticPointer ptr;
+                bool found = false;
+                for (auto sid : probe_shards) {
+                    if (shards_[sid]->GetSemanticPointer(internal_snap, hit.id, &ptr).ok()) {
+                        ptr.session_id = out->zero_copy_session_id;
+                        out->zero_copy_pointers.push_back(ptr);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    out->zero_copy_pointers.push_back(ptr);
+                }
+            }
+        }
+    }
+
     return Status::Ok();
 }
 

@@ -1,0 +1,8 @@
+pomai.membrane.v3
+name __default__
+shards 1
+dim 128
+kind VECTOR
+metric L2
+index_params 64 16
+Ý\%

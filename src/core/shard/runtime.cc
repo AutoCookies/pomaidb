@@ -17,6 +17,8 @@
 #include "core/shard/layer_lookup.h"
 #include <queue>
 #include "core/shard/filter_evaluator.h" // Added
+#include <iostream>
+#include <list>
 #include "pomai/metadata.h" // Added
 
 namespace pomai::core
@@ -193,6 +195,7 @@ namespace pomai::core
             std::uint64_t tombstones_purged{0};
             std::uint64_t old_versions_dropped{0};
             std::uint64_t live_entries_kept{0};
+            std::list<std::vector<float>> compact_buffers;
         };
 
         BackgroundJob(Type t, FreezeState st) : type(t), state(std::move(st)) {}
@@ -513,6 +516,28 @@ namespace pomai::core
     std::pair<pomai::Status, bool> ShardRuntime::ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id) {
         const auto lookup = LookupById(nullptr, snap, id, dim_);
         return {Status::Ok(), lookup.state == LookupState::kFound};
+    }
+
+    pomai::Status ShardRuntime::GetSemanticPointer(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out) {
+        if (!snap) return pomai::Status::InvalidArgument("snapshot null");
+        // Look in segments only since memtables are not zero-copy aligned
+        for (const auto& seg : snap->segments) {
+             const uint8_t* raw_payload = nullptr;
+             if (seg->FindRaw(id, &raw_payload, nullptr) == table::SegmentReader::FindResult::kFound) {
+                 out->raw_data_ptr = raw_payload;
+                 out->dim = seg->Dim();
+                 if (seg->IsQuantized()) {
+                     out->quant_min = seg->GetQuantizer()->GetGlobalMin();
+                     out->quant_inv_scale = seg->GetQuantizer()->GetGlobalInvScale();
+                 } else {
+                     out->quant_min = 0;
+                     out->quant_inv_scale = 1.0f;
+                 }
+                 out->session_id = 0; // Filled later
+                 return pomai::Status::Ok();
+             }
+        }
+        return pomai::Status::NotFound("vector not in segments (might be in memtable or deleted)");
     }
 
     pomai::Status ShardRuntime::Flush()
@@ -1059,9 +1084,15 @@ namespace pomai::core
                         if (top.is_deleted) {
                             state.tombstones_purged++;
                         } else {
-                            std::span<const float> vec;
+                            std::span<const float> vec_mapped;
+                            std::vector<float> vec_decoded;
                             pomai::Metadata meta;
-                            if (state.input_segments[top.seg_idx]->ReadAt(top.entry_idx, nullptr, &vec, nullptr, &meta).ok()) {
+                            auto res = state.input_segments[top.seg_idx]->FindAndDecode(top.id, &vec_mapped, &vec_decoded, &meta);
+                            if (res == table::SegmentReader::FindResult::kFound) {
+                                if (state.input_segments[top.seg_idx]->IsQuantized()) {
+                                    state.compact_buffers.push_back(std::move(vec_decoded));
+                                    vec_mapped = std::span<const float>(state.compact_buffers.back());
+                                }
                                 if (!state.builder) {
                                     auto sys_now = std::chrono::system_clock::now().time_since_epoch().count();
                                     state.filename = "seg_" + std::to_string(sys_now) + "_compacted_" +
@@ -1069,7 +1100,8 @@ namespace pomai::core
                                     state.filepath = (fs::path(shard_dir_) / state.filename).string();
                                     state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_);
                                 }
-                                auto st = state.builder->Add(top.id, pomai::VectorView(vec), false, meta);
+                                std::cout << "TEST_DEBUG COMPACT PRE-ADD id: " << top.id << " vec_mapped[0]: " << vec_mapped[0] << std::endl;
+                                auto st = state.builder->Add(top.id, pomai::VectorView(vec_mapped), false, meta);
                                 if (!st.ok()) {
                                     complete_job(pomai::Status::Internal("Compact: SegmentBuilder::Add failed: " + st.message()));
                                     return;
@@ -1129,6 +1161,7 @@ namespace pomai::core
 
                 state.built_segments.push_back({state.filename, state.filepath, std::move(reader)});
                 state.builder.reset();
+                state.compact_buffers.clear();
                 state.segment_part++;
                 state.phase = state.heap.empty() ? BackgroundJob::Phase::kCommitManifest : BackgroundJob::Phase::kBuild;
             } else if (state.phase == BackgroundJob::Phase::kCommitManifest) {

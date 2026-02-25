@@ -45,6 +45,7 @@ namespace pomai
         std::vector<Filter> filters; // AND semantics
         bool force_fanout = false;
         uint32_t routing_probe_override = 0;
+        bool zero_copy = false;
         
         SearchOptions() = default;
         

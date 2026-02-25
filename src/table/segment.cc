@@ -74,7 +74,7 @@ namespace pomai::table
         SegmentHeader h{};
         std::memset(&h, 0, sizeof(h));
         std::memcpy(h.magic, kMagic, sizeof(h.magic));
-        h.version = 4; // V4
+        h.version = 5; // V5
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
         h.is_quantized = 1; // Enable SQ8 by default for builder
@@ -99,10 +99,27 @@ namespace pomai::table
             h.quant_inv_scale = 0.0f;
         }
         
-        // Calculate Metadata Offset upfront
-        // Header + (Count * EntrySize) (V4 uses 1-byte per dim for vectors)
-        size_t entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
-        h.metadata_offset = static_cast<uint32_t>(sizeof(SegmentHeader) + entries_.size() * entry_size);
+        // Prepare metadata arrays
+        std::vector<uint64_t> offsets;
+        std::vector<char> blob;
+        offsets.reserve(entries_.size() + 1);
+        
+        // V5 variables
+        size_t entry_size = 0;
+        uint32_t entries_start_offset = 0;
+        
+        if (h.version >= 5) {
+            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
+            entry_size = (unpadded_size + 4095) & ~4095;
+            entries_start_offset = 4096;
+            h.entry_size = static_cast<uint32_t>(entry_size);
+            h.entries_start_offset = entries_start_offset;
+            h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
+        } else {
+            entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
+            entries_start_offset = sizeof(SegmentHeader);
+            h.metadata_offset = static_cast<uint32_t>(sizeof(SegmentHeader) + entries_.size() * entry_size);
+        }
 
         // Write header
         st = file.PWrite(0, &h, sizeof(h));
@@ -115,23 +132,37 @@ namespace pomai::table
         const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&h);
         crc = pomai::util::Crc32c(header_bytes, sizeof(h), crc);
 
+        if (h.version >= 5) {
+            std::vector<uint8_t> pad(entries_start_offset - sizeof(SegmentHeader), 0);
+            st = file.PWrite(offset, pad.data(), pad.size());
+            if (!st.ok()) return st;
+            crc = pomai::util::Crc32c(pad.data(), pad.size(), crc);
+            offset += pad.size();
+        }
+
         // Stream entries to disk (one at a time)
-        std::vector<uint8_t> entry_buffer;
-        entry_buffer.reserve(entry_size);
+        void* raw_buffer = nullptr;
+        if (posix_memalign(&raw_buffer, 4096, entry_size) != 0) {
+            return pomai::Status::IOError("posix_memalign failed");
+        }
+        
+        uint8_t* entry_buffer = static_cast<uint8_t*>(raw_buffer);
 
         for (const auto& e : entries_) {
-            entry_buffer.clear();
+            std::memset(entry_buffer, 0, entry_size);
+            size_t cursor = 0;
             
             // ID (8 bytes)
             const uint8_t* p_id = reinterpret_cast<const uint8_t*>(&e.id);
-            entry_buffer.insert(entry_buffer.end(), p_id, p_id + sizeof(e.id));
+            std::memcpy(entry_buffer + cursor, p_id, sizeof(e.id));
+            cursor += sizeof(e.id);
             
             // Flags + Padding (4 bytes: 1 flag + 3 pad)
             uint8_t flags = e.is_deleted ? kFlagTombstone : kFlagNone;
-            entry_buffer.push_back(flags);
-            entry_buffer.push_back(0);
-            entry_buffer.push_back(0);
-            entry_buffer.push_back(0);
+            entry_buffer[cursor++] = flags;
+            entry_buffer[cursor++] = 0;
+            entry_buffer[cursor++] = 0;
+            entry_buffer[cursor++] = 0;
 
             // Vector (dim * 1 bytes)
             std::vector<uint8_t> encoded;
@@ -141,23 +172,24 @@ namespace pomai::table
                 std::span<const float> vec_span(e.vec.data, dim_);
                 encoded = quantizer.Encode(vec_span);
             }
-            entry_buffer.insert(entry_buffer.end(), encoded.begin(), encoded.end());
+            std::memcpy(entry_buffer + cursor, encoded.data(), encoded.size());
 
             // Write entry
-            st = file.PWrite(offset, entry_buffer.data(), entry_buffer.size());
-            if (!st.ok()) return st;
+            st = file.PWrite(offset, entry_buffer, entry_size);
+            if (!st.ok()) {
+                free(raw_buffer);
+                return st;
+            }
             
             // Update CRC incrementally
-            crc = pomai::util::Crc32c(entry_buffer.data(), entry_buffer.size(), crc);
+            crc = pomai::util::Crc32c(entry_buffer, entry_size, crc);
             
-            offset += entry_buffer.size();
+            offset += entry_size;
         }
+        
+        free(raw_buffer);
 
         // Write Metadata Block
-        // Prepare metadata arrays
-        std::vector<uint64_t> offsets;
-        std::vector<char> blob;
-        offsets.reserve(entries_.size() + 1);
         
         for (const auto& e : entries_) {
             offsets.push_back(blob.size());
@@ -274,14 +306,21 @@ namespace pomai::table
 
         if (strncmp(h->magic, kMagic, 12) != 0) return pomai::Status::Corruption("bad magic");
         
-        // Support V2, V3 and V4
-        if (h->version != 2 && h->version != 3 && h->version != 4) {
+        // Support V2, V3, V4, and V5
+        if (h->version != 2 && h->version != 3 && h->version != 4 && h->version != 5) {
             return pomai::Status::Corruption("unsupported version");
         }
         
         reader->count_ = h->count;
         reader->dim_ = h->dim;
         
+        if (h->version >= 5) {
+            reader->entries_start_offset_ = h->entries_start_offset;
+            reader->entry_size_ = h->entry_size;
+        } else {
+            reader->entries_start_offset_ = sizeof(SegmentHeader);
+        }
+
         if (h->version >= 4) {
             reader->is_quantized_ = (h->is_quantized == 1);
         } else {
@@ -289,13 +328,17 @@ namespace pomai::table
         }
         
         if (reader->is_quantized_) {
-            reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(uint8_t); // ID + Flags/Pad + uint8_t Vec
+            if (h->version < 5) {
+                reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(uint8_t);
+            }
             
             // Initialize quantizer from explicitly serialized floats
             reader->quantizer_ = std::make_unique<core::ScalarQuantizer8Bit>(h->dim);
             reader->quantizer_->LoadState(h->quant_min, h->quant_inv_scale);
         } else {
-            reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float); // ID + Flags/Pad + float Vec
+            if (h->version < 5) {
+                reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float);
+            }
         }
         
         if (h->version >= 3) {
@@ -308,7 +351,7 @@ namespace pomai::table
         reader->file_size_ = size;
 
         // Verify size
-        size_t expected_min = sizeof(SegmentHeader) + reader->count_ * reader->entry_size_ + 4; // + CRC
+        size_t expected_min = reader->entries_start_offset_ + reader->count_ * reader->entry_size_ + 4; // + CRC
         if (size < expected_min) return pomai::Status::Corruption("segment truncated");
 
         // Try load index (best effort)
@@ -430,7 +473,7 @@ namespace pomai::table
         int64_t left = 0;
         int64_t right = count_ - 1;
         
-        const uint8_t* entries_start = base_addr_ + sizeof(SegmentHeader);
+        const uint8_t* entries_start = base_addr_ + entries_start_offset_;
 
         while (left <= right) {
             int64_t mid = left + (right - left) / 2;
@@ -469,7 +512,7 @@ namespace pomai::table
     {
         if (index >= count_) return pomai::Status::InvalidArgument("index out of range");
 
-        const uint8_t* p = base_addr_ + sizeof(SegmentHeader) + index * entry_size_;
+        const uint8_t* p = base_addr_ + entries_start_offset_ + index * entry_size_;
         
         if (out_id) {
              std::memcpy(out_id, p, sizeof(uint64_t));

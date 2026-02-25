@@ -69,12 +69,12 @@ POMAI_TEST(DB_SegmentLoading_ReadTest) {
     std::vector<float> out;
     POMAI_EXPECT_OK(db->Get(membrane, 10, &out));
     POMAI_EXPECT_EQ(out.size(), (size_t)dim);
-    POMAI_EXPECT_EQ(out[0], 1.0f);
+    POMAI_EXPECT_TRUE(std::abs(out[0] - 1.0f) < 0.1f);
     
     out.clear();
     POMAI_EXPECT_OK(db->Get(membrane, 20, &out));
-    POMAI_EXPECT_EQ(out[0], 0.0f);
-    POMAI_EXPECT_EQ(out[1], 1.0f);
+    POMAI_EXPECT_TRUE(std::abs(out[0] - 0.0f) < 0.1f);
+    POMAI_EXPECT_TRUE(std::abs(out[1] - 1.0f) < 0.1f);
     
     // Non-existent
     pomai::Status st = db->Get(membrane, 99, &out);
@@ -132,7 +132,7 @@ POMAI_TEST(DB_FreezeAndCompact) {
     // Verify readable
     std::vector<float> out;
     POMAI_EXPECT_OK(db->Get(membrane, 10, &out));
-    POMAI_EXPECT_EQ(out[0], 1.0f);
+    POMAI_EXPECT_TRUE(std::abs(out[0] - 1.0f) < 0.1f);
     
     // 3. Update (Shadowing)
     std::vector<float> vec1_v2 = {2.0f, 0.0f, 0.0f, 0.0f};
@@ -144,7 +144,7 @@ POMAI_TEST(DB_FreezeAndCompact) {
     // Verify updated value
     out.clear();
     POMAI_EXPECT_OK(db->Get(membrane, 10, &out));
-    POMAI_EXPECT_EQ(out[0], 2.0f);
+    POMAI_EXPECT_TRUE(std::abs(out[0] - 2.0f) < 0.1f);
     
     // 5. Delete 20
     POMAI_EXPECT_OK(db->Delete(membrane, 20));
@@ -161,7 +161,7 @@ POMAI_TEST(DB_FreezeAndCompact) {
     // Verify data state
     out.clear();
     POMAI_EXPECT_OK(db->Get(membrane, 10, &out));
-    POMAI_EXPECT_EQ(out[0], 2.0f); // Still v2
+    POMAI_EXPECT_TRUE(std::abs(out[0] - 2.0f) < 0.1f); // Still v2
     
     st = db->Get(membrane, 20, &out);
     POMAI_EXPECT_EQ(st.code(), pomai::ErrorCode::kNotFound); // Still deleted

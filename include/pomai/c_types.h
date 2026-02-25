@@ -30,6 +30,8 @@ typedef struct pomai_snapshot_t pomai_snapshot_t;
 typedef struct pomai_iter_t pomai_iter_t;
 typedef struct pomai_txn_t pomai_txn_t;
 
+#define POMAI_QUERY_FLAG_ZERO_COPY 1
+
 typedef enum {
     POMAI_FSYNC_POLICY_NEVER = 0,
     POMAI_FSYNC_POLICY_ALWAYS = 1,
@@ -85,7 +87,17 @@ typedef struct {
     const char* filter_expression;
     float alpha;
     uint32_t deadline_ms;
+    uint32_t flags;
 } pomai_query_t;
+
+typedef struct {
+    uint32_t struct_size;
+    const void* raw_data_ptr;
+    uint32_t dim;
+    float quant_min;
+    float quant_inv_scale;
+    uint64_t session_id;
+} pomai_semantic_pointer_t;
 
 typedef struct {
     uint32_t struct_size;
@@ -93,6 +105,7 @@ typedef struct {
     uint64_t* ids;
     float* scores;
     uint32_t* shard_ids;
+    pomai_semantic_pointer_t* zero_copy_pointers;
 } pomai_search_results_t;
 
 typedef struct {
