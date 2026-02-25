@@ -46,13 +46,14 @@ LookupResult LookupById(const std::shared_ptr<table::MemTable>& active,
 
     for (const auto& segment : snapshot->segments) {
         std::span<const float> seg_vec;
+        std::vector<float> seg_decoded;
         pomai::Metadata seg_meta;
-        const auto find = segment->Find(id, &seg_vec, &seg_meta);
+        const auto find = segment->FindAndDecode(id, &seg_vec, &seg_decoded, &seg_meta);
         if (find == table::SegmentReader::FindResult::kFoundTombstone) {
             return {.state = LookupState::kTombstone};
         }
         if (find == table::SegmentReader::FindResult::kFound) {
-            return {.state = LookupState::kFound, .vec = seg_vec, .meta = std::move(seg_meta)};
+            return {.state = LookupState::kFound, .vec = seg_vec, .decoded_vec = std::move(seg_decoded), .meta = std::move(seg_meta)};
         }
     }
 

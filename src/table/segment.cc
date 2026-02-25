@@ -74,13 +74,34 @@ namespace pomai::table
         SegmentHeader h{};
         std::memset(&h, 0, sizeof(h));
         std::memcpy(h.magic, kMagic, sizeof(h.magic));
-        h.version = 3; // V3
+        h.version = 4; // V4
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
+        h.is_quantized = 1; // Enable SQ8 by default for builder
+        
+        // Train Quantizer
+        core::ScalarQuantizer8Bit quantizer(dim_);
+        std::vector<float> training_data;
+        training_data.reserve(entries_.size() * dim_);
+        
+        for (const auto& e : entries_) {
+            if (!e.is_deleted) {
+                training_data.insert(training_data.end(), e.vec.data, e.vec.data + dim_);
+            }
+        }
+        
+        if (!training_data.empty()) {
+            quantizer.Train(training_data, training_data.size() / dim_);
+            h.quant_min = quantizer.GetGlobalMin();
+            h.quant_inv_scale = quantizer.GetGlobalInvScale();
+        } else {
+            h.quant_min = 0.0f;
+            h.quant_inv_scale = 0.0f;
+        }
         
         // Calculate Metadata Offset upfront
-        // Header + (Count * EntrySize)
-        size_t entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(float);
+        // Header + (Count * EntrySize) (V4 uses 1-byte per dim for vectors)
+        size_t entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
         h.metadata_offset = static_cast<uint32_t>(sizeof(SegmentHeader) + entries_.size() * entry_size);
 
         // Write header
@@ -112,10 +133,15 @@ namespace pomai::table
             entry_buffer.push_back(0);
             entry_buffer.push_back(0);
 
-            // Vector (dim * 4 bytes)
-            const float* vec_ptr = e.is_deleted ? zero_buffer_.data() : e.vec.data;
-            const uint8_t* p_vec = reinterpret_cast<const uint8_t*>(vec_ptr);
-            entry_buffer.insert(entry_buffer.end(), p_vec, p_vec + (dim_ * sizeof(float)));
+            // Vector (dim * 1 bytes)
+            std::vector<uint8_t> encoded;
+            if (e.is_deleted) {
+                encoded.assign(dim_, 0); // Zeroed out tombstone
+            } else {
+                std::span<const float> vec_span(e.vec.data, dim_);
+                encoded = quantizer.Encode(vec_span);
+            }
+            entry_buffer.insert(entry_buffer.end(), encoded.begin(), encoded.end());
 
             // Write entry
             st = file.PWrite(offset, entry_buffer.data(), entry_buffer.size());
@@ -248,16 +274,31 @@ namespace pomai::table
 
         if (strncmp(h->magic, kMagic, 12) != 0) return pomai::Status::Corruption("bad magic");
         
-        // Support V2 and V3
-        if (h->version != 2 && h->version != 3) {
+        // Support V2, V3 and V4
+        if (h->version != 2 && h->version != 3 && h->version != 4) {
             return pomai::Status::Corruption("unsupported version");
         }
         
         reader->count_ = h->count;
         reader->dim_ = h->dim;
-        reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float); // ID + Flags/Pad + Vec
         
-        if (h->version == 3) {
+        if (h->version >= 4) {
+            reader->is_quantized_ = (h->is_quantized == 1);
+        } else {
+            reader->is_quantized_ = false;
+        }
+        
+        if (reader->is_quantized_) {
+            reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(uint8_t); // ID + Flags/Pad + uint8_t Vec
+            
+            // Initialize quantizer from explicitly serialized floats
+            reader->quantizer_ = std::make_unique<core::ScalarQuantizer8Bit>(h->dim);
+            reader->quantizer_->LoadState(h->quant_min, h->quant_inv_scale);
+        } else {
+            reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float); // ID + Flags/Pad + float Vec
+        }
+        
+        if (h->version >= 3) {
             reader->metadata_offset_ = h->metadata_offset;
         } else {
             reader->metadata_offset_ = 0;
@@ -309,6 +350,20 @@ namespace pomai::table
         }
     }
 
+    pomai::Status SegmentReader::GetQuantized(pomai::VectorId id, std::span<const uint8_t>* out_codes, pomai::Metadata* out_meta) const
+    {
+        if (!is_quantized_) return pomai::Status::InvalidArgument("Segment is not quantized");
+        
+        const uint8_t* raw_payload = nullptr;
+        auto res = FindRaw(id, &raw_payload, out_meta);
+        if (res == FindResult::kFound) {
+            if (out_codes) *out_codes = std::span<const uint8_t>(raw_payload, dim_);
+            return pomai::Status::Ok();
+        }
+        if (res == FindResult::kFoundTombstone) return pomai::Status::NotFound("tombstone");
+        return pomai::Status::NotFound("id not found in segment");
+    }
+
     pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const
     {
          auto res = Find(id, out_vec, out_meta);
@@ -328,6 +383,47 @@ namespace pomai::table
     }
 
     SegmentReader::FindResult SegmentReader::Find(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const
+    {
+        // For backwards compatibility and instances where we don't need a decoded buffer safely (e.g. tests)
+        // If it's quantized, it will just flatly fail with this signature since span<const float>
+        // implies pointing into mmap memory, which doesn't exist.
+        if (is_quantized_) return FindResult::kNotFound;
+        
+        const uint8_t* raw_payload = nullptr;
+        auto res = FindRaw(id, &raw_payload, out_meta);
+        if (res == FindResult::kFoundTombstone && out_vec) {
+            *out_vec = {};
+        }
+        if (res == FindResult::kFound && out_vec) {
+            const float* vec_ptr = reinterpret_cast<const float*>(raw_payload);
+            *out_vec = std::span<const float>(vec_ptr, dim_);
+        }
+        return res;
+    }
+    
+    SegmentReader::FindResult SegmentReader::FindAndDecode(pomai::VectorId id, std::span<const float>* out_vec_mapped, std::vector<float>* out_vec_decoded, pomai::Metadata* out_meta) const
+    {
+        const uint8_t* raw_payload = nullptr;
+        auto res = FindRaw(id, &raw_payload, out_meta);
+        
+        if (res == FindResult::kFoundTombstone && out_vec_mapped) {
+            *out_vec_mapped = {};
+        }
+        
+        if (res == FindResult::kFound) {
+            if (is_quantized_) {
+                if (out_vec_decoded) {
+                    *out_vec_decoded = quantizer_->Decode(std::span<const uint8_t>(raw_payload, dim_));
+                    if (out_vec_mapped) *out_vec_mapped = *out_vec_decoded;
+                }
+            } else {
+                if (out_vec_mapped) *out_vec_mapped = std::span<const float>(reinterpret_cast<const float*>(raw_payload), dim_);
+            }
+        }
+        return res;
+    }
+
+    SegmentReader::FindResult SegmentReader::FindRaw(pomai::VectorId id, const uint8_t** raw_payload, pomai::Metadata* out_meta) const
     {
         if (count_ == 0) return FindResult::kNotFound;
 
@@ -349,19 +445,12 @@ namespace pomai::table
                 // Found
                 uint8_t flags = *(p + 8);
                 if (flags & kFlagTombstone) {
-                    if(out_vec) *out_vec = {}; // Deleted
-                    // Should we return metadata for tombstone? 
-                    // Usually tombstones don't have metadata updates attached to them for filtering,
-                    // BUT they might hide earlier versions.
-                    // Implementation choice: Metadata on tombstone can be useful (e.g. timestamp).
-                    // In current Builder, tombstone stores given metadata.
                     if(out_meta) GetMetadata(static_cast<uint32_t>(mid), out_meta);
                     return FindResult::kFoundTombstone;
                 }
                 
                 // Vector starts at offset 8 (ID) + 4 (Flags+Pad) = 12
-                const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
-                if (out_vec) *out_vec = std::span<const float>(vec_ptr, dim_);
+                if (raw_payload) *raw_payload = p + 12;
                 if(out_meta) GetMetadata(static_cast<uint32_t>(mid), out_meta);
                 
                 return FindResult::kFound;
@@ -394,8 +483,15 @@ namespace pomai::table
              if (is_deleted) {
                  *out_vec = {};
              } else {
-                 const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
-                 *out_vec = std::span<const float>(vec_ptr, dim_);
+                 if (is_quantized_) {
+                     // ReadAt returning span<float> is incompatible with quantizer without allocation wrapper.
+                     // The caller must decode using ForEach or GetQuantized. 
+                     // We return an empty span here and rely on higher layers utilizing FindAndDecode across Segments.
+                     *out_vec = {};
+                 } else {
+                     const float* vec_ptr = reinterpret_cast<const float*>(p + 12);
+                     *out_vec = std::span<const float>(vec_ptr, dim_);
+                 }
              }
         }
         

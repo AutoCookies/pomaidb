@@ -67,6 +67,17 @@ namespace pomai::core
             return s;
         }
 
+        float DotSq8Scalar(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale)
+        {
+            float distance = 0.0f;
+            const size_t dim = query.size();
+            for (size_t i = 0; i < dim; ++i) {
+                const float approx_val = min_val + static_cast<float>(codes[i]) * inv_scale;
+                distance += query[i] * approx_val;
+            }
+            return distance;
+        }
+
 #if POMAI_X86_SIMD && (defined(__GNUC__) || defined(__clang__))
         __attribute__((target("avx2,fma")))
         float DotAvx(std::span<const float> a, std::span<const float> b)
@@ -150,16 +161,88 @@ namespace pomai::core
             }
             return s;
         }
+
+        __attribute__((target("avx2,fma")))
+        float DotSq8Avx(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale)
+        {
+            const float *pq = query.data();
+            const uint8_t *pc = codes.data();
+            std::size_t n = query.size();
+            
+            __m256 sum0 = _mm256_setzero_ps();
+            __m256 sum1 = _mm256_setzero_ps();
+            
+            __m256 v_min = _mm256_set1_ps(min_val);
+            __m256 v_inv_scale = _mm256_set1_ps(inv_scale);
+            
+            std::size_t i = 0;
+            // Unroll by 16 (2 AVX registers)
+            for (; i + 16 <= n; i += 16)
+            {
+                // Load 16 uint8s (128 bits total)
+                __m128i c_chars = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pc + i));
+                
+                // Expand lower 8 bytes to 32-bit uints then floats
+                __m256i c_ints0 = _mm256_cvtepu8_epi32(c_chars);
+                __m256 c_floats0 = _mm256_cvtepi32_ps(c_ints0);
+                
+                // Expand upper 8 bytes. Shift right by 8 bytes.
+                __m128i c_chars_hi = _mm_bsrli_si128(c_chars, 8);
+                __m256i c_ints1 = _mm256_cvtepu8_epi32(c_chars_hi);
+                __m256 c_floats1 = _mm256_cvtepi32_ps(c_ints1);
+                
+                // Scale and shift: approx = codes * inv_scale + min_val
+                __m256 approx0 = _mm256_fmadd_ps(c_floats0, v_inv_scale, v_min);
+                __m256 approx1 = _mm256_fmadd_ps(c_floats1, v_inv_scale, v_min);
+                
+                // Vector dot product
+                __m256 vq0 = _mm256_loadu_ps(pq + i);
+                __m256 vq1 = _mm256_loadu_ps(pq + i + 8);
+                
+                sum0 = _mm256_fmadd_ps(vq0, approx0, sum0);
+                sum1 = _mm256_fmadd_ps(vq1, approx1, sum1);
+            }
+            __m256 sum = _mm256_add_ps(sum0, sum1);
+            
+            // Unroll by 8 (1 AVX register)
+            for (; i + 8 <= n; i += 8)
+            {
+                // _mm_loadl_epi64 to load 8 bytes into lower 64 bits of 128-bit reg
+                __m128i c_chars = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc + i));
+                __m256i c_ints = _mm256_cvtepu8_epi32(c_chars);
+                __m256 c_floats = _mm256_cvtepi32_ps(c_ints);
+                
+                __m256 approx = _mm256_fmadd_ps(c_floats, v_inv_scale, v_min);
+                __m256 vq = _mm256_loadu_ps(pq + i);
+                sum = _mm256_fmadd_ps(vq, approx, sum);
+            }
+            
+            float temp[8];
+            _mm256_storeu_ps(temp, sum);
+            float s = 0.0f;
+            for (int k = 0; k < 8; ++k) s += temp[k];
+
+            // Tail processing
+            for (; i < n; ++i)
+            {
+                const float approx_val = min_val + static_cast<float>(pc[i]) * inv_scale;
+                s += pq[i] * approx_val;
+            }
+            return s;
+        }
 #else
         // If not GCC/Clang, simple fallback (or rely on global flags if MSVC)
         float DotAvx(std::span<const float> a, std::span<const float> b) { return DotScalar(a, b); }
         float L2SqAvx(std::span<const float> a, std::span<const float> b) { return L2SqScalar(a, b); }
+        float DotSq8Avx(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale) { return DotSq8Scalar(query, codes, min_val, inv_scale); }
 #endif
 
         using DistFn = float (*)(std::span<const float>, std::span<const float>);
+        using DotSq8Fn = float (*)(std::span<const float>, std::span<const uint8_t>, float, float);
         
         DistFn dot_fn = DotScalar;
         DistFn l2_fn = L2SqScalar;
+        DotSq8Fn dot_sq8_fn = DotSq8Scalar;
         std::once_flag init_flag;
 
         void InitOnce()
@@ -169,6 +252,7 @@ namespace pomai::core
             {
                 dot_fn = DotAvx;
                 l2_fn = L2SqAvx;
+                dot_sq8_fn = DotSq8Avx;
             }
 #endif
         }
@@ -189,5 +273,11 @@ namespace pomai::core
     {
         std::call_once(init_flag, InitOnce);
         return l2_fn(a, b);
+    }
+
+    float DotSq8(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale)
+    {
+        std::call_once(init_flag, InitOnce);
+        return dot_sq8_fn(query, codes, min_val, inv_scale);
     }
 }
