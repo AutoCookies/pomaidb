@@ -108,6 +108,8 @@ namespace pomai::core
 
     using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, StopCmd, FreezeCmd, CompactCmd, IteratorCmd>;
 
+    class SearchMergePolicy;
+
     class ShardRuntime
     {
     public:
@@ -160,6 +162,12 @@ namespace pomai::core
                              const SearchOptions& opts,
                              std::vector<pomai::SearchHit> *out); // Overload
 
+        pomai::Status SearchBatchLocal(std::span<const float> queries,
+                                       const std::vector<uint32_t>& query_indices,
+                                       std::uint32_t topk,
+                                       const SearchOptions& opts,
+                                       std::vector<std::vector<pomai::SearchHit>>* out_results);
+
         // Non-blocking enqueue. Returns ResourceExhausted if full.
         pomai::Status TryEnqueue(Command &&cmd);
 
@@ -188,12 +196,15 @@ namespace pomai::core
         pomai::Status GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta = nullptr);
         std::pair<pomai::Status, bool> ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id);
 
+        // Core scoring routine that uses a prebuilt merge_policy
         pomai::Status SearchLocalInternal(std::shared_ptr<table::MemTable> active,
                                           std::shared_ptr<ShardSnapshot> snap, 
                                           std::span<const float> query,
                                           std::uint32_t topk,
                                           const SearchOptions& opts,
-                                          std::vector<pomai::SearchHit> *out);
+                                          SearchMergePolicy& merge_policy,
+                                          std::vector<pomai::SearchHit> *out,
+                                          bool use_pool);
 
                                           
         // Helper to load segments

@@ -52,6 +52,12 @@ namespace pomai::core
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
         Status Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts,
                       pomai::SearchResult *out);
+        Status SearchInternal(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts,
+                              pomai::SearchResult *out, bool use_pool);
+        Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                           uint32_t topk, std::vector<pomai::SearchResult>* out);
+        Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                           uint32_t topk, const SearchOptions& opts, std::vector<pomai::SearchResult>* out);
 
         const pomai::DBOptions &options() const { return opt_; }
         pomai::MembraneKind kind() const { return kind_; }

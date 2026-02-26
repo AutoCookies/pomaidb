@@ -364,6 +364,25 @@ namespace pomai::core
         return state->vector_engine->Search(query, topk, opts, out);
     }
 
+    Status MembraneManager::SearchBatch(std::string_view membrane, std::span<const float> queries,
+                                        uint32_t num_queries, std::uint32_t topk, std::vector<pomai::SearchResult> *out)
+    {
+        return SearchBatch(membrane, queries, num_queries, topk, SearchOptions{}, out);
+    }
+
+    Status MembraneManager::SearchBatch(std::string_view membrane, std::span<const float> queries,
+                                        uint32_t num_queries, std::uint32_t topk, const SearchOptions& opts, std::vector<pomai::SearchResult> *out)
+    {
+        if (!out)
+            return Status::InvalidArgument("out is null");
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
+            return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for SearchBatch");
+        return state->vector_engine->SearchBatch(queries, num_queries, topk, opts, out);
+    }
+
     Status MembraneManager::SearchRag(std::string_view membrane, const pomai::RagQuery& query,
                                       const pomai::RagSearchOptions& opts, pomai::RagSearchResult *out)
     {

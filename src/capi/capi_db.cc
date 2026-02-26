@@ -326,11 +326,107 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     return nullptr;
 }
 
+pomai_status_t* pomai_search_batch(pomai_db_t* db, const pomai_query_t* queries, size_t num_queries, pomai_search_results_t** out) {
+    if (db == nullptr || queries == nullptr || out == nullptr || num_queries == 0) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "invalid batch search args");
+    }
+    if (queries[0].struct_size < MinQueryStructSize()) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "query.struct_size is too small");
+    }
+    
+    // We assume all queries in the batch have the same dimensions and options.
+    const uint32_t dim = queries[0].dim;
+    const uint32_t topk = queries[0].topk;
+    
+    pomai::SearchOptions opts;
+    if (!ParseTenantFilter(queries[0].filter_expression, &opts)) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "filter_expression must use tenant=<value>");
+    }
+    if (queries[0].flags & POMAI_QUERY_FLAG_ZERO_COPY) {
+        opts.zero_copy = true;
+    }
+
+    std::vector<float> flat_queries;
+    flat_queries.reserve(num_queries * dim);
+    for (size_t i = 0; i < num_queries; ++i) {
+        if (queries[i].vector == nullptr || queries[i].dim != dim || queries[i].topk != topk) {
+            return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "batch queries must have identical dim and topk");
+        }
+        flat_queries.insert(flat_queries.end(), queries[i].vector, queries[i].vector + dim);
+    }
+
+    std::vector<pomai::SearchResult> batch_res;
+    auto st = db->db->SearchBatch(std::span<const float>(flat_queries.data(), flat_queries.size()), num_queries, topk, opts, &batch_res);
+    
+    if (!st.ok() && st.code() != pomai::ErrorCode::kPartial) {
+        return ToCStatus(st);
+    }
+
+    // Allocate array of results
+    *out = new pomai_search_results_t[num_queries];
+    
+    for (size_t q = 0; q < num_queries; ++q) {
+        const auto& res = batch_res[q];
+        pomai_search_results_t& pub = (*out)[q];
+
+        pub.struct_size = static_cast<uint32_t>(sizeof(pomai_search_results_t));
+        pub.count = res.hits.size();
+        
+        pub.ids = new uint64_t[pub.count];
+        pub.scores = new float[pub.count];
+        pub.shard_ids = new uint32_t[pub.count];
+        
+        for (size_t i = 0; i < pub.count; ++i) {
+            pub.ids[i] = res.hits[i].id;
+            pub.scores[i] = res.hits[i].score;
+            pub.shard_ids[i] = UINT32_MAX;
+        }
+
+        if (opts.zero_copy && !res.zero_copy_pointers.empty()) {
+            pub.zero_copy_pointers = new pomai_semantic_pointer_t[res.zero_copy_pointers.size()];
+            for (size_t i = 0; i < res.zero_copy_pointers.size(); ++i) {
+                pub.zero_copy_pointers[i].struct_size = sizeof(pomai_semantic_pointer_t);
+                pub.zero_copy_pointers[i].raw_data_ptr = res.zero_copy_pointers[i].raw_data_ptr;
+                pub.zero_copy_pointers[i].dim = res.zero_copy_pointers[i].dim;
+                pub.zero_copy_pointers[i].quant_min = res.zero_copy_pointers[i].quant_min;
+                pub.zero_copy_pointers[i].quant_inv_scale = res.zero_copy_pointers[i].quant_inv_scale;
+                pub.zero_copy_pointers[i].session_id = res.zero_copy_pointers[i].session_id;
+            }
+        } else {
+            pub.zero_copy_pointers = nullptr;
+        }
+    }
+
+    if (st.code() == pomai::ErrorCode::kPartial) {
+        return MakeStatus(POMAI_STATUS_PARTIAL_FAILURE, st.message());
+    }
+    return nullptr;
+}
+
 void pomai_search_results_free(pomai_search_results_t* results) {
     if (results && results->zero_copy_pointers) {
         delete[] results->zero_copy_pointers;
     }
     delete reinterpret_cast<SearchResultsWrapper*>(results);
+}
+
+void pomai_search_batch_free(pomai_search_results_t* results, size_t num_queries) {
+    if (!results) return;
+    for (size_t i = 0; i < num_queries; ++i) {
+        if (results[i].ids) {
+            delete[] results[i].ids;
+        }
+        if (results[i].scores) {
+            delete[] results[i].scores;
+        }
+        if (results[i].shard_ids) {
+            delete[] results[i].shard_ids;
+        }
+        if (results[i].zero_copy_pointers) {
+            delete[] results[i].zero_copy_pointers;
+        }
+    }
+    delete[] results;
 }
 
 void pomai_release_pointer(uint64_t session_id) {

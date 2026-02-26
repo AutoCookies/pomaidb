@@ -50,6 +50,12 @@ namespace pomai
                                     SearchResult *out) = 0;
         virtual Status SearchVector(std::span<const float> query, uint32_t topk,
                                     const SearchOptions& opts, SearchResult *out) = 0;
+        
+        // Batch Search (runs concurrently across multiple queries)
+        virtual Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                                   uint32_t topk, std::vector<SearchResult>* out) = 0;
+        virtual Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                                   uint32_t topk, const SearchOptions& opts, std::vector<SearchResult>* out) = 0;
         virtual Status SearchRag(const RagQuery& query, const RagSearchOptions& opts, RagSearchResult *out) = 0;
 
         // Membrane API
@@ -85,6 +91,10 @@ namespace pomai
                                     uint32_t topk, SearchResult *out) = 0;
         virtual Status SearchVector(std::string_view membrane, std::span<const float> query,
                                     uint32_t topk, const SearchOptions& opts, SearchResult *out) = 0;
+        virtual Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, 
+                                   uint32_t topk, std::vector<SearchResult>* out) = 0;
+        virtual Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, 
+                                   uint32_t topk, const SearchOptions& opts, std::vector<SearchResult>* out) = 0;
         virtual Status SearchRag(std::string_view membrane, const RagQuery& query,
                                  const RagSearchOptions& opts, RagSearchResult *out) = 0;
 

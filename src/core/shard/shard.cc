@@ -68,6 +68,15 @@ namespace pomai::core
         return rt_->Search(q, k, opts, out);
     }
 
+    Status Shard::SearchBatchLocal(std::span<const float> queries,
+                                   const std::vector<uint32_t>& query_indices,
+                                   std::uint32_t topk,
+                                   const SearchOptions& opts,
+                                   std::vector<std::vector<pomai::SearchHit>>* out_results) const
+    {
+        return rt_->SearchBatchLocal(queries, query_indices, topk, opts, out_results);
+    }
+
     Status Shard::Freeze() { return rt_->Freeze(); }
     Status Shard::Compact() { return rt_->Compact(); }
     Status Shard::NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out) { return rt_->NewIterator(out); }

@@ -22,6 +22,7 @@ namespace pomai::index
             opt_.nprobe = opt_.nlist;
 
         centroids_.assign(static_cast<std::size_t>(opt_.nlist) * dim_, 0.0f);
+        cluster_counts_.assign(opt_.nlist, 0);
         counts_.assign(opt_.nlist, 0);
         lists_.resize(opt_.nlist);
 
@@ -210,12 +211,34 @@ namespace pomai::index
         std::vector<pomai::VectorId>().swap(train_ids_);
     }
 
-    void IvfCoarse::SeedOrUpdateCentroid(std::uint32_t, std::span<const float>)
+    void IvfCoarse::OnlineCentroidUpdate(std::uint32_t cid, std::span<const float> vec)
     {
-       // Deprecated/Unused. 
-       // We keep it private in header but won't define logic here since we moved to Trainer.
-       // Actually I need to remove it from header to be clean, but I did a partial replace on header.
-       // I'll leave it empty.
+        // Calculate dynamic learning rate based on cluster density.
+        // Giai đoạn sơ sinh: Ít vector -> eta lớn. Giai đoạn trưởng thành: Nhiều vector -> eta nhỏ.
+        uint32_t count = cluster_counts_[cid];
+        float eta = std::max(opt_.min_learning_rate, opt_.max_learning_rate / (1.0f + static_cast<float>(count) / 100.0f));
+
+        float* centroid = &centroids_[cid * dim_];
+        
+        // Competitive Learning Update: C_new = C_old + eta * (V - C_old)
+        float sq_norm = 0.0f;
+        for (uint32_t i = 0; i < dim_; ++i)
+        {
+             centroid[i] = centroid[i] + eta * (vec[i] - centroid[i]);
+             sq_norm += centroid[i] * centroid[i];
+        }
+
+        // Re-normalize to unit hypersphere
+        if (sq_norm > 1e-12f)
+        {
+             float inv_norm = 1.0f / std::sqrt(sq_norm);
+             for (uint32_t i = 0; i < dim_; ++i)
+             {
+                  centroid[i] *= inv_norm;
+             }
+        }
+        
+        cluster_counts_[cid]++;
     }
 
     pomai::Status IvfCoarse::Put(pomai::VectorId id, std::span<const float> vec)
@@ -283,6 +306,10 @@ namespace pomai::index
         uint32_t cid = AssignCentroid(vec);
         lists_[cid].push_back(id);
         id2list_[id] = cid;
+        
+        // Streaming Index: Adapt centroid towards newly added vector.
+        OnlineCentroidUpdate(cid, vec);
+        
         return pomai::Status::Ok();
     }
 
@@ -328,10 +355,12 @@ namespace pomai::index
         if (static_cast<std::uint32_t>(query.size()) != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
 
-        // If not ready => let caller brute-force.
-        // ready() checks trained_.
-        if (!ready())
+        // If not ready => we are still buffering. Return everything in buffer to ensure recall
+        // since we haven't built the index yet.
+        if (!ready()) {
+            candidates->insert(candidates->end(), train_ids_.begin(), train_ids_.end());
             return pomai::Status::Ok();
+        }
 
         // Standard routing
         auto &scored = scratch_scored_;

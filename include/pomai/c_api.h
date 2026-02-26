@@ -26,6 +26,8 @@ POMAI_API pomai_status_t* pomai_exists(pomai_db_t* db, uint64_t id, bool* out_ex
 
 POMAI_API pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_search_results_t** out);
 POMAI_API void pomai_search_results_free(pomai_search_results_t* results);
+POMAI_API pomai_status_t* pomai_search_batch(pomai_db_t* db, const pomai_query_t* queries, size_t num_queries, pomai_search_results_t** out);
+POMAI_API void pomai_search_batch_free(pomai_search_results_t* results, size_t num_queries);
 POMAI_API void pomai_release_pointer(uint64_t session_id);
 
 POMAI_API pomai_status_t* pomai_get_snapshot(pomai_db_t* db, pomai_snapshot_t** out_snap);

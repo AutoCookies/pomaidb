@@ -29,6 +29,7 @@ typedef struct pomai_db_t pomai_db_t;
 typedef struct pomai_snapshot_t pomai_snapshot_t;
 typedef struct pomai_iter_t pomai_iter_t;
 typedef struct pomai_txn_t pomai_txn_t;
+typedef struct pomai_status_t pomai_status_t;
 
 #define POMAI_QUERY_FLAG_ZERO_COPY 1
 
@@ -107,6 +108,12 @@ typedef struct {
     uint32_t* shard_ids;
     pomai_semantic_pointer_t* zero_copy_pointers;
 } pomai_search_results_t;
+
+POMAI_API pomai_status_t* pomai_search_batch(
+    pomai_db_t* db, const pomai_query_t* queries, size_t num_queries,
+    pomai_search_results_t** out_results);
+
+POMAI_API void pomai_search_batch_free(pomai_search_results_t* results, size_t num_queries);
 
 typedef struct {
     uint32_t struct_size;

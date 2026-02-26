@@ -182,6 +182,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(routing_table_test)
   pomai_add_labeled_test(routing_table_test "unit")
 
+  add_executable(streaming_index_test tests/unit/streaming_index_test.cc)
+  pomai_setup_test(streaming_index_test)
+  pomai_add_labeled_test(streaming_index_test "unit")
+
   add_executable(recall_test tests/recall/recall_test.cc tests/recall/recall_dataset.cc tests/common/bruteforce_oracle.cc)
   pomai_setup_test(recall_test)
   pomai_add_labeled_test(recall_test "recall")

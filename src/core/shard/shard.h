@@ -40,6 +40,12 @@ namespace pomai::core
         Status SearchLocal(std::span<const float> q, std::uint32_t k,
                            const SearchOptions& opts, std::vector<pomai::SearchHit> *out) const;
 
+        Status SearchBatchLocal(std::span<const float> queries,
+                                const std::vector<uint32_t>& query_indices,
+                                std::uint32_t topk,
+                                const SearchOptions& opts,
+                                std::vector<std::vector<pomai::SearchHit>>* out_results) const;
+
         Status Freeze();
         Status Compact();
         Status NewIterator(std::unique_ptr<pomai::SnapshotIterator> *out);

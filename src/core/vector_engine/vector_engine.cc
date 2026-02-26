@@ -19,6 +19,7 @@
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 #include "util/logging.h"
+#include "core/distance.h"
 
 namespace pomai::core {
 namespace {
@@ -82,6 +83,7 @@ std::uint32_t VectorEngine::ShardOf(VectorId id, std::uint32_t shard_count) {
 
 Status VectorEngine::Open() {
     if (opened_) return Status::Ok();
+    core::InitDistance();
     return OpenLocked();
 }
 
@@ -134,7 +136,8 @@ Status VectorEngine::OpenLocked() {
             hw = 1;
         }
         size_t target = hw > 1 ? (hw - 1) : 1;
-        threads = std::min(target, static_cast<size_t>(opt_.shard_count));
+        // Do not cap by shard_count for batch searches. Queries can run in parallel.
+        threads = target;
         if (threads == 0) {
             threads = 1;
         }
@@ -490,6 +493,14 @@ Status VectorEngine::Search(std::span<const float> query,
                             std::uint32_t topk,
                             const SearchOptions& opts,
                             pomai::SearchResult* out) {
+    return SearchInternal(query, topk, opts, out, true);
+}
+
+Status VectorEngine::SearchInternal(std::span<const float> query,
+                                    std::uint32_t topk,
+                                    const SearchOptions& opts,
+                                    pomai::SearchResult* out,
+                                    bool use_pool) {
     if (!opened_) return Status::InvalidArgument("vector_engine not opened");
     if (!out) return Status::InvalidArgument("vector_engine output is null");
 
@@ -504,15 +515,15 @@ Status VectorEngine::Search(std::span<const float> query,
     std::vector<std::future<pomai::Status>> futures;
     futures.reserve(probe_shards.size());
 
-    if (search_pool_ && probe_shards.size() > 1) {
+    if (search_pool_ && use_pool && probe_shards.size() > 1) {
         for (std::size_t i = 0; i < probe_shards.size(); ++i) {
             const std::uint32_t sid = probe_shards[i];
-            futures.push_back(search_pool_->Enqueue([&, sid, i] { return shards_[sid]->SearchLocal(query, topk, opts, &per[i]); }));
+            futures.push_back(search_pool_->Enqueue([this, query, topk, opts, &per, sid, i] { return shards_[sid]->SearchLocal(query, topk, opts, &per[i]); }));
         }
     } else {
         for (std::size_t i = 0; i < probe_shards.size(); ++i) {
             const std::uint32_t sid = probe_shards[i];
-            futures.push_back(std::async(std::launch::deferred, [&, sid, i] { return shards_[sid]->SearchLocal(query, topk, opts, &per[i]); }));
+            futures.push_back(std::async(std::launch::deferred, [this, query, topk, opts, &per, sid, i] { return shards_[sid]->SearchLocal(query, topk, opts, &per[i]); }));
         }
     }
 
@@ -552,6 +563,115 @@ Status VectorEngine::Search(std::span<const float> query,
                 }
                 if (!found) {
                     out->zero_copy_pointers.push_back(ptr);
+                }
+            }
+        }
+    }
+
+    return Status::Ok();
+}
+Status VectorEngine::SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                                 uint32_t topk, std::vector<pomai::SearchResult>* out) {
+    return SearchBatch(queries, num_queries, topk, SearchOptions{}, out);
+}
+
+Status VectorEngine::SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                                 uint32_t topk, const SearchOptions& opts, std::vector<pomai::SearchResult>* out) {
+    if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (!out) return Status::InvalidArgument("vector_engine output is null");
+    
+    // queries span must contain (num_queries * dim) floats.
+    if (queries.size() != static_cast<size_t>(num_queries) * opt_.dim) {
+        return Status::InvalidArgument("vector_engine queries dimension mismatch for batch search");
+    }
+
+    out->clear();
+    out->resize(num_queries);
+
+    if (num_queries == 0 || topk == 0) {
+        return Status::Ok();
+    }
+
+    // 1. Group queries by shard
+    std::vector<std::vector<uint32_t>> queries_by_shard(opt_.shard_count);
+    for (uint32_t i = 0; i < num_queries; ++i) {
+        std::span<const float> single_query(queries.data() + (i * opt_.dim), opt_.dim);
+        auto probe_shards = BuildProbeShards(single_query, opts);
+        for (auto sid : probe_shards) {
+            queries_by_shard[sid].push_back(i);
+        }
+    }
+
+    // 2. Dispatch tasks to shards
+    std::vector<std::future<Status>> futures;
+    // shard_results[shard_id][query_index] -> hits
+    std::vector<std::vector<std::vector<pomai::SearchHit>>> shard_results(opt_.shard_count);
+
+    for (uint32_t sid = 0; sid < opt_.shard_count; ++sid) {
+        if (queries_by_shard[sid].empty()) continue;
+        
+        shard_results[sid].resize(num_queries);
+
+        auto task = [this, sid, queries, &queries_by_shard, topk, opts, &shard_results]() {
+            return shards_[sid]->SearchBatchLocal(queries, queries_by_shard[sid], topk, opts, &shard_results[sid]);
+        };
+
+        if (search_pool_) {
+            futures.push_back(search_pool_->Enqueue(task));
+        } else {
+            // Use std::async as fallback if no pool
+            futures.push_back(std::async(std::launch::async, task));
+        }
+    }
+    
+    // 3. Wait for all shard tasks
+    for (auto& f : futures) {
+        Status st = f.get();
+        if (!st.ok()) return st;
+    }
+
+    // 4. Merge results for each query
+    for (uint32_t i = 0; i < num_queries; ++i) {
+        std::vector<std::vector<pomai::SearchHit>> per_query_hits;
+        for (uint32_t sid = 0; sid < opt_.shard_count; ++sid) {
+            if (!shard_results[sid].empty() && !shard_results[sid][i].empty()) {
+                per_query_hits.push_back(std::move(shard_results[sid][i]));
+            }
+        }
+        out->at(i).hits = MergeTopK(per_query_hits, topk);
+        // Track candidates scanned if needed (optional)
+    }
+
+    // 5. Zero-copy support
+    if (opts.zero_copy) {
+        std::shared_ptr<pomai::Snapshot> active_snap;
+        GetSnapshot(&active_snap);
+        auto snap_wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(active_snap);
+        if (snap_wrapper) {
+            auto internal_snap = snap_wrapper->GetInternal();
+            auto session_id = core::MemoryPinManager::Instance().Pin(active_snap);
+            
+            for (uint32_t i = 0; i < num_queries; ++i) {
+                out->at(i).zero_copy_session_id = session_id;
+                out->at(i).zero_copy_pointers.reserve(out->at(i).hits.size());
+                
+                std::span<const float> single_query(queries.data() + (i * opt_.dim), opt_.dim);
+                auto probe_shards = BuildProbeShards(single_query, opts);
+
+                for (const auto& hit : out->at(i).hits) {
+                    pomai::SemanticPointer ptr;
+                    bool found = false;
+                    for (auto sid : probe_shards) {
+                        if (shards_[sid]->GetSemanticPointer(internal_snap, hit.id, &ptr).ok()) {
+                            ptr.session_id = session_id;
+                            out->at(i).zero_copy_pointers.push_back(ptr);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        out->at(i).zero_copy_pointers.push_back(ptr);
+                    }
                 }
             }
         }

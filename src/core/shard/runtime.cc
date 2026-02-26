@@ -47,15 +47,16 @@ namespace pomai::core
                 entries += n;
             }
         };
+    } // anonymous namespace
 
-        struct VisibilityEntry {
-            bool is_tombstone{false};
-            const void* source{nullptr};
-        };
+    struct VisibilityEntry {
+        bool is_tombstone{false};
+        const void* source{nullptr};
+    };
 
-        class SearchMergePolicy {
-        public:
-            void Reserve(std::size_t capacity) {
+    class SearchMergePolicy {
+    public:
+        void Reserve(std::size_t capacity) {
                 visibility_.reserve(capacity);
             }
 
@@ -127,7 +128,6 @@ namespace pomai::core
             std::uint32_t k_;
             std::priority_queue<pomai::SearchHit, std::vector<pomai::SearchHit>, WorseHit> heap_;
         };
-    } // namespace
 
     struct ShardRuntime::BackgroundJob {
         enum class Type {
@@ -231,7 +231,6 @@ namespace pomai::core
         opt.nlist = index_params_.nlist;
         opt.nprobe = index_params_.nprobe;
         opt.warmup = 256;
-        opt.ema = 0.05f;
         ivf_ = std::make_unique<pomai::index::IvfCoarse>(dim_, opt);
     }
 
@@ -614,15 +613,14 @@ namespace pomai::core
             return pomai::Status::Ok();
         }
 
-        // Get Snapshot
-        auto snap = GetSnapshot();
-        if (!snap) return pomai::Status::Aborted("shard not ready");
-
-        // P0.2: Capture active memtable for concurrency
-        auto active = mem_.load(std::memory_order_acquire);
-
-        // Local Search using Snapshot + Active (Bypass Mailbox)
-        return SearchLocalInternal(active, snap, query, topk, opts, out);
+        std::vector<std::vector<pomai::SearchHit>> batch_out(1);
+        auto st = SearchBatchLocal(query, {0}, topk, opts, &batch_out);
+        if (st.ok()) {
+            *out = std::move(batch_out[0]);
+        } else {
+            out->clear();
+        }
+        return st;
     }
 
     // -------------------------
@@ -881,8 +879,13 @@ namespace pomai::core
         SearchReply r;
         auto snap = GetSnapshot();
         if(snap) {
-             auto active = mem_.load(std::memory_order_acquire);
-             r.st = SearchLocalInternal(active, snap, {c.query.data(), c.query.size()}, c.topk, SearchOptions{}, &r.hits);
+             std::vector<std::vector<pomai::SearchHit>> batch_out(1);
+             std::vector<float> query_vec(c.query.begin(), c.query.end());
+             auto st = SearchBatchLocal(query_vec, {0}, c.topk, SearchOptions{}, &batch_out);
+             r.st = st;
+             if (st.ok()) {
+                 r.hits = std::move(batch_out[0]);
+             }
         } else {
             r.st = Status::Aborted("no snapshot");
         }
@@ -958,6 +961,15 @@ namespace pomai::core
                     if (!st.ok()) {
                         complete_job(pomai::Status::Internal("Freeze: SegmentBuilder::Add failed: " + st.message()));
                         return;
+                    }
+
+                    // Feed Streaming IVF for continuous SOM updates
+                    if (!entry.is_deleted) {
+                         st = ivf_->Put(entry.id, std::span<const float>(entry.vec));
+                         if (!st.ok()) {
+                             complete_job(pomai::Status::Internal("Freeze: IVF::Put failed: " + st.message()));
+                             return;
+                         }
                     }
 
                     bg_budget.Consume();
@@ -1106,6 +1118,13 @@ namespace pomai::core
                                     complete_job(pomai::Status::Internal("Compact: SegmentBuilder::Add failed: " + st.message()));
                                     return;
                                 }
+
+                                // Feed downstream Streaming IVF
+                                st = ivf_->Put(top.id, vec_mapped);
+                                if (!st.ok()) {
+                                     complete_job(pomai::Status::Internal("Compact: IVF::Put failed: " + st.message()));
+                                     return;
+                                }
                                 state.live_entries_kept++;
                                 if (state.builder->Count() >= kMaxSegmentEntries) {
                                     state.phase = BackgroundJob::Phase::kFinalizeSegment;
@@ -1200,6 +1219,79 @@ namespace pomai::core
         }
     }
 
+    pomai::Status ShardRuntime::SearchBatchLocal(std::span<const float> queries,
+                                                 const std::vector<uint32_t>& query_indices,
+                                                 std::uint32_t topk,
+                                                 const SearchOptions& opts,
+                                                 std::vector<std::vector<pomai::SearchHit>>* out_results)
+    {
+        if (query_indices.empty()) return pomai::Status::Ok();
+        if (queries.size() % dim_ != 0) return pomai::Status::InvalidArgument("dim mismatch");
+        if (!out_results) return pomai::Status::InvalidArgument("out_results null");
+        
+        auto snap = GetSnapshot();
+        if (!snap) return pomai::Status::Aborted("shard not ready");
+        auto active = mem_.load(std::memory_order_acquire);
+
+        SearchMergePolicy merge_policy;
+        std::size_t reserve_hint = 0;
+        if (active) reserve_hint += active->GetCount();
+        if (snap) {
+            for (const auto& frozen : snap->frozen_memtables) reserve_hint += frozen->GetCount();
+            for (const auto& seg : snap->segments) reserve_hint += seg->Count();
+        }
+        merge_policy.Reserve(reserve_hint);
+
+        std::uint64_t visibility_scanned = 0;
+        if (active) {
+            const void* source = active.get();
+            active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
+                ++visibility_scanned;
+                merge_policy.RecordIfUnresolved(id, is_deleted, source);
+            });
+        }
+        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
+            const void* source = it->get();
+            (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
+                ++visibility_scanned;
+                merge_policy.RecordIfUnresolved(id, is_deleted, source);
+            });
+        }
+        for (const auto& seg : snap->segments) {
+            const void* source = seg.get();
+            seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
+                ++visibility_scanned;
+                merge_policy.RecordIfUnresolved(id, is_deleted, source);
+            });
+        }
+
+        if (thread_pool_ && query_indices.size() > 1) {
+            std::vector<std::future<pomai::Status>> futures;
+            futures.reserve(query_indices.size());
+            for (uint32_t q_idx : query_indices) {
+                std::span<const float> single_query(queries.data() + (q_idx * dim_), dim_);
+                futures.push_back(thread_pool_->Enqueue([this, active, snap, single_query, topk, opts, &merge_policy, out_results, q_idx]() {
+                    // Pass use_pool=false because we are already running in a query-level thread.
+                    return SearchLocalInternal(active, snap, single_query, topk, opts, merge_policy, &(*out_results)[q_idx], false);
+                }));
+            }
+            for (auto& f : futures) {
+                auto st = f.get();
+                if (!st.ok()) return st;
+            }
+        } else {
+            for (uint32_t q_idx : query_indices) {
+                std::span<const float> single_query(queries.data() + (q_idx * dim_), dim_);
+                auto st = SearchLocalInternal(active, snap, single_query, topk, opts, merge_policy, &(*out_results)[q_idx], false);
+                if (!st.ok()) return st;
+            }
+        }
+
+        last_query_candidates_scanned_.fetch_add(visibility_scanned * query_indices.size(), std::memory_order_relaxed);
+        
+        return pomai::Status::Ok();
+    }
+
 // -------------------------
     // SearchLocalInternal: DB-grade 1-pass merge scan
     // -------------------------
@@ -1210,53 +1302,12 @@ namespace pomai::core
             std::span<const float> query,
             std::uint32_t topk,
             const SearchOptions& opts,
-            std::vector<pomai::SearchHit> *out)
+            SearchMergePolicy& merge_policy,
+            std::vector<pomai::SearchHit> *out,
+            bool use_pool)
     {
         out->clear();
         out->reserve(topk);
-        std::uint64_t visibility_scanned = 0;
-        SearchMergePolicy merge_policy;
-
-        std::size_t reserve_hint = 0;
-        if (active) {
-            reserve_hint += active->GetCount();
-        }
-        if (snap) {
-            for (const auto& frozen : snap->frozen_memtables) {
-                reserve_hint += frozen->GetCount();
-            }
-            for (const auto& seg : snap->segments) {
-                reserve_hint += seg->Count();
-            }
-        }
-        merge_policy.Reserve(reserve_hint);
-
-        // -------------------------
-        // Phase 1: Deterministic visibility map (newest -> oldest)
-        // -------------------------
-        if (active) {
-            const void* source = active.get();
-            active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                ++visibility_scanned;
-                merge_policy.RecordIfUnresolved(id, is_deleted, source);
-            });
-        }
-
-        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
-            const void* source = it->get();
-            (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                ++visibility_scanned;
-                merge_policy.RecordIfUnresolved(id, is_deleted, source);
-            });
-        }
-
-        for (const auto& seg : snap->segments) {
-            const void* source = seg.get();
-            seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                ++visibility_scanned;
-                merge_policy.RecordIfUnresolved(id, is_deleted, source);
-            });
-        }
 
         // -------------------------
         // Phase 2: Parallel scoring over authoritative sources
@@ -1264,9 +1315,15 @@ namespace pomai::core
         std::atomic<std::uint64_t> scored_scanned{0};
         std::vector<pomai::SearchHit> candidates;
 
-        const std::size_t min_candidates = std::max<std::size_t>(static_cast<std::size_t>(topk) * 50u, 2000u);
+        bool has_filters = !opts.filters.empty();
+        const std::size_t min_candidates = has_filters ? std::max<std::size_t>(static_cast<std::size_t>(topk) * 50u, 2000u) : (static_cast<std::size_t>(topk) * 10u);
         std::size_t max_candidates = std::max<std::size_t>(static_cast<std::size_t>(topk) * 200u, min_candidates);
         uint32_t effective_nprobe = index_params_.nprobe == 0 ? 1 : index_params_.nprobe;
+        
+        // If we expect to hit many candidates but nprobe is small, try to increase nprobe instead of full scan
+        if (has_filters && effective_nprobe < 8) {
+            effective_nprobe = std::min<uint32_t>(32u, effective_nprobe * 8); // Heuristic to avoid brute force
+        }
         bool allow_fallback = true;
         if (thread_pool_) {
             const std::size_t threads = thread_pool_->Size();
@@ -1400,7 +1457,7 @@ namespace pomai::core
 
         for (std::size_t i = 0; i < snap->segments.size(); ++i) {
             const auto& seg = snap->segments[i];
-            if (segment_pool_) {
+            if (segment_pool_ && use_pool) {
                 futures.push_back(segment_pool_->Enqueue([&, seg]() { return score_segment(seg); }));
             } else {
                 segment_hits[i] = score_segment(seg);
@@ -1428,8 +1485,9 @@ namespace pomai::core
 
         out->assign(candidates.begin(), candidates.end());
 
+        // Note: visibility_scanned is tracked inside SearchBatchLocal for the batch mapping
         last_query_candidates_scanned_.store(
-            visibility_scanned + scored_scanned.load(std::memory_order_relaxed),
+            scored_scanned.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         return pomai::Status::Ok();
     }

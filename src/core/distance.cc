@@ -265,19 +265,16 @@ namespace pomai::core
 
     float Dot(std::span<const float> a, std::span<const float> b)
     {
-        std::call_once(init_flag, InitOnce);
         return dot_fn(a, b);
     }
 
     float L2Sq(std::span<const float> a, std::span<const float> b)
     {
-        std::call_once(init_flag, InitOnce);
         return l2_fn(a, b);
     }
 
     float DotSq8(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale)
     {
-        std::call_once(init_flag, InitOnce);
         return dot_sq8_fn(query, codes, min_val, inv_scale);
     }
 }
