@@ -74,7 +74,7 @@ namespace pomai::table
         SegmentHeader h{};
         std::memset(&h, 0, sizeof(h));
         std::memcpy(h.magic, kMagic, sizeof(h.magic));
-        h.version = 5; // V5
+        h.version = 6; // V6: 64-byte alignment + IVF positional indices
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
         h.is_quantized = 1; // Enable SQ8 by default for builder
@@ -108,7 +108,14 @@ namespace pomai::table
         size_t entry_size = 0;
         uint32_t entries_start_offset = 0;
         
-        if (h.version >= 5) {
+        if (h.version >= 6) {
+            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
+            entry_size = (unpadded_size + 63) & ~63; // 64-byte alignment
+            entries_start_offset = 128; // Small header + alignment
+            h.entry_size = static_cast<uint32_t>(entry_size);
+            h.entries_start_offset = entries_start_offset;
+            h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
+        } else if (h.version >= 5) {
             size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
             entry_size = (unpadded_size + 4095) & ~4095;
             entries_start_offset = 4096;
@@ -253,9 +260,10 @@ namespace pomai::table
          auto st = idx->Train(training_data, num_live);
          if (!st.ok()) return st;
          
-         for(const auto& e : entries_) {
+         for (size_t i = 0; i < entries_.size(); ++i) {
+             const auto& e = entries_[i];
              if (!e.is_deleted) {
-                 st = idx->Add(e.id, e.vec.span());
+                 st = idx->Add(static_cast<uint32_t>(i), e.vec.span());
                  if (!st.ok()) return st;
              }
          }
@@ -306,8 +314,8 @@ namespace pomai::table
 
         if (strncmp(h->magic, kMagic, 12) != 0) return pomai::Status::Corruption("bad magic");
         
-        // Support V2, V3, V4, and V5
-        if (h->version != 2 && h->version != 3 && h->version != 4 && h->version != 5) {
+        // Support V2 to V6
+        if (h->version < 2 || h->version > 6) {
             return pomai::Status::Corruption("unsupported version");
         }
         
@@ -369,7 +377,7 @@ namespace pomai::table
     }
 
     pomai::Status SegmentReader::Search(std::span<const float> query, uint32_t nprobe, 
-                                        std::vector<pomai::VectorId>* out_candidates) const
+                                        std::vector<uint32_t>* out_candidates) const
     {
         if (!index_) return pomai::Status::Ok(); // Empty candidates -> Fallback
         return index_->Search(query, nprobe, out_candidates);
@@ -508,6 +516,36 @@ namespace pomai::table
         return FindResult::kNotFound;
     }
 
+    pomai::Status SegmentReader::ReadAtCodes(uint32_t index, pomai::VectorId* out_id, std::span<const uint8_t>* out_codes, bool* out_deleted, pomai::Metadata* out_meta) const
+    {
+        if (index >= count_) return pomai::Status::InvalidArgument("index out of range");
+
+        const uint8_t* p = base_addr_ + entries_start_offset_ + index * entry_size_;
+        
+        if (out_id) {
+             std::memcpy(out_id, p, sizeof(uint64_t));
+        }
+        
+        uint8_t flags = *(p + 8);
+        bool is_deleted = (flags & kFlagTombstone);
+        if (out_deleted) *out_deleted = is_deleted;
+
+        if (out_codes) {
+             if (is_deleted || !is_quantized_) {
+                 *out_codes = {};
+             } else {
+                 const uint8_t* code_ptr = p + 12;
+                 *out_codes = std::span<const uint8_t>(code_ptr, dim_);
+             }
+        }
+        
+        if (out_meta) {
+            GetMetadata(index, out_meta);
+        }
+        
+        return pomai::Status::Ok();
+    }
+    
     pomai::Status SegmentReader::ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted, pomai::Metadata* out_meta) const
     {
         if (index >= count_) return pomai::Status::InvalidArgument("index out of range");

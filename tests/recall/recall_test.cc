@@ -74,7 +74,7 @@ POMAI_TEST(Recall_Clustered_Basic) {
     pomai::util::ThreadPool pool(4);
     
     pomai::IndexParams index_opts;
-    ShardRuntime rt(shard_id, path, dopt.dim, pomai::MembraneKind::kVector, std::move(wal),
+    ShardRuntime rt(shard_id, path, dopt.dim, pomai::MembraneKind::kVector, pomai::MetricType::kL2, std::move(wal),
                     std::move(mem), 1024, index_opts, &pool);
     POMAI_EXPECT_OK(rt.Start());
     
@@ -174,7 +174,7 @@ POMAI_TEST(Recall_Uniform_Hard) {
     
     auto mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);
     
-    ShardRuntime rt(shard_id, path, dopt.dim, pomai::MembraneKind::kVector, std::move(wal),
+    ShardRuntime rt(shard_id, path, dopt.dim, pomai::MembraneKind::kVector, pomai::MetricType::kL2, std::move(wal),
                     std::move(mem), 1024, pomai::IndexParams{});
     POMAI_EXPECT_OK(rt.Start());
     

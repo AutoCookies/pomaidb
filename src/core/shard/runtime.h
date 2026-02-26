@@ -117,6 +117,7 @@ namespace pomai::core
                      std::string shard_dir,
                      std::uint32_t dim,
                      pomai::MembraneKind kind,
+                     pomai::MetricType metric,
                      std::unique_ptr<storage::Wal> wal,
                      std::unique_ptr<table::MemTable> mem,
                      std::size_t mailbox_cap,
@@ -200,10 +201,12 @@ namespace pomai::core
         pomai::Status SearchLocalInternal(std::shared_ptr<table::MemTable> active,
                                           std::shared_ptr<ShardSnapshot> snap, 
                                           std::span<const float> query,
+                                          float query_sum,
                                           std::uint32_t topk,
-                                          const SearchOptions& opts,
+                                          const pomai::SearchOptions& opts,
                                           SearchMergePolicy& merge_policy,
-                                          std::vector<pomai::SearchHit> *out,
+                                          bool use_visibility,
+                                          std::vector<pomai::SearchHit>* out,
                                           bool use_pool);
 
                                           
@@ -223,6 +226,7 @@ namespace pomai::core
         const std::string shard_dir_;
         const std::uint32_t dim_;
         const pomai::MembraneKind kind_;
+        const pomai::MetricType metric_;
 
         std::unique_ptr<storage::Wal> wal_;
         std::atomic<std::shared_ptr<table::MemTable>> mem_;

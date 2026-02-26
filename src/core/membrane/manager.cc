@@ -43,7 +43,7 @@ namespace pomai::core
             MembraneState state;
             state.spec = loaded_spec;
             if (loaded_spec.kind == pomai::MembraneKind::kVector) {
-                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind);
+                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind, loaded_spec.metric);
             } else {
                 state.rag_engine = std::make_unique<RagEngine>(opt, loaded_spec);
             }
@@ -85,7 +85,7 @@ namespace pomai::core
                 MembraneState state;
                 state.spec = mspec;
                 if (mspec.kind == pomai::MembraneKind::kVector) {
-                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind);
+                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind, mspec.metric);
                 } else {
                     state.rag_engine = std::make_unique<RagEngine>(opt, mspec);
                 }
@@ -176,7 +176,7 @@ namespace pomai::core
         MembraneState state;
         state.spec = spec;
         if (spec.kind == pomai::MembraneKind::kVector) {
-            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind);
+            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind, spec.metric);
         } else {
             state.rag_engine = std::make_unique<RagEngine>(opt, spec);
         }

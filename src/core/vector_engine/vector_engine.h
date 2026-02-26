@@ -25,7 +25,7 @@ namespace pomai::core
     class VectorEngine
     {
     public:
-        explicit VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind);
+        explicit VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind, pomai::MetricType metric);
         ~VectorEngine();
 
         VectorEngine(const VectorEngine &) = delete;
@@ -61,6 +61,7 @@ namespace pomai::core
 
         const pomai::DBOptions &options() const { return opt_; }
         pomai::MembraneKind kind() const { return kind_; }
+        pomai::MetricType metric() const { return metric_; }
 
     private:
         Status OpenLocked();
@@ -72,6 +73,7 @@ namespace pomai::core
 
         pomai::DBOptions opt_;
         pomai::MembraneKind kind_;
+        pomai::MetricType metric_;
         bool opened_ = false;
 
         std::vector<std::unique_ptr<Shard>> shards_;

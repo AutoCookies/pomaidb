@@ -74,7 +74,8 @@ static std::vector<pomai::SearchHit> MergeTopK(const std::vector<std::vector<pom
 }
 } // namespace
 
-VectorEngine::VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind) : opt_(std::move(opt)), kind_(kind) {}
+VectorEngine::VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind, pomai::MetricType metric)
+    : opt_(std::move(opt)), kind_(kind), metric_(metric) {}
 VectorEngine::~VectorEngine() = default;
 
 std::uint32_t VectorEngine::ShardOf(VectorId id, std::uint32_t shard_count) {
@@ -171,7 +172,7 @@ Status VectorEngine::OpenLocked() {
         auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
         std::filesystem::create_directories(shard_dir, ec);
 
-        auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, kind_, std::move(wal), std::move(mem),
+        auto rt = std::make_unique<ShardRuntime>(i, shard_dir, opt_.dim, kind_, metric_, std::move(wal), std::move(mem),
                                                  kMailboxCap, opt_.index_params, search_pool_.get(),
                                                  segment_pool_.get());
         auto shard = std::make_unique<Shard>(std::move(rt));

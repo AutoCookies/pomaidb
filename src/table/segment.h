@@ -82,13 +82,14 @@ namespace pomai::table
         
         // Approximate Search via IVF Index.
         pomai::Status Search(std::span<const float> query, uint32_t nprobe, 
-                             std::vector<pomai::VectorId>* out_candidates) const;
+                             std::vector<uint32_t>* out_candidates) const;
 
         bool HasIndex() const { return index_ != nullptr; }
 
         
         // Read entry at index [0, Count()-1]
         pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted, pomai::Metadata* out_meta) const;
+        pomai::Status ReadAtCodes(uint32_t index, pomai::VectorId* out_id, std::span<const uint8_t>* out_codes, bool* out_deleted, pomai::Metadata* out_meta) const;
         pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const;
 
 
@@ -153,6 +154,10 @@ namespace pomai::table
         uint32_t Count() const { return count_; }
         uint32_t Dim() const { return dim_; }
         std::string Path() const { return path_; }
+
+        const uint8_t* GetBaseAddr() const { return base_addr_; }
+        uint32_t GetEntriesStartOffset() const { return entries_start_offset_; }
+        std::size_t GetEntrySize() const { return entry_size_; }
 
     private:
         SegmentReader();

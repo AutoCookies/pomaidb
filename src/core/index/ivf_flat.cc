@@ -144,18 +144,18 @@ pomai::Status IvfFlatIndex::Train(std::span<const float> data, size_t num_vector
     return pomai::Status::Ok();
 }
 
-pomai::Status IvfFlatIndex::Add(pomai::VectorId id, std::span<const float> vec) {
+pomai::Status IvfFlatIndex::Add(uint32_t entry_index, std::span<const float> vec) {
     if (!trained_) return pomai::Status::Aborted("Index not trained");
     if (vec.size() != dim_) return pomai::Status::InvalidArgument("Dim mismatch");
     
     uint32_t c = FindNearestCentroid(vec);
-    lists_[c].push_back(id);
+    lists_[c].push_back(entry_index);
     total_count_++;
     return pomai::Status::Ok();
 }
 
 pomai::Status IvfFlatIndex::Search(std::span<const float> query, uint32_t nprobe, 
-                                   std::vector<pomai::VectorId>* out) const {
+                                   std::vector<uint32_t>* out) const {
     if (!trained_) {
         // Fallback or empty? 
         // If not trained, we can't search via index.
@@ -164,23 +164,24 @@ pomai::Status IvfFlatIndex::Search(std::span<const float> query, uint32_t nprobe
         // NOTE: In our design, "not trained" means index shouldn't exist.
     }
     
-    // 1. Score Centroids (using Dot Product as per FindNearestCentroid)
-    std::vector<std::pair<float, uint32_t>> scores;
-    scores.reserve(opt_.nlist);
+    // 1. Score Centroids
+    thread_local std::vector<std::pair<float, uint32_t>> scores_reuse;
+    scores_reuse.clear();
+    scores_reuse.reserve(opt_.nlist);
     
     for (uint32_t c = 0; c < opt_.nlist; ++c) {
         std::span<const float> cen(&centroids_[c * dim_], dim_);
         float s = pomai::core::Dot(query, cen);
-        scores.push_back({s, c});
+        scores_reuse.push_back({s, c});
     }
     
     // 2. Select Top nprobe
     uint32_t K = std::min(nprobe, opt_.nlist);
-    std::partial_sort(scores.begin(), scores.begin() + K, scores.end(), std::greater<>());
+    std::partial_sort(scores_reuse.begin(), scores_reuse.begin() + K, scores_reuse.end(), std::greater<>());
     
     // 3. Gather
     for (uint32_t k = 0; k < K; ++k) {
-        uint32_t c = scores[k].second;
+        uint32_t c = scores_reuse[k].second;
         const auto& lst = lists_[c];
         out->insert(out->end(), lst.begin(), lst.end());
     }
@@ -211,7 +212,7 @@ pomai::Status IvfFlatIndex::Save(const std::string& path) const {
         uint32_t sz = static_cast<uint32_t>(lst.size());
         WritePod(out, sz);
         if (sz > 0) {
-            out.write(reinterpret_cast<const char*>(lst.data()), lst.size() * sizeof(pomai::VectorId));
+            out.write(reinterpret_cast<const char*>(lst.data()), lst.size() * sizeof(uint32_t));
         }
     }
     
@@ -275,7 +276,7 @@ pomai::Status IvfFlatIndex::Load(const std::string& path, std::unique_ptr<IvfFla
 
     // Lists
     uint64_t ids_seen = 0;
-    const uint64_t max_possible_ids = (static_cast<uint64_t>(file_size) - fixed_header - centroid_bytes - static_cast<uint64_t>(nlist) * sizeof(uint32_t)) / sizeof(pomai::VectorId);
+    const uint64_t max_possible_ids = (static_cast<uint64_t>(file_size) - fixed_header - centroid_bytes - static_cast<uint64_t>(nlist) * sizeof(uint32_t)) / sizeof(uint32_t);
     for (uint32_t i = 0; i < nlist; ++i) {
         uint32_t sz;
         ReadPod(in, sz);
@@ -286,7 +287,7 @@ pomai::Status IvfFlatIndex::Load(const std::string& path, std::unique_ptr<IvfFla
 
         idx->lists_[i].resize(sz);
         if (sz > 0) {
-            in.read(reinterpret_cast<char*>(idx->lists_[i].data()), static_cast<std::streamsize>(static_cast<uint64_t>(sz) * sizeof(pomai::VectorId)));
+            in.read(reinterpret_cast<char*>(idx->lists_[i].data()), static_cast<std::streamsize>(static_cast<uint64_t>(sz) * sizeof(uint32_t)));
         }
     }
 
