@@ -13,6 +13,27 @@ option(POMAI_BUILD_TESTS "Build tests" OFF)
 option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
 
 # =========================
+# Phase 3: mimalloc — vendored from third_party/mimalloc
+# (DragonflyDB patches pre-applied via: git apply patches/mimalloc-v2.2.4/*.patch)
+# =========================
+option(POMAI_USE_MIMALLOC "Use mimalloc as global allocator (MI_OVERRIDE=ON)" ON)
+
+if (POMAI_USE_MIMALLOC)
+  # mimalloc options — must be set BEFORE add_subdirectory
+  set(MI_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_OBJECT   OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+  set(MI_OVERRIDE       ON  CACHE BOOL "" FORCE)   # replace malloc/free globally
+  set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+  set(MI_USE_CXX        ON  CACHE BOOL "" FORCE)   # C++ new/delete overrides
+  add_subdirectory(third_party/mimalloc EXCLUDE_FROM_ALL)
+  message(STATUS "[pomai] mimalloc: enabled (static, MI_OVERRIDE=ON)")
+else()
+  message(STATUS "[pomai] mimalloc: disabled")
+endif()
+
+
+# =========================
 # Library: pomai
 # =========================
 add_library(pomai STATIC
@@ -50,7 +71,29 @@ target_include_directories(pomai
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    # Phase 3 helio base primitives (header-only, pure std)
 )
+
+# Phase 3: mimalloc — TWO linking modes
+#
+#  Mode A (full MI_OVERRIDE): for standalone executables/static binaries only.
+#          malloc/free/new/delete are globally replaced. Fast, but UNSAFE when
+#          loaded as a .so by a host process (e.g. Python) that has its own heap.
+#
+#  Mode B (no-override, libpomai_c.so): mimalloc is used internally via
+#          mi_heap_* APIs. The global malloc/free are NOT replaced, so Python's
+#          glibc heap and mimalloc coexist without conflict.
+#
+# We achieve this by NOT linking mimalloc into libpomai (the intermediate static
+# lib). Instead:
+#   - libpomai_c.so  links mimalloc-static with MI_OVERRIDE=OFF (internal-only)
+#   - test/bench executables link mimalloc-static with MI_OVERRIDE=ON
+#     (done in the executable's own target_link_libraries)
+#
+# Note: MI_OVERRIDE is set at mimalloc *build time* (above), so we build ONE
+# mimalloc with MI_OVERRIDE=ON. For the .so we suppress interposition by NOT
+# exporting gnu-versioned malloc symbols — achieved via -Wl,--exclude-libs.
+
 
 # =========================
 # Library: pomai_c (C ABI)
@@ -68,6 +111,26 @@ set_target_properties(pomai_c_static PROPERTIES OUTPUT_NAME pomai_c)
 
 target_link_libraries(pomai_c PRIVATE pomai)
 target_link_libraries(pomai_c_static PRIVATE pomai)
+
+# Phase 3 fix: DO NOT link mimalloc into the SHARED library (libpomai_c.so).
+#
+# Reason: mimalloc compiled with MI_OVERRIDE=ON installs a __attribute__((constructor))
+# that patches the global malloc/free vtable at dlopen() time. When Python (or any
+# other host) loads the .so, mimalloc hijacks the entire process heap. Pointers
+# allocated by Python/glibc then get freed by mimalloc (or vice-versa) -> SIGABRT.
+#
+# Safe model:
+#   - libpomai_c.so  -> NO mimalloc. Uses glibc malloc. Safe for ctypes/JNI/FFI.
+#   - libpomai_c.a   -> mimalloc-static. For standalone executables that own the heap.
+#   - test/bench exes -> inherit mimalloc from pomai_c_static.
+#
+if (POMAI_USE_MIMALLOC)
+  # Static wrapper: link mimalloc so executables that embed libpomai get the fast path.
+  target_link_libraries(pomai_c_static PRIVATE mimalloc-static)
+  target_compile_definitions(pomai_c_static PRIVATE POMAI_USE_MIMALLOC=1)
+  # Shared library: intentionally NO mimalloc link.
+  # Internal allocations inside the .so use glibc, which is safe across FFI boundaries.
+endif()
 
 # Export C API symbols when building shared library on Windows.
 target_compile_definitions(pomai_c PRIVATE POMAI_C_BUILD_DLL)

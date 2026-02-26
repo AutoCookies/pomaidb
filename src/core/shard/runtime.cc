@@ -255,6 +255,19 @@ namespace pomai::core
         }
     }
 
+    // Phase 4: lock-free stats snapshot
+    ShardStats ShardRuntime::GetStats() const noexcept
+    {
+        ShardStats s;
+        s.shard_id          = shard_id_;
+        s.ops_processed     = ops_processed_.load(std::memory_order_relaxed);
+        s.queue_depth       = static_cast<std::uint64_t>(mailbox_.Size());
+        s.candidates_scanned = last_query_candidates_scanned_.load(std::memory_order_relaxed);
+        auto mem = mem_.load(std::memory_order_acquire);
+        s.memtable_entries  = mem ? static_cast<std::uint64_t>(mem->GetCount()) : 0u;
+        return s;
+    }
+
     pomai::Status ShardRuntime::Start()
     {
         if (started_.exchange(true))

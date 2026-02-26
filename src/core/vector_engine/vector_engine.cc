@@ -400,6 +400,25 @@ Status VectorEngine::Flush() {
 
 Status VectorEngine::Freeze() {
     if (!opened_) return Status::InvalidArgument("vector_engine not opened");
+    if (shards_.empty()) return Status::Ok();
+
+    // Phase 2: Parallel freeze — fan out to all shards concurrently.
+    // Each shard's freeze is handled by its own actor (RunLoop); we just
+    // enqueue the command from multiple threads simultaneously.
+    if (search_pool_ && shards_.size() > 1) {
+        std::vector<std::future<Status>> futs;
+        futs.reserve(shards_.size());
+        for (auto& s : shards_) {
+            futs.push_back(search_pool_->Enqueue([&s]() { return s->Freeze(); }));
+        }
+        for (auto& f : futs) {
+            Status st = f.get();
+            if (!st.ok()) return st;
+        }
+        return Status::Ok();
+    }
+
+    // Fallback: sequential (no thread pool or single shard).
     for (auto& s : shards_) {
         Status st = s->Freeze();
         if (!st.ok()) return st;

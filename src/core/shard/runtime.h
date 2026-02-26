@@ -13,13 +13,14 @@
 
 #include "core/shard/mailbox.h"
 #include "core/shard/snapshot.h"
+#include "core/shard/shard_stats.h"
 #include "pomai/metadata.h"
-#include "pomai/search.h" // Restored
+#include "pomai/search.h"
 #include "pomai/iterator.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
-#include "pomai/options.h" 
-#include "util/thread_pool.h" 
+#include "pomai/options.h"
+#include "util/thread_pool.h"
 
 namespace pomai::storage
 {
@@ -175,6 +176,10 @@ namespace pomai::core
         std::size_t GetQueueDepth() const { return mailbox_.Size(); }
         std::uint64_t GetOpsProcessed() const { return ops_processed_.load(std::memory_order_relaxed); }
         std::uint64_t LastQueryCandidatesScanned() const { return last_query_candidates_scanned_.load(std::memory_order_relaxed); }
+
+        // Phase 4: per-shard snapshot of runtime metrics (lock-free, any thread).
+        ShardStats GetStats() const noexcept;
+
 
     private:
         struct BackgroundJob;

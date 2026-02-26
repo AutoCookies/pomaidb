@@ -1,169 +1,208 @@
+// memtable.cc — MemTable implementation using FlatHashMemMap.
+//
+// PHASE 1 UPDATE: Replaced std::unordered_map + shared_mutex with
+// FlatHashMemMap (open-addressing, robin-hood, backward-shift deletion).
+// Single-writer (ShardRuntime actor): no lock needed on write path.
+// Seqlock protects readers.
+
 #include "table/memtable.h"
 #include <cstring>
 #include <mutex>
 
-namespace pomai::table
-{
+namespace pomai::table {
 
-    static std::size_t AlignUp(std::size_t x, std::size_t a)
-    {
-        return (x + (a - 1)) & ~(a - 1);
+static std::size_t AlignUp(std::size_t x, std::size_t a) {
+    return (x + (a - 1)) & ~(a - 1);
+}
+
+void* Arena::Allocate(std::size_t n, std::size_t align) {
+    if (blocks_.empty() || AlignUp(blocks_.back().used, align) + n > block_bytes_) {
+        Block b;
+        b.mem  = std::make_unique<std::byte[]>(block_bytes_);
+        b.used = 0;
+        blocks_.push_back(std::move(b));
     }
+    auto& blk  = blocks_.back();
+    blk.used   = AlignUp(blk.used, align);
+    void* p    = blk.mem.get() + blk.used;
+    blk.used  += n;
+    return p;
+}
 
-    void *Arena::Allocate(std::size_t n, std::size_t align)
-    {
-        if (blocks_.empty() || AlignUp(blocks_.back().used, align) + n > block_bytes_)
-        {
-            Block b;
-            b.mem = std::make_unique<std::byte[]>(block_bytes_);
-            b.used = 0;
-            blocks_.push_back(std::move(b));
-        }
-        auto &blk = blocks_.back();
-        blk.used = AlignUp(blk.used, align);
-        void *p = blk.mem.get() + blk.used;
-        blk.used += n;
-        return p;
+// ------------------------------------------------
+// MemTable constructor
+// ------------------------------------------------
+MemTable::MemTable(std::uint32_t dim, std::size_t arena_block_bytes)
+    : dim_(dim), arena_(arena_block_bytes),
+      map_(/* initial_cap = */ 128)
+{}
+
+// ------------------------------------------------
+// Put (no metadata)
+// ------------------------------------------------
+pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec) {
+    return Put(id, vec, pomai::Metadata());
+}
+
+// ------------------------------------------------
+// Put (with metadata)
+// ------------------------------------------------
+pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec,
+                            const pomai::Metadata& meta) {
+    if (vec.dim != dim_)
+        return pomai::Status::InvalidArgument("dim mismatch");
+
+    float* dst = static_cast<float*>(arena_.Allocate(vec.size_bytes(), alignof(float)));
+    std::memcpy(dst, vec.data, vec.size_bytes());
+
+    // Writer holds seqlock during map mutation.
+    seqlock_.BeginWrite();
+    map_.Put(id, dst);
+    seqlock_.EndWrite();
+
+    // Metadata is rare — use its own shared_mutex.
+    if (!meta.tenant.empty()) {
+        std::unique_lock lk(meta_mu_);
+        metadata_[id] = meta;
+    } else {
+        std::unique_lock lk(meta_mu_);
+        metadata_.erase(id);
     }
+    return pomai::Status::Ok();
+}
 
-    MemTable::MemTable(std::uint32_t dim, std::size_t arena_block_bytes)
-        : dim_(dim), arena_(arena_block_bytes)
-    {
-    }
+// ------------------------------------------------
+// PutBatch
+// ------------------------------------------------
+pomai::Status MemTable::PutBatch(const std::vector<pomai::VectorId>& ids,
+                                 const std::vector<pomai::VectorView>& vectors) {
+    if (ids.size() != vectors.size())
+        return pomai::Status::InvalidArgument("ids and vectors size mismatch");
+    if (ids.empty())
+        return pomai::Status::Ok();
 
-    pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec)
-    {
-        return Put(id, vec, pomai::Metadata());
-    }
-
-    pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec, const pomai::Metadata& meta)
-    {
-        std::unique_lock lock(mutex_);
+    for (const auto& vec : vectors)
         if (vec.dim != dim_)
             return pomai::Status::InvalidArgument("dim mismatch");
-        float *dst = static_cast<float *>(arena_.Allocate(vec.size_bytes(), alignof(float)));
+
+    // Allocate all memory first (arena is not thread-safe, writer-only).
+    std::vector<float*> ptrs;
+    ptrs.reserve(ids.size());
+    for (const auto& vec : vectors) {
+        float* dst = static_cast<float*>(arena_.Allocate(vec.size_bytes(), alignof(float)));
         std::memcpy(dst, vec.data, vec.size_bytes());
-        map_[id] = dst;
-        
-        // Store metadata if not empty
-        // For MVP with just 'tenant', check if tenant is empty
-        if (!meta.tenant.empty()) {
-            metadata_[id] = meta;
-        } else {
-            // Ensure no metadata exists if empty (overwrite case)
-            metadata_.erase(id);
-        }
-        
-        return pomai::Status::Ok();
+        ptrs.push_back(dst);
     }
 
-    pomai::Status MemTable::PutBatch(const std::vector<pomai::VectorId>& ids,
-                                      const std::vector<pomai::VectorView>& vectors)
+    seqlock_.BeginWrite();
+    for (std::size_t i = 0; i < ids.size(); ++i)
+        map_.Put(ids[i], ptrs[i]);
+    seqlock_.EndWrite();
+
+    return pomai::Status::Ok();
+}
+
+// ------------------------------------------------
+// Delete (tombstone)
+// ------------------------------------------------
+pomai::Status MemTable::Delete(pomai::VectorId id) {
+    seqlock_.BeginWrite();
+    map_.Put(id, nullptr); // nullptr = tombstone
+    seqlock_.EndWrite();
+
     {
-        std::unique_lock lock(mutex_);
-        // Validation
-        if (ids.size() != vectors.size())
-            return pomai::Status::InvalidArgument("ids and vectors size mismatch");
-        if (ids.empty())
-            return pomai::Status::Ok();
-        
-        // Validate dimensions for all vectors
-        for (const auto& vec : vectors) {
-            if (vec.dim != dim_)
-                return pomai::Status::InvalidArgument("dim mismatch");
-        }
-        
-        // Batch insert: allocate and copy all vectors
-        for (std::size_t i = 0; i < ids.size(); ++i) {
-            float *dst = static_cast<float *>(arena_.Allocate(vectors[i].size_bytes(), alignof(float)));
-            std::memcpy(dst, vectors[i].data, vectors[i].size_bytes());
-            map_[ids[i]] = dst;
-        }
-        
-        return pomai::Status::Ok();
+        std::unique_lock lk(meta_mu_);
+        metadata_.erase(id);
     }
+    return pomai::Status::Ok();
+}
 
-    pomai::Status MemTable::Delete(pomai::VectorId id)
+// ------------------------------------------------
+// Get (vector pointer only)
+// ------------------------------------------------
+pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec) const {
+    return Get(id, out_vec, nullptr);
+}
+
+// ------------------------------------------------
+// Get (vector + metadata)
+// ------------------------------------------------
+pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec,
+                            pomai::Metadata* out_meta) const {
+    if (!out_vec) return Status::InvalidArgument("out_vec is null");
+
+    // Seqlock read: retry if write is in progress.
+    float* ptr = nullptr;
+    uint64_t seq;
+    do {
+        seq = seqlock_.BeginRead();
+        auto* v = map_.Find(id);
+        ptr = v ? *v : nullptr;
+    } while (!seqlock_.EndRead(seq));
+
+    if (ptr == nullptr) {
+        *out_vec = nullptr;
+        return Status::NotFound("vector not found");
+    }
+    *out_vec = ptr;
+
+    if (out_meta) {
+        std::shared_lock lk(meta_mu_);
+        auto it = metadata_.find(id);
+        *out_meta = (it != metadata_.end()) ? it->second : pomai::Metadata{};
+    }
+    return Status::Ok();
+}
+
+// ------------------------------------------------
+// Clear
+// ------------------------------------------------
+void MemTable::Clear() {
+    seqlock_.BeginWrite();
+    map_.Clear();
+    seqlock_.EndWrite();
+
     {
-        std::unique_lock lock(mutex_);
-        map_[id] = nullptr; // Tombstone
-        metadata_.erase(id); // Clear metadata
-        return pomai::Status::Ok();
-    }
-
-    pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec) const {
-        std::shared_lock lock(mutex_);
-        if (!out_vec) return Status::InvalidArgument("out_vec is null");
-        auto it = map_.find(id);
-        if (it == map_.end() || it->second == nullptr) {
-            *out_vec = nullptr;
-            return Status::NotFound("vector not found");
-        }
-        *out_vec = it->second;
-        return Status::Ok();
-    }
-
-    pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec, pomai::Metadata* out_meta) const {
-        std::shared_lock lock(mutex_);
-        if (!out_vec) return Status::InvalidArgument("out_vec is null");
-        auto it = map_.find(id);
-        if (it == map_.end() || it->second == nullptr) {
-            *out_vec = nullptr;
-            return Status::NotFound("vector not found");
-        }
-        *out_vec = it->second;
-        
-        if (out_meta) {
-            auto meta_it = metadata_.find(id);
-            if (meta_it != metadata_.end()) {
-                *out_meta = meta_it->second;
-            } else {
-                *out_meta = pomai::Metadata(); // Default/Empty
-            }
-        }
-        return Status::Ok();
-    }
-
-    void MemTable::Clear()
-    {
-        std::unique_lock lock(mutex_);
-        map_.clear();
+        std::unique_lock lk(meta_mu_);
         metadata_.clear();
-        arena_.Clear();
     }
+    arena_.Clear();
+}
 
-    MemTable::Cursor MemTable::CreateCursor() const
-    {
-        return Cursor(this, map_.cbegin(), map_.cend());
+// ------------------------------------------------
+// Cursor — snapshot of all slots at creation time
+// ------------------------------------------------
+MemTable::Cursor MemTable::CreateCursor() const {
+    std::vector<Cursor::Entry> snap;
+    // Snapshot the table under a seqlock read.
+    uint64_t seq;
+    do {
+        seq = seqlock_.BeginRead();
+        snap.clear();
+        map_.ForEach([&](const pomai::VectorId& id, float* const& ptr) {
+            snap.push_back({id, ptr});
+        });
+    } while (!seqlock_.EndRead(seq));
+
+    return Cursor(this, std::move(snap));
+}
+
+bool MemTable::Cursor::Next(CursorEntry* out) {
+    if (!out || idx_ >= snap_.size()) return false;
+
+    const Entry& e         = snap_[idx_++];
+    const bool   is_deleted = (e.ptr == nullptr);
+    std::span<const float> vec;
+    if (!is_deleted) vec = {e.ptr, mem_->dim_};
+
+    const pomai::Metadata* meta_ptr = nullptr;
+    if (!is_deleted) {
+        std::shared_lock lk(mem_->meta_mu_);
+        auto it = mem_->metadata_.find(e.id);
+        if (it != mem_->metadata_.end()) meta_ptr = &it->second;
     }
-
-    bool MemTable::Cursor::Next(CursorEntry* out)
-    {
-        if (!out) {
-            return false;
-        }
-        if (it_ == end_) {
-            return false;
-        }
-        const auto id = it_->first;
-        const float* ptr = it_->second;
-        const bool is_deleted = (ptr == nullptr);
-        std::span<const float> vec;
-        if (!is_deleted) {
-            vec = std::span<const float>{ptr, mem_->dim_};
-        }
-        const pomai::Metadata* meta_ptr = nullptr;
-        if (!is_deleted) {
-            auto meta_it = mem_->metadata_.find(id);
-            if (meta_it != mem_->metadata_.end()) {
-                meta_ptr = &meta_it->second;
-            }
-        }
-        *out = CursorEntry{id, vec, is_deleted, meta_ptr};
-        ++it_;
-        return true;
-    }
-
-
+    *out = CursorEntry{e.id, vec, is_deleted, meta_ptr};
+    return true;
+}
 
 } // namespace pomai::table
