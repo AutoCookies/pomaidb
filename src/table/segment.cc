@@ -140,8 +140,6 @@ namespace pomai::table
         // Write header
         st = file->Append(Slice(reinterpret_cast<const uint8_t*>(&h), sizeof(h)));
         if (!st.ok()) return st;
-
-        uint64_t offset = sizeof(SegmentHeader);
         
         // Incremental CRC computation
         uint32_t crc = 0;

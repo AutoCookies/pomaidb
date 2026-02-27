@@ -22,4 +22,4 @@ Please include as much of the following information as possible:
 - Description of the vulnerability (what it is, how it can be triggered)
 - Affected versions (e.g. v1.3.0, main branch commit hash)
 - Steps to reproduce (code snippet, input data, environment details)
-- Potential impact (data leak, crash, code
+- Potential impact (data leak, crash, code)

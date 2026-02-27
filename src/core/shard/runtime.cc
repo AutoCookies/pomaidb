@@ -883,7 +883,7 @@ namespace pomai::core
     // HandleCompact: Budgeted background compaction
     // -------------------------
 
-    std::optional<pomai::Status> ShardRuntime::HandleCompact(CompactCmd &c)
+    std::optional<pomai::Status> ShardRuntime::HandleCompact(CompactCmd & /*c*/)
     {
         if (background_job_) return std::nullopt; // Keep in queue
 
@@ -897,7 +897,7 @@ namespace pomai::core
 
         storage::CompactionManager::LevelStats l0_stats;
         l0_stats.level = 0;
-        l0_stats.file_count = segments_.size();
+        l0_stats.file_count = static_cast<uint32_t>(segments_.size());
         l0_stats.total_size = total_size;
         l0_stats.score = static_cast<double>(segments_.size()) / 4.0; // Assume 4 files trigger L0->L1
         stats.push_back(l0_stats);

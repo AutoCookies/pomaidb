@@ -146,8 +146,39 @@ class PosixWritableFile : public WritableFile {
     return res == 0 ? Status::Ok() : Status::IOError("Close failed");
   }
 
- private:
+ protected:
   int fd_;
+};
+
+/**
+ * SectorAlignedWritableFile: Pads writes to the hardware sector boundary (4KB).
+ * Distilled from SQLite's sector-aligned VFS.
+ */
+class SectorAlignedWritableFile : public PosixWritableFile {
+ public:
+  static constexpr size_t SECTOR_SIZE = 4096;
+  
+  explicit SectorAlignedWritableFile(int fd) : PosixWritableFile(fd), offset_(0) {}
+
+  Status Append(Slice data) override {
+    Status s = PosixWritableFile::Append(data);
+    if (s.ok()) offset_ += data.size();
+    return s;
+  }
+
+  /// Pad to sector boundary and sync.
+  Status Sync() override {
+    size_t padding = SECTOR_SIZE - (offset_ % SECTOR_SIZE);
+    if (padding != SECTOR_SIZE) {
+      std::string pad_data(padding, '\0');
+      Status s = Append(Slice(pad_data));
+      if (!s.ok()) return s;
+    }
+    return PosixWritableFile::Sync();
+  }
+
+ private:
+  size_t offset_;
 };
 
 // --- Factory Implementations ---
