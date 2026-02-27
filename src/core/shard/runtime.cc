@@ -17,6 +17,7 @@
 #include "core/shard/layer_lookup.h"
 #include <queue>
 #include "core/shard/filter_evaluator.h" // Added
+#include "core/bitset_mask.h"             // Phase 3: pre-computed per-segment bitset
 #include <iostream>
 #include <list>
 #include "pomai/metadata.h" // Added
@@ -1415,6 +1416,14 @@ namespace pomai::core
             std::uint64_t local_scanned = 0;
             bool used_candidates = false;
 
+            // Phase 3: Pre-compute bitset for this segment when filters active.
+            // One sequential forward pass (cache-friendly mmap reads) replaces
+            // per-candidate FilterEvaluator::Matches() calls in the hot loops below.
+            core::BitsetMask seg_mask(seg->Count());
+            if (has_filters) {
+                seg_mask.BuildFromSegment(*seg, opts);
+            }
+
             if (!use_visibility && !has_filters) { // FAST PATH
                 if (seg->IsQuantized()) {
                     float q_min = seg->GetQuantizer()->GetGlobalMin();
@@ -1465,7 +1474,7 @@ namespace pomai::core
                                 const auto* entry = merge_policy.Find(id);
                                 if (!entry || entry->source != source || entry->is_tombstone) continue;
                             }
-                            if (has_filters && !core::FilterEvaluator::Matches(local_meta, opts)) continue;
+                            if (has_filters && !seg_mask.Test(entry_idx)) continue;
 
                             float score = pomai::core::DotSq8(query, codes, q_min, q_inv_scale, query_sum);
                             local.Push(id, score);
@@ -1483,7 +1492,7 @@ namespace pomai::core
                                 const auto* entry = merge_policy.Find(id);
                                 if (!entry || entry->source != source || entry->is_tombstone) continue;
                             }
-                            if (has_filters && !core::FilterEvaluator::Matches(local_meta, opts)) continue;
+                            if (has_filters && !seg_mask.Test(entry_idx)) continue;
 
                             float score = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine)
                                               ? pomai::core::Dot(query, vec)
@@ -1496,17 +1505,19 @@ namespace pomai::core
 
             if (!used_candidates) {
                 if (has_filters) {
+                    // ForEach fallback with BitsetMask: use a counter to get entry_idx.
+                    // ForEach doesn't expose entry_idx directly, so we use a local counter.
+                    uint32_t fe_idx = 0;
                     seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                        const uint32_t my_idx = fe_idx++;
                         ++local_scanned;
                         if (is_deleted) return;
                         if (use_visibility) {
                             const auto* entry = merge_policy.Find(id);
                             if (!entry || entry->source != source || entry->is_tombstone) return;
                         }
-                        
-                        const pomai::Metadata default_meta;
-                        const pomai::Metadata& m = meta ? *meta : default_meta;
-                        if (!core::FilterEvaluator::Matches(m, opts)) return;
+                        // Phase 3: bit test replaces string-compare FilterEvaluator::Matches()
+                        if (!seg_mask.Test(my_idx)) return;
 
                         float score = 0.0f;
                         if (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine) {

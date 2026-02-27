@@ -94,6 +94,9 @@ add_library(pomai STATIC
   # Phase 2: Product Quantizer
   src/core/quantization/pomai_pq.cc
 
+  # Phase 3 (Milvus-Lite inspired): BitsetMask pre-computed filter bitset
+  src/core/bitset_mask.cc
+
   # Phase 3+4: HNSW index wrapper (compiled only when FAISS is ON)
   $<$<BOOL:${POMAI_USE_FAISS}>:src/core/index/hnsw_index.cc>
 
