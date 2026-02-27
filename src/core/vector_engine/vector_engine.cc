@@ -203,8 +203,9 @@ Status VectorEngine::OpenLocked() {
 Status VectorEngine::Close() {
     if (!opened_) return Status::Ok();
     if (routing_mode_.load() == routing::RoutingMode::kReady && routing_mutable_) {
-        std::lock_guard<std::mutex> lg(routing_mu_);
-        (void)routing::SaveRoutingTableAtomic(opt_.path, *routing_mutable_, opt_.routing_keep_prev != 0);
+        shard_router_.Update([&]{
+            (void)routing::SaveRoutingTableAtomic(opt_.path, *routing_mutable_, opt_.routing_keep_prev != 0);
+        });
     }
     shards_.clear();
     search_pool_.reset();
@@ -221,19 +222,20 @@ void VectorEngine::MaybeWarmupAndInitRouting(std::span<const float> vec) {
     }
     if (warmup_count_ < warmup_target_) return;
 
-    std::lock_guard<std::mutex> lg(routing_mu_);
-    if (routing_mode_.load() == routing::RoutingMode::kReady) return;
-    const std::uint32_t rk = std::max(1u, opt_.routing_k == 0 ? (2u * opt_.shard_count) : opt_.routing_k);
-    auto built = routing::BuildInitialTable(std::span<const float>(warmup_reservoir_.data(), warmup_reservoir_.size()),
-                                            warmup_count_, opt_.dim, rk, opt_.shard_count, 5, 12345);
-    routing_prev_ = routing_current_;
-    routing_mutable_ = std::make_shared<routing::RoutingTable>(built);
-    routing_current_ = routing_mutable_;
-    routing_mode_.store(routing::RoutingMode::kReady);
-    (void)routing::SaveRoutingTableAtomic(opt_.path, built, opt_.routing_keep_prev != 0);
-    util::Log(util::LogLevel::kInfo,
-              "[routing] mode=READY warmup_size=" + std::to_string(warmup_count_) +
-                  " k=" + std::to_string(built.k));
+    shard_router_.Update([&]{
+        if (routing_mode_.load() == routing::RoutingMode::kReady) return;
+        const std::uint32_t rk = std::max(1u, opt_.routing_k == 0 ? (2u * opt_.shard_count) : opt_.routing_k);
+        auto built = routing::BuildInitialTable(std::span<const float>(warmup_reservoir_.data(), warmup_reservoir_.size()),
+                                                warmup_count_, opt_.dim, rk, opt_.shard_count, 5, 12345);
+        routing_prev_ = routing_current_;
+        routing_mutable_ = std::make_shared<routing::RoutingTable>(built);
+        routing_current_ = routing_mutable_;
+        routing_mode_.store(routing::RoutingMode::kReady);
+        (void)routing::SaveRoutingTableAtomic(opt_.path, built, opt_.routing_keep_prev != 0);
+        util::Log(util::LogLevel::kInfo,
+                  "[routing] mode=READY warmup_size=" + std::to_string(warmup_count_) +
+                      " k=" + std::to_string(built.k));
+    });
 }
 
 std::uint32_t VectorEngine::RouteShardForVector(VectorId id, std::span<const float> vec) {
@@ -246,8 +248,9 @@ std::uint32_t VectorEngine::RouteShardForVector(VectorId id, std::span<const flo
     const std::uint32_t sid = table->RouteVector(vec);
 
     {
-        std::lock_guard<std::mutex> lg(routing_mu_);
-        if (routing_mutable_) routing::OnlineUpdate(routing_mutable_.get(), vec);
+        shard_router_.Update([&]{
+            if (routing_mutable_) routing::OnlineUpdate(routing_mutable_.get(), vec);
+        });
     }
     ++puts_since_persist_;
     MaybePersistRoutingAsync();
@@ -256,10 +259,9 @@ std::uint32_t VectorEngine::RouteShardForVector(VectorId id, std::span<const flo
 
 void VectorEngine::MaybePersistRoutingAsync() {
     if (puts_since_persist_ < kPersistEveryPuts) return;
-    std::lock_guard<std::mutex> lg(routing_mu_);
-    if (routing_persist_inflight_ || !routing_mutable_) return;
+    if (routing_persist_inflight_.load(std::memory_order_relaxed) || !routing_mutable_) return;
     puts_since_persist_ = 0;
-    routing_persist_inflight_ = true;
+    routing_persist_inflight_.store(true, std::memory_order_relaxed);
     auto snapshot = std::make_shared<routing::RoutingTable>(*routing_mutable_);
     if (search_pool_) {
         (void)search_pool_->Enqueue([this, snapshot]() {
@@ -267,12 +269,11 @@ void VectorEngine::MaybePersistRoutingAsync() {
             if (!st.ok()) {
                 util::Log(util::LogLevel::kWarn, "[routing] persist failed: " + st.message());
             }
-            std::lock_guard<std::mutex> lk(routing_mu_);
-            routing_persist_inflight_ = false;
+            routing_persist_inflight_.store(false, std::memory_order_release);
             return Status::Ok();
         });
     } else {
-        routing_persist_inflight_ = false;
+        routing_persist_inflight_.store(false, std::memory_order_relaxed);
     }
 }
 

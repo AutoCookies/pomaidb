@@ -2,6 +2,9 @@
 #include <filesystem>
 #include <cassert>
 #include <unordered_map>
+#ifdef __linux__
+#include <sched.h>   // sched_setaffinity, cpu_set_t — CPU affinity pinning
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -285,7 +288,25 @@ namespace pomai::core
         if (!st.ok()) return st;
 
         worker_ = std::jthread([this]
-                               { RunLoop(); });
+                               {
+                                // Phase 1 (Helio shared-nothing): pin this shard's thread
+                                // to a specific CPU core so its L1/L2 cache is dedicated.
+                                // Guarded for Linux/Android only; silently skipped elsewhere.
+#if defined(__linux__)
+                                {
+                                    const int nproc = static_cast<int>(
+                                        std::thread::hardware_concurrency());
+                                    if (nproc > 0) {
+                                        cpu_set_t cs;
+                                        CPU_ZERO(&cs);
+                                        CPU_SET(static_cast<int>(shard_id_) % nproc, &cs);
+                                        // Best-effort: ignore errors (e.g. Docker CPU restrictions)
+                                        (void)sched_setaffinity(0, sizeof(cs), &cs);
+                                    }
+                                }
+#endif
+                                RunLoop();
+                               });
         return pomai::Status::Ok();
     }
 

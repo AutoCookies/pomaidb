@@ -2,7 +2,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -16,6 +15,7 @@
 #include "pomai/snapshot.h"
 #include "util/thread_pool.h"
 #include "core/routing/routing_table.h"
+#include "core/shard/router.h"  // Phase 4: seqlock ShardRouter
 
 namespace pomai::core
 {
@@ -84,12 +84,15 @@ namespace pomai::core
         std::shared_ptr<routing::RoutingTable> routing_mutable_;
         routing::RoutingTablePtr routing_current_;
         routing::RoutingTablePtr routing_prev_;
-        mutable std::mutex routing_mu_;
+        // Phase 4: seqlock replaces routing_mu_ — readers check even seq counter,
+        // writer bumps it odd→even. Zero-cost on the common (already-routed) read path.
+        core::ShardRouter shard_router_{1}; // resized in Open()
+        alignas(64) std::atomic<uint32_t> routing_seqlock_{0};
+        std::atomic<bool> routing_persist_inflight_{false};
         std::vector<float> warmup_reservoir_;
         std::uint32_t warmup_count_ = 0;
         std::uint32_t warmup_target_ = 0;
         std::uint64_t puts_since_persist_ = 0;
-        bool routing_persist_inflight_ = false;
 
         std::atomic<std::uint32_t> routed_shards_last_query_count_{0};
         std::atomic<std::uint32_t> routed_probe_centroids_last_query_{0};

@@ -7,3 +7,6 @@
 [submodule "third_party/milvus-lite"]
 	path = third_party/milvus-lite
 	url = https://github.com/milvus-io/milvus-lite.git
+[submodule "third_party/helio"]
+	path = third_party/helio
+	url = https://github.com/romange/helio.git
