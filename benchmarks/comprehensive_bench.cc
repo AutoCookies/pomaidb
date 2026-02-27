@@ -274,7 +274,7 @@ public:
         std::unique_ptr<pomai::DB> db;
         auto st = pomai::DB::Open(opts, &db);
         if (!st.ok()) {
-            fprintf(stderr, "Failed to open DB: %s\n", st.message().c_str());
+            fprintf(stderr, "Failed to open DB: %s\n", st.message());
             exit(1);
         }
         
@@ -282,7 +282,7 @@ public:
         for (uint32_t i = 0; i < dataset_.vectors.size(); ++i) {
             st = db->Put(i, dataset_.vectors[i]);
             if (!st.ok()) {
-                fprintf(stderr, "Put failed: %s\n", st.message().c_str());
+                fprintf(stderr, "Put failed: %s\n", st.message());
                 exit(1);
             }
             
@@ -296,7 +296,7 @@ public:
         // Freeze to build segments
         st = db->Freeze("__default__");
         if (!st.ok()) {
-            fprintf(stderr, "Freeze failed: %s\n", st.message().c_str());
+            fprintf(stderr, "Freeze failed: %s\n", st.message());
         }
         
         auto build_end = high_resolution_clock::now();
@@ -325,7 +325,7 @@ public:
                 
                 st = db->Search(dataset_.queries[qi], config_.topk, &search_result);
                 if (!st.ok()) {
-                    fprintf(stderr, "Search failed: %s\n", st.message().c_str());
+                    fprintf(stderr, "Search failed: %s\n", st.message());
                     continue;
                 }
                 

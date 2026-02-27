@@ -60,7 +60,7 @@ namespace
         {
              std::vector<float> check;
              pomai::Status st = db->Get(1000, &check);
-             if (!st.ok()) printf("Before Freeze: Get(1000) failed: %s\n", st.message().c_str());
+             if (!st.ok()) printf("Before Freeze: Get(1000) failed: %s\n", st.message());
              else printf("Before Freeze: Get(1000) OK\n");
         }
 

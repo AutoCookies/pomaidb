@@ -19,11 +19,13 @@
 #include "core/shard/manifest.h"
 #include "core/shard/layer_lookup.h"
 #include <queue>
-#include "core/shard/filter_evaluator.h" // Added
+#include "core/storage/compaction_manager.h"
+#include "core/shard/filter_evaluator.h"
 #include "core/bitset_mask.h"             // Phase 3: pre-computed per-segment bitset
 #include <iostream>
 #include <list>
 #include "pomai/metadata.h" // Added
+#include "util/posix_file.h" // Added for FsyncDir
 
 namespace pomai::core
 {
@@ -246,6 +248,7 @@ namespace pomai::core
         opt.nprobe = index_params_.nprobe;
         opt.warmup = 256;
         ivf_ = std::make_unique<pomai::index::IvfCoarse>(dim_, opt);
+        compaction_manager_ = std::make_unique<storage::CompactionManager>();
     }
 
     ShardRuntime::~ShardRuntime()
@@ -854,7 +857,7 @@ namespace pomai::core
         if (mem_.load(std::memory_order_relaxed)->GetCount() > 0) {
             auto st = RotateMemTable();
             if (!st.ok()) {
-                return pomai::Status::Internal("Freeze: RotateMemTable failed: " + st.message());
+                return pomai::Status::Internal(std::string("Freeze: RotateMemTable failed: ") + st.message());
             }
         }
 
@@ -879,22 +882,36 @@ namespace pomai::core
 
     std::optional<pomai::Status> ShardRuntime::HandleCompact(CompactCmd &c)
     {
-        (void)c;
-        if (background_job_) {
-            return pomai::Status::Busy("background job already running");
-        }
-        if (segments_.empty()) {
-            return pomai::Status::Ok();
+        if (background_job_) return std::nullopt; // Keep in queue
+
+        // 1. Calculate stats for compaction manager
+        std::vector<storage::CompactionManager::LevelStats> stats;
+        uint64_t total_size = 0;
+        for (const auto& seg : segments_) {
+            // Best effort file size estimation
+            total_size += fs::file_size(seg->Path());
         }
 
+        storage::CompactionManager::LevelStats l0_stats;
+        l0_stats.level = 0;
+        l0_stats.file_count = segments_.size();
+        l0_stats.total_size = total_size;
+        l0_stats.score = static_cast<double>(segments_.size()) / 4.0; // Assume 4 files trigger L0->L1
+        stats.push_back(l0_stats);
+
+        // 2. Pick task
+        auto task = compaction_manager_->PickCompaction(stats);
+        if (!task.valid) {
+            return pomai::Status::Ok(); // Nothing to compact
+        }
+
+        // 3. Setup background job
         BackgroundJob::CompactState state;
-        state.input_segments = segments_;
-        state.old_segments = segments_;
-        auto job = std::make_unique<BackgroundJob>(BackgroundJob::Type::kCompact, std::move(state));
-        job->done = std::move(c.done);
+        // For now, compact all segments in L0 since we are simplifying.
+        state.input_segments = segments_; 
+        background_job_ = std::make_unique<BackgroundJob>(BackgroundJob::Type::kCompact, std::move(state));
 
-        background_job_ = std::move(job);
-        return std::nullopt;
+        return std::nullopt; // Async
     }
 
     IteratorReply ShardRuntime::HandleIterator(IteratorCmd &c)
@@ -1004,7 +1021,7 @@ namespace pomai::core
                     pomai::Metadata meta_copy = entry.meta ? *entry.meta : pomai::Metadata();
                     auto st = state.builder->Add(entry.id, pomai::VectorView(entry.vec), entry.is_deleted, meta_copy);
                     if (!st.ok()) {
-                        complete_job(pomai::Status::Internal("Freeze: SegmentBuilder::Add failed: " + st.message()));
+                        complete_job(pomai::Status::Internal(std::string("Freeze: SegmentBuilder::Add failed: ") + st.message()));
                         return;
                     }
 
@@ -1012,7 +1029,7 @@ namespace pomai::core
                     if (!entry.is_deleted) {
                          st = ivf_->Put(entry.id, std::span<const float>(entry.vec));
                          if (!st.ok()) {
-                             complete_job(pomai::Status::Internal("Freeze: IVF::Put failed: " + st.message()));
+                             complete_job(pomai::Status::Internal(std::string("Freeze: IVF::Put failed: ") + st.message()));
                              return;
                          }
                     }
@@ -1026,24 +1043,24 @@ namespace pomai::core
                 } else if (state.phase == BackgroundJob::Phase::kFinalizeSegment) {
                     auto st = state.builder->BuildIndex();
                     if (!st.ok()) {
-                        complete_job(pomai::Status::Internal("Freeze: BuildIndex failed: " + st.message()));
+                        complete_job(pomai::Status::Internal(std::string("Freeze: BuildIndex failed: ") + st.message()));
                         return;
                     }
                     st = state.builder->Finish();
                     if (!st.ok()) {
-                        complete_job(pomai::Status::Internal("Freeze: SegmentBuilder::Finish failed: " + st.message()));
+                        complete_job(pomai::Status::Internal(std::string("Freeze: SegmentBuilder::Finish failed: ") + st.message()));
                         return;
                     }
                     st = pomai::util::FsyncDir(shard_dir_);
                     if (!st.ok()) {
-                        complete_job(pomai::Status::Internal("Freeze: FsyncDir after segment failed: " + st.message()));
+                        complete_job(pomai::Status::Internal(std::string("Freeze: FsyncDir after segment failed: ") + st.message()));
                         return;
                     }
 
                     std::unique_ptr<table::SegmentReader> reader;
                     st = table::SegmentReader::Open(state.filepath, &reader);
                     if (!st.ok()) {
-                        complete_job(pomai::Status::Internal("Freeze: SegmentReader::Open failed: " + st.message()));
+                        complete_job(pomai::Status::Internal(std::string("Freeze: SegmentReader::Open failed: ") + st.message()));
                         return;
                     }
 
@@ -1066,7 +1083,7 @@ namespace pomai::core
                     std::vector<std::string> seg_names;
                     auto st = ShardManifest::Load(shard_dir_, &seg_names);
                     if (!st.ok()) {
-                        complete_job(pomai::Status::Internal("Freeze: ShardManifest::Load failed: " + st.message()));
+                        complete_job(pomai::Status::Internal(std::string("Freeze: ShardManifest::Load failed: ") + st.message()));
                         return;
                     }
 
@@ -1076,7 +1093,7 @@ namespace pomai::core
 
                     st = ShardManifest::Commit(shard_dir_, seg_names);
                     if (!st.ok()) {
-                        complete_job(pomai::Status::Internal("Freeze: ShardManifest::Commit failed: " + st.message()));
+                        complete_job(pomai::Status::Internal(std::string("Freeze: ShardManifest::Commit failed: ") + st.message()));
                         return;
                     }
                     state.phase = BackgroundJob::Phase::kInstall;
@@ -1093,7 +1110,7 @@ namespace pomai::core
                     if (wal_epoch_ == state.wal_epoch_at_start) {
                         auto st = wal_->Reset();
                         if (!st.ok()) {
-                            complete_job(pomai::Status::Internal("Freeze: WAL::Reset failed: " + st.message()));
+                            complete_job(pomai::Status::Internal(std::string("Freeze: WAL::Reset failed: ") + st.message()));
                             return;
                         }
                     }
@@ -1160,14 +1177,14 @@ namespace pomai::core
                                 std::cout << "TEST_DEBUG COMPACT PRE-ADD id: " << top.id << " vec_mapped[0]: " << vec_mapped[0] << std::endl;
                                 auto st = state.builder->Add(top.id, pomai::VectorView(vec_mapped), false, meta);
                                 if (!st.ok()) {
-                                    complete_job(pomai::Status::Internal("Compact: SegmentBuilder::Add failed: " + st.message()));
+                                    complete_job(pomai::Status::Internal(std::string("Compact: SegmentBuilder::Add failed: ") + st.message()));
                                     return;
                                 }
 
                                 // Feed downstream Streaming IVF
                                 st = ivf_->Put(top.id, vec_mapped);
                                 if (!st.ok()) {
-                                     complete_job(pomai::Status::Internal("Compact: IVF::Put failed: " + st.message()));
+                                     complete_job(pomai::Status::Internal(std::string("Compact: IVF::Put failed: ") + st.message()));
                                      return;
                                 }
                                 state.live_entries_kept++;
@@ -1202,24 +1219,24 @@ namespace pomai::core
                 }
                 auto st = state.builder->BuildIndex();
                 if (!st.ok()) {
-                    complete_job(pomai::Status::Internal("Compact: BuildIndex failed: " + st.message()));
+                    complete_job(pomai::Status::Internal(std::string("Compact: BuildIndex failed: ") + st.message()));
                     return;
                 }
                 st = state.builder->Finish();
                 if (!st.ok()) {
-                    complete_job(pomai::Status::Internal("Compact: SegmentBuilder::Finish failed: " + st.message()));
+                    complete_job(pomai::Status::Internal(std::string("Compact: SegmentBuilder::Finish failed: ") + st.message()));
                     return;
                 }
                 st = pomai::util::FsyncDir(shard_dir_);
                 if (!st.ok()) {
-                    complete_job(pomai::Status::Internal("Compact: FsyncDir after segment failed: " + st.message()));
+                    complete_job(pomai::Status::Internal(std::string("Compact: FsyncDir after segment failed: ") + st.message()));
                     return;
                 }
 
                 std::unique_ptr<table::SegmentReader> reader;
                 st = table::SegmentReader::Open(state.filepath, &reader);
                 if (!st.ok()) {
-                    complete_job(pomai::Status::Internal("Compact: SegmentReader::Open failed: " + st.message()));
+                    complete_job(pomai::Status::Internal(std::string("Compact: SegmentReader::Open failed: ") + st.message()));
                     return;
                 }
 
@@ -1236,7 +1253,7 @@ namespace pomai::core
                 }
                 auto st = ShardManifest::Commit(shard_dir_, seg_names);
                 if (!st.ok()) {
-                    complete_job(pomai::Status::Internal("Compact: ShardManifest::Commit failed: " + st.message()));
+                    complete_job(pomai::Status::Internal(std::string("Compact: ShardManifest::Commit failed: ") + st.message()));
                     return;
                 }
                 state.phase = BackgroundJob::Phase::kInstall;

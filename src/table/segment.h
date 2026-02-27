@@ -13,7 +13,8 @@
 #include "pomai/metadata.h"
 #include "pomai/options.h"
 #include "pomai/quantization/scalar_quantizer.h"
-#include "util/posix_file.h"
+#include "core/storage/io_provider.h"
+#include "util/slice.h"
 
 // Forward declare in correct namespace
 namespace pomai::index { class IvfFlatIndex; }
@@ -59,9 +60,9 @@ namespace pomai::table
 
         ~SegmentReader();
 
-        // Looks up a vector by ID. 
-        pomai::Status Get(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const;
-        pomai::Status Get(pomai::VectorId id, std::span<const float> *out_vec) const;
+        // Zero-copy lookup using PinnableSlice
+        pomai::Status Get(pomai::VectorId id, pomai::PinnableSlice* out_vec, pomai::Metadata* out_meta) const;
+        pomai::Status Get(pomai::VectorId id, pomai::PinnableSlice* out_vec) const;
         
         // V4: Quantized raw lookup
         bool IsQuantized() const { return is_quantized_; }
@@ -167,7 +168,7 @@ namespace pomai::table
         SegmentReader();
 
         std::string path_;
-        pomai::util::PosixFile file_;
+        std::unique_ptr<storage::MemoryMappedFile> mmap_file_;
         uint32_t count_ = 0;
         uint32_t dim_ = 0;
         std::size_t entry_size_ = 0;

@@ -160,13 +160,13 @@ Status VectorEngine::OpenLocked() {
         auto wal = std::make_unique<storage::Wal>(opt_.path, i, kWalSegmentBytes, opt_.fsync);
         auto st = wal->Open();
         if (!st.ok()) {
-            first_error = Status(st.code(), "vector_engine wal open failed: " + st.message());
+            first_error = Status(st.code(), std::string("vector_engine wal open failed: ") + st.message());
             break;
         }
         auto mem = std::make_unique<table::MemTable>(opt_.dim, kArenaBlockBytes);
         st = wal->ReplayInto(*mem);
         if (!st.ok()) {
-            first_error = Status(st.code(), "vector_engine wal replay failed: " + st.message());
+            first_error = Status(st.code(), std::string("vector_engine wal replay failed: ") + st.message());
             break;
         }
         auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
@@ -179,7 +179,7 @@ Status VectorEngine::OpenLocked() {
 
         st = shard->Start();
         if (!st.ok()) {
-            first_error = Status(st.code(), "vector_engine shard start failed: " + st.message());
+            first_error = Status(st.code(), std::string("vector_engine shard start failed: ") + st.message());
             break;
         }
         shards_.push_back(std::move(shard));
@@ -267,7 +267,7 @@ void VectorEngine::MaybePersistRoutingAsync() {
         (void)search_pool_->Enqueue([this, snapshot]() {
             auto st = routing::SaveRoutingTableAtomic(opt_.path, *snapshot, opt_.routing_keep_prev != 0);
             if (!st.ok()) {
-                util::Log(util::LogLevel::kWarn, "[routing] persist failed: " + st.message());
+                util::Log(util::LogLevel::kWarn, std::string("[routing] persist failed: ") + st.message());
             }
             routing_persist_inflight_.store(false, std::memory_order_release);
             return Status::Ok();
@@ -564,7 +564,8 @@ Status VectorEngine::SearchInternal(std::span<const float> query,
 
     if (opts.zero_copy) {
         std::shared_ptr<pomai::Snapshot> active_snap;
-        GetSnapshot(&active_snap);
+        auto st_snap = GetSnapshot(&active_snap);
+        if (!st_snap.ok()) return st_snap;
         auto snap_wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(active_snap);
         if (snap_wrapper) {
             auto internal_snap = snap_wrapper->GetInternal();
@@ -666,7 +667,8 @@ Status VectorEngine::SearchBatch(std::span<const float> queries, uint32_t num_qu
     // 5. Zero-copy support
     if (opts.zero_copy) {
         std::shared_ptr<pomai::Snapshot> active_snap;
-        GetSnapshot(&active_snap);
+        auto st_snap = GetSnapshot(&active_snap);
+        if (!st_snap.ok()) return st_snap;
         auto snap_wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(active_snap);
         if (snap_wrapper) {
             auto internal_snap = snap_wrapper->GetInternal();

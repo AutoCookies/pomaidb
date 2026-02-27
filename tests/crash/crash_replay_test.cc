@@ -64,7 +64,7 @@ static void ChildWriter(const std::string &path)
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(opt, &db);
     if (!st.ok())
-        Die(st.message().c_str());
+        Die(st.message());
     
     // Create a named membrane to verify persistence logic too
     pomai::MembraneSpec mspec;
@@ -72,9 +72,9 @@ static void ChildWriter(const std::string &path)
     mspec.dim = 16;
     mspec.shard_count = 2;
     st = db->CreateMembrane(mspec);
-    if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists) Die(st.message().c_str());
+    if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists) Die(st.message());
     st = db->OpenMembrane("important_data"); 
-    if (!st.ok()) Die(st.message().c_str());
+    if (!st.ok()) Die(st.message());
 
     std::vector<float> v(opt.dim);
     for (std::uint64_t i = 1; i <= 20000; ++i)
@@ -84,10 +84,10 @@ static void ChildWriter(const std::string &path)
         
         // Write to both default and named membrane
         st = db->Put(i, v);
-        if (!st.ok()) Die(st.message().c_str());
+        if (!st.ok()) Die(st.message());
 
         st = db->Put("important_data", i, v);
-        if (!st.ok()) Die(st.message().c_str());
+        if (!st.ok()) Die(st.message());
 
         // Always Flush to match FsyncPolicy::kAlways behavior on WAL (technically Put flushes WAL if kAlways, 
         // but Flush() ensures everything is pushed down if using kOnFlush. 
@@ -133,7 +133,7 @@ static void VerifyConsistency(const std::string &path)
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(opt, &db);
     if (!st.ok())
-        Die(("reopen failed: " + st.message()).c_str());
+        Die((std::string("reopen failed: ") + st.message()).c_str());
 
     // 3. Verify named membrane restoration (Critical Fix Check)
     st = db->OpenMembrane("important_data");

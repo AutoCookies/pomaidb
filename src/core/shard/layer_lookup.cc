@@ -12,7 +12,7 @@ LookupResult LookupById(const std::shared_ptr<table::MemTable>& active,
                         std::uint32_t dim) {
     if (active) {
         if (active->IsTombstone(id)) {
-            return {.state = LookupState::kTombstone};
+            return {.state = LookupState::kTombstone, .vec = {}, .decoded_vec = {}, .meta = {}, .pinnable_vec = {}};
         }
 
         const float* vec_ptr = nullptr;
@@ -20,8 +20,10 @@ LookupResult LookupById(const std::shared_ptr<table::MemTable>& active,
         const auto st = active->Get(id, &vec_ptr, &meta);
         if (st.ok() && vec_ptr != nullptr) {
             return {.state = LookupState::kFound,
-                    .vec = std::span<const float>(vec_ptr, dim),
-                    .meta = std::move(meta)};
+                    .vec = std::span<const float>(vec_ptr, static_cast<std::size_t>(dim)),
+                    .decoded_vec = {},
+                    .meta = std::move(meta),
+                    .pinnable_vec = {}};
         }
     }
 
@@ -31,7 +33,7 @@ LookupResult LookupById(const std::shared_ptr<table::MemTable>& active,
 
     for (auto it = snapshot->frozen_memtables.rbegin(); it != snapshot->frozen_memtables.rend(); ++it) {
         if ((*it)->IsTombstone(id)) {
-            return {.state = LookupState::kTombstone};
+            return {.state = LookupState::kTombstone, .vec = {}, .decoded_vec = {}, .meta = {}, .pinnable_vec = {}};
         }
 
         const float* vec_ptr = nullptr;
@@ -39,25 +41,35 @@ LookupResult LookupById(const std::shared_ptr<table::MemTable>& active,
         const auto st = (*it)->Get(id, &vec_ptr, &meta);
         if (st.ok() && vec_ptr != nullptr) {
             return {.state = LookupState::kFound,
-                    .vec = std::span<const float>(vec_ptr, dim),
-                    .meta = std::move(meta)};
+                    .vec = std::span<const float>(vec_ptr, static_cast<std::size_t>(dim)),
+                    .decoded_vec = {},
+                    .meta = std::move(meta),
+                    .pinnable_vec = {}};
         }
     }
 
     for (const auto& segment : snapshot->segments) {
-        std::span<const float> seg_vec;
-        std::vector<float> seg_decoded;
-        pomai::Metadata seg_meta;
-        const auto find = segment->FindAndDecode(id, &seg_vec, &seg_decoded, &seg_meta);
-        if (find == table::SegmentReader::FindResult::kFoundTombstone) {
-            return {.state = LookupState::kTombstone};
+        LookupResult res;
+        const auto st = segment->Get(id, &res.pinnable_vec, &res.meta);
+        if (st.ok()) {
+            res.state = LookupState::kFound;
+            // Map PinnableSlice data back to span<float> for existing consumers
+            if (!segment->IsQuantized()) {
+                res.vec = std::span<const float>(reinterpret_cast<const float*>(res.pinnable_vec.data()), static_cast<std::size_t>(dim));
+            } else {
+                // If quantized, we still need to decode for the 'vec' span if requested.
+                // However, for pure zero-copy distillation, we prioritize the raw pinned data.
+                res.decoded_vec = segment->GetQuantizer()->Decode(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(res.pinnable_vec.data()), static_cast<std::size_t>(dim)));
+                res.vec = res.decoded_vec;
+            }
+            return res;
         }
-        if (find == table::SegmentReader::FindResult::kFound) {
-            return {.state = LookupState::kFound, .vec = seg_vec, .decoded_vec = std::move(seg_decoded), .meta = std::move(seg_meta)};
+        if (st.code() == ErrorCode::kNotFound && std::string_view(st.message()) == "tombstone") {
+            return {.state = LookupState::kTombstone, .vec = {}, .decoded_vec = {}, .meta = {}, .pinnable_vec = {}};
         }
     }
 
-    return {};
+    return {.state = LookupState::kNotFound, .vec = {}, .decoded_vec = {}, .meta = {}, .pinnable_vec = {}};
 }
 
 }  // namespace pomai::core

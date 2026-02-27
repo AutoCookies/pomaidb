@@ -55,7 +55,7 @@ int main(int argc, char** argv)
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(opts, &db);
     if (!st.ok()) {
-        fprintf(stderr, "Open failed: %s\n", st.message().c_str());
+        fprintf(stderr, "Open failed: %s\n", st.message());
         return 1;
     }
 
@@ -66,12 +66,12 @@ int main(int argc, char** argv)
     rag.kind = pomai::MembraneKind::kRag;
     st = db->CreateMembrane(rag);
     if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists) {
-        fprintf(stderr, "CreateMembrane failed: %s\n", st.message().c_str());
+        fprintf(stderr, "CreateMembrane failed: %s\n", st.message());
         return 1;
     }
     st = db->OpenMembrane("rag");
     if (!st.ok()) {
-        fprintf(stderr, "OpenMembrane failed: %s\n", st.message().c_str());
+        fprintf(stderr, "OpenMembrane failed: %s\n", st.message());
         return 1;
     }
 
@@ -90,7 +90,7 @@ int main(int argc, char** argv)
 
         st = db->PutChunk("rag", chunk);
         if (!st.ok()) {
-            fprintf(stderr, "PutChunk failed: %s\n", st.message().c_str());
+            fprintf(stderr, "PutChunk failed: %s\n", st.message());
             return 1;
         }
     }
@@ -109,7 +109,7 @@ int main(int argc, char** argv)
     st = db->SearchRag("rag", lexical_query, opts_lex, &lex_out);
     auto t1 = high_resolution_clock::now();
     if (!st.ok()) {
-        fprintf(stderr, "SearchRag (lexical) failed: %s\n", st.message().c_str());
+        fprintf(stderr, "SearchRag (lexical) failed: %s\n", st.message());
         return 1;
     }
 
@@ -123,7 +123,7 @@ int main(int argc, char** argv)
     st = db->SearchRag("rag", hybrid_query, opts_hybrid, &hybrid_out);
     auto t3 = high_resolution_clock::now();
     if (!st.ok()) {
-        fprintf(stderr, "SearchRag (hybrid) failed: %s\n", st.message().c_str());
+        fprintf(stderr, "SearchRag (hybrid) failed: %s\n", st.message());
         return 1;
     }
 

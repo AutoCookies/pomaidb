@@ -39,3 +39,4 @@ venv
 ./build*
 .venv-benchmark
 benchmarks/cross_engine/output
+/build_fuzz

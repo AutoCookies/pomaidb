@@ -25,6 +25,7 @@
 namespace pomai::storage
 {
     class Wal;
+    class CompactionManager;
 }
 namespace pomai::table
 {
@@ -257,6 +258,7 @@ namespace pomai::core
         pomai::util::ThreadPool* segment_pool_{nullptr}; // Added
         pomai::IndexParams index_params_;
 
+        std::unique_ptr<storage::CompactionManager> compaction_manager_;
         std::unique_ptr<BackgroundJob> background_job_;
         std::uint64_t wal_epoch_{0};
 

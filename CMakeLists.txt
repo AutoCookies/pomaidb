@@ -80,6 +80,7 @@ add_library(pomai STATIC
   src/storage/wal/wal.cc
   src/storage/manifest/manifest.cc
   src/table/segment.cc
+  src/core/storage/compaction_manager.cc
 
   src/core/quantization/scalar_quantizer.cc
   src/core/index/ivf_coarse.cc
@@ -434,6 +435,8 @@ if (POMAI_BUILD_TESTS)
   add_executable(basic_workload_tsan_test tests/tsan/basic_workload_tsan_test.cc)
   pomai_setup_test(basic_workload_tsan_test)
   pomai_add_labeled_test(basic_workload_tsan_test "tsan")
+
+  add_subdirectory(tests/fuzz)
 endif()
 
 # =========================
