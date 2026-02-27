@@ -34,6 +34,37 @@ endif()
 
 
 # =========================
+# FAISS — CPU-only static build (Phases 1-4)
+# GPU, Python SWIG, extras (demos/benchmarks) and MKL all disabled.
+# BLAS is used only for PQ training (lapack sgemm); optional on edge.
+# =========================
+option(POMAI_USE_FAISS "Integrate FAISS HNSW + PQ into PomaiDB" ON)
+
+if (POMAI_USE_FAISS)
+  set(FAISS_ENABLE_GPU     OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_PYTHON  OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_C_API   OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_EXTRAS  OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_MKL     OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_SVS     OFF CACHE BOOL "" FORCE)
+  # Use AVX2 on x86, generic on ARM (NEON via compiler flags)
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    set(FAISS_OPT_LEVEL "avx2" CACHE STRING "" FORCE)
+  else()
+    set(FAISS_OPT_LEVEL "generic" CACHE STRING "" FORCE)
+  endif()
+  # Suppress FAISS's perf_tests which require gflags (BUILD_TESTING guard)
+  set(_POMAI_SAVED_BUILD_TESTING ${BUILD_TESTING})
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/faiss EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING ${_POMAI_SAVED_BUILD_TESTING} CACHE BOOL "" FORCE)
+  message(STATUS "[pomai] FAISS: enabled (CPU-only, ${FAISS_OPT_LEVEL})")
+else()
+  message(STATUS "[pomai] FAISS: disabled")
+endif()
+
+
+# =========================
 # Library: pomai
 # =========================
 add_library(pomai STATIC
@@ -60,6 +91,12 @@ add_library(pomai STATIC
   src/core/routing/routing_persist.cc
   src/core/rag/rag_engine.cc
 
+  # Phase 2: Product Quantizer
+  src/core/quantization/pomai_pq.cc
+
+  # Phase 3+4: HNSW index wrapper (compiled only when FAISS is ON)
+  $<$<BOOL:${POMAI_USE_FAISS}>:src/core/index/hnsw_index.cc>
+
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
   src/util/crc32c.cc
@@ -71,8 +108,31 @@ target_include_directories(pomai
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    # Phase 3 helio base primitives (header-only, pure std)
 )
+
+# Phase 3 (FAISS HNSW) + Phase 2 (PQ) linkage
+if (POMAI_USE_FAISS)
+  # faiss_avx2 exists only on x86; fall back to faiss on ARM/generic
+  if (TARGET faiss_avx2)
+    set(_FAISS_TARGET faiss_avx2)
+  else()
+    set(_FAISS_TARGET faiss)
+  endif()
+  target_link_libraries(pomai PRIVATE ${_FAISS_TARGET})
+  target_include_directories(pomai PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/faiss)
+  target_compile_definitions(pomai PRIVATE POMAI_USE_FAISS=1)
+  message(STATUS "[pomai] Linking FAISS target: ${_FAISS_TARGET}")
+
+  # OpenMP required by HNSW (parallel graph build)
+  find_package(OpenMP QUIET)
+  if (OpenMP_CXX_FOUND)
+    target_link_libraries(pomai PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "[pomai] OpenMP: found")
+  else()
+    message(STATUS "[pomai] OpenMP: not found — HNSW build will be single-threaded")
+  endif()
+endif()
 
 # Phase 3: mimalloc — TWO linking modes
 #

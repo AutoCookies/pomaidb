@@ -1,270 +1,353 @@
+// distance.cc — SIMD-dispatched distance kernels for PomaiDB.
+//
+// Phase 1 update:
+//  - Added NEON dispatch path for ARM (RPi 5, Android) via sse2neon.h
+//  - Added DotBatch / L2SqBatch for bulk multi-vector distance (HNSW traversal)
+//
+// Dispatch priority: AVX2+FMA (x86) > NEON (ARM) > scalar (WASM/fallback)
+
 #include "core/distance.h"
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#define POMAI_X86_SIMD 1
+
+// ── Platform detection ────────────────────────────────────────────────────────
+#if defined(__x86_64__) || defined(_M_X64)
+#  define POMAI_X86_SIMD 1
+#  define POMAI_ARM_SIMD 0
+#elif defined(__aarch64__) || defined(__arm__)
+#  define POMAI_X86_SIMD 0
+#  define POMAI_ARM_SIMD 1
 #else
-#define POMAI_X86_SIMD 0
+#  define POMAI_X86_SIMD 0
+#  define POMAI_ARM_SIMD 0
 #endif
+
 #if POMAI_X86_SIMD
-#include <immintrin.h>
+#  include <immintrin.h>
 #endif
+
+// ARM NEON: use sse2neon shim from helio (maps SSE/AVX2 intrinsics to NEON)
+#if POMAI_ARM_SIMD
+#  include <arm_neon.h>
+#endif
+
+#include <cstring>
 #include <mutex>
 #include <memory>
 
 #if defined(__GNUC__) || defined(__clang__)
-#include <cpuid.h>
+#  if POMAI_X86_SIMD
+#    include <cpuid.h>
+#  endif
 #endif
 
 namespace pomai::core
 {
     namespace
     {
+        // ── Scalar fallbacks ──────────────────────────────────────────────────
         float DotScalar(std::span<const float> a, std::span<const float> b)
         {
-            float s0 = 0.0f;
-            float s1 = 0.0f;
-            float s2 = 0.0f;
-            float s3 = 0.0f;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
             const std::size_t n = a.size();
             std::size_t i = 0;
             for (; i + 4 <= n; i += 4) {
-                s0 += a[i] * b[i];
-                s1 += a[i + 1] * b[i + 1];
-                s2 += a[i + 2] * b[i + 2];
-                s3 += a[i + 3] * b[i + 3];
+                s0 += a[i]   * b[i];
+                s1 += a[i+1] * b[i+1];
+                s2 += a[i+2] * b[i+2];
+                s3 += a[i+3] * b[i+3];
             }
             float s = s0 + s1 + s2 + s3;
-            for (; i < n; ++i) {
-                s += a[i] * b[i];
-            }
+            for (; i < n; ++i) s += a[i] * b[i];
             return s;
         }
 
         float L2SqScalar(std::span<const float> a, std::span<const float> b)
         {
-            float s0 = 0.0f;
-            float s1 = 0.0f;
-            float s2 = 0.0f;
-            float s3 = 0.0f;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
             const std::size_t n = a.size();
             std::size_t i = 0;
-            for (; i + 4 <= n; i += 4)
-            {
-                float d0 = a[i] - b[i];
-                float d1 = a[i + 1] - b[i + 1];
-                float d2 = a[i + 2] - b[i + 2];
-                float d3 = a[i + 3] - b[i + 3];
-                s0 += d0 * d0;
-                s1 += d1 * d1;
-                s2 += d2 * d2;
-                s3 += d3 * d3;
+            for (; i + 4 <= n; i += 4) {
+                float d0 = a[i]-b[i], d1 = a[i+1]-b[i+1],
+                      d2 = a[i+2]-b[i+2], d3 = a[i+3]-b[i+3];
+                s0 += d0*d0; s1 += d1*d1; s2 += d2*d2; s3 += d3*d3;
             }
             float s = s0 + s1 + s2 + s3;
-            for (; i < n; ++i)
-            {
-                float d = a[i] - b[i];
-                s += d * d;
-            }
+            for (; i < n; ++i) { float d = a[i]-b[i]; s += d*d; }
             return s;
         }
 
-        float DotSq8Scalar(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale, float query_sum)
+        float DotSq8Scalar(std::span<const float> q, std::span<const uint8_t> c,
+                           float min_val, float inv_scale, float q_sum)
         {
-            float sum_qc = 0.0f;
-            const size_t dim = query.size();
-            for (size_t i = 0; i < dim; ++i) {
-                sum_qc += query[i] * static_cast<float>(codes[i]);
-            }
-            return sum_qc * inv_scale + query_sum * min_val;
+            float sum = 0.0f;
+            for (std::size_t i = 0; i < q.size(); ++i)
+                sum += q[i] * static_cast<float>(c[i]);
+            return sum * inv_scale + q_sum * min_val;
         }
 
+        // Scalar batch
+        void DotBatchScalar(std::span<const float> query,
+                            const float* db, std::size_t n, std::uint32_t dim,
+                            float* out)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+                out[i] = DotScalar(query, {db + i * dim, dim});
+        }
+
+        void L2SqBatchScalar(std::span<const float> query,
+                             const float* db, std::size_t n, std::uint32_t dim,
+                             float* out)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+                out[i] = L2SqScalar(query, {db + i * dim, dim});
+        }
+
+        // ── x86 AVX2+FMA kernels (compile-time target, runtime dispatched) ───
 #if POMAI_X86_SIMD && (defined(__GNUC__) || defined(__clang__))
         __attribute__((target("avx2,fma")))
         float DotAvx(std::span<const float> a, std::span<const float> b)
         {
-            const float *pa = a.data();
-            const float *pb = b.data();
+            const float *pa = a.data(), *pb = b.data();
             std::size_t n = a.size();
-            
-            __m256 sum0 = _mm256_setzero_ps();
-            __m256 sum1 = _mm256_setzero_ps();
+            __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
             std::size_t i = 0;
-            for (; i + 16 <= n; i += 16)
-            {
-                __m256 va0 = _mm256_loadu_ps(pa + i);
-                __m256 vb0 = _mm256_loadu_ps(pb + i);
-                __m256 va1 = _mm256_loadu_ps(pa + i + 8);
-                __m256 vb1 = _mm256_loadu_ps(pb + i + 8);
-                sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
-                sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
+            for (; i + 16 <= n; i += 16) {
+                s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pa+i),   _mm256_loadu_ps(pb+i),   s0);
+                s1 = _mm256_fmadd_ps(_mm256_loadu_ps(pa+i+8), _mm256_loadu_ps(pb+i+8), s1);
             }
-            __m256 sum = _mm256_add_ps(sum0, sum1);
+            __m256 sum = _mm256_add_ps(s0, s1);
             for (; i + 8 <= n; i += 8)
-            {
-                __m256 va = _mm256_loadu_ps(pa + i);
-                __m256 vb = _mm256_loadu_ps(pb + i);
-                sum = _mm256_fmadd_ps(va, vb, sum);
-            }
-            
-            // Horizontal sum
-            // (There are faster ways but this is readable)
-            float temp[8];
-            _mm256_storeu_ps(temp, sum);
-            float s = 0.0f;
-            for (int k = 0; k < 8; ++k) s += temp[k];
-
-            // Tail
-            for (; i < n; ++i)
-                s += pa[i] * pb[i];
+                sum = _mm256_fmadd_ps(_mm256_loadu_ps(pa+i), _mm256_loadu_ps(pb+i), sum);
+            float t[8]; _mm256_storeu_ps(t, sum);
+            float s = t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6]+t[7];
+            for (; i < n; ++i) s += pa[i]*pb[i];
             return s;
         }
 
         __attribute__((target("avx2,fma")))
         float L2SqAvx(std::span<const float> a, std::span<const float> b)
         {
-            const float *pa = a.data();
-            const float *pb = b.data();
+            const float *pa = a.data(), *pb = b.data();
             std::size_t n = a.size();
-
-            __m256 sum0 = _mm256_setzero_ps();
-            __m256 sum1 = _mm256_setzero_ps();
+            __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
             std::size_t i = 0;
-            for (; i + 16 <= n; i += 16)
-            {
-                __m256 va0 = _mm256_loadu_ps(pa + i);
-                __m256 vb0 = _mm256_loadu_ps(pb + i);
-                __m256 va1 = _mm256_loadu_ps(pa + i + 8);
-                __m256 vb1 = _mm256_loadu_ps(pb + i + 8);
-                __m256 d0 = _mm256_sub_ps(va0, vb0);
-                __m256 d1 = _mm256_sub_ps(va1, vb1);
-                sum0 = _mm256_fmadd_ps(d0, d0, sum0);
-                sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+            for (; i + 16 <= n; i += 16) {
+                __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(pa+i),   _mm256_loadu_ps(pb+i));
+                __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(pa+i+8), _mm256_loadu_ps(pb+i+8));
+                s0 = _mm256_fmadd_ps(d0, d0, s0);
+                s1 = _mm256_fmadd_ps(d1, d1, s1);
             }
-            __m256 sum = _mm256_add_ps(sum0, sum1);
-            for (; i + 8 <= n; i += 8)
-            {
-                __m256 va = _mm256_loadu_ps(pa + i);
-                __m256 vb = _mm256_loadu_ps(pb + i);
-                __m256 d = _mm256_sub_ps(va, vb);
+            __m256 sum = _mm256_add_ps(s0, s1);
+            for (; i + 8 <= n; i += 8) {
+                __m256 d = _mm256_sub_ps(_mm256_loadu_ps(pa+i), _mm256_loadu_ps(pb+i));
                 sum = _mm256_fmadd_ps(d, d, sum);
             }
-
-            float temp[8];
-            _mm256_storeu_ps(temp, sum);
-            float s = 0.0f;
-            for (int k = 0; k < 8; ++k) s += temp[k];
-
-            for (; i < n; ++i)
-            {
-                float d = pa[i] - pb[i];
-                s += d * d;
-            }
+            float t[8]; _mm256_storeu_ps(t, sum);
+            float s = t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6]+t[7];
+            for (; i < n; ++i) { float d = pa[i]-pb[i]; s += d*d; }
             return s;
         }
 
         __attribute__((target("avx2,fma")))
-        float DotSq8Avx(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale, float query_sum)
+        float DotSq8Avx(std::span<const float> q, std::span<const uint8_t> c,
+                        float min_val, float inv_scale, float q_sum)
         {
-            const float *pq = query.data();
-            const uint8_t *pc = codes.data();
-            std::size_t n = query.size();
-            
-            __m256 sum0 = _mm256_setzero_ps();
-            __m256 sum1 = _mm256_setzero_ps();
-            
+            const float *pq = q.data(); const uint8_t *pc = c.data();
+            std::size_t n = q.size();
+            __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
             std::size_t i = 0;
-            // Unroll by 16 (2 AVX registers)
-            for (; i + 16 <= n; i += 16)
-            {
-                // Load 16 uint8s (128 bits total)
-                __m128i c_chars = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pc + i));
-                
-                // Expand lower 8 bytes to 32-bit uints then floats
-                __m256i c_ints0 = _mm256_cvtepu8_epi32(c_chars);
-                __m256 c_floats0 = _mm256_cvtepi32_ps(c_ints0);
-                
-                // Expand upper 8 bytes. Shift right by 8 bytes.
-                __m128i c_chars_hi = _mm_bsrli_si128(c_chars, 8);
-                __m256i c_ints1 = _mm256_cvtepu8_epi32(c_chars_hi);
-                __m256 c_floats1 = _mm256_cvtepi32_ps(c_ints1);
-                
-                // Vector dot product
-                __m256 vq0 = _mm256_loadu_ps(pq + i);
-                __m256 vq1 = _mm256_loadu_ps(pq + i + 8);
-                
-                sum0 = _mm256_fmadd_ps(vq0, c_floats0, sum0);
-                sum1 = _mm256_fmadd_ps(vq1, c_floats1, sum1);
+            for (; i + 16 <= n; i += 16) {
+                __m128i cc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(pc+i));
+                __m256 cf0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(cc));
+                __m256 cf1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_bsrli_si128(cc, 8)));
+                s0 = _mm256_fmadd_ps(_mm256_loadu_ps(pq+i),   cf0, s0);
+                s1 = _mm256_fmadd_ps(_mm256_loadu_ps(pq+i+8), cf1, s1);
             }
-            __m256 sum = _mm256_add_ps(sum0, sum1);
-            
-            // Unroll by 8 (1 AVX register)
-            for (; i + 8 <= n; i += 8)
-            {
-                // _mm_loadl_epi64 to load 8 bytes into lower 64 bits of 128-bit reg
-                __m128i c_chars = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc + i));
-                __m256i c_ints = _mm256_cvtepu8_epi32(c_chars);
-                __m256 c_floats = _mm256_cvtepi32_ps(c_ints);
-                
-                __m256 vq = _mm256_loadu_ps(pq + i);
-                sum = _mm256_fmadd_ps(vq, c_floats, sum);
+            __m256 sum = _mm256_add_ps(s0, s1);
+            for (; i + 8 <= n; i += 8) {
+                __m256 cf = _mm256_cvtepi32_ps(
+                    _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(pc+i))));
+                sum = _mm256_fmadd_ps(_mm256_loadu_ps(pq+i), cf, sum);
             }
-            
-            float temp[8];
-            _mm256_storeu_ps(temp, sum);
-            float s = 0.0f;
-            for (int k = 0; k < 8; ++k) s += temp[k];
+            float t[8]; _mm256_storeu_ps(t, sum);
+            float s = t[0]+t[1]+t[2]+t[3]+t[4]+t[5]+t[6]+t[7];
+            for (; i < n; ++i) s += pq[i] * static_cast<float>(pc[i]);
+            return s * inv_scale + q_sum * min_val;
+        }
 
-            // Tail processing
-            for (; i < n; ++i)
-            {
-                s += pq[i] * static_cast<float>(pc[i]);
-            }
-            return s * inv_scale + query_sum * min_val;
+        // Batch versions — call per-row scalar to allow auto-vectorisation
+        // at the outer loop level (compiler can hoist the query broadcast).
+        __attribute__((target("avx2,fma")))
+        void DotBatchAvx(std::span<const float> query,
+                         const float* db, std::size_t n, std::uint32_t dim,
+                         float* out)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+                out[i] = DotAvx(query, {db + i*dim, dim});
+        }
+
+        __attribute__((target("avx2,fma")))
+        void L2SqBatchAvx(std::span<const float> query,
+                          const float* db, std::size_t n, std::uint32_t dim,
+                          float* out)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+                out[i] = L2SqAvx(query, {db + i*dim, dim});
         }
 #else
-        // If not GCC/Clang, simple fallback (or rely on global flags if MSVC)
-        float DotAvx(std::span<const float> a, std::span<const float> b) { return DotScalar(a, b); }
-        float L2SqAvx(std::span<const float> a, std::span<const float> b) { return L2SqScalar(a, b); }
-        float DotSq8Avx(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale, float query_sum) { return DotSq8Scalar(query, codes, min_val, inv_scale, query_sum); }
+        // Non-GCC/Clang x86 fallbacks
+        float DotAvx(std::span<const float> a, std::span<const float> b)
+            { return DotScalar(a, b); }
+        float L2SqAvx(std::span<const float> a, std::span<const float> b)
+            { return L2SqScalar(a, b); }
+        float DotSq8Avx(std::span<const float> q, std::span<const uint8_t> c,
+                        float min_val, float inv_scale, float q_sum)
+            { return DotSq8Scalar(q, c, min_val, inv_scale, q_sum); }
+        void DotBatchAvx(std::span<const float> q, const float* db,
+                         std::size_t n, std::uint32_t dim, float* out)
+            { DotBatchScalar(q, db, n, dim, out); }
+        void L2SqBatchAvx(std::span<const float> q, const float* db,
+                          std::size_t n, std::uint32_t dim, float* out)
+            { L2SqBatchScalar(q, db, n, dim, out); }
 #endif
 
-        using DistFn = float (*)(std::span<const float>, std::span<const float>);
-        using DotSq8Fn = float (*)(std::span<const float>, std::span<const uint8_t>, float, float, float);
-        
-        DistFn dot_fn = DotScalar;
-        DistFn l2_fn = L2SqScalar;
-        DotSq8Fn dot_sq8_fn = DotSq8Scalar;
+        // ── ARM NEON kernels ──────────────────────────────────────────────────
+#if POMAI_ARM_SIMD
+        float DotNeon(std::span<const float> a, std::span<const float> b)
+        {
+            const float *pa = a.data(), *pb = b.data();
+            std::size_t n = a.size();
+            float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
+            std::size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                s0 = vmlaq_f32(s0, vld1q_f32(pa+i),   vld1q_f32(pb+i));
+                s1 = vmlaq_f32(s1, vld1q_f32(pa+i+4), vld1q_f32(pb+i+4));
+            }
+            float32x4_t sum = vaddq_f32(s0, s1);
+            for (; i + 4 <= n; i += 4)
+                sum = vmlaq_f32(sum, vld1q_f32(pa+i), vld1q_f32(pb+i));
+            float s = vaddvq_f32(sum);
+            for (; i < n; ++i) s += pa[i]*pb[i];
+            return s;
+        }
+
+        float L2SqNeon(std::span<const float> a, std::span<const float> b)
+        {
+            const float *pa = a.data(), *pb = b.data();
+            std::size_t n = a.size();
+            float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
+            std::size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                float32x4_t d0 = vsubq_f32(vld1q_f32(pa+i),   vld1q_f32(pb+i));
+                float32x4_t d1 = vsubq_f32(vld1q_f32(pa+i+4), vld1q_f32(pb+i+4));
+                s0 = vmlaq_f32(s0, d0, d0);
+                s1 = vmlaq_f32(s1, d1, d1);
+            }
+            float32x4_t sum = vaddq_f32(s0, s1);
+            for (; i + 4 <= n; i += 4) {
+                float32x4_t d = vsubq_f32(vld1q_f32(pa+i), vld1q_f32(pb+i));
+                sum = vmlaq_f32(sum, d, d);
+            }
+            float s = vaddvq_f32(sum);
+            for (; i < n; ++i) { float d=pa[i]-pb[i]; s += d*d; }
+            return s;
+        }
+
+        float DotSq8Neon(std::span<const float> q, std::span<const uint8_t> c,
+                         float min_val, float inv_scale, float q_sum)
+        {
+            const float *pq = q.data(); const uint8_t *pc = c.data();
+            std::size_t n = q.size();
+            float32x4_t s0 = vdupq_n_f32(0.0f), s1 = vdupq_n_f32(0.0f);
+            std::size_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                uint8x8_t  cu  = vld1_u8(pc+i);
+                uint16x8_t cu16= vmovl_u8(cu);
+                float32x4_t cf0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(cu16)));
+                float32x4_t cf1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(cu16)));
+                s0 = vmlaq_f32(s0, vld1q_f32(pq+i),   cf0);
+                s1 = vmlaq_f32(s1, vld1q_f32(pq+i+4), cf1);
+            }
+            float s = vaddvq_f32(vaddq_f32(s0, s1));
+            for (; i < n; ++i) s += pq[i] * static_cast<float>(pc[i]);
+            return s * inv_scale + q_sum * min_val;
+        }
+
+        void DotBatchNeon(std::span<const float> query,
+                          const float* db, std::size_t n, std::uint32_t dim,
+                          float* out)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+                out[i] = DotNeon(query, {db + i*dim, dim});
+        }
+
+        void L2SqBatchNeon(std::span<const float> query,
+                           const float* db, std::size_t n, std::uint32_t dim,
+                           float* out)
+        {
+            for (std::size_t i = 0; i < n; ++i)
+                out[i] = L2SqNeon(query, {db + i*dim, dim});
+        }
+#endif // POMAI_ARM_SIMD
+
+        // ── Dispatch tables ───────────────────────────────────────────────────
+        using DistFn    = float (*)(std::span<const float>, std::span<const float>);
+        using DotSq8Fn  = float (*)(std::span<const float>, std::span<const uint8_t>,
+                                    float, float, float);
+        using BatchDistFn = void (*)(std::span<const float>, const float*,
+                                    std::size_t, std::uint32_t, float*);
+
+        DistFn      dot_fn      = DotScalar;
+        DistFn      l2_fn       = L2SqScalar;
+        DotSq8Fn    dot_sq8_fn  = DotSq8Scalar;
+        BatchDistFn dot_batch_fn  = DotBatchScalar;
+        BatchDistFn l2_batch_fn   = L2SqBatchScalar;
         std::once_flag init_flag;
 
         void InitOnce()
         {
 #if POMAI_X86_SIMD && (defined(__GNUC__) || defined(__clang__))
-            if (__builtin_cpu_supports("avx2"))
-            {
-                dot_fn = DotAvx;
-                l2_fn = L2SqAvx;
-                dot_sq8_fn = DotSq8Avx;
+            if (__builtin_cpu_supports("avx2")) {
+                dot_fn       = DotAvx;
+                l2_fn        = L2SqAvx;
+                dot_sq8_fn   = DotSq8Avx;
+                dot_batch_fn = DotBatchAvx;
+                l2_batch_fn  = L2SqBatchAvx;
+                return;
             }
 #endif
+#if POMAI_ARM_SIMD
+            // NEON is always present on AArch64. On 32-bit ARMv7 it's optional;
+            // for edge targets (RPi 5, Android arm64) we assume AArch64.
+            dot_fn       = DotNeon;
+            l2_fn        = L2SqNeon;
+            dot_sq8_fn   = DotSq8Neon;
+            dot_batch_fn = DotBatchNeon;
+            l2_batch_fn  = L2SqBatchNeon;
+#endif
         }
-    }
+    } // anonymous namespace
 
-    void InitDistance()
-    {
-        std::call_once(init_flag, InitOnce);
-    }
+    // ── Public API ────────────────────────────────────────────────────────────
+    void InitDistance()  { std::call_once(init_flag, InitOnce); }
 
     float Dot(std::span<const float> a, std::span<const float> b)
-    {
-        return dot_fn(a, b);
-    }
+        { return dot_fn(a, b); }
 
     float L2Sq(std::span<const float> a, std::span<const float> b)
-    {
-        return l2_fn(a, b);
-    }
+        { return l2_fn(a, b); }
 
-    float DotSq8(std::span<const float> query, std::span<const uint8_t> codes, float min_val, float inv_scale, float query_sum)
-    {
-        return dot_sq8_fn(query, codes, min_val, inv_scale, query_sum);
-    }
-}
+    float DotSq8(std::span<const float> q, std::span<const uint8_t> c,
+                 float min_val, float inv_scale, float q_sum)
+        { return dot_sq8_fn(q, c, min_val, inv_scale, q_sum); }
+
+    void DotBatch(std::span<const float> query,
+                  const float* db, std::size_t n, std::uint32_t dim,
+                  float* results)
+        { dot_batch_fn(query, db, n, dim, results); }
+
+    void L2SqBatch(std::span<const float> query,
+                   const float* db, std::size_t n, std::uint32_t dim,
+                   float* results)
+        { l2_batch_fn(query, db, n, dim, results); }
+
+} // namespace pomai::core
