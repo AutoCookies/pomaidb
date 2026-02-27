@@ -1,48 +1,112 @@
-# Contributing to PomaiDB
+# 🤝 Contributing to PomaiDB
 
-## Development setup
+Thank you for considering contributing to **PomaiDB**!  
+We truly believe every good idea — no matter how small — can help turn PomaiDB into **the most stable, reliable, and performant embedded vector database for real-world Edge AI**.
 
-### Build
-```bash
-cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
-cmake --build build -j
-```
+PomaiDB is still, but we are **extremely serious** about building something that lasts on constrained devices (phones, Raspberry Pi, Jetson, WASM, low-RAM IoT).  
+We care deeply about **stability**, **correctness**, **battery life**, **crash safety**, **ARM64/NEON performance**, and **zero bloat**.
 
-### Tests
-```bash
-ctest --test-dir build --output-on-failure
-```
+Your contribution — whether it's a tiny bug fix, a benchmark on new hardware, a performance tweak, documentation, or a bold new feature — is **genuinely valued**.  
+We read every issue, every PR, and every comment with attention.
 
-### Labels
-You can target specific labels (unit/integ/crash/tsan/recall):
-```bash
-ctest --test-dir build -L unit
-```
+## We Especially Welcome These Kinds of Contributions
 
-## Code structure overview
-- `include/`: Public API headers. (Source: `include/pomai/pomai.h`.)
-- `src/api/`: API implementation. (Source: `src/api/db.cc`.)
-- `src/core/`: Engine, shard runtime, mailbox, and indexing. (Source: `src/core/...`.)
-- `src/storage/`: WAL and manifest logic. (Source: `src/storage/...`.)
-- `src/table/`: MemTable and segment format. (Source: `src/table/...`.)
-- `tests/`: Unit, integration, crash, recall, and TSAN tests.
+We maintain this prioritized list so contributors know where help is most needed right now:
 
-## Pull request requirements
-- **Build must pass** with `POMAI_BUILD_TESTS=ON`.
-- **Tests must pass** for the areas affected.
-- **Docs updated** when behavior changes; refer to `docs/` as the single source of truth.
-- **No behavioral claims** without a code pointer or test reference.
+### Stability & Correctness (Highest Priority)
+- Crash / power-loss recovery improvements
+- WAL / manifest / Freeze edge-case tests (battery die, SD card corruption, OOM)
+- Thread-safety / race-condition fixes in sharded MemTables or snapshots
+- Memory leak / undefined behavior reports + fixes (Valgrind, ASan, UBSan)
+- Fuzz testing on input vectors / queries
 
-## Commit message conventions
-- Format: `<area>: <summary>`
-- Examples:
-  - `docs: define consistency model`
-  - `storage: fix WAL replay edge case`
+### Edge Hardware & Performance
+- Benchmarks on real devices: Raspberry Pi 5/4, Orange Pi, Jetson Nano, Android phones, old laptops
+- NEON / SVE / AVX2 / AVX-512 tuned distance kernels
+- Allocation profiling & fragmentation reduction (mimalloc tuning, custom allocators)
+- Power consumption measurements during ingest / search / freeze
+- WASM-specific optimizations & size reductions
 
-## Style rules
-- C++20, warnings enabled (`-Wall -Wextra -Wpedantic -Wconversion -Wshadow`). (Source: `CMakeLists.txt`.)
-- Keep public API in `include/pomai/` minimal and stable.
+### Quantization & Approximate Indexing
+- Integrating scalar quantization (SQ4/SQ8) and product quantization (PQ/OPQ/IVFPQ)
+- Activating & tuning IVF from the existing partial code
+- Lightweight HNSW integration (low M, efConstruction 40–80)
+- Recall vs speed vs memory trade-off tables
 
-## Security and responsible disclosure
-- Report security issues privately to the maintainers (see `GOVERNANCE.md`).
-- Do not open public issues for vulnerabilities before a fix is ready.
+### Bindings & Usability
+- Python bindings (pybind11) — `pip install pomaidb`
+- Go / Rust / Swift / Kotlin bindings
+- Simple CLI tool (`pomai put`, `pomai search`, `pomai freeze`)
+- Example apps: offline RAG notebook, on-device agent memory
+
+### Documentation & Education
+- Clearer explanations of Freeze semantics, membrane types, consistency guarantees
+- Real-world use-case guides (personal RAG, sensor time-series, photo embeddings)
+- Benchmark methodology & reproducible scripts
+- Vietnamese / multilingual docs (we're based in Vietnam!)
+
+### Testing & CI
+- More unit / integration tests (especially Freeze → recovery flows)
+- Cross-platform CI (Linux ARM64, macOS Apple Silicon, Windows MSVC)
+- Sanitizer builds in CI (ASan, TSan, MSan)
+
+### Small but Impactful Wins
+- Better error messages & status codes
+- Logging improvements (structured, levels)
+- CMake presets & developer scripts
+- GitHub Actions workflow optimizations
+
+## How to Contribute (Step-by-Step)
+
+1. **Find or create an issue**
+   - Look at [open issues](https://github.com/AutoCookies/pomaidb/issues)
+   - If your idea is new → open an issue first (label it `idea`, `enhancement`, `performance`, `stability`, etc.)
+   - We **always** discuss ideas before coding — this saves everyone time
+
+2. **Fork & branch**
+   ```bash
+   git clone git@github.com:YOUR_USERNAME/pomaidb.git
+   cd pomaidb
+   git checkout -b fix/crash-on-low-battery
+   ```
+
+3. **Develop**
+   - Follow existing style (clang-format, CMake conventions)
+   - Add tests (GoogleTest in `/tests/`)
+   - Run benchmarks before/after if performance-related
+
+4. **Commit & push**
+   - Conventional commits preferred (e.g. `fix: handle OOM during Freeze`, `feat: NEON L2 kernel`, `docs: add RAG example`)
+   - Keep commits small & focused
+
+5. **Open Pull Request**
+   - Fill the PR template (we have one)
+   - Link related issue(s)
+   - Describe what you changed and why
+   - Add before/after benchmarks if relevant
+
+6. **Wait for review**
+   - We usually respond within 1–3 days
+   - We may ask for changes — it's normal and helpful
+
+## Code of Conduct
+
+We follow the **Contributor Covenant Code of Conduct** — be kind, respectful, patient.  
+All participants (maintainers, contributors, users) are expected to follow it.
+
+## Recognition
+
+Every merged contributor gets:
+- Shout-out in release notes
+- Added to CONTRIBUTORS file
+- Eternal gratitude from the Edge AI community
+
+We especially celebrate people who help make PomaiDB **stable on real devices** — because that's what matters most.
+
+## Questions?
+
+Open an issue with label `question` or ping @AutoCookies on GitHub / Discord (link coming soon).
+
+Thank you — your ideas and code are what will make PomaiDB the go-to embedded vector DB for 2026 and beyond.
+
+Let's bring fast, private, local AI to every device.  

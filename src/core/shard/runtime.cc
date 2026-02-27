@@ -689,6 +689,9 @@ namespace pomai::core
         bool stop_now = false;
         for (;;)
         {
+            // Elite: Poll sharded executor for intrusive tasks and reset hot memory pools
+            executor_.Poll(32);
+            mem_manager_.ResetHotPools();
             std::optional<Command> opt;
             if (background_job_) {
                 opt = mailbox_.PopFor(kBackgroundPoll);

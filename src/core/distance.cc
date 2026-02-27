@@ -24,7 +24,7 @@
 #  include <immintrin.h>
 #endif
 
-// ARM NEON: use sse2neon shim from helio (maps SSE/AVX2 intrinsics to NEON)
+// ARM NEON: native intrinsics (maps SSE/AVX2 concepts to NEON)
 #if POMAI_ARM_SIMD
 #  include <arm_neon.h>
 #endif

@@ -21,6 +21,9 @@
 #include "pomai/types.h"
 #include "pomai/options.h"
 #include "util/thread_pool.h"
+#include "core/concurrency/concurrency_macros.h"
+#include "core/concurrency/executor.h"
+#include "core/memory/local_pool.h"
 
 namespace pomai::storage
 {
@@ -112,7 +115,7 @@ namespace pomai::core
 
     class SearchMergePolicy;
 
-    class ShardRuntime
+    class POMAI_CACHE_ALIGNED ShardRuntime
     {
     public:
         ShardRuntime(std::uint32_t shard_id,
@@ -248,14 +251,19 @@ namespace pomai::core
         // IVF coarse index for candidate selection (centroid routing).
         std::unique_ptr<pomai::index::IvfCoarse> ivf_;
 
-        BoundedMpscQueue<Command> mailbox_;
-        std::atomic<std::uint64_t> ops_processed_{0};
-        std::atomic<std::uint64_t> last_query_candidates_scanned_{0};
+        // Elite Concurrency & Memory Base
+        concurrency::Executor executor_;
+        memory::ShardMemoryManager mem_manager_;
+
+        // --- Padded / Aligned State to prevent false sharing ---
+        POMAI_CACHE_ALIGNED BoundedMpscQueue<Command> mailbox_;
+        POMAI_CACHE_ALIGNED std::atomic<std::uint64_t> ops_processed_{0};
+        POMAI_CACHE_ALIGNED std::atomic<std::uint64_t> last_query_candidates_scanned_{0};
 
         std::atomic<bool> started_{false};
 
         pomai::util::ThreadPool* thread_pool_{nullptr};
-        pomai::util::ThreadPool* segment_pool_{nullptr}; // Added
+        pomai::util::ThreadPool* segment_pool_{nullptr}; 
         pomai::IndexParams index_params_;
 
         std::unique_ptr<storage::CompactionManager> compaction_manager_;
