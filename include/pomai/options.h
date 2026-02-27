@@ -24,10 +24,26 @@ namespace pomai
         kRag = 1,
     };
 
+    enum class IndexType : uint8_t
+    {
+        kIvfFlat = 0,
+        kHnsw = 1,
+    };
+
     struct IndexParams
     {
+        IndexType type = IndexType::kIvfFlat;
+        // IVF Params
         uint32_t nlist = 64;
         uint32_t nprobe = 16;
+        // HNSW Params
+        uint32_t hnsw_m = 32;
+        uint32_t hnsw_ef_construction = 200;
+        uint32_t hnsw_ef_search = 64;
+        // Adaptive dispatcher: segments with fewer vectors use brute-force SIMD
+        // (guaranteeing 100% recall). Larger segments use HNSW graph traversal.
+        // Default: 0 = always use HNSW when available (rely on ef_search for recall).
+        uint32_t adaptive_threshold = 5000;
     };
 
     struct DBOptions
@@ -43,6 +59,7 @@ namespace pomai
         uint32_t routing_probe = 0;
         uint32_t routing_warmup_mult = 20;
         uint32_t routing_keep_prev = 1;
+        MetricType metric = MetricType::kL2;
     };
 
     // One membrane = one logical collection.

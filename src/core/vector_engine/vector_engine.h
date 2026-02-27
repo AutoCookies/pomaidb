@@ -2,7 +2,6 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -16,6 +15,7 @@
 #include "pomai/snapshot.h"
 #include "util/thread_pool.h"
 #include "core/routing/routing_table.h"
+#include "core/shard/router.h"  // Phase 4: seqlock ShardRouter
 
 namespace pomai::core
 {
@@ -25,7 +25,7 @@ namespace pomai::core
     class VectorEngine
     {
     public:
-        explicit VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind);
+        explicit VectorEngine(pomai::DBOptions opt, pomai::MembraneKind kind, pomai::MetricType metric);
         ~VectorEngine();
 
         VectorEngine(const VectorEngine &) = delete;
@@ -52,9 +52,16 @@ namespace pomai::core
         Status Search(std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
         Status Search(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts,
                       pomai::SearchResult *out);
+        Status SearchInternal(std::span<const float> query, std::uint32_t topk, const SearchOptions& opts,
+                              pomai::SearchResult *out, bool use_pool);
+        Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                           uint32_t topk, std::vector<pomai::SearchResult>* out);
+        Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
+                           uint32_t topk, const SearchOptions& opts, std::vector<pomai::SearchResult>* out);
 
         const pomai::DBOptions &options() const { return opt_; }
         pomai::MembraneKind kind() const { return kind_; }
+        pomai::MetricType metric() const { return metric_; }
 
     private:
         Status OpenLocked();
@@ -66,6 +73,7 @@ namespace pomai::core
 
         pomai::DBOptions opt_;
         pomai::MembraneKind kind_;
+        pomai::MetricType metric_;
         bool opened_ = false;
 
         std::vector<std::unique_ptr<Shard>> shards_;
@@ -76,12 +84,15 @@ namespace pomai::core
         std::shared_ptr<routing::RoutingTable> routing_mutable_;
         routing::RoutingTablePtr routing_current_;
         routing::RoutingTablePtr routing_prev_;
-        mutable std::mutex routing_mu_;
+        // Phase 4: seqlock replaces routing_mu_ — readers check even seq counter,
+        // writer bumps it odd→even. Zero-cost on the common (already-routed) read path.
+        core::ShardRouter shard_router_{1}; // resized in Open()
+        alignas(64) std::atomic<uint32_t> routing_seqlock_{0};
+        std::atomic<bool> routing_persist_inflight_{false};
         std::vector<float> warmup_reservoir_;
         std::uint32_t warmup_count_ = 0;
         std::uint32_t warmup_target_ = 0;
         std::uint64_t puts_since_persist_ = 0;
-        bool routing_persist_inflight_ = false;
 
         std::atomic<std::uint32_t> routed_shards_last_query_count_{0};
         std::atomic<std::uint32_t> routed_probe_centroids_last_query_{0};

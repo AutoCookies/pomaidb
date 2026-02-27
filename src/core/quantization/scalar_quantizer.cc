@@ -105,7 +105,9 @@ float ScalarQuantizer8Bit::ComputeDistance(std::span<const float> query, std::sp
     }
 
     // Call out to the optimized global dispatcher which dynamically employs AVX2 if supported
-    return pomai::core::DotSq8(query, codes, global_min_, global_inv_scale_);
+    float q_sum = 0.0f;
+    for (float f : query) q_sum += f;
+    return pomai::core::DotSq8(query, codes, global_min_, global_inv_scale_, q_sum);
 }
 
 void ScalarQuantizer8Bit::LoadState(float min_val, float inv_scale) {

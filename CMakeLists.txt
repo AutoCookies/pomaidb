@@ -13,6 +13,58 @@ option(POMAI_BUILD_TESTS "Build tests" OFF)
 option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
 
 # =========================
+# Phase 3: mimalloc — vendored from third_party/mimalloc
+# (DragonflyDB patches pre-applied via: git apply patches/mimalloc-v2.2.4/*.patch)
+# =========================
+option(POMAI_USE_MIMALLOC "Use mimalloc as global allocator (MI_OVERRIDE=ON)" ON)
+
+if (POMAI_USE_MIMALLOC)
+  # mimalloc options — must be set BEFORE add_subdirectory
+  set(MI_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_OBJECT   OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+  set(MI_OVERRIDE       ON  CACHE BOOL "" FORCE)   # replace malloc/free globally
+  set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+  set(MI_USE_CXX        ON  CACHE BOOL "" FORCE)   # C++ new/delete overrides
+  add_subdirectory(third_party/mimalloc EXCLUDE_FROM_ALL)
+  message(STATUS "[pomai] mimalloc: enabled (static, MI_OVERRIDE=ON)")
+else()
+  message(STATUS "[pomai] mimalloc: disabled")
+endif()
+
+
+# =========================
+# FAISS — CPU-only static build (Phases 1-4)
+# GPU, Python SWIG, extras (demos/benchmarks) and MKL all disabled.
+# BLAS is used only for PQ training (lapack sgemm); optional on edge.
+# =========================
+option(POMAI_USE_FAISS "Integrate FAISS HNSW + PQ into PomaiDB" ON)
+
+if (POMAI_USE_FAISS)
+  set(FAISS_ENABLE_GPU     OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_PYTHON  OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_C_API   OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_EXTRAS  OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_MKL     OFF CACHE BOOL "" FORCE)
+  set(FAISS_ENABLE_SVS     OFF CACHE BOOL "" FORCE)
+  # Use AVX2 on x86, generic on ARM (NEON via compiler flags)
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    set(FAISS_OPT_LEVEL "avx2" CACHE STRING "" FORCE)
+  else()
+    set(FAISS_OPT_LEVEL "generic" CACHE STRING "" FORCE)
+  endif()
+  # Suppress FAISS's perf_tests which require gflags (BUILD_TESTING guard)
+  set(_POMAI_SAVED_BUILD_TESTING ${BUILD_TESTING})
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/faiss EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING ${_POMAI_SAVED_BUILD_TESTING} CACHE BOOL "" FORCE)
+  message(STATUS "[pomai] FAISS: enabled (CPU-only, ${FAISS_OPT_LEVEL})")
+else()
+  message(STATUS "[pomai] FAISS: disabled")
+endif()
+
+
+# =========================
 # Library: pomai
 # =========================
 add_library(pomai STATIC
@@ -39,6 +91,15 @@ add_library(pomai STATIC
   src/core/routing/routing_persist.cc
   src/core/rag/rag_engine.cc
 
+  # Phase 2: Product Quantizer
+  src/core/quantization/pomai_pq.cc
+
+  # Phase 3 (Milvus-Lite inspired): BitsetMask pre-computed filter bitset
+  src/core/bitset_mask.cc
+
+  # Phase 3+4: HNSW index wrapper (compiled only when FAISS is ON)
+  $<$<BOOL:${POMAI_USE_FAISS}>:src/core/index/hnsw_index.cc>
+
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
   src/util/crc32c.cc
@@ -51,6 +112,51 @@ target_include_directories(pomai
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+# Phase 3 (FAISS HNSW) + Phase 2 (PQ) linkage
+if (POMAI_USE_FAISS)
+  # faiss_avx2 exists only on x86; fall back to faiss on ARM/generic
+  if (TARGET faiss_avx2)
+    set(_FAISS_TARGET faiss_avx2)
+  else()
+    set(_FAISS_TARGET faiss)
+  endif()
+  target_link_libraries(pomai PRIVATE ${_FAISS_TARGET})
+  target_include_directories(pomai PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/faiss)
+  target_compile_definitions(pomai PRIVATE POMAI_USE_FAISS=1)
+  message(STATUS "[pomai] Linking FAISS target: ${_FAISS_TARGET}")
+
+  # OpenMP required by HNSW (parallel graph build)
+  find_package(OpenMP QUIET)
+  if (OpenMP_CXX_FOUND)
+    target_link_libraries(pomai PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "[pomai] OpenMP: found")
+  else()
+    message(STATUS "[pomai] OpenMP: not found — HNSW build will be single-threaded")
+  endif()
+endif()
+
+# Phase 3: mimalloc — TWO linking modes
+#
+#  Mode A (full MI_OVERRIDE): for standalone executables/static binaries only.
+#          malloc/free/new/delete are globally replaced. Fast, but UNSAFE when
+#          loaded as a .so by a host process (e.g. Python) that has its own heap.
+#
+#  Mode B (no-override, libpomai_c.so): mimalloc is used internally via
+#          mi_heap_* APIs. The global malloc/free are NOT replaced, so Python's
+#          glibc heap and mimalloc coexist without conflict.
+#
+# We achieve this by NOT linking mimalloc into libpomai (the intermediate static
+# lib). Instead:
+#   - libpomai_c.so  links mimalloc-static with MI_OVERRIDE=OFF (internal-only)
+#   - test/bench executables link mimalloc-static with MI_OVERRIDE=ON
+#     (done in the executable's own target_link_libraries)
+#
+# Note: MI_OVERRIDE is set at mimalloc *build time* (above), so we build ONE
+# mimalloc with MI_OVERRIDE=ON. For the .so we suppress interposition by NOT
+# exporting gnu-versioned malloc symbols — achieved via -Wl,--exclude-libs.
+
 
 # =========================
 # Library: pomai_c (C ABI)
@@ -68,6 +174,26 @@ set_target_properties(pomai_c_static PROPERTIES OUTPUT_NAME pomai_c)
 
 target_link_libraries(pomai_c PRIVATE pomai)
 target_link_libraries(pomai_c_static PRIVATE pomai)
+
+# Phase 3 fix: DO NOT link mimalloc into the SHARED library (libpomai_c.so).
+#
+# Reason: mimalloc compiled with MI_OVERRIDE=ON installs a __attribute__((constructor))
+# that patches the global malloc/free vtable at dlopen() time. When Python (or any
+# other host) loads the .so, mimalloc hijacks the entire process heap. Pointers
+# allocated by Python/glibc then get freed by mimalloc (or vice-versa) -> SIGABRT.
+#
+# Safe model:
+#   - libpomai_c.so  -> NO mimalloc. Uses glibc malloc. Safe for ctypes/JNI/FFI.
+#   - libpomai_c.a   -> mimalloc-static. For standalone executables that own the heap.
+#   - test/bench exes -> inherit mimalloc from pomai_c_static.
+#
+if (POMAI_USE_MIMALLOC)
+  # Static wrapper: link mimalloc so executables that embed libpomai get the fast path.
+  target_link_libraries(pomai_c_static PRIVATE mimalloc-static)
+  target_compile_definitions(pomai_c_static PRIVATE POMAI_USE_MIMALLOC=1)
+  # Shared library: intentionally NO mimalloc link.
+  # Internal allocations inside the .so use glibc, which is safe across FFI boundaries.
+endif()
 
 # Export C API symbols when building shared library on Windows.
 target_compile_definitions(pomai_c PRIVATE POMAI_C_BUILD_DLL)
@@ -181,6 +307,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(routing_table_test tests/unit/routing_table_test.cc)
   pomai_setup_test(routing_table_test)
   pomai_add_labeled_test(routing_table_test "unit")
+
+  add_executable(streaming_index_test tests/unit/streaming_index_test.cc)
+  pomai_setup_test(streaming_index_test)
+  pomai_add_labeled_test(streaming_index_test "unit")
 
   add_executable(recall_test tests/recall/recall_test.cc tests/recall/recall_dataset.cc tests/common/bruteforce_oracle.cc)
   pomai_setup_test(recall_test)

@@ -11,11 +11,13 @@
 #include "pomai/status.h"
 #include "pomai/types.h"
 #include "pomai/metadata.h"
+#include "pomai/options.h"
 #include "pomai/quantization/scalar_quantizer.h"
 #include "util/posix_file.h"
 
 // Forward declare in correct namespace
 namespace pomai::index { class IvfFlatIndex; }
+#include "core/index/hnsw_index.h"
 
 namespace pomai::table
 {
@@ -41,7 +43,9 @@ namespace pomai::table
         uint8_t  reserved1[3];
         float    quant_min;       // SQ8 minimum bound
         float    quant_inv_scale; // SQ8 global inverse scale
-        uint32_t reserved2[4];
+        uint32_t entries_start_offset; // V5+: Start of entries block (must be 4096-aligned)
+        uint32_t entry_size;           // V5+: Padded entry size
+        uint32_t reserved2[2];
     };
 
     // Flags
@@ -80,13 +84,14 @@ namespace pomai::table
         
         // Approximate Search via IVF Index.
         pomai::Status Search(std::span<const float> query, uint32_t nprobe, 
-                             std::vector<pomai::VectorId>* out_candidates) const;
+                             std::vector<uint32_t>* out_candidates) const;
 
         bool HasIndex() const { return index_ != nullptr; }
 
         
         // Read entry at index [0, Count()-1]
         pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted, pomai::Metadata* out_meta) const;
+        pomai::Status ReadAtCodes(uint32_t index, pomai::VectorId* out_id, std::span<const uint8_t>* out_codes, bool* out_deleted, pomai::Metadata* out_meta) const;
         pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const;
 
 
@@ -96,7 +101,7 @@ namespace pomai::table
         void ForEach(F &&func) const
         {
             if (count_ == 0) return;
-            const uint8_t* p = base_addr_ + sizeof(SegmentHeader);
+            const uint8_t* p = base_addr_ + entries_start_offset_;
             const uint8_t* meta_offsets_base = nullptr;
             const char* meta_blob = nullptr;
             
@@ -152,6 +157,12 @@ namespace pomai::table
         uint32_t Dim() const { return dim_; }
         std::string Path() const { return path_; }
 
+        const uint8_t* GetBaseAddr() const { return base_addr_; }
+        uint32_t GetEntriesStartOffset() const { return entries_start_offset_; }
+        std::size_t GetEntrySize() const { return entry_size_; }
+
+        const pomai::index::HnswIndex* GetHnswIndex() const { return hnsw_index_.get(); }
+
     private:
         SegmentReader();
 
@@ -160,6 +171,7 @@ namespace pomai::table
         uint32_t count_ = 0;
         uint32_t dim_ = 0;
         std::size_t entry_size_ = 0;
+        uint32_t entries_start_offset_ = 0;
         uint32_t metadata_offset_ = 0;
         
         // V4: Quantization properties
@@ -170,6 +182,7 @@ namespace pomai::table
         std::size_t file_size_ = 0;
         
         std::unique_ptr<pomai::index::IvfFlatIndex> index_;
+        std::unique_ptr<pomai::index::HnswIndex> hnsw_index_;
         
         // Internal helper
         void GetMetadata(uint32_t index, pomai::Metadata* out) const;
@@ -178,14 +191,14 @@ namespace pomai::table
     class SegmentBuilder
     {
     public:
-        SegmentBuilder(std::string path, uint32_t dim);
+        SegmentBuilder(std::string path, uint32_t dim, pomai::IndexParams index_params = {}, pomai::MetricType metric = pomai::MetricType::kL2);
         
         pomai::Status Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted, const pomai::Metadata& meta);
         pomai::Status Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted);
 
         pomai::Status Finish();
         
-        pomai::Status BuildIndex(uint32_t nlist);
+        pomai::Status BuildIndex();
 
         uint32_t Count() const { return static_cast<uint32_t>(entries_.size()); }
 
@@ -199,6 +212,8 @@ namespace pomai::table
         
         std::string path_;
         uint32_t dim_;
+        pomai::IndexParams index_params_;
+        pomai::MetricType metric_;
         std::vector<Entry> entries_;
         std::vector<float> zero_buffer_;
     };

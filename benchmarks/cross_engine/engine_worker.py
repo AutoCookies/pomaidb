@@ -44,6 +44,12 @@ class PomaiOptions(ctypes.Structure):
         ("fsync_policy", ctypes.c_uint32),
         ("memory_budget_bytes", ctypes.c_uint64),
         ("deadline_ms", ctypes.c_uint32),
+        ("index_type", ctypes.c_uint8),
+        ("hnsw_m", ctypes.c_uint32),
+        ("hnsw_ef_construction", ctypes.c_uint32),
+        ("hnsw_ef_search", ctypes.c_uint32),
+        ("adaptive_threshold", ctypes.c_uint32),
+        ("metric", ctypes.c_uint8),
     ]
 
 
@@ -67,6 +73,18 @@ class PomaiQuery(ctypes.Structure):
         ("filter_expression", ctypes.c_char_p),
         ("alpha", ctypes.c_float),
         ("deadline_ms", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class PomaiSemanticPointer(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("raw_data_ptr", ctypes.c_void_p),
+        ("dim", ctypes.c_uint32),
+        ("quant_min", ctypes.c_float),
+        ("quant_inv_scale", ctypes.c_float),
+        ("session_id", ctypes.c_uint64),
     ]
 
 
@@ -77,17 +95,20 @@ class PomaiSearchResults(ctypes.Structure):
         ("ids", ctypes.POINTER(ctypes.c_uint64)),
         ("scores", ctypes.POINTER(ctypes.c_float)),
         ("shard_ids", ctypes.POINTER(ctypes.c_uint32)),
+        ("zero_copy_pointers", ctypes.POINTER(PomaiSemanticPointer)),
     ]
 
 
-def run_pomai(base, queries, gt, lib_path: Path, repeats: int):
+def run_pomai(base, queries, gt, lib_path: Path, repeats: int, metric: str):
     lib = ctypes.CDLL(str(lib_path))
     lib.pomai_options_init.argtypes = [ctypes.POINTER(PomaiOptions)]
     lib.pomai_open.argtypes = [ctypes.POINTER(PomaiOptions), ctypes.POINTER(ctypes.c_void_p)]
     lib.pomai_put_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiUpsert), ctypes.c_size_t]
     lib.pomai_freeze.argtypes = [ctypes.c_void_p]
     lib.pomai_search.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiQuery), ctypes.POINTER(ctypes.POINTER(PomaiSearchResults))]
+    lib.pomai_search_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiQuery), ctypes.c_size_t, ctypes.POINTER(ctypes.POINTER(PomaiSearchResults))]
     lib.pomai_search_results_free.argtypes = [ctypes.POINTER(PomaiSearchResults)]
+    lib.pomai_search_batch_free.argtypes = [ctypes.POINTER(PomaiSearchResults), ctypes.c_size_t]
     lib.pomai_status_message.argtypes = [ctypes.c_void_p]
     lib.pomai_status_message.restype = ctypes.c_char_p
     lib.pomai_status_free.argtypes = [ctypes.c_void_p]
@@ -107,6 +128,12 @@ def run_pomai(base, queries, gt, lib_path: Path, repeats: int):
     opts.path = str(tmpdir / "db").encode()
     opts.shards = 4
     opts.dim = base.shape[1]
+    opts.index_type = 1 # HNSW
+    opts.hnsw_m = 32
+    opts.hnsw_ef_construction = 200
+    opts.hnsw_ef_search = 64
+    opts.adaptive_threshold = 0 
+    opts.metric = 1 if metric == "ip" else 0
     check(lib.pomai_open(ctypes.byref(opts), ctypes.byref(db)))
 
     ids = np.arange(base.shape[0], dtype=np.uint64)
@@ -127,6 +154,7 @@ def run_pomai(base, queries, gt, lib_path: Path, repeats: int):
             batch[i].metadata = None
             batch[i].metadata_len = 0
         check(lib.pomai_put_batch(db, batch, n))
+        holder.clear() # Fix memory leak: allow GC of ctypes arrays
     ingestion_s = time.perf_counter() - ingest_start
 
     build_start = time.perf_counter()
@@ -136,29 +164,38 @@ def run_pomai(base, queries, gt, lib_path: Path, repeats: int):
     all_lat = []
     qps = []
     pred = []
+    
+    num_queries = len(queries)
+    batch_queries = (PomaiQuery * num_queries)()
+    c_queries_arrays = [] # keep references to avoid GC
+    for i in range(num_queries):
+        cvec = (ctypes.c_float * base.shape[1])(*queries[i])
+        c_queries_arrays.append(cvec)
+        batch_queries[i].struct_size = ctypes.sizeof(PomaiQuery)
+        batch_queries[i].vector = cvec
+        batch_queries[i].dim = base.shape[1]
+        batch_queries[i].topk = 10
+        batch_queries[i].filter_expression = None
+        batch_queries[i].alpha = ctypes.c_float(0.0)
+        batch_queries[i].deadline_ms = 0
+        batch_queries[i].flags = 0
+
     for r in range(repeats):
-        lat = []
+        out = ctypes.POINTER(PomaiSearchResults)()
         start = time.perf_counter()
-        run_pred = []
-        for qv in queries:
-            cvec = (ctypes.c_float * base.shape[1])(*qv)
-            q = PomaiQuery()
-            q.struct_size = ctypes.sizeof(PomaiQuery)
-            q.vector = cvec
-            q.dim = base.shape[1]
-            q.topk = 10
-            q.filter_expression = None
-            q.alpha = ctypes.c_float(0.0)
-            q.deadline_ms = 0
-            out = ctypes.POINTER(PomaiSearchResults)()
-            t0 = time.perf_counter()
-            check(lib.pomai_search(db, ctypes.byref(q), ctypes.byref(out)))
-            lat.append((time.perf_counter() - t0) * 1000.0)
-            run_pred.append([int(out.contents.ids[i]) for i in range(min(10, out.contents.count))])
-            lib.pomai_search_results_free(out)
+        
+        check(lib.pomai_search_batch(db, batch_queries, num_queries, ctypes.byref(out)))
+        
         elapsed = time.perf_counter() - start
-        qps.append(len(queries) / elapsed)
-        all_lat.append(float(np.mean(lat)))
+        
+        run_pred = []
+        for i in range(num_queries):
+            run_pred.append([int(out[i].ids[j]) for j in range(min(10, out[i].count))])
+            
+        lib.pomai_search_batch_free(out, num_queries)
+        
+        qps.append(num_queries / elapsed)
+        all_lat.append((elapsed / num_queries) * 1000.0) 
         pred = run_pred
 
     lib.pomai_close(db)
@@ -168,8 +205,8 @@ def run_pomai(base, queries, gt, lib_path: Path, repeats: int):
     pred_ids = np.array(pred, dtype=np.int64)
     rec = recall_at_k(pred_ids, gt, 10)
     return {
-        "engine": "PomaiDB",
-        "params": {"shards": 4, "topk": 10, "durability": "default (WAL enabled by default)"},
+        "engine": "PomaiDB HNSW",
+        "params": {"shards": 4, "topk": 10, "M": 32, "efConstruction": 200, "efSearch": 64},
         "ingestion_time_s": ingestion_s,
         "index_build_time_s": build_s,
         "query_throughput_qps": float(np.mean(qps)),
@@ -322,7 +359,7 @@ def main():
     gt = np.load(args.ground_truth)
 
     if args.engine == "pomai":
-        result = run_pomai(base, queries, gt, Path(args.libpomai), args.repeats)
+        result = run_pomai(base, queries, gt, Path(args.libpomai), args.repeats, args.metric)
     elif args.engine == "hnswlib":
         result = run_hnswlib(base, queries, gt, args.repeats, args.metric)
     elif args.engine == "faiss_flat":

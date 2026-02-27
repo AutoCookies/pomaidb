@@ -43,30 +43,27 @@ namespace
         
         // Get existing
         std::span<const float> out;
-        POMAI_EXPECT_OK(reader->Get(10, &out));
+        std::vector<float> decoded;
+        POMAI_EXPECT_TRUE(reader->FindAndDecode(10, &out, &decoded, nullptr) == pomai::table::SegmentReader::FindResult::kFound);
         POMAI_EXPECT_EQ(out.size(), 4);
-        POMAI_EXPECT_EQ(out[0], 1.0f);
+        POMAI_EXPECT_TRUE(std::abs(out[0] - 1.0f) < 0.1f);
         
-        POMAI_EXPECT_OK(reader->Get(20, &out));
-        POMAI_EXPECT_EQ(out[0], 5.0f);
+        POMAI_EXPECT_TRUE(reader->FindAndDecode(20, &out, &decoded, nullptr) == pomai::table::SegmentReader::FindResult::kFound);
+        POMAI_EXPECT_TRUE(std::abs(out[0] - 5.0f) < 0.1f);
         
         // Get Tombstone
-        auto st = reader->Get(30, &out);
-        POMAI_EXPECT_TRUE(!st.ok());
-        POMAI_EXPECT_EQ(st.code(), pomai::ErrorCode::kNotFound);
-        POMAI_EXPECT_EQ(st.message(), std::string("tombstone"));
+        auto res = reader->FindAndDecode(30, &out, &decoded, nullptr);
+        POMAI_EXPECT_TRUE(res == pomai::table::SegmentReader::FindResult::kFoundTombstone);
         
         // Find API
-        POMAI_EXPECT_TRUE(reader->Find(10, &out) == pomai::table::SegmentReader::FindResult::kFound);
-        POMAI_EXPECT_TRUE(reader->Find(20, &out) == pomai::table::SegmentReader::FindResult::kFound);
-        POMAI_EXPECT_TRUE(reader->Find(30, &out) == pomai::table::SegmentReader::FindResult::kFoundTombstone);
-        POMAI_EXPECT_TRUE(reader->Find(99, &out) == pomai::table::SegmentReader::FindResult::kNotFound);
+        POMAI_EXPECT_TRUE(reader->FindAndDecode(10, nullptr, nullptr, nullptr) == pomai::table::SegmentReader::FindResult::kFound);
+        POMAI_EXPECT_TRUE(reader->FindAndDecode(20, nullptr, nullptr, nullptr) == pomai::table::SegmentReader::FindResult::kFound);
+        POMAI_EXPECT_TRUE(reader->FindAndDecode(30, nullptr, nullptr, nullptr) == pomai::table::SegmentReader::FindResult::kFoundTombstone);
+        POMAI_EXPECT_TRUE(reader->FindAndDecode(99, nullptr, nullptr, nullptr) == pomai::table::SegmentReader::FindResult::kNotFound);
 
         // Get non-existing
-        st = reader->Get(15, &out);
-        POMAI_EXPECT_TRUE(!st.ok());
-        POMAI_EXPECT_EQ(st.code(), pomai::ErrorCode::kNotFound);
-        POMAI_EXPECT_EQ(st.message(), std::string("id not found in segment"));
+        res = reader->FindAndDecode(15, &out, &decoded, nullptr);
+        POMAI_EXPECT_TRUE(res == pomai::table::SegmentReader::FindResult::kNotFound);
         
         // ForEach
         int count = 0;
@@ -80,11 +77,11 @@ namespace
         POMAI_EXPECT_EQ(count, 3);
         POMAI_EXPECT_EQ(tombstones, 1);
         
-        st = reader->Get(5, &out); // Check before first
-        POMAI_EXPECT_TRUE(!st.ok());
+        res = reader->FindAndDecode(5, &out, &decoded, nullptr); // Check before first
+        POMAI_EXPECT_TRUE(res == pomai::table::SegmentReader::FindResult::kNotFound);
         
-        st = reader->Get(40, &out); // Check after last
-        POMAI_EXPECT_TRUE(!st.ok());
+        res = reader->FindAndDecode(40, &out, &decoded, nullptr); // Check after last
+        POMAI_EXPECT_TRUE(res == pomai::table::SegmentReader::FindResult::kNotFound);
     }
 
 } // namespace

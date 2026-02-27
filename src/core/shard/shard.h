@@ -33,10 +33,18 @@ namespace pomai::core
         Status Delete(VectorId id);
         Status Flush();
 
+        Status GetSemanticPointer(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out);
+
         Status SearchLocal(std::span<const float> q, std::uint32_t k,
                            std::vector<pomai::SearchHit> *out) const;
         Status SearchLocal(std::span<const float> q, std::uint32_t k,
                            const SearchOptions& opts, std::vector<pomai::SearchHit> *out) const;
+
+        Status SearchBatchLocal(std::span<const float> queries,
+                                const std::vector<uint32_t>& query_indices,
+                                std::uint32_t topk,
+                                const SearchOptions& opts,
+                                std::vector<std::vector<pomai::SearchHit>>* out_results) const;
 
         Status Freeze();
         Status Compact();

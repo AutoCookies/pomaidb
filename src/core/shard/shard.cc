@@ -46,6 +46,11 @@ namespace pomai::core
         return rt_->Delete(id);
     }
 
+    pomai::Status Shard::GetSemanticPointer(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out)
+    {
+        return rt_->GetSemanticPointer(std::move(snap), id, out);
+    }
+
     pomai::Status Shard::Flush()
     {
         return rt_->Flush();
@@ -61,6 +66,15 @@ namespace pomai::core
                               const SearchOptions& opts, std::vector<pomai::SearchHit> *out) const
     {
         return rt_->Search(q, k, opts, out);
+    }
+
+    Status Shard::SearchBatchLocal(std::span<const float> queries,
+                                   const std::vector<uint32_t>& query_indices,
+                                   std::uint32_t topk,
+                                   const SearchOptions& opts,
+                                   std::vector<std::vector<pomai::SearchHit>>* out_results) const
+    {
+        return rt_->SearchBatchLocal(queries, query_indices, topk, opts, out_results);
     }
 
     Status Shard::Freeze() { return rt_->Freeze(); }

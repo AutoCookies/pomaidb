@@ -27,7 +27,8 @@ namespace pomai::index
             std::uint32_t nlist = 64;   // #centroids
             std::uint32_t nprobe = 4;   // #centroids to probe at query time
             std::uint32_t warmup = 256; // below this #live vectors -> fallback brute force
-            float ema = 0.05f;          // centroid update rate after seeded
+            float max_learning_rate = 0.5f; // Initial aggressive learning rate
+            float min_learning_rate = 0.001f; // Stabilized learning rate floor
         };
 
         IvfCoarse(std::uint32_t dim, Options opt);
@@ -55,13 +56,14 @@ namespace pomai::index
 
     private:
         std::uint32_t AssignCentroid(std::span<const float> vec) const;
-        void SeedOrUpdateCentroid(std::uint32_t cid, std::span<const float> vec);
+        void OnlineCentroidUpdate(std::uint32_t cid, std::span<const float> vec);
 
         std::uint32_t dim_;
         Options opt_;
 
         // centroid vectors: size = nlist * dim
         std::vector<float> centroids_;
+        std::vector<std::uint32_t> cluster_counts_;
         std::vector<std::uint32_t> counts_;
 
         // posting lists: vector of ids

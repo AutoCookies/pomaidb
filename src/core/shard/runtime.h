@@ -13,13 +13,14 @@
 
 #include "core/shard/mailbox.h"
 #include "core/shard/snapshot.h"
+#include "core/shard/shard_stats.h"
 #include "pomai/metadata.h"
-#include "pomai/search.h" // Restored
+#include "pomai/search.h"
 #include "pomai/iterator.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
-#include "pomai/options.h" 
-#include "util/thread_pool.h" 
+#include "pomai/options.h"
+#include "util/thread_pool.h"
 
 namespace pomai::storage
 {
@@ -108,6 +109,8 @@ namespace pomai::core
 
     using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, StopCmd, FreezeCmd, CompactCmd, IteratorCmd>;
 
+    class SearchMergePolicy;
+
     class ShardRuntime
     {
     public:
@@ -115,6 +118,7 @@ namespace pomai::core
                      std::string shard_dir,
                      std::uint32_t dim,
                      pomai::MembraneKind kind,
+                     pomai::MetricType metric,
                      std::unique_ptr<storage::Wal> wal,
                      std::unique_ptr<table::MemTable> mem,
                      std::size_t mailbox_cap,
@@ -150,6 +154,8 @@ namespace pomai::core
              return current_snapshot_.load(std::memory_order_acquire);
         }
 
+        pomai::Status GetSemanticPointer(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out);
+
         pomai::Status Search(std::span<const float> query,
                              std::uint32_t topk,
                              std::vector<pomai::SearchHit> *out);
@@ -158,12 +164,22 @@ namespace pomai::core
                              const SearchOptions& opts,
                              std::vector<pomai::SearchHit> *out); // Overload
 
+        pomai::Status SearchBatchLocal(std::span<const float> queries,
+                                       const std::vector<uint32_t>& query_indices,
+                                       std::uint32_t topk,
+                                       const SearchOptions& opts,
+                                       std::vector<std::vector<pomai::SearchHit>>* out_results);
+
         // Non-blocking enqueue. Returns ResourceExhausted if full.
         pomai::Status TryEnqueue(Command &&cmd);
 
         std::size_t GetQueueDepth() const { return mailbox_.Size(); }
         std::uint64_t GetOpsProcessed() const { return ops_processed_.load(std::memory_order_relaxed); }
         std::uint64_t LastQueryCandidatesScanned() const { return last_query_candidates_scanned_.load(std::memory_order_relaxed); }
+
+        // Phase 4: per-shard snapshot of runtime metrics (lock-free, any thread).
+        ShardStats GetStats() const noexcept;
+
 
     private:
         struct BackgroundJob;
@@ -186,12 +202,17 @@ namespace pomai::core
         pomai::Status GetFromSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta = nullptr);
         std::pair<pomai::Status, bool> ExistsInSnapshot(std::shared_ptr<ShardSnapshot> snap, pomai::VectorId id);
 
+        // Core scoring routine that uses a prebuilt merge_policy
         pomai::Status SearchLocalInternal(std::shared_ptr<table::MemTable> active,
                                           std::shared_ptr<ShardSnapshot> snap, 
                                           std::span<const float> query,
+                                          float query_sum,
                                           std::uint32_t topk,
-                                          const SearchOptions& opts,
-                                          std::vector<pomai::SearchHit> *out);
+                                          const pomai::SearchOptions& opts,
+                                          SearchMergePolicy& merge_policy,
+                                          bool use_visibility,
+                                          std::vector<pomai::SearchHit>* out,
+                                          bool use_pool);
 
                                           
         // Helper to load segments
@@ -210,6 +231,7 @@ namespace pomai::core
         const std::string shard_dir_;
         const std::uint32_t dim_;
         const pomai::MembraneKind kind_;
+        const pomai::MetricType metric_;
 
         std::unique_ptr<storage::Wal> wal_;
         std::atomic<std::shared_ptr<table::MemTable>> mem_;

@@ -179,6 +179,18 @@ namespace pomai
             return mgr_.SearchRag(core::MembraneManager::kDefaultMembrane, query, opts, out);
         }
 
+        Status SearchBatch(std::span<const float> queries, uint32_t num_queries,
+                           uint32_t topk, std::vector<SearchResult>* out) override
+        {
+            return mgr_.SearchBatch(core::MembraneManager::kDefaultMembrane, queries, num_queries, topk, out);
+        }
+
+        Status SearchBatch(std::span<const float> queries, uint32_t num_queries,
+                           uint32_t topk, const SearchOptions& opts, std::vector<SearchResult>* out) override
+        {
+            return mgr_.SearchBatch(core::MembraneManager::kDefaultMembrane, queries, num_queries, topk, opts, out);
+        }
+
         // ...
 
         Status Search(std::string_view membrane, std::span<const float> query,
@@ -209,6 +221,18 @@ namespace pomai
                          const RagSearchOptions& opts, RagSearchResult *out) override
         {
             return mgr_.SearchRag(membrane, query, opts, out);
+        }
+
+        Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries,
+                           uint32_t topk, std::vector<SearchResult>* out) override
+        {
+            return mgr_.SearchBatch(membrane, queries, num_queries, topk, out);
+        }
+
+        Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries,
+                           uint32_t topk, const SearchOptions& opts, std::vector<SearchResult>* out) override
+        {
+            return mgr_.SearchBatch(membrane, queries, num_queries, topk, opts, out);
         }
 
         Status Freeze(std::string_view membrane) override

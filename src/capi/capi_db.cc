@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "capi_utils.h"
+#include "core/memory/pin_manager.h"
 #include "pomai/version.h"
 
 namespace {
@@ -31,7 +32,7 @@ struct SearchResultsWrapper {
 };
 
 constexpr uint32_t MinOptionsStructSize() {
-    return static_cast<uint32_t>(offsetof(pomai_options_t, memory_budget_bytes) + sizeof(uint64_t));
+    return static_cast<uint32_t>(offsetof(pomai_options_t, hnsw_ef_search) + sizeof(uint32_t));
 }
 
 constexpr uint32_t MinUpsertStructSize() {
@@ -110,6 +111,12 @@ void pomai_options_init(pomai_options_t* opts) {
     opts->fsync_policy = POMAI_FSYNC_POLICY_NEVER;
     opts->memory_budget_bytes = 0;
     opts->deadline_ms = 0;
+    opts->index_type = 0; // IVF
+    opts->hnsw_m = 32;
+    opts->hnsw_ef_construction = 200;
+    opts->hnsw_ef_search = 64;
+    opts->adaptive_threshold = 5000;
+    opts->metric = 0; // L2
 }
 
 void pomai_scan_options_init(pomai_scan_options_t* opts) {
@@ -144,6 +151,18 @@ pomai_status_t* pomai_open(const pomai_options_t* opts, pomai_db_t** out_db) {
     cpp_opts.fsync = (opts->fsync_policy == POMAI_FSYNC_POLICY_ALWAYS)
                          ? pomai::FsyncPolicy::kAlways
                          : pomai::FsyncPolicy::kNever;
+    cpp_opts.metric = (opts->metric == 1) ? pomai::MetricType::kInnerProduct : pomai::MetricType::kL2;
+    cpp_opts.index_params.adaptive_threshold = opts->adaptive_threshold;
+    
+    // Default to IVF, overwrite if HNSW.
+    if (opts->index_type == 1) {
+        cpp_opts.index_params.type = pomai::IndexType::kHnsw;
+        cpp_opts.index_params.hnsw_m = opts->hnsw_m;
+        cpp_opts.index_params.hnsw_ef_construction = opts->hnsw_ef_construction;
+        cpp_opts.index_params.hnsw_ef_search = opts->hnsw_ef_search;
+    } else {
+        cpp_opts.index_params.type = pomai::IndexType::kIvfFlat;
+    }
 
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(cpp_opts, &db);
@@ -273,6 +292,9 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     if (!ParseTenantFilter(query->filter_expression, &opts)) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "filter_expression must use tenant=<value>");
     }
+    if (query->flags & POMAI_QUERY_FLAG_ZERO_COPY) {
+        opts.zero_copy = true;
+    }
 
     auto st = db->db->Search(std::span<const float>(query->vector, query->dim), query->topk, opts, &res);
     if (!st.ok() && st.code() != pomai::ErrorCode::kPartial) {
@@ -298,6 +320,19 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     w->pub.ids = w->ids.data();
     w->pub.scores = w->scores.data();
     w->pub.shard_ids = w->shard_ids.data();
+    if (opts.zero_copy && !res.zero_copy_pointers.empty()) {
+        w->pub.zero_copy_pointers = new pomai_semantic_pointer_t[res.zero_copy_pointers.size()];
+        for (size_t i = 0; i < res.zero_copy_pointers.size(); ++i) {
+            w->pub.zero_copy_pointers[i].struct_size = sizeof(pomai_semantic_pointer_t);
+            w->pub.zero_copy_pointers[i].raw_data_ptr = res.zero_copy_pointers[i].raw_data_ptr;
+            w->pub.zero_copy_pointers[i].dim = res.zero_copy_pointers[i].dim;
+            w->pub.zero_copy_pointers[i].quant_min = res.zero_copy_pointers[i].quant_min;
+            w->pub.zero_copy_pointers[i].quant_inv_scale = res.zero_copy_pointers[i].quant_inv_scale;
+            w->pub.zero_copy_pointers[i].session_id = res.zero_copy_pointers[i].session_id;
+        }
+    } else {
+        w->pub.zero_copy_pointers = nullptr;
+    }
     *out = &w->pub;
 
     if (st.code() == pomai::ErrorCode::kPartial) {
@@ -309,8 +344,111 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     return nullptr;
 }
 
+pomai_status_t* pomai_search_batch(pomai_db_t* db, const pomai_query_t* queries, size_t num_queries, pomai_search_results_t** out) {
+    if (db == nullptr || queries == nullptr || out == nullptr || num_queries == 0) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "invalid batch search args");
+    }
+    if (queries[0].struct_size < MinQueryStructSize()) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "query.struct_size is too small");
+    }
+    
+    // We assume all queries in the batch have the same dimensions and options.
+    const uint32_t dim = queries[0].dim;
+    const uint32_t topk = queries[0].topk;
+    
+    pomai::SearchOptions opts;
+    if (!ParseTenantFilter(queries[0].filter_expression, &opts)) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "filter_expression must use tenant=<value>");
+    }
+    if (queries[0].flags & POMAI_QUERY_FLAG_ZERO_COPY) {
+        opts.zero_copy = true;
+    }
+
+    std::vector<float> flat_queries;
+    flat_queries.reserve(num_queries * dim);
+    for (size_t i = 0; i < num_queries; ++i) {
+        if (queries[i].vector == nullptr || queries[i].dim != dim || queries[i].topk != topk) {
+            return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "batch queries must have identical dim and topk");
+        }
+        flat_queries.insert(flat_queries.end(), queries[i].vector, queries[i].vector + dim);
+    }
+
+    std::vector<pomai::SearchResult> batch_res;
+    auto st = db->db->SearchBatch(std::span<const float>(flat_queries.data(), flat_queries.size()), num_queries, topk, opts, &batch_res);
+    
+    if (!st.ok() && st.code() != pomai::ErrorCode::kPartial) {
+        return ToCStatus(st);
+    }
+
+    // Allocate array of results
+    *out = new pomai_search_results_t[num_queries];
+    
+    for (size_t q = 0; q < num_queries; ++q) {
+        const auto& res = batch_res[q];
+        pomai_search_results_t& pub = (*out)[q];
+
+        pub.struct_size = static_cast<uint32_t>(sizeof(pomai_search_results_t));
+        pub.count = res.hits.size();
+        
+        pub.ids = new uint64_t[pub.count];
+        pub.scores = new float[pub.count];
+        pub.shard_ids = new uint32_t[pub.count];
+        
+        for (size_t i = 0; i < pub.count; ++i) {
+            pub.ids[i] = res.hits[i].id;
+            pub.scores[i] = res.hits[i].score;
+            pub.shard_ids[i] = UINT32_MAX;
+        }
+
+        if (opts.zero_copy && !res.zero_copy_pointers.empty()) {
+            pub.zero_copy_pointers = new pomai_semantic_pointer_t[res.zero_copy_pointers.size()];
+            for (size_t i = 0; i < res.zero_copy_pointers.size(); ++i) {
+                pub.zero_copy_pointers[i].struct_size = sizeof(pomai_semantic_pointer_t);
+                pub.zero_copy_pointers[i].raw_data_ptr = res.zero_copy_pointers[i].raw_data_ptr;
+                pub.zero_copy_pointers[i].dim = res.zero_copy_pointers[i].dim;
+                pub.zero_copy_pointers[i].quant_min = res.zero_copy_pointers[i].quant_min;
+                pub.zero_copy_pointers[i].quant_inv_scale = res.zero_copy_pointers[i].quant_inv_scale;
+                pub.zero_copy_pointers[i].session_id = res.zero_copy_pointers[i].session_id;
+            }
+        } else {
+            pub.zero_copy_pointers = nullptr;
+        }
+    }
+
+    if (st.code() == pomai::ErrorCode::kPartial) {
+        return MakeStatus(POMAI_STATUS_PARTIAL_FAILURE, st.message());
+    }
+    return nullptr;
+}
+
 void pomai_search_results_free(pomai_search_results_t* results) {
+    if (results && results->zero_copy_pointers) {
+        delete[] results->zero_copy_pointers;
+    }
     delete reinterpret_cast<SearchResultsWrapper*>(results);
+}
+
+void pomai_search_batch_free(pomai_search_results_t* results, size_t num_queries) {
+    if (!results) return;
+    for (size_t i = 0; i < num_queries; ++i) {
+        if (results[i].ids) {
+            delete[] results[i].ids;
+        }
+        if (results[i].scores) {
+            delete[] results[i].scores;
+        }
+        if (results[i].shard_ids) {
+            delete[] results[i].shard_ids;
+        }
+        if (results[i].zero_copy_pointers) {
+            delete[] results[i].zero_copy_pointers;
+        }
+    }
+    delete[] results;
+}
+
+void pomai_release_pointer(uint64_t session_id) {
+    pomai::core::MemoryPinManager::Instance().Unpin(session_id);
 }
 
 void pomai_free(void* p) {

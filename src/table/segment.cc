@@ -25,8 +25,8 @@ namespace pomai::table
     // Writes: Incremental, not buffered in RAM
     // CRC: Computed on the fly (incremental)
     
-    SegmentBuilder::SegmentBuilder(std::string path, uint32_t dim)
-        : path_(std::move(path)), dim_(dim), zero_buffer_(dim, 0.0f)
+    SegmentBuilder::SegmentBuilder(std::string path, uint32_t dim, pomai::IndexParams index_params, pomai::MetricType metric)
+        : path_(std::move(path)), dim_(dim), index_params_(std::move(index_params)), metric_(metric), zero_buffer_(dim, 0.0f)
     {
     }
 
@@ -74,10 +74,12 @@ namespace pomai::table
         SegmentHeader h{};
         std::memset(&h, 0, sizeof(h));
         std::memcpy(h.magic, kMagic, sizeof(h.magic));
-        h.version = 4; // V4
+        h.version = 6; // V6: 64-byte alignment + IVF positional indices
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
-        h.is_quantized = 1; // Enable SQ8 by default for builder
+        // Use quantization if requested in IndexParams (or by default)
+        const bool use_quantization = true; // For now keep default as it was intended, but fix logic
+        h.is_quantized = use_quantization ? 1 : 0;
         
         // Train Quantizer
         core::ScalarQuantizer8Bit quantizer(dim_);
@@ -99,10 +101,37 @@ namespace pomai::table
             h.quant_inv_scale = 0.0f;
         }
         
-        // Calculate Metadata Offset upfront
-        // Header + (Count * EntrySize) (V4 uses 1-byte per dim for vectors)
-        size_t entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
-        h.metadata_offset = static_cast<uint32_t>(sizeof(SegmentHeader) + entries_.size() * entry_size);
+        // Prepare metadata arrays
+        std::vector<uint64_t> offsets;
+        std::vector<char> blob;
+        offsets.reserve(entries_.size() + 1);
+        
+        // V5 variables
+        size_t entry_size = 0;
+        uint32_t entries_start_offset = 0;
+        
+        const bool is_quantized = (h.is_quantized != 0);
+        const size_t element_size = is_quantized ? sizeof(uint8_t) : sizeof(float);
+
+        if (h.version >= 6) {
+            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * element_size;
+            entry_size = (unpadded_size + 63) & ~63; // 64-byte alignment
+            entries_start_offset = 128; // Small header + alignment
+            h.entry_size = static_cast<uint32_t>(entry_size);
+            h.entries_start_offset = entries_start_offset;
+            h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
+        } else if (h.version >= 5) {
+            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * element_size;
+            entry_size = (unpadded_size + 4095) & ~4095;
+            entries_start_offset = 4096;
+            h.entry_size = static_cast<uint32_t>(entry_size);
+            h.entries_start_offset = entries_start_offset;
+            h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
+        } else {
+            entry_size = sizeof(uint64_t) + 4 + dim_ * element_size;
+            entries_start_offset = sizeof(SegmentHeader);
+            h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
+        }
 
         // Write header
         st = file.PWrite(0, &h, sizeof(h));
@@ -115,49 +144,73 @@ namespace pomai::table
         const uint8_t* header_bytes = reinterpret_cast<const uint8_t*>(&h);
         crc = pomai::util::Crc32c(header_bytes, sizeof(h), crc);
 
+        if (h.version >= 5) {
+            std::size_t pad_size = entries_start_offset - sizeof(SegmentHeader);
+            std::vector<uint8_t> pad(pad_size, 0);
+            st = file.PWrite(offset, pad.data(), pad.size());
+            if (!st.ok()) return st;
+            crc = pomai::util::Crc32c(pad.data(), pad.size(), crc);
+            offset = entries_start_offset; // UPDATED: Correctly position offset for entries
+        }
+
         // Stream entries to disk (one at a time)
-        std::vector<uint8_t> entry_buffer;
-        entry_buffer.reserve(entry_size);
+        void* raw_buffer = nullptr;
+        if (posix_memalign(&raw_buffer, 4096, entry_size) != 0) {
+            return pomai::Status::IOError("posix_memalign failed");
+        }
+        
+        uint8_t* entry_buffer = static_cast<uint8_t*>(raw_buffer);
 
         for (const auto& e : entries_) {
-            entry_buffer.clear();
+            std::memset(entry_buffer, 0, entry_size);
+            size_t cursor = 0;
             
             // ID (8 bytes)
             const uint8_t* p_id = reinterpret_cast<const uint8_t*>(&e.id);
-            entry_buffer.insert(entry_buffer.end(), p_id, p_id + sizeof(e.id));
+            std::memcpy(entry_buffer + cursor, p_id, sizeof(e.id));
+            cursor += sizeof(e.id);
             
             // Flags + Padding (4 bytes: 1 flag + 3 pad)
             uint8_t flags = e.is_deleted ? kFlagTombstone : kFlagNone;
-            entry_buffer.push_back(flags);
-            entry_buffer.push_back(0);
-            entry_buffer.push_back(0);
-            entry_buffer.push_back(0);
+            entry_buffer[cursor++] = flags;
+            entry_buffer[cursor++] = 0;
+            entry_buffer[cursor++] = 0;
+            entry_buffer[cursor++] = 0;
 
-            // Vector (dim * 1 bytes)
-            std::vector<uint8_t> encoded;
-            if (e.is_deleted) {
-                encoded.assign(dim_, 0); // Zeroed out tombstone
+            // Vector (dim * 1 bytes or dim * 4 bytes)
+            if (is_quantized) {
+                std::vector<uint8_t> encoded;
+                if (e.is_deleted) {
+                    encoded.assign(dim_, 0); 
+                } else {
+                    std::span<const float> vec_span(e.vec.data, dim_);
+                    encoded = quantizer.Encode(vec_span);
+                }
+                std::memcpy(entry_buffer + cursor, encoded.data(), encoded.size());
             } else {
-                std::span<const float> vec_span(e.vec.data, dim_);
-                encoded = quantizer.Encode(vec_span);
+                if (e.is_deleted) {
+                    std::memcpy(entry_buffer + cursor, zero_buffer_.data(), dim_ * sizeof(float));
+                } else {
+                    std::memcpy(entry_buffer + cursor, e.vec.data, dim_ * sizeof(float));
+                }
             }
-            entry_buffer.insert(entry_buffer.end(), encoded.begin(), encoded.end());
 
             // Write entry
-            st = file.PWrite(offset, entry_buffer.data(), entry_buffer.size());
-            if (!st.ok()) return st;
+            st = file.PWrite(offset, entry_buffer, entry_size);
+            if (!st.ok()) {
+                free(raw_buffer);
+                return st;
+            }
             
             // Update CRC incrementally
-            crc = pomai::util::Crc32c(entry_buffer.data(), entry_buffer.size(), crc);
+            crc = pomai::util::Crc32c(entry_buffer, entry_size, crc);
             
-            offset += entry_buffer.size();
+            offset += entry_size;
         }
+        
+        free(raw_buffer);
 
         // Write Metadata Block
-        // Prepare metadata arrays
-        std::vector<uint64_t> offsets;
-        std::vector<char> blob;
-        offsets.reserve(entries_.size() + 1);
         
         for (const auto& e : entries_) {
             offsets.push_back(blob.size());
@@ -200,8 +253,8 @@ namespace pomai::table
         return pomai::Status::Ok();
     }
 
-    pomai::Status SegmentBuilder::BuildIndex(uint32_t nlist) {
-         // Gather valid vectors for training
+    pomai::Status SegmentBuilder::BuildIndex() {
+         // Gather valid vectors for training/building
          std::vector<float> training_data;
          training_data.reserve(entries_.size() * dim_);
          size_t num_live = 0;
@@ -212,34 +265,68 @@ namespace pomai::table
                  num_live++;
              }
          }
-         
-         pomai::index::IvfFlatIndex::Options opt;
-         opt.nlist = nlist;
-         if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1U, static_cast<uint32_t>(num_live));
 
-         auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
-         auto st = idx->Train(training_data, num_live);
-         if (!st.ok()) return st;
-         
-         for(const auto& e : entries_) {
-             if (!e.is_deleted) {
-                 st = idx->Add(e.id, e.vec.span());
-                 if (!st.ok()) return st;
+         if (index_params_.type == pomai::IndexType::kHnsw) {
+             pomai::index::HnswOptions opts;
+             opts.M = index_params_.hnsw_m;
+             opts.ef_construction = index_params_.hnsw_ef_construction;
+             opts.ef_search = index_params_.hnsw_ef_search;
+             
+             auto idx = std::make_unique<pomai::index::HnswIndex>(dim_, opts, metric_);
+             // Store real user VectorIds so HnswIndex::Search returns them directly.
+             std::vector<pomai::VectorId> ids;
+             ids.reserve(num_live);
+             for (size_t i = 0; i < entries_.size(); ++i) {
+                 if (!entries_[i].is_deleted) {
+                     ids.push_back(entries_[i].id); // real user VectorId
+                 }
              }
-         }
-         
-         std::string idx_path = path_ + ".idx.tmp";
-         st = idx->Save(idx_path);
-         if (!st.ok()) return st;
-         
-         std::string final_idx_path = path_;
-         if (final_idx_path.size() > 4 && final_idx_path.substr(final_idx_path.size()-4) == ".dat") {
-             final_idx_path = final_idx_path.substr(0, final_idx_path.size()-4);
-         }
-         final_idx_path += ".idx";
-         
-         if (rename(idx_path.c_str(), final_idx_path.c_str()) != 0) {
-             return pomai::Status::IOError("rename idx failed");
+             auto st = idx->AddBatch(ids.data(), training_data.data(), num_live);
+             if (!st.ok()) return st;
+
+             std::string hnsw_path = path_ + ".hnsw.tmp";
+             st = idx->Save(hnsw_path);
+             if (!st.ok()) return st;
+
+             std::string final_hnsw_path = path_;
+             if (final_hnsw_path.size() > 4 && final_hnsw_path.substr(final_hnsw_path.size()-4) == ".dat") {
+                 final_hnsw_path = final_hnsw_path.substr(0, final_hnsw_path.size()-4);
+             }
+             final_hnsw_path += ".hnsw";
+
+             if (rename(hnsw_path.c_str(), final_hnsw_path.c_str()) != 0) {
+                 return pomai::Status::IOError("rename hnsw failed");
+             }
+         } else {
+             pomai::index::IvfFlatIndex::Options opt;
+             opt.nlist = index_params_.nlist;
+             if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1U, static_cast<uint32_t>(num_live));
+
+             auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
+             auto st = idx->Train(training_data, num_live);
+             if (!st.ok()) return st;
+             
+             for (size_t i = 0; i < entries_.size(); ++i) {
+                 const auto& e = entries_[i];
+                 if (!e.is_deleted) {
+                     st = idx->Add(static_cast<uint32_t>(i), e.vec.span());
+                     if (!st.ok()) return st;
+                 }
+             }
+             
+             std::string idx_path = path_ + ".idx.tmp";
+             st = idx->Save(idx_path);
+             if (!st.ok()) return st;
+             
+             std::string final_idx_path = path_;
+             if (final_idx_path.size() > 4 && final_idx_path.substr(final_idx_path.size()-4) == ".dat") {
+                 final_idx_path = final_idx_path.substr(0, final_idx_path.size()-4);
+             }
+             final_idx_path += ".idx";
+             
+             if (rename(idx_path.c_str(), final_idx_path.c_str()) != 0) {
+                 return pomai::Status::IOError("rename idx failed");
+             }
          }
          
          return pomai::Status::Ok();
@@ -274,14 +361,21 @@ namespace pomai::table
 
         if (strncmp(h->magic, kMagic, 12) != 0) return pomai::Status::Corruption("bad magic");
         
-        // Support V2, V3 and V4
-        if (h->version != 2 && h->version != 3 && h->version != 4) {
+        // Support V2 to V6
+        if (h->version < 2 || h->version > 6) {
             return pomai::Status::Corruption("unsupported version");
         }
         
         reader->count_ = h->count;
         reader->dim_ = h->dim;
         
+        if (h->version >= 5) {
+            reader->entries_start_offset_ = h->entries_start_offset;
+            reader->entry_size_ = h->entry_size;
+        } else {
+            reader->entries_start_offset_ = sizeof(SegmentHeader);
+        }
+
         if (h->version >= 4) {
             reader->is_quantized_ = (h->is_quantized == 1);
         } else {
@@ -289,13 +383,17 @@ namespace pomai::table
         }
         
         if (reader->is_quantized_) {
-            reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(uint8_t); // ID + Flags/Pad + uint8_t Vec
+            if (h->version < 5) {
+                reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(uint8_t);
+            }
             
             // Initialize quantizer from explicitly serialized floats
             reader->quantizer_ = std::make_unique<core::ScalarQuantizer8Bit>(h->dim);
             reader->quantizer_->LoadState(h->quant_min, h->quant_inv_scale);
         } else {
-            reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float); // ID + Flags/Pad + float Vec
+            if (h->version < 5) {
+                reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float);
+            }
         }
         
         if (h->version >= 3) {
@@ -308,7 +406,7 @@ namespace pomai::table
         reader->file_size_ = size;
 
         // Verify size
-        size_t expected_min = sizeof(SegmentHeader) + reader->count_ * reader->entry_size_ + 4; // + CRC
+        size_t expected_min = reader->entries_start_offset_ + reader->count_ * reader->entry_size_ + 4; // + CRC
         if (size < expected_min) return pomai::Status::Corruption("segment truncated");
 
         // Try load index (best effort)
@@ -316,17 +414,22 @@ namespace pomai::table
         if (idx_path.size() > 4 && idx_path.substr(idx_path.size()-4) == ".dat") {
              idx_path = idx_path.substr(0, idx_path.size()-4);
         }
+        std::string hnsw_path = idx_path + ".hnsw";
         idx_path += ".idx";
         
-        // Ignore error if not found (fallback to scan)
-        (void)pomai::index::IvfFlatIndex::Load(idx_path, &reader->index_);
+        // Try HNSW first
+        st = pomai::index::HnswIndex::Load(hnsw_path, &reader->hnsw_index_);
+        if (!st.ok()) {
+            // Ignore error if not found (fallback to scan)
+            (void)pomai::index::IvfFlatIndex::Load(idx_path, &reader->index_);
+        }
 
         *out = std::move(reader);
         return pomai::Status::Ok();
     }
 
     pomai::Status SegmentReader::Search(std::span<const float> query, uint32_t nprobe, 
-                                        std::vector<pomai::VectorId>* out_candidates) const
+                                        std::vector<uint32_t>* out_candidates) const
     {
         if (!index_) return pomai::Status::Ok(); // Empty candidates -> Fallback
         return index_->Search(query, nprobe, out_candidates);
@@ -430,7 +533,7 @@ namespace pomai::table
         int64_t left = 0;
         int64_t right = count_ - 1;
         
-        const uint8_t* entries_start = base_addr_ + sizeof(SegmentHeader);
+        const uint8_t* entries_start = base_addr_ + entries_start_offset_;
 
         while (left <= right) {
             int64_t mid = left + (right - left) / 2;
@@ -465,11 +568,41 @@ namespace pomai::table
         return FindResult::kNotFound;
     }
 
+    pomai::Status SegmentReader::ReadAtCodes(uint32_t index, pomai::VectorId* out_id, std::span<const uint8_t>* out_codes, bool* out_deleted, pomai::Metadata* out_meta) const
+    {
+        if (index >= count_) return pomai::Status::InvalidArgument("index out of range");
+
+        const uint8_t* p = base_addr_ + entries_start_offset_ + index * entry_size_;
+        
+        if (out_id) {
+             std::memcpy(out_id, p, sizeof(uint64_t));
+        }
+        
+        uint8_t flags = *(p + 8);
+        bool is_deleted = (flags & kFlagTombstone);
+        if (out_deleted) *out_deleted = is_deleted;
+
+        if (out_codes) {
+             if (is_deleted || !is_quantized_) {
+                 *out_codes = {};
+             } else {
+                 const uint8_t* code_ptr = p + 12;
+                 *out_codes = std::span<const uint8_t>(code_ptr, dim_);
+             }
+        }
+        
+        if (out_meta) {
+            GetMetadata(index, out_meta);
+        }
+        
+        return pomai::Status::Ok();
+    }
+    
     pomai::Status SegmentReader::ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted, pomai::Metadata* out_meta) const
     {
         if (index >= count_) return pomai::Status::InvalidArgument("index out of range");
 
-        const uint8_t* p = base_addr_ + sizeof(SegmentHeader) + index * entry_size_;
+        const uint8_t* p = base_addr_ + entries_start_offset_ + index * entry_size_;
         
         if (out_id) {
              std::memcpy(out_id, p, sizeof(uint64_t));

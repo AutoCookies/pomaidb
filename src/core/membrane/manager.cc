@@ -25,6 +25,8 @@ namespace pomai::core
         spec.name = std::string(kDefaultMembrane);
         spec.dim = base_.dim;
         spec.shard_count = base_.shard_count;
+        spec.index_params = base_.index_params;
+        spec.metric = base_.metric;
 
         auto st = CreateMembrane(spec);
         if (st.code() == pomai::ErrorCode::kAlreadyExists)
@@ -43,7 +45,7 @@ namespace pomai::core
             MembraneState state;
             state.spec = loaded_spec;
             if (loaded_spec.kind == pomai::MembraneKind::kVector) {
-                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind);
+                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind, loaded_spec.metric);
             } else {
                 state.rag_engine = std::make_unique<RagEngine>(opt, loaded_spec);
             }
@@ -85,7 +87,7 @@ namespace pomai::core
                 MembraneState state;
                 state.spec = mspec;
                 if (mspec.kind == pomai::MembraneKind::kVector) {
-                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind);
+                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind, mspec.metric);
                 } else {
                     state.rag_engine = std::make_unique<RagEngine>(opt, mspec);
                 }
@@ -176,7 +178,7 @@ namespace pomai::core
         MembraneState state;
         state.spec = spec;
         if (spec.kind == pomai::MembraneKind::kVector) {
-            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind);
+            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind, spec.metric);
         } else {
             state.rag_engine = std::make_unique<RagEngine>(opt, spec);
         }
@@ -362,6 +364,25 @@ namespace pomai::core
         if (state->spec.kind != pomai::MembraneKind::kVector)
             return Status::InvalidArgument("VECTOR membrane required for Search");
         return state->vector_engine->Search(query, topk, opts, out);
+    }
+
+    Status MembraneManager::SearchBatch(std::string_view membrane, std::span<const float> queries,
+                                        uint32_t num_queries, std::uint32_t topk, std::vector<pomai::SearchResult> *out)
+    {
+        return SearchBatch(membrane, queries, num_queries, topk, SearchOptions{}, out);
+    }
+
+    Status MembraneManager::SearchBatch(std::string_view membrane, std::span<const float> queries,
+                                        uint32_t num_queries, std::uint32_t topk, const SearchOptions& opts, std::vector<pomai::SearchResult> *out)
+    {
+        if (!out)
+            return Status::InvalidArgument("out is null");
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
+            return Status::NotFound("membrane not found");
+        if (state->spec.kind != pomai::MembraneKind::kVector)
+            return Status::InvalidArgument("VECTOR membrane required for SearchBatch");
+        return state->vector_engine->SearchBatch(queries, num_queries, topk, opts, out);
     }
 
     Status MembraneManager::SearchRag(std::string_view membrane, const pomai::RagQuery& query,
