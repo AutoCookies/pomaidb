@@ -232,9 +232,7 @@ void VectorEngine::MaybeWarmupAndInitRouting(std::span<const float> vec) {
         routing_current_ = routing_mutable_;
         routing_mode_.store(routing::RoutingMode::kReady);
         (void)routing::SaveRoutingTableAtomic(opt_.path, built, opt_.routing_keep_prev != 0);
-        util::Log(util::LogLevel::kInfo,
-                  "[routing] mode=READY warmup_size=" + std::to_string(warmup_count_) +
-                      " k=" + std::to_string(built.k));
+        POMAI_LOG_INFO("[routing] mode=READY warmup_size={} k={}", warmup_count_, built.k);
     });
 }
 
@@ -266,9 +264,7 @@ void VectorEngine::MaybePersistRoutingAsync() {
     if (search_pool_) {
         (void)search_pool_->Enqueue([this, snapshot]() {
             auto st = routing::SaveRoutingTableAtomic(opt_.path, *snapshot, opt_.routing_keep_prev != 0);
-            if (!st.ok()) {
-                util::Log(util::LogLevel::kWarn, std::string("[routing] persist failed: ") + st.message());
-            }
+                POMAI_LOG_WARN("[routing] persist failed: {}", st.message());
             routing_persist_inflight_.store(false, std::memory_order_release);
             return Status::Ok();
         });

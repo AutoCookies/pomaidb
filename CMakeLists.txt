@@ -252,6 +252,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(mailbox_test)
   pomai_add_labeled_test(mailbox_test "unit")
 
+  add_executable(logging_test tests/unit/logging_test.cc)
+  pomai_setup_test(logging_test)
+  pomai_add_labeled_test(logging_test "unit")
+
   add_executable(wal_test tests/unit/wal_test.cc)
   pomai_setup_test(wal_test)
   pomai_add_labeled_test(wal_test "unit")

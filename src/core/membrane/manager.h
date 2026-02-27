@@ -68,6 +68,8 @@ namespace pomai::core
         Status GetSnapshot(std::string_view membrane, std::shared_ptr<pomai::Snapshot>* out);
         Status NewIterator(std::string_view membrane, const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out);
 
+        const pomai::DBOptions& GetOptions() const { return base_; }
+
         // Default membrane convenience: use name "__default__"
         static constexpr std::string_view kDefaultMembrane = "__default__";
 

@@ -26,6 +26,7 @@
 #include <list>
 #include "pomai/metadata.h" // Added
 #include "util/posix_file.h" // Added for FsyncDir
+#include "util/logging.h"
 
 namespace pomai::core
 {
@@ -318,6 +319,8 @@ namespace pomai::core
         std::vector<std::string> seg_names;
         auto st = ShardManifest::Load(shard_dir_, &seg_names);
         if (!st.ok()) return st;
+        
+        POMAI_LOG_INFO("[shard:{}] Loading {} segments from {}", shard_id_, seg_names.size(), shard_dir_);
         
         segments_.clear();
         for (const auto& name : seg_names) {
@@ -843,6 +846,7 @@ namespace pomai::core
 
     pomai::Status ShardRuntime::HandleFlush(FlushCmd &)
     {
+        POMAI_LOG_INFO("[shard:{}] Flushing memtables to segment", shard_id_);
         return wal_->Flush();
     }
 
@@ -885,6 +889,7 @@ namespace pomai::core
 
     std::optional<pomai::Status> ShardRuntime::HandleCompact(CompactCmd & /*c*/)
     {
+        POMAI_LOG_INFO("[shard:{}] Starting background compaction", shard_id_);
         if (background_job_) return std::nullopt; // Keep in queue
 
         // 1. Calculate stats for compaction manager
