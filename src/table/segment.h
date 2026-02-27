@@ -11,11 +11,13 @@
 #include "pomai/status.h"
 #include "pomai/types.h"
 #include "pomai/metadata.h"
+#include "pomai/options.h"
 #include "pomai/quantization/scalar_quantizer.h"
 #include "util/posix_file.h"
 
 // Forward declare in correct namespace
 namespace pomai::index { class IvfFlatIndex; }
+#include "core/index/hnsw_index.h"
 
 namespace pomai::table
 {
@@ -159,6 +161,8 @@ namespace pomai::table
         uint32_t GetEntriesStartOffset() const { return entries_start_offset_; }
         std::size_t GetEntrySize() const { return entry_size_; }
 
+        const pomai::index::HnswIndex* GetHnswIndex() const { return hnsw_index_.get(); }
+
     private:
         SegmentReader();
 
@@ -178,6 +182,7 @@ namespace pomai::table
         std::size_t file_size_ = 0;
         
         std::unique_ptr<pomai::index::IvfFlatIndex> index_;
+        std::unique_ptr<pomai::index::HnswIndex> hnsw_index_;
         
         // Internal helper
         void GetMetadata(uint32_t index, pomai::Metadata* out) const;
@@ -186,14 +191,14 @@ namespace pomai::table
     class SegmentBuilder
     {
     public:
-        SegmentBuilder(std::string path, uint32_t dim);
+        SegmentBuilder(std::string path, uint32_t dim, pomai::IndexParams index_params = {}, pomai::MetricType metric = pomai::MetricType::kL2);
         
         pomai::Status Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted, const pomai::Metadata& meta);
         pomai::Status Add(pomai::VectorId id, pomai::VectorView vec, bool is_deleted);
 
         pomai::Status Finish();
         
-        pomai::Status BuildIndex(uint32_t nlist);
+        pomai::Status BuildIndex();
 
         uint32_t Count() const { return static_cast<uint32_t>(entries_.size()); }
 
@@ -207,6 +212,8 @@ namespace pomai::table
         
         std::string path_;
         uint32_t dim_;
+        pomai::IndexParams index_params_;
+        pomai::MetricType metric_;
         std::vector<Entry> entries_;
         std::vector<float> zero_buffer_;
     };

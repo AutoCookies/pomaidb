@@ -998,7 +998,7 @@ namespace pomai::core
                                          std::to_string(state.mem_index) + "_" +
                                          std::to_string(state.segment_part) + ".dat";
                         state.filepath = (fs::path(shard_dir_) / state.filename).string();
-                        state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_);
+                        state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_, index_params_, metric_);
                     }
 
                     pomai::Metadata meta_copy = entry.meta ? *entry.meta : pomai::Metadata();
@@ -1024,7 +1024,7 @@ namespace pomai::core
                         state.phase = BackgroundJob::Phase::kFinalizeSegment;
                     }
                 } else if (state.phase == BackgroundJob::Phase::kFinalizeSegment) {
-                    auto st = state.builder->BuildIndex(index_params_.nlist);
+                    auto st = state.builder->BuildIndex();
                     if (!st.ok()) {
                         complete_job(pomai::Status::Internal("Freeze: BuildIndex failed: " + st.message()));
                         return;
@@ -1155,7 +1155,7 @@ namespace pomai::core
                                     state.filename = "seg_" + std::to_string(sys_now) + "_compacted_" +
                                                      std::to_string(state.segment_part) + ".dat";
                                     state.filepath = (fs::path(shard_dir_) / state.filename).string();
-                                    state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_);
+                                    state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_, index_params_, metric_);
                                 }
                                 std::cout << "TEST_DEBUG COMPACT PRE-ADD id: " << top.id << " vec_mapped[0]: " << vec_mapped[0] << std::endl;
                                 auto st = state.builder->Add(top.id, pomai::VectorView(vec_mapped), false, meta);
@@ -1200,7 +1200,7 @@ namespace pomai::core
                     state.phase = BackgroundJob::Phase::kCommitManifest;
                     continue;
                 }
-                auto st = state.builder->BuildIndex(index_params_.nlist);
+                auto st = state.builder->BuildIndex();
                 if (!st.ok()) {
                     complete_job(pomai::Status::Internal("Compact: BuildIndex failed: " + st.message()));
                     return;
@@ -1446,6 +1446,36 @@ namespace pomai::core
             }
 
             if (!use_visibility && !has_filters) { // FAST PATH
+                // === ADAPTIVE DISPATCHER ===
+                // Small segments: brute-force SIMD for 100% recall.
+                // Large segments (>= threshold): HNSW graph traversal.
+                const bool use_graph = (seg->Count() >= index_params_.adaptive_threshold) &&
+                                       (seg->GetHnswIndex() != nullptr);
+                if (use_graph) {
+                    auto* hnsw = seg->GetHnswIndex();
+                    std::vector<pomai::VectorId> out_ids;
+                    std::vector<float> out_dists;
+                    // Pass ef_search from index params for tuning
+                    const int ef = static_cast<int>(
+                        std::max(index_params_.hnsw_ef_search,
+                                 static_cast<uint32_t>(topk) * 2));
+                    if (hnsw->Search(query, topk, ef, &out_ids, &out_dists).ok() &&
+                        !out_ids.empty()) {
+                        used_candidates = true;
+                        for (size_t i = 0; i < out_ids.size(); ++i) {
+                            local_scanned++;
+                            // id_map now stores real user VectorIds directly.
+                            if (this->metric_ == pomai::MetricType::kInnerProduct ||
+                                this->metric_ == pomai::MetricType::kCosine) {
+                                local.Push(out_ids[i], out_dists[i]);
+                            } else {
+                                local.Push(out_ids[i], -out_dists[i]);
+                            }
+                        }
+                        total_scanned.fetch_add(local_scanned, std::memory_order_relaxed);
+                        return local.Drain();
+                    }
+                }
                 if (seg->IsQuantized()) {
                     float q_min = seg->GetQuantizer()->GetGlobalMin();
                     float q_inv_scale = seg->GetQuantizer()->GetGlobalInvScale();
@@ -1530,6 +1560,7 @@ namespace pomai::core
                     // ForEach doesn't expose entry_idx directly, so we use a local counter.
                     uint32_t fe_idx = 0;
                     seg->ForEach([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                        (void)meta; // suppress unused warning
                         const uint32_t my_idx = fe_idx++;
                         ++local_scanned;
                         if (is_deleted) return;

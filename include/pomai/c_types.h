@@ -47,6 +47,14 @@ typedef struct {
     pomai_fsync_policy_t fsync_policy;
     uint64_t memory_budget_bytes;
     uint32_t deadline_ms;
+    
+    // Indexing
+    uint8_t index_type; // 0 = IVF, 1 = HNSW
+    uint32_t hnsw_m;
+    uint32_t hnsw_ef_construction;
+    uint32_t hnsw_ef_search;
+    uint32_t adaptive_threshold;
+    uint8_t metric; // 0 = L2, 1 = IP
 } pomai_options_t;
 
 typedef struct {

@@ -16,6 +16,7 @@
 
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/options.h"
 
 // Forward-declare FAISS types to avoid pulling FAISS headers into every TU.
 namespace faiss {
@@ -36,7 +37,7 @@ struct HnswOptions {
 class HnswIndex {
 public:
     /// Create an empty HNSW index (not yet trained/populated).
-    HnswIndex(uint32_t dim, HnswOptions opts = {});
+    HnswIndex(uint32_t dim, HnswOptions opts = {}, pomai::MetricType metric = pomai::MetricType::kInnerProduct);
     ~HnswIndex();
 
     // Non-copyable

@@ -25,8 +25,8 @@ namespace pomai::table
     // Writes: Incremental, not buffered in RAM
     // CRC: Computed on the fly (incremental)
     
-    SegmentBuilder::SegmentBuilder(std::string path, uint32_t dim)
-        : path_(std::move(path)), dim_(dim), zero_buffer_(dim, 0.0f)
+    SegmentBuilder::SegmentBuilder(std::string path, uint32_t dim, pomai::IndexParams index_params, pomai::MetricType metric)
+        : path_(std::move(path)), dim_(dim), index_params_(std::move(index_params)), metric_(metric), zero_buffer_(dim, 0.0f)
     {
     }
 
@@ -77,7 +77,9 @@ namespace pomai::table
         h.version = 6; // V6: 64-byte alignment + IVF positional indices
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
-        h.is_quantized = 1; // Enable SQ8 by default for builder
+        // Use quantization if requested in IndexParams (or by default)
+        const bool use_quantization = true; // For now keep default as it was intended, but fix logic
+        h.is_quantized = use_quantization ? 1 : 0;
         
         // Train Quantizer
         core::ScalarQuantizer8Bit quantizer(dim_);
@@ -108,24 +110,27 @@ namespace pomai::table
         size_t entry_size = 0;
         uint32_t entries_start_offset = 0;
         
+        const bool is_quantized = (h.is_quantized != 0);
+        const size_t element_size = is_quantized ? sizeof(uint8_t) : sizeof(float);
+
         if (h.version >= 6) {
-            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
+            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * element_size;
             entry_size = (unpadded_size + 63) & ~63; // 64-byte alignment
             entries_start_offset = 128; // Small header + alignment
             h.entry_size = static_cast<uint32_t>(entry_size);
             h.entries_start_offset = entries_start_offset;
             h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
         } else if (h.version >= 5) {
-            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
+            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * element_size;
             entry_size = (unpadded_size + 4095) & ~4095;
             entries_start_offset = 4096;
             h.entry_size = static_cast<uint32_t>(entry_size);
             h.entries_start_offset = entries_start_offset;
             h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
         } else {
-            entry_size = sizeof(uint64_t) + 4 + dim_ * sizeof(uint8_t);
+            entry_size = sizeof(uint64_t) + 4 + dim_ * element_size;
             entries_start_offset = sizeof(SegmentHeader);
-            h.metadata_offset = static_cast<uint32_t>(sizeof(SegmentHeader) + entries_.size() * entry_size);
+            h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
         }
 
         // Write header
@@ -140,11 +145,12 @@ namespace pomai::table
         crc = pomai::util::Crc32c(header_bytes, sizeof(h), crc);
 
         if (h.version >= 5) {
-            std::vector<uint8_t> pad(entries_start_offset - sizeof(SegmentHeader), 0);
+            std::size_t pad_size = entries_start_offset - sizeof(SegmentHeader);
+            std::vector<uint8_t> pad(pad_size, 0);
             st = file.PWrite(offset, pad.data(), pad.size());
             if (!st.ok()) return st;
             crc = pomai::util::Crc32c(pad.data(), pad.size(), crc);
-            offset += pad.size();
+            offset = entries_start_offset; // UPDATED: Correctly position offset for entries
         }
 
         // Stream entries to disk (one at a time)
@@ -171,15 +177,23 @@ namespace pomai::table
             entry_buffer[cursor++] = 0;
             entry_buffer[cursor++] = 0;
 
-            // Vector (dim * 1 bytes)
-            std::vector<uint8_t> encoded;
-            if (e.is_deleted) {
-                encoded.assign(dim_, 0); // Zeroed out tombstone
+            // Vector (dim * 1 bytes or dim * 4 bytes)
+            if (is_quantized) {
+                std::vector<uint8_t> encoded;
+                if (e.is_deleted) {
+                    encoded.assign(dim_, 0); 
+                } else {
+                    std::span<const float> vec_span(e.vec.data, dim_);
+                    encoded = quantizer.Encode(vec_span);
+                }
+                std::memcpy(entry_buffer + cursor, encoded.data(), encoded.size());
             } else {
-                std::span<const float> vec_span(e.vec.data, dim_);
-                encoded = quantizer.Encode(vec_span);
+                if (e.is_deleted) {
+                    std::memcpy(entry_buffer + cursor, zero_buffer_.data(), dim_ * sizeof(float));
+                } else {
+                    std::memcpy(entry_buffer + cursor, e.vec.data, dim_ * sizeof(float));
+                }
             }
-            std::memcpy(entry_buffer + cursor, encoded.data(), encoded.size());
 
             // Write entry
             st = file.PWrite(offset, entry_buffer, entry_size);
@@ -239,8 +253,8 @@ namespace pomai::table
         return pomai::Status::Ok();
     }
 
-    pomai::Status SegmentBuilder::BuildIndex(uint32_t nlist) {
-         // Gather valid vectors for training
+    pomai::Status SegmentBuilder::BuildIndex() {
+         // Gather valid vectors for training/building
          std::vector<float> training_data;
          training_data.reserve(entries_.size() * dim_);
          size_t num_live = 0;
@@ -251,35 +265,68 @@ namespace pomai::table
                  num_live++;
              }
          }
-         
-         pomai::index::IvfFlatIndex::Options opt;
-         opt.nlist = nlist;
-         if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1U, static_cast<uint32_t>(num_live));
 
-         auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
-         auto st = idx->Train(training_data, num_live);
-         if (!st.ok()) return st;
-         
-         for (size_t i = 0; i < entries_.size(); ++i) {
-             const auto& e = entries_[i];
-             if (!e.is_deleted) {
-                 st = idx->Add(static_cast<uint32_t>(i), e.vec.span());
-                 if (!st.ok()) return st;
+         if (index_params_.type == pomai::IndexType::kHnsw) {
+             pomai::index::HnswOptions opts;
+             opts.M = index_params_.hnsw_m;
+             opts.ef_construction = index_params_.hnsw_ef_construction;
+             opts.ef_search = index_params_.hnsw_ef_search;
+             
+             auto idx = std::make_unique<pomai::index::HnswIndex>(dim_, opts, metric_);
+             // Store real user VectorIds so HnswIndex::Search returns them directly.
+             std::vector<pomai::VectorId> ids;
+             ids.reserve(num_live);
+             for (size_t i = 0; i < entries_.size(); ++i) {
+                 if (!entries_[i].is_deleted) {
+                     ids.push_back(entries_[i].id); // real user VectorId
+                 }
              }
-         }
-         
-         std::string idx_path = path_ + ".idx.tmp";
-         st = idx->Save(idx_path);
-         if (!st.ok()) return st;
-         
-         std::string final_idx_path = path_;
-         if (final_idx_path.size() > 4 && final_idx_path.substr(final_idx_path.size()-4) == ".dat") {
-             final_idx_path = final_idx_path.substr(0, final_idx_path.size()-4);
-         }
-         final_idx_path += ".idx";
-         
-         if (rename(idx_path.c_str(), final_idx_path.c_str()) != 0) {
-             return pomai::Status::IOError("rename idx failed");
+             auto st = idx->AddBatch(ids.data(), training_data.data(), num_live);
+             if (!st.ok()) return st;
+
+             std::string hnsw_path = path_ + ".hnsw.tmp";
+             st = idx->Save(hnsw_path);
+             if (!st.ok()) return st;
+
+             std::string final_hnsw_path = path_;
+             if (final_hnsw_path.size() > 4 && final_hnsw_path.substr(final_hnsw_path.size()-4) == ".dat") {
+                 final_hnsw_path = final_hnsw_path.substr(0, final_hnsw_path.size()-4);
+             }
+             final_hnsw_path += ".hnsw";
+
+             if (rename(hnsw_path.c_str(), final_hnsw_path.c_str()) != 0) {
+                 return pomai::Status::IOError("rename hnsw failed");
+             }
+         } else {
+             pomai::index::IvfFlatIndex::Options opt;
+             opt.nlist = index_params_.nlist;
+             if (num_live < opt.nlist) opt.nlist = std::max<uint32_t>(1U, static_cast<uint32_t>(num_live));
+
+             auto idx = std::make_unique<pomai::index::IvfFlatIndex>(dim_, opt);
+             auto st = idx->Train(training_data, num_live);
+             if (!st.ok()) return st;
+             
+             for (size_t i = 0; i < entries_.size(); ++i) {
+                 const auto& e = entries_[i];
+                 if (!e.is_deleted) {
+                     st = idx->Add(static_cast<uint32_t>(i), e.vec.span());
+                     if (!st.ok()) return st;
+                 }
+             }
+             
+             std::string idx_path = path_ + ".idx.tmp";
+             st = idx->Save(idx_path);
+             if (!st.ok()) return st;
+             
+             std::string final_idx_path = path_;
+             if (final_idx_path.size() > 4 && final_idx_path.substr(final_idx_path.size()-4) == ".dat") {
+                 final_idx_path = final_idx_path.substr(0, final_idx_path.size()-4);
+             }
+             final_idx_path += ".idx";
+             
+             if (rename(idx_path.c_str(), final_idx_path.c_str()) != 0) {
+                 return pomai::Status::IOError("rename idx failed");
+             }
          }
          
          return pomai::Status::Ok();
@@ -367,10 +414,15 @@ namespace pomai::table
         if (idx_path.size() > 4 && idx_path.substr(idx_path.size()-4) == ".dat") {
              idx_path = idx_path.substr(0, idx_path.size()-4);
         }
+        std::string hnsw_path = idx_path + ".hnsw";
         idx_path += ".idx";
         
-        // Ignore error if not found (fallback to scan)
-        (void)pomai::index::IvfFlatIndex::Load(idx_path, &reader->index_);
+        // Try HNSW first
+        st = pomai::index::HnswIndex::Load(hnsw_path, &reader->hnsw_index_);
+        if (!st.ok()) {
+            // Ignore error if not found (fallback to scan)
+            (void)pomai::index::IvfFlatIndex::Load(idx_path, &reader->index_);
+        }
 
         *out = std::move(reader);
         return pomai::Status::Ok();

@@ -25,6 +25,8 @@ namespace pomai::core
         spec.name = std::string(kDefaultMembrane);
         spec.dim = base_.dim;
         spec.shard_count = base_.shard_count;
+        spec.index_params = base_.index_params;
+        spec.metric = base_.metric;
 
         auto st = CreateMembrane(spec);
         if (st.code() == pomai::ErrorCode::kAlreadyExists)

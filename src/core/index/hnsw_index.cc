@@ -17,13 +17,15 @@
 namespace pomai::index {
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
-HnswIndex::HnswIndex(uint32_t dim, HnswOptions opts)
+HnswIndex::HnswIndex(uint32_t dim, HnswOptions opts, pomai::MetricType metric)
     : dim_(dim), opts_(opts)
 {
-    // faiss::IndexHNSWFlat(d, M) — uses L2 by default; we switch to IP below
-    // based on pomai convention (inner product by default).
+    faiss::MetricType faiss_metric = faiss::METRIC_L2;
+    if (metric == pomai::MetricType::kInnerProduct || metric == pomai::MetricType::kCosine) {
+        faiss_metric = faiss::METRIC_INNER_PRODUCT;
+    }
     index_ = std::make_unique<faiss::IndexHNSWFlat>(
-        static_cast<int>(dim_), opts_.M, faiss::METRIC_INNER_PRODUCT);
+        static_cast<int>(dim_), opts_.M, faiss_metric);
     index_->hnsw.efConstruction = opts_.ef_construction;
     index_->hnsw.efSearch       = opts_.ef_search;
 }
@@ -102,10 +104,11 @@ pomai::Status HnswIndex::Save(const std::string& path) const
     // Append id_map to the same file
     std::ofstream f(path, std::ios::binary | std::ios::app);
     if (!f) return pomai::Status::IOError("Cannot append id_map to " + path);
+    // Write length at the END so Load() can read it from the tail.
     const uint64_t n = static_cast<uint64_t>(id_map_.size());
-    f.write(reinterpret_cast<const char*>(&n), sizeof(n));
     f.write(reinterpret_cast<const char*>(id_map_.data()),
             n * sizeof(VectorId));
+    f.write(reinterpret_cast<const char*>(&n), sizeof(n));
     if (!f) return pomai::Status::IOError("id_map write failed: " + path);
     return pomai::Status::Ok();
 }
@@ -165,8 +168,11 @@ pomai::Status HnswIndex::Load(const std::string& path,
     opts.ef_construction= hnsw_idx->hnsw.efConstruction;
     opts.ef_search      = hnsw_idx->hnsw.efSearch;
 
+    pomai::MetricType metric = (hnsw_idx->metric_type == faiss::METRIC_INNER_PRODUCT) 
+        ? pomai::MetricType::kInnerProduct : pomai::MetricType::kL2;
+
     auto result       = std::make_unique<HnswIndex>(
-        static_cast<uint32_t>(hnsw_idx->d), opts);
+        static_cast<uint32_t>(hnsw_idx->d), opts, metric);
     result->index_.reset(hnsw_idx);
     result->id_map_ = std::move(id_map);
     *out = std::move(result);

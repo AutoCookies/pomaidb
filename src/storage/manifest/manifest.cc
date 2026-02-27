@@ -272,8 +272,12 @@ namespace pomai::storage
             else if (spec.metric == pomai::MetricType::kCosine) mtype = "COS";
             out += "metric " + mtype + "\n";
 
-            out += "index_params " + std::to_string(spec.index_params.nlist) + " " + 
-                   std::to_string(spec.index_params.nprobe) + "\n";
+            out += "index_params " + std::to_string(static_cast<uint32_t>(spec.index_params.type)) + " " +
+                   std::to_string(spec.index_params.nlist) + " " + 
+                   std::to_string(spec.index_params.nprobe) + " " +
+                   std::to_string(spec.index_params.hnsw_m) + " " +
+                   std::to_string(spec.index_params.hnsw_ef_construction) + " " +
+                   std::to_string(spec.index_params.hnsw_ef_search) + "\n";
 
             return AtomicWriteFile(MembraneManifestPath(root_path, spec.name), out);
         }
@@ -327,9 +331,19 @@ namespace pomai::storage
                         spec->kind = ParseMembraneKind(toks[1]);
                     }
                 } else if (toks[0] == "index_params") {
-                    if (toks.size() > 2) {
+                    if (toks.size() == 3) {
+                         spec->index_params.type = pomai::IndexType::kIvfFlat;
                          ParseU32(toks[1], &spec->index_params.nlist);
                          ParseU32(toks[2], &spec->index_params.nprobe);
+                    } else if (toks.size() >= 7) {
+                         uint32_t type_val = 0;
+                         ParseU32(toks[1], &type_val);
+                         spec->index_params.type = (type_val == 1) ? pomai::IndexType::kHnsw : pomai::IndexType::kIvfFlat;
+                         ParseU32(toks[2], &spec->index_params.nlist);
+                         ParseU32(toks[3], &spec->index_params.nprobe);
+                         ParseU32(toks[4], &spec->index_params.hnsw_m);
+                         ParseU32(toks[5], &spec->index_params.hnsw_ef_construction);
+                         ParseU32(toks[6], &spec->index_params.hnsw_ef_search);
                     }
                 }
             }

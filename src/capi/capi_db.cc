@@ -32,7 +32,7 @@ struct SearchResultsWrapper {
 };
 
 constexpr uint32_t MinOptionsStructSize() {
-    return static_cast<uint32_t>(offsetof(pomai_options_t, memory_budget_bytes) + sizeof(uint64_t));
+    return static_cast<uint32_t>(offsetof(pomai_options_t, hnsw_ef_search) + sizeof(uint32_t));
 }
 
 constexpr uint32_t MinUpsertStructSize() {
@@ -111,6 +111,12 @@ void pomai_options_init(pomai_options_t* opts) {
     opts->fsync_policy = POMAI_FSYNC_POLICY_NEVER;
     opts->memory_budget_bytes = 0;
     opts->deadline_ms = 0;
+    opts->index_type = 0; // IVF
+    opts->hnsw_m = 32;
+    opts->hnsw_ef_construction = 200;
+    opts->hnsw_ef_search = 64;
+    opts->adaptive_threshold = 5000;
+    opts->metric = 0; // L2
 }
 
 void pomai_scan_options_init(pomai_scan_options_t* opts) {
@@ -145,6 +151,18 @@ pomai_status_t* pomai_open(const pomai_options_t* opts, pomai_db_t** out_db) {
     cpp_opts.fsync = (opts->fsync_policy == POMAI_FSYNC_POLICY_ALWAYS)
                          ? pomai::FsyncPolicy::kAlways
                          : pomai::FsyncPolicy::kNever;
+    cpp_opts.metric = (opts->metric == 1) ? pomai::MetricType::kInnerProduct : pomai::MetricType::kL2;
+    cpp_opts.index_params.adaptive_threshold = opts->adaptive_threshold;
+    
+    // Default to IVF, overwrite if HNSW.
+    if (opts->index_type == 1) {
+        cpp_opts.index_params.type = pomai::IndexType::kHnsw;
+        cpp_opts.index_params.hnsw_m = opts->hnsw_m;
+        cpp_opts.index_params.hnsw_ef_construction = opts->hnsw_ef_construction;
+        cpp_opts.index_params.hnsw_ef_search = opts->hnsw_ef_search;
+    } else {
+        cpp_opts.index_params.type = pomai::IndexType::kIvfFlat;
+    }
 
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(cpp_opts, &db);
