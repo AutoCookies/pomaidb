@@ -46,6 +46,54 @@ jobs:
       - name: TSAN workload tests
         run: ctest --test-dir build-tsan --output-on-failure -L tsan
 
+  asan:
+    name: asan-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      # POMAI_USE_PALLOC=OFF only here: ASan must intercept allocator; default build uses palloc.
+      - name: Configure (ASan)
+        env:
+          CC: clang
+          CXX: clang++
+        run: >-
+          cmake -S . -B build-asan -DPOMAI_BUILD_TESTS=ON -DPOMAI_USE_PALLOC=OFF
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS='-fsanitize=address -fno-omit-frame-pointer'
+          -DCMAKE_CXX_FLAGS='-fsanitize=address -fno-omit-frame-pointer'
+          -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=address'
+          -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=address'
+      - name: Build (ASan)
+        run: cmake --build build-asan --parallel
+      - name: Run tests (ASan)
+        run: ctest --test-dir build-asan --output-on-failure -C RelWithDebInfo -E "tsan|crash"
+
+  ubsan:
+    name: ubsan-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+      # POMAI_USE_PALLOC=OFF only here: sanitizers need default allocator; default build uses palloc.
+      - name: Configure (UBSan)
+        env:
+          CC: clang
+          CXX: clang++
+        run: >-
+          cmake -S . -B build-ubsan -DPOMAI_BUILD_TESTS=ON -DPOMAI_USE_PALLOC=OFF
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_FLAGS='-fsanitize=undefined -fno-omit-frame-pointer'
+          -DCMAKE_CXX_FLAGS='-fsanitize=undefined -fno-omit-frame-pointer'
+          -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=undefined'
+          -DCMAKE_SHARED_LINKER_FLAGS='-fsanitize=undefined'
+      - name: Build (UBSan)
+        run: cmake --build build-ubsan --parallel
+      - name: Run tests (UBSan)
+        run: ctest --test-dir build-ubsan --output-on-failure -C RelWithDebInfo -E "tsan|crash"
+
   python-ffi-smoke:
     name: python-ffi-smoke
     runs-on: ubuntu-latest

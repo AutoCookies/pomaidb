@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pomai LANGUAGES C CXX)
+project(pomai VERSION 0.1.0 LANGUAGES C CXX)
 
 # =========================
 # Global build settings

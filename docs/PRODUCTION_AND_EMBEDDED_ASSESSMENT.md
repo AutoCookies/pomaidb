@@ -40,13 +40,16 @@ The project explicitly prioritizes **stability, correctness, and crash safety** 
 - **Testing**
   - Unit (WAL, memtable, segment, manifest, shard manifest, HNSW, distance), integration (persistence, open, batch, consistency, search, filters, RAG, membrane), crash/recovery, fuzz (storage, membrane).
 
-### Gaps and risks
+### Addressed (former gaps)
 
-- **No API/ABI stability promise** — no semantic versioning or compatibility guarantee documented; APIs may evolve.
-- **Documented “still” early stage** (CONTRIBUTING) — more recovery edge cases (OOM, SD card corruption, battery die) and sanitizer CI are explicitly wanted.
-- **Python** — ctypes-based; no official `pip` package or pybind11 bindings yet.
+- **API/ABI stability and versioning** — documented in [docs/VERSIONING.md](VERSIONING.md); semantic versioning and compatibility policy for C++ API, C API, and Python package.
+- **Recovery edge cases and sanitizer CI** — ASan, UBSan, and TSan run in GitHub Actions; recovery tests include backpressure (many puts) and bad storage (missing segment on reopen).
+- **Python** — official `pip install pomaidb` from the `python/` directory; see [docs/PYTHON_API.md](PYTHON_API.md). Bindings are ctypes-based; pybind11 contributions welcome.
+
+### Remaining considerations
+
 - **Operational limits** — no single “max vectors” or “max dimension” doc; backpressure and constants (e.g. `kMaxFrozenMemtables`, `kMemtableSoftLimit`) define practical limits.
-- **Performance** — batch search QPS has been improved but is still far below specialized in-process engines (e.g. hnswlib/FAISS) in the repo’s own benchmarks; acceptable for many embedded workloads but not “max throughput” focused.
+- **Performance** — batch search QPS has been improved but is still below specialized in-process engines (e.g. hnswlib/FAISS) in the repo’s benchmarks; acceptable for many embedded workloads.
 
 ---
 

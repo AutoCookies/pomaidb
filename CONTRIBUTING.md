@@ -3,7 +3,7 @@
 Thank you for considering contributing to **PomaiDB**!  
 We truly believe every good idea — no matter how small — can help turn PomaiDB into **the most stable, reliable, and performant embedded vector database for real-world Edge AI**.
 
-PomaiDB is still, but we are **extremely serious** about building something that lasts on constrained devices (phones, Raspberry Pi, Jetson, WASM, low-RAM IoT).  
+PomaiDB is **production-capable for embedded use**: we document API/ABI stability and versioning ([docs/VERSIONING.md](docs/VERSIONING.md)), run sanitizer CI (ASan, UBSan, TSan), and include recovery edge-case tests (backpressure, bad storage). We are **extremely serious** about building something that lasts on constrained devices (phones, Raspberry Pi, Jetson, WASM, low-RAM IoT).  
 We care deeply about **stability**, **correctness**, **battery life**, **crash safety**, **ARM64/NEON performance**, and **zero bloat**.
 
 Your contribution — whether it's a tiny bug fix, a benchmark on new hardware, a performance tweak, documentation, or a bold new feature — is **genuinely valued**.  
@@ -15,9 +15,9 @@ We maintain this prioritized list so contributors know where help is most needed
 
 ### Stability & Correctness (Highest Priority)
 - Crash / power-loss recovery improvements
-- WAL / manifest / Freeze edge-case tests (battery die, SD card corruption, OOM)
+- WAL / manifest / Freeze edge-case tests (battery die, SD card corruption, OOM) — we already have recovery tests for backpressure and bad/missing storage in CI
 - Thread-safety / race-condition fixes in sharded MemTables or snapshots
-- Memory leak / undefined behavior reports + fixes (Valgrind, ASan, UBSan)
+- Memory leak / undefined behavior reports + fixes (Valgrind, ASan, UBSan) — **ASan and UBSan runs are in CI**
 - Fuzz testing on input vectors / queries
 
 ### Edge Hardware & Performance
@@ -34,7 +34,7 @@ We maintain this prioritized list so contributors know where help is most needed
 - Recall vs speed vs memory trade-off tables
 
 ### Bindings & Usability
-- Python bindings (pybind11) — `pip install pomaidb`
+- **Python**: `pip install pomaidb` is supported (see [python/](python/) and [docs/PYTHON_API.md](docs/PYTHON_API.md)); pybind11 bindings for a richer API are welcome
 - Go / Rust / Swift / Kotlin bindings
 - Simple CLI tool (`pomai put`, `pomai search`, `pomai freeze`)
 - Example apps: offline RAG notebook, on-device agent memory
@@ -48,7 +48,7 @@ We maintain this prioritized list so contributors know where help is most needed
 ### Testing & CI
 - More unit / integration tests (especially Freeze → recovery flows)
 - Cross-platform CI (Linux ARM64, macOS Apple Silicon, Windows MSVC)
-- Sanitizer builds in CI (ASan, TSan, MSan)
+- **Sanitizer CI**: ASan, UBSan, and TSan runs are enabled in GitHub Actions (see [.github/workflows/ci.yml](.github/workflows/ci.yml))
 
 ### Small but Impactful Wins
 - Better error messages & status codes

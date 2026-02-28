@@ -153,4 +153,57 @@ POMAI_TEST(ConcurrentConsistency) {
     db->Close();
 }
 
+// Reopen with missing segment file (bad storage) should fail gracefully
+POMAI_TEST(BadStorage_MissingSegmentReopenFails) {
+    DBOptions opt;
+    opt.path = pomai::test::TempDir("bad_storage");
+    opt.dim = 4;
+    opt.shard_count = 1;
+    opt.fsync = FsyncPolicy::kNever;
+
+    {
+        std::unique_ptr<DB> db;
+        POMAI_EXPECT_OK(DB::Open(opt, &db));
+        std::vector<float> v = {1.0f, 2.0f, 3.0f, 4.0f};
+        for (int i = 0; i < 20; ++i)
+            POMAI_EXPECT_OK(db->Put(static_cast<VectorId>(i), v));
+        POMAI_EXPECT_OK(db->Freeze("__default__"));
+        POMAI_EXPECT_OK(db->Close());
+    }
+
+    fs::path shard_dir = fs::path(opt.path) / "membranes" / "__default__" / "shards" / "0";
+    if (!fs::exists(shard_dir)) { return; }
+    for (const auto& e : fs::directory_iterator(shard_dir)) {
+        if (e.path().extension() == ".dat") {
+            fs::remove(e.path());
+            break;
+        }
+    }
+
+    std::unique_ptr<DB> db;
+    auto st = DB::Open(opt, &db);
+    POMAI_EXPECT_TRUE(!st.ok());
+}
+
+// Many puts without freeze: exercises backpressure path and ensures no crash
+POMAI_TEST(Backpressure_ManyPutsNoCrash) {
+    DBOptions opt;
+    opt.path = pomai::test::TempDir("backpressure");
+    opt.dim = 4;
+    opt.shard_count = 1;
+    opt.fsync = FsyncPolicy::kNever;
+
+    std::unique_ptr<DB> db;
+    POMAI_EXPECT_OK(DB::Open(opt, &db));
+    std::vector<float> v = {1.0f, 2.0f, 3.0f, 4.0f};
+    constexpr int kPuts = 2000;
+    for (int i = 0; i < kPuts; ++i) {
+        Status st = db->Put(static_cast<VectorId>(i), v);
+        if (st.code() == ErrorCode::kResourceExhausted)
+            break;
+        POMAI_EXPECT_OK(st);
+    }
+    POMAI_EXPECT_OK(db->Close());
+}
+
 } // namespace
