@@ -12,6 +12,8 @@
 
 #include "capi_utils.h"
 #include "core/memory/pin_manager.h"
+#include "pomai/options.h"
+#include "pomai/rag.h"
 #include "pomai/version.h"
 
 namespace {
@@ -426,6 +428,90 @@ void pomai_search_results_free(pomai_search_results_t* results) {
         delete[] results->zero_copy_pointers;
     }
     delete reinterpret_cast<SearchResultsWrapper*>(results);
+}
+
+// RAG
+pomai_status_t* pomai_create_rag_membrane(pomai_db_t* db, const char* name, uint32_t dim, uint32_t shard_count) {
+    if (db == nullptr || name == nullptr || *name == '\0') {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "db and name must be non-null");
+    }
+    pomai::MembraneSpec spec;
+    spec.name = name;
+    spec.dim = dim;
+    spec.shard_count = shard_count > 0 ? shard_count : 1;
+    spec.kind = pomai::MembraneKind::kRag;
+    auto st = db->db->CreateMembrane(spec);
+    if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists) {
+        return ToCStatus(st);
+    }
+    st = db->db->OpenMembrane(name);
+    return ToCStatus(st);
+}
+
+pomai_status_t* pomai_put_chunk(pomai_db_t* db, const char* membrane_name, const pomai_rag_chunk_t* chunk) {
+    if (db == nullptr || membrane_name == nullptr || chunk == nullptr) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "db, membrane_name, chunk must be non-null");
+    }
+    if (chunk->token_ids == nullptr || chunk->token_count == 0) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "chunk requires token_ids and token_count > 0");
+    }
+    pomai::RagChunk cpp_chunk;
+    cpp_chunk.chunk_id = chunk->chunk_id;
+    cpp_chunk.doc_id = chunk->doc_id;
+    cpp_chunk.tokens.assign(chunk->token_ids, chunk->token_ids + chunk->token_count);
+    if (chunk->vector != nullptr && chunk->dim > 0) {
+        cpp_chunk.vec = pomai::VectorView(chunk->vector, chunk->dim);
+    }
+    return ToCStatus(db->db->PutChunk(membrane_name, cpp_chunk));
+}
+
+pomai_status_t* pomai_search_rag(pomai_db_t* db, const char* membrane_name, const pomai_rag_query_t* query,
+                                 const pomai_rag_search_options_t* opts, pomai_rag_search_result_t* out_result) {
+    if (db == nullptr || membrane_name == nullptr || query == nullptr || opts == nullptr || out_result == nullptr) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "rag search args must be non-null");
+    }
+    if ((query->token_ids == nullptr || query->token_count == 0) && (query->vector == nullptr || query->dim == 0)) {
+        return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "query requires tokens or vector");
+    }
+    pomai::RagQuery cpp_query;
+    if (query->token_ids != nullptr && query->token_count > 0) {
+        cpp_query.tokens = std::span<const pomai::TokenId>(query->token_ids, query->token_count);
+    }
+    if (query->vector != nullptr && query->dim > 0) {
+        cpp_query.vec = pomai::VectorView(query->vector, query->dim);
+    }
+    cpp_query.topk = query->topk > 0 ? query->topk : 10u;
+
+    pomai::RagSearchOptions cpp_opts;
+    cpp_opts.candidate_budget = opts->candidate_budget;
+    cpp_opts.token_budget = opts->token_budget;
+    cpp_opts.enable_vector_rerank = opts->enable_vector_rerank;
+
+    pomai::RagSearchResult cpp_result;
+    auto st = db->db->SearchRag(membrane_name, cpp_query, cpp_opts, &cpp_result);
+    if (!st.ok()) {
+        return ToCStatus(st);
+    }
+
+    out_result->hit_count = cpp_result.hits.size();
+    out_result->hits = nullptr;
+    if (out_result->hit_count > 0) {
+        out_result->hits = new pomai_rag_hit_t[out_result->hit_count];
+        for (size_t i = 0; i < out_result->hit_count; ++i) {
+            out_result->hits[i].chunk_id = cpp_result.hits[i].chunk_id;
+            out_result->hits[i].doc_id = cpp_result.hits[i].doc_id;
+            out_result->hits[i].score = cpp_result.hits[i].score;
+            out_result->hits[i].token_matches = cpp_result.hits[i].token_matches;
+        }
+    }
+    return nullptr;
+}
+
+void pomai_rag_search_result_free(pomai_rag_search_result_t* result) {
+    if (result == nullptr) return;
+    delete[] result->hits;
+    result->hits = nullptr;
+    result->hit_count = 0;
 }
 
 void pomai_search_batch_free(pomai_search_results_t* results, size_t num_queries) {

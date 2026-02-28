@@ -123,6 +123,45 @@ POMAI_API pomai_status_t* pomai_search_batch(
 
 POMAI_API void pomai_search_batch_free(pomai_search_results_t* results, size_t num_queries);
 
+// RAG: chunk and query types
+typedef struct {
+    uint32_t struct_size;
+    uint64_t chunk_id;
+    uint64_t doc_id;
+    const uint32_t* token_ids;
+    size_t token_count;
+    const float* vector;
+    uint32_t dim;  // 0 if no vector
+} pomai_rag_chunk_t;
+
+typedef struct {
+    uint32_t struct_size;
+    const uint32_t* token_ids;
+    size_t token_count;
+    const float* vector;
+    uint32_t dim;   // 0 if no vector
+    uint32_t topk;
+} pomai_rag_query_t;
+
+typedef struct {
+    uint32_t struct_size;
+    uint32_t candidate_budget;
+    uint32_t token_budget;           // 0 = no limit
+    bool enable_vector_rerank;
+} pomai_rag_search_options_t;
+
+typedef struct {
+    uint64_t chunk_id;
+    uint64_t doc_id;
+    float score;
+    uint32_t token_matches;
+} pomai_rag_hit_t;
+
+typedef struct {
+    size_t hit_count;
+    pomai_rag_hit_t* hits;
+} pomai_rag_search_result_t;
+
 typedef struct {
     uint32_t struct_size;
     uint64_t start_id;

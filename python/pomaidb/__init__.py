@@ -10,7 +10,11 @@ import ctypes
 import os
 from pathlib import Path
 
-__all__ = ["open_db", "close", "put_batch", "freeze", "search_batch", "PomaiDBError"]
+__all__ = [
+    "open_db", "close", "put_batch", "freeze", "search_batch",
+    "create_rag_membrane", "put_chunk", "search_rag",
+    "PomaiDBError",
+]
 
 # Default library path when running from repo (build dir)
 def _find_lib():
@@ -124,10 +128,72 @@ def _register_api(lib):
     lib.pomai_status_free.argtypes = [ctypes.c_void_p]
     lib.pomai_status_free.restype = None
 
+    # RAG types
+    class PomaiRagChunk(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("chunk_id", ctypes.c_uint64),
+            ("doc_id", ctypes.c_uint64),
+            ("token_ids", ctypes.POINTER(ctypes.c_uint32)),
+            ("token_count", ctypes.c_size_t),
+            ("vector", ctypes.POINTER(ctypes.c_float)),
+            ("dim", ctypes.c_uint32),
+        ]
+
+    class PomaiRagQuery(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("token_ids", ctypes.POINTER(ctypes.c_uint32)),
+            ("token_count", ctypes.c_size_t),
+            ("vector", ctypes.POINTER(ctypes.c_float)),
+            ("dim", ctypes.c_uint32),
+            ("topk", ctypes.c_uint32),
+        ]
+
+    class PomaiRagSearchOptions(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("candidate_budget", ctypes.c_uint32),
+            ("token_budget", ctypes.c_uint32),
+            ("enable_vector_rerank", ctypes.c_bool),
+        ]
+
+    class PomaiRagHit(ctypes.Structure):
+        _fields_ = [
+            ("chunk_id", ctypes.c_uint64),
+            ("doc_id", ctypes.c_uint64),
+            ("score", ctypes.c_float),
+            ("token_matches", ctypes.c_uint32),
+        ]
+
+    class PomaiRagSearchResult(ctypes.Structure):
+        _fields_ = [
+            ("hit_count", ctypes.c_size_t),
+            ("hits", ctypes.POINTER(PomaiRagHit)),
+        ]
+
+    lib.pomai_create_rag_membrane.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32]
+    lib.pomai_create_rag_membrane.restype = ctypes.c_void_p
+    lib.pomai_put_chunk.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(PomaiRagChunk)]
+    lib.pomai_put_chunk.restype = ctypes.c_void_p
+    lib.pomai_search_rag.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p,
+        ctypes.POINTER(PomaiRagQuery), ctypes.POINTER(PomaiRagSearchOptions),
+        ctypes.POINTER(PomaiRagSearchResult),
+    ]
+    lib.pomai_search_rag.restype = ctypes.c_void_p
+    lib.pomai_rag_search_result_free.argtypes = [ctypes.POINTER(PomaiRagSearchResult)]
+    lib.pomai_rag_search_result_free.restype = None
+
     lib._pomai_options = PomaiOptions
     lib._pomai_upsert = PomaiUpsert
     lib._pomai_query = PomaiQuery
     lib._pomai_search_results = PomaiSearchResults
+    lib._pomai_rag_chunk = PomaiRagChunk
+    lib._pomai_rag_query = PomaiRagQuery
+    lib._pomai_rag_search_options = PomaiRagSearchOptions
+    lib._pomai_rag_hit = PomaiRagHit
+    lib._pomai_rag_search_result = PomaiRagSearchResult
 
 
 def _check(st):
@@ -224,3 +290,71 @@ def search_batch(db, queries, topk=10):
         ]
     finally:
         _lib.pomai_search_batch_free(out, n)
+
+
+def create_rag_membrane(db, name, dim, shard_count=1):
+    """Create and open a RAG membrane. Use it for put_chunk and search_rag."""
+    _ensure_lib()
+    _check(_lib.pomai_create_rag_membrane(db, name.encode("utf-8"), dim, shard_count))
+
+
+def put_chunk(db, membrane_name, chunk_id, doc_id, token_ids, vector=None):
+    """Insert a RAG chunk. token_ids: list of int (token IDs); vector: optional list of float (embedding)."""
+    _ensure_lib()
+    chunk = _lib._pomai_rag_chunk()
+    chunk.struct_size = ctypes.sizeof(_lib._pomai_rag_chunk())
+    chunk.chunk_id = int(chunk_id)
+    chunk.doc_id = int(doc_id)
+    tokens = (ctypes.c_uint32 * len(token_ids))(*token_ids)
+    chunk.token_ids = tokens
+    chunk.token_count = len(token_ids)
+    if vector is not None and len(vector) > 0:
+        vec = (ctypes.c_float * len(vector))(*vector)
+        chunk.vector = vec
+        chunk.dim = len(vector)
+    else:
+        chunk.vector = None
+        chunk.dim = 0
+    _check(_lib.pomai_put_chunk(db, membrane_name.encode("utf-8"), ctypes.byref(chunk)))
+
+
+def search_rag(db, membrane_name, token_ids=None, vector=None, topk=10, candidate_budget=200, enable_vector_rerank=True):
+    """RAG search. Provide token_ids and/or vector. Returns list of (chunk_id, doc_id, score, token_matches)."""
+    _ensure_lib()
+    opts = _lib._pomai_rag_search_options()
+    opts.struct_size = ctypes.sizeof(_lib._pomai_rag_search_options())
+    opts.candidate_budget = candidate_budget
+    opts.token_budget = 0
+    opts.enable_vector_rerank = enable_vector_rerank
+
+    query = _lib._pomai_rag_query()
+    query.struct_size = ctypes.sizeof(_lib._pomai_rag_query())
+    query.topk = topk
+    if token_ids and len(token_ids) > 0:
+        q_tokens = (ctypes.c_uint32 * len(token_ids))(*token_ids)
+        query.token_ids = q_tokens
+        query.token_count = len(token_ids)
+    else:
+        query.token_ids = None
+        query.token_count = 0
+    if vector and len(vector) > 0:
+        q_vec = (ctypes.c_float * len(vector))(*vector)
+        query.vector = q_vec
+        query.dim = len(vector)
+    else:
+        query.vector = None
+        query.dim = 0
+
+    if (not token_ids or query.token_count == 0) and (not vector or query.dim == 0):
+        raise ValueError("search_rag requires token_ids or vector")
+
+    result = _lib._pomai_rag_search_result()
+    _check(_lib.pomai_search_rag(db, membrane_name.encode("utf-8"), ctypes.byref(query), ctypes.byref(opts), ctypes.byref(result)))
+    try:
+        hits = []
+        for i in range(result.hit_count):
+            h = result.hits[i]
+            hits.append((h.chunk_id, h.doc_id, h.score, h.token_matches))
+        return hits
+    finally:
+        _lib.pomai_rag_search_result_free(ctypes.byref(result))

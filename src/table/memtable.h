@@ -21,8 +21,16 @@
 #include "pomai/types.h"
 #include "table/arena.h"
 #include "table/flat_hash_memmap.h"
+#include "third_party/hash/xxhash64.h"
 
 namespace pomai::table {
+
+/// Hash functor for VectorId using xxHash64 — better distribution than std::hash for sequential IDs.
+struct XxHash64ForVectorId {
+  std::size_t operator()(pomai::VectorId k) const noexcept {
+    return static_cast<std::size_t>(XXHash64::hash(&k, sizeof(k), 0));
+  }
+};
 
 // Seqlock – readers spin if a write is in progress, readers never block writers.
 class Seqlock {
@@ -159,8 +167,8 @@ private:
     Arena         arena_;
 
     // Primary map: VectorId -> float* (nullptr = tombstone)
-    // Mutable from writer thread only; reads are seqlock-protected.
-    mutable FlatHashMemMap<pomai::VectorId, float*> map_;
+    // XxHash64 gives better distribution than std::hash for sequential VectorIds (fewer collisions).
+    mutable FlatHashMemMap<pomai::VectorId, float*, XxHash64ForVectorId> map_;
 
     // Metadata is rare (only tenant-tagged vectors).
     // Kept as unordered_map + shared_mutex to avoid over-engineering the common path.

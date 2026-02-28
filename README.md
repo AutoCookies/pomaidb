@@ -1,123 +1,160 @@
-# PomaiDB — Edge Vector Database
-
 <div align="center">
-    <img src="./assets/logo.png" alt="PomaiDB Logo"/>
-</div>
+
+# 🍇 PomaiDB
+
+<img src="./assets/logo.png" alt="PomaiDb Logo"/>
+
+### **The vector database that runs on the edge — not in the cloud.**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![C++20](https://img.shields.io/badge/Standard-C%2B%2B20-red.svg)](https://en.cppreference.com/w/cpp/20)
-[![Platforms](https://img.shields.io/badge/Platforms-ARM64%20%7C%20x86__64-orange.svg)]()
-[![GitHub stars](https://img.shields.io/github/stars/AutoCookies/pomaidb?style=social)](https://github.com/AutoCookies/pomaidb)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus)](https://en.cppreference.com/w/cpp/20)
+[![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20ARM64%20%7C%20x86__64-333333?logo=linux)](https://github.com/AutoCookies/pomaidb)
+[![Python](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)](python/README.md)
 
-**PomaiDB** is a **lean, high-performance embedded vector database** built in pure C++20 — designed specifically for **Edge AI** on resource-constrained devices: phones, Raspberry Pi, IoT boards, embedded systems, and even browsers via WASM.
+**[⭐ Star](https://github.com/AutoCookies/pomaidb/stargazers)** · **[🍴 Fork](https://github.com/AutoCookies/pomaidb/fork)** · **[📖 Docs](docs/)** · **[🤝 Contribute](CONTRIBUTING.md)**
 
-No servers. No cloud dependencies. No unnecessary layers.  
-Just fast, private, local vector search that runs directly on your device.
+</div>
 
-> “A database should be like a Pomegranate: atomic grains of data, each protected by an immutable membrane.”
+---
 
-## 🎯 Purpose & Core Philosophy
+**PomaiDB** is a **lean, embedded vector database** in pure C++20. No servers. No API keys. No internet.  
+It runs **in-process** on your device — Raspberry Pi, phone, laptop, IoT — with a tiny footprint, crash-safe storage, and SIMD-accelerated search.  
+Built for **offline RAG**, **on-device agents**, and **private embedding search**.
 
-In the world of on-device AI, personal agents, offline RAG, and private long-term memory, existing vector databases are often too heavy, too server-oriented, or too memory-hungry.
+> *"A database should be like a pomegranate: atomic grains of data, each protected by an immutable membrane."*
 
-**PomaiDB exists to solve exactly that problem:**
+---
 
-- Be **truly embedded** — runs in-process, single binary, tiny footprint (~2–5 MB static possible)
-- Deliver **real-time performance** on low-power ARM64 hardware (Raspberry Pi, phones, Jetson Nano)
-- Guarantee **privacy & safety** — no network calls, crash-resilient, power-loss tolerant
-- Offer **zero-copy efficiency** — data moves from storage to search kernel without redundant copies
-- Stay **simple and predictable** — deterministic behavior, no background threads eating battery
+## ✨ Why PomaiDB?
 
-PomaiDB is built for developers who want **local-first, offline-capable AI** without compromising speed or reliability.
+| You want… | PomaiDB gives you |
+|-----------|-------------------|
+| **Privacy** | Data never leaves the device. No cloud, no telemetry. |
+| **Offline-first** | Works without the internet. Survives power loss and reboots. |
+| **Small & fast** | ~2–5 MB static, ARM64/NEON and x86 SIMD. Real-time search on low-power hardware. |
+| **Embedded** | Single binary, in-process. No daemon, no Docker, no K8s. |
+| **Crash-safe** | WAL + atomic manifest. Recover after battery death or SD corruption. |
+| **Simple** | C++ and C API; Python via `pip install pomaidb`. No heavy runtime. |
 
-## 💎 Key Design Pillars
+**Ideal for:** edge AI, **personal RAG** (hybrid lexical + vector), local semantic search, IoT embeddings, on-device agents, and anywhere you need **vector search without the cloud**. Use a RAG membrane for chunk-level ingest and search (`create_rag_membrane`, `put_chunk`, `search_rag` in C and Python).
 
-- **Single-process embedded core** — no server, no external services
-- **Sharded actor model** — lock-free reads, dedicated writer per shard
-- **Atomic Freeze semantics** — readers always see a consistent, published snapshot
-- **Native ARM64 / NEON SIMD** — optimized brute-force distance computation
-- **Typed membranes** — `VECTOR` for embeddings, `RAG` for hybrid text + vector
-- **WAL + atomic manifest** — crash-safe, survives sudden power loss
-- **Minimal dependencies** — pure C++20 + CMake (FAISS optional for advanced indexing)
+---
 
-## ⚡ Quick Start (C++)
+## 🚀 Quick Start
+
+### C++
 
 ```cpp
 #include <pomai/pomai.h>
-#include <vector>
-#include <iostream>
 
 int main() {
     pomai::DBOptions opt;
-    opt.path = "./my-vault.pdb";
-    opt.dim = 384;                             // e.g. sentence-transformers/all-MiniLM-L6-v2
-    opt.shard_count = std::thread::hardware_concurrency();
+    opt.path = "./my-vectors.pdb";
+    opt.dim = 384;   // e.g. sentence-transformers
+    opt.shard_count = 1;
 
     std::unique_ptr<pomai::DB> db;
-    auto st = pomai::DB::Open(opt, &db);
-    if (!st.ok()) {
-        std::cerr << "Open failed: " << st.ToString() << "\n";
-        return 1;
-    }
+    pomai::DB::Open(opt, &db);
 
-    // Ingest a vector
-    std::vector<float> embedding(384, 0.42f); // your model output
-    db->Put(1337, embedding.data());
-
-    // Make data visible (atomic snapshot)
+    std::vector<float> vec(384, 0.42f);
+    db->Put(1, vec);
     db->Freeze("__default__");
 
-    // Search
     pomai::SearchResult res;
-    db->Search(embedding.data(), 10, &res);
+    db->Search(vec.data(), 10, &res);
+    for (const auto& hit : res.hits)
+        std::cout << hit.id << " " << hit.score << "\n";
 
-    for (const auto& hit : res.hits) {
-        std::cout << "Hit: ID=" << hit.id << " | Score=" << hit.score << "\n";
-    }
-
+    db->Close();
     return 0;
 }
 ```
 
-## 🛡️ Why Edge-First Matters
-
-Most vector databases are built for cloud or powerful servers.  
-PomaiDB is built for **your device**:
-
-- Runs offline — no internet, no API keys
-- Survives battery death or sudden reboot
-- Minimizes SD card / flash wear (low write amplification)
-- Uses tiny memory footprint even with thousands of vectors
-- Optimized for ARM64 — native NEON for distance calculations
-
-## 📦 Build & Run
+### Python
 
 ```bash
-git clone https://github.com/AutoCookies/pomaidb
-cd pomaidb
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j
+# Build the C library first (see Build below), then:
+pip install ./python
+export POMAI_C_LIB=/path/to/build/libpomai_c.so   # or .dylib on macOS
 ```
 
-Run tests:
-```bash
-ctest
+```python
+import pomaidb
+
+db = pomaidb.open_db("/tmp/my_db", dim=128, shards=1)
+pomaidb.put_batch(db, ids=[1, 2, 3], vectors=[[0.1]*128, [0.2]*128, [0.3]*128])
+pomaidb.freeze(db)
+results = pomaidb.search_batch(db, queries=[[0.15]*128], topk=5)
+pomaidb.close(db)
 ```
 
-## 🤝 Contributing
-
-We welcome every idea that helps make PomaiDB more stable, faster, and more useful on real edge hardware.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
-## 📜 License
-
-Apache License 2.0 — free to use, modify, and distribute.
+[Full Python API →](docs/PYTHON_API.md)
 
 ---
 
-<p align="center">
-Made with ❤️ for builders who want <b>private, fast, local AI</b> on every device.<br/>
-<b>Star ⭐ if you're building the future of Edge AI!</b>
-</p>
+## 📦 Build & Test
+
+```bash
+git clone https://github.com/AutoCookies/pomaidb.git
+cd pomaidb
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+Run the cross-engine benchmark (PomaiDB vs hnswlib, FAISS):
+
+```bash
+./benchmark_all.sh
+```
+
+---
+
+## 🏗️ What’s inside
+
+- **Single-process, sharded** — lock-free reads, one writer per shard.
+- **Atomic Freeze** — readers see a consistent snapshot; no torn reads.
+- **WAL + manifest** — durable commits; recovery from crash or power loss.
+- **HNSW + segments** — graph index and on-disk segments; batch search with configurable parallelism.
+- **SimSIMD** — NEON (ARM64) and AVX (x86) for fast distance (L2, inner product, cosine).
+- **Membranes** — separate namespaces (e.g. `VECTOR`, `RAG`) in one DB. **RAG** membranes support chunk ingest (token IDs + optional embedding) and hybrid search (lexical + vector rerank).
+- **C + C++ API** — easy FFI for Python, Node, or any language that talks C.
+
+[Versioning & API stability →](docs/VERSIONING.md) · [Production & embedded assessment →](docs/PRODUCTION_AND_EMBEDDED_ASSESSMENT.md)
+
+---
+
+## 🛡️ Edge-first, not cloud-first
+
+Most vector DBs assume servers and networks. PomaiDB assumes **your device**:
+
+- ✅ Runs **offline** — no API keys, no latency, no vendor lock-in  
+- ✅ **Crash-resilient** — WAL replay, manifest fallback  
+- ✅ **Low write amplification** — gentle on SD cards and flash  
+- ✅ **Small memory** — thousands of vectors on modest RAM  
+- ✅ **ARM64-optimized** — NEON kernels for phones, Pi, Jetson  
+
+---
+
+## 🤝 Contributing
+
+We care about **stability**, **correctness**, and **real edge hardware**.  
+Whether it’s a bug fix, a benchmark on a Raspberry Pi, or a new binding — we’d love your help.
+
+👉 **[CONTRIBUTING.md](CONTRIBUTING.md)** — how to contribute, what we prioritize, and how we work.
+
+---
+
+## 📜 License
+
+[Apache 2.0](LICENSE) — use, modify, and distribute freely.
+
+---
+
+<div align="center">
+
+**If you’re building private, fast, local AI — give us a ⭐ and share the repo.**
+
+*PomaiDB · Made for the edge.*
+
+</div>

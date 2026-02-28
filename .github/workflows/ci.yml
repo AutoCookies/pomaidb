@@ -105,6 +105,8 @@ jobs:
         run: cmake --build build --target pomai_c --parallel
       - name: Run Python ctypes smoke
         run: python3 tests/ffi/python_ctypes_smoke.py
+      - name: Run RAG smoke
+        run: python3 scripts/rag_smoke.py
 
   perf-gate:
     name: perf-gate

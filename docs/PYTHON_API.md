@@ -24,6 +24,10 @@ PomaiDB is exposed to Python via the **C API** and **ctypes**. The official pack
 | `freeze(db)`   | Flush memtable to segment and build index. Must be called before new data is visible to search. |
 | `search_batch(db, queries, topk=10)` | Batch search. `queries`: list of list of float (n_queries × dim). Returns list of `(ids, scores)` per query. |
 | `close(db)`    | Close the database. |
+| **RAG** | |
+| `create_rag_membrane(db, name, dim, shard_count=1)` | Create and open a RAG membrane for chunk storage and hybrid search. |
+| `put_chunk(db, membrane_name, chunk_id, doc_id, token_ids, vector=None)` | Insert a chunk: token IDs (required) and optional embedding vector. |
+| `search_rag(db, membrane_name, token_ids=None, vector=None, topk=10, ...)` | RAG search by token overlap and/or vector. Returns list of `(chunk_id, doc_id, score, token_matches)`. |
 
 Exceptions: `pomaidb.PomaiDBError` on any failing call.
 
@@ -51,9 +55,10 @@ The shared library exposes:
 - `pomai_search_batch(db, queries, n, &out)` — batch search; `out` is array of `PomaiSearchResults`
 - `pomai_search_batch_free(out, n)` — free search results
 - `pomai_close(db)` — close DB
+- **RAG:** `pomai_create_rag_membrane(db, name, dim, shard_count)`, `pomai_put_chunk(db, membrane_name, chunk)`, `pomai_search_rag(db, membrane_name, query, opts, result)`, `pomai_rag_search_result_free(result)`
 - `pomai_status_message(status)` / `pomai_status_free(status)` — error message
 
-Struct layouts and constants are in `include/pomai/c_types.h`. The `pomaidb` package registers these for you.
+Struct layouts and constants are in `include/pomai/c_types.h`. The `pomaidb` package registers these for you. RAG quick start: `examples/rag_quickstart.py`.
 
 ## Versioning
 

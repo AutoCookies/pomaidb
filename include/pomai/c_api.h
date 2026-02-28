@@ -32,6 +32,13 @@ POMAI_API void pomai_record_free(pomai_record_t* record);
 POMAI_API pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_search_results_t** out);
 POMAI_API void pomai_search_results_free(pomai_search_results_t* results);
 
+// RAG membrane and search
+POMAI_API pomai_status_t* pomai_create_rag_membrane(pomai_db_t* db, const char* name, uint32_t dim, uint32_t shard_count);
+POMAI_API pomai_status_t* pomai_put_chunk(pomai_db_t* db, const char* membrane_name, const pomai_rag_chunk_t* chunk);
+POMAI_API pomai_status_t* pomai_search_rag(pomai_db_t* db, const char* membrane_name, const pomai_rag_query_t* query,
+                                           const pomai_rag_search_options_t* opts, pomai_rag_search_result_t* out_result);
+POMAI_API void pomai_rag_search_result_free(pomai_rag_search_result_t* result);
+
 // Snapshot & Scan
 POMAI_API pomai_status_t* pomai_get_snapshot(pomai_db_t* db, pomai_snapshot_t** out_snap);
 POMAI_API void pomai_snapshot_free(pomai_snapshot_t* snap);
