@@ -14,6 +14,7 @@
 #include "core/shard/mailbox.h"
 #include "core/shard/snapshot.h"
 #include "core/shard/shard_stats.h"
+#include "palloc.h"
 #include "pomai/metadata.h"
 #include "pomai/search.h"
 #include "pomai/iterator.h"
@@ -269,6 +270,7 @@ namespace pomai::core
         std::unique_ptr<storage::CompactionManager> compaction_manager_;
         std::unique_ptr<BackgroundJob> background_job_;
         std::uint64_t wal_epoch_{0};
+        palloc_heap_t* palloc_heap_{nullptr};
 
         std::jthread worker_;
     };

@@ -24,9 +24,11 @@ pomai::Status HnswIndex::Add(VectorId id, std::span<const float> vec)
     if (vec.size() != dim_)
         return pomai::Status::InvalidArgument("vector dim mismatch");
     
-    // Store vector in flat pool
+    // Store vector in flat pool (64-byte aligned for AVX-512)
     pomai::hnsw::storage_idx_t internal_id = static_cast<pomai::hnsw::storage_idx_t>(id_map_.size());
-    vector_pool_.insert(vector_pool_.end(), vec.begin(), vec.end());
+    size_t old_size = vector_pool_.size();
+    vector_pool_.resize(old_size + dim_);
+    std::memcpy(&vector_pool_[old_size], vec.data(), dim_ * sizeof(float));
     id_map_.push_back(id);
 
     // Distance computer for the new point
@@ -130,7 +132,8 @@ pomai::Status HnswIndex::Load(const std::string& path,
     std::vector<VectorId> id_map(n);
     fread(id_map.data(), sizeof(VectorId), n, f);
     
-    std::vector<float> vector_pool(n * dim);
+    pomai::util::AlignedVector<float> vector_pool;
+    vector_pool.resize(n * dim);
     fread(vector_pool.data(), sizeof(float), n * dim, f);
     
     fclose(f);

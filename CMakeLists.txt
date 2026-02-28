@@ -86,10 +86,11 @@ add_library(pomai STATIC
 target_include_directories(pomai
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/palloc/include
 )
 
 # OpenMP for parallel builds if needed
@@ -493,3 +494,5 @@ install(FILES
   include/pomai/c_types.h
   include/pomai/c_version.h
   DESTINATION include/pomai)
+add_executable(palloc_perf_verify tests/palloc_perf_verify.cc)
+target_link_libraries(palloc_perf_verify PRIVATE pomai palloc-static pthread)

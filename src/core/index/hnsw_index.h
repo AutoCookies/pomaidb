@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <vector>
+#include "util/aligned_vector.h"
 
 #include "pomai/status.h"
 #include "pomai/types.h"
@@ -87,7 +88,7 @@ private:
     std::unique_ptr<pomai::hnsw::HNSW> index_;
 
     // Native HNSW requires us to manage the vector storage for distance calls
-    std::vector<float> vector_pool_;
+    pomai::util::AlignedVector<float> vector_pool_;
     pomai::MetricType metric_;
     
     // faiss internal idx → PomaiDB VectorId mapping
