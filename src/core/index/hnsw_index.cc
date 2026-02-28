@@ -1,44 +1,46 @@
-// hnsw_index.cc — HnswIndex implementation wrapping faiss::IndexHNSWFlat.
-//
-// Phases 3 & 4:
-//  - Phase 3: Add/Search delegation to faiss::IndexHNSWFlat
-//  - Phase 4: Save/Load via faiss::write_index / faiss::read_index
-
 #include "core/index/hnsw_index.h"
 
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <algorithm>
 
-// Pull complete FAISS headers only in this TU
-#include <faiss/IndexHNSW.h>
-#include <faiss/index_io.h>
+#include "third_party/pomaidb_hnsw/hnsw.h"
+#include "core/distance.h"
 
 namespace pomai::index {
 
-// ── Constructor / Destructor ──────────────────────────────────────────────────
 HnswIndex::HnswIndex(uint32_t dim, HnswOptions opts, pomai::MetricType metric)
     : dim_(dim), opts_(opts)
 {
-    faiss::MetricType faiss_metric = faiss::METRIC_L2;
-    if (metric == pomai::MetricType::kInnerProduct || metric == pomai::MetricType::kCosine) {
-        faiss_metric = faiss::METRIC_INNER_PRODUCT;
-    }
-    index_ = std::make_unique<faiss::IndexHNSWFlat>(
-        static_cast<int>(dim_), opts_.M, faiss_metric);
-    index_->hnsw.efConstruction = opts_.ef_construction;
-    index_->hnsw.efSearch       = opts_.ef_search;
+    metric_ = metric;
+    index_ = std::make_unique<pomai::hnsw::HNSW>(opts_.M, opts_.ef_construction);
 }
 
 HnswIndex::~HnswIndex() = default;
 
-// ── Build Phase ───────────────────────────────────────────────────────────────
 pomai::Status HnswIndex::Add(VectorId id, std::span<const float> vec)
 {
     if (vec.size() != dim_)
         return pomai::Status::InvalidArgument("vector dim mismatch");
-    index_->add(1, vec.data());
+    
+    // Store vector in flat pool
+    pomai::hnsw::storage_idx_t internal_id = static_cast<pomai::hnsw::storage_idx_t>(id_map_.size());
+    vector_pool_.insert(vector_pool_.end(), vec.begin(), vec.end());
     id_map_.push_back(id);
+
+    // Distance computer for the new point
+    pomai::hnsw::HNSW::DistanceComputer dist_func = [&](pomai::hnsw::storage_idx_t i1, pomai::hnsw::storage_idx_t i2) {
+        std::span<const float> v1(&vector_pool_[static_cast<size_t>(i1) * dim_], dim_);
+        std::span<const float> v2(&vector_pool_[static_cast<size_t>(i2) * dim_], dim_);
+        if (metric_ == pomai::MetricType::kInnerProduct || metric_ == pomai::MetricType::kCosine) {
+            return 1.0f - pomai::core::Dot(v1, v2); // Distance-like for dot product
+        } else {
+            return pomai::core::L2Sq(v1, v2);
+        }
+    };
+
+    index_->add_point(internal_id, -1, dist_func);
     return pomai::Status::Ok();
 }
 
@@ -46,13 +48,13 @@ pomai::Status HnswIndex::AddBatch(const VectorId* ids,
                                    const float*    vecs,
                                    std::size_t     n)
 {
-    if (n == 0) return pomai::Status::Ok();
-    index_->add(static_cast<faiss::idx_t>(n), vecs);
-    id_map_.insert(id_map_.end(), ids, ids + n);
+    for (size_t i = 0; i < n; ++i) {
+        auto st = Add(ids[i], std::span<const float>(vecs + i * dim_, dim_));
+        if (!st.ok()) return st;
+    }
     return pomai::Status::Ok();
 }
 
-// ── Query Phase ───────────────────────────────────────────────────────────────
 pomai::Status HnswIndex::Search(std::span<const float> query,
                                  uint32_t               topk,
                                  int                    ef_search,
@@ -64,117 +66,85 @@ pomai::Status HnswIndex::Search(std::span<const float> query,
     if (id_map_.empty())
         return pomai::Status::Ok();
 
-    const uint32_t k = std::min<uint32_t>(topk, static_cast<uint32_t>(id_map_.size()));
+    int ef = (ef_search > 0) ? ef_search : opts_.ef_search;
 
-    // Temporarily override efSearch if caller requests it
-    const int saved_ef = index_->hnsw.efSearch;
-    if (ef_search > 0) index_->hnsw.efSearch = ef_search;
+    pomai::hnsw::HNSW::QueryDistanceComputer qdis = [&](pomai::hnsw::storage_idx_t target_id) {
+        std::span<const float> v_target(&vector_pool_[static_cast<size_t>(target_id) * dim_], dim_);
+        if (metric_ == pomai::MetricType::kInnerProduct || metric_ == pomai::MetricType::kCosine) {
+            return 1.0f - pomai::core::Dot(query, v_target);
+        } else {
+            return pomai::core::L2Sq(query, v_target);
+        }
+    };
 
-    std::vector<faiss::idx_t> faiss_ids(k, -1);
-    std::vector<float>        faiss_dists(k, 0.0f);
-    index_->search(1, query.data(), static_cast<faiss::idx_t>(k),
-                   faiss_dists.data(), faiss_ids.data());
-
-    index_->hnsw.efSearch = saved_ef;
+    std::vector<pomai::hnsw::storage_idx_t> internal_ids;
+    std::vector<float> distances;
+    index_->search(qdis, static_cast<int>(topk), ef, internal_ids, distances);
 
     out_ids->clear();
     out_dists->clear();
-    for (uint32_t i = 0; i < k; ++i) {
-        if (faiss_ids[i] < 0) break;
-        out_ids->push_back(id_map_[static_cast<std::size_t>(faiss_ids[i])]);
-        out_dists->push_back(faiss_dists[i]);
+    for (size_t i = 0; i < internal_ids.size(); ++i) {
+        out_ids->push_back(id_map_[static_cast<size_t>(internal_ids[i])]);
+        out_dists->push_back(distances[i]);
     }
+
     return pomai::Status::Ok();
 }
 
-// ── Persistence (Phase 4) ─────────────────────────────────────────────────────
-// .hnsw sidecar file format:
-//   [FAISS native binary (faiss::write_index)]
-//   [uint64 n_ids]
-//   [VectorId × n_ids]
-
 pomai::Status HnswIndex::Save(const std::string& path) const
 {
-    try {
-        faiss::write_index(index_.get(), path.c_str());
-    } catch (const std::exception& ex) {
-        return pomai::Status::IOError(std::string("HNSW write failed: ") + ex.what());
-    }
-
-    // Append id_map to the same file
-    std::ofstream f(path, std::ios::binary | std::ios::app);
-    if (!f) return pomai::Status::IOError("Cannot append id_map to " + path);
-    // Write length at the END so Load() can read it from the tail.
-    const uint64_t n = static_cast<uint64_t>(id_map_.size());
-    f.write(reinterpret_cast<const char*>(id_map_.data()),
-            n * sizeof(VectorId));
-    f.write(reinterpret_cast<const char*>(&n), sizeof(n));
-    if (!f) return pomai::Status::IOError("id_map write failed: " + path);
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return pomai::Status::IOError("Cannot open " + path + " for writing");
+    
+    index_->save(f);
+    
+    // Save metadata
+    fwrite(&dim_, sizeof(uint32_t), 1, f);
+    fwrite(&metric_, sizeof(pomai::MetricType), 1, f);
+    
+    size_t n = id_map_.size();
+    fwrite(&n, sizeof(size_t), 1, f);
+    fwrite(id_map_.data(), sizeof(VectorId), n, f);
+    fwrite(vector_pool_.data(), sizeof(float), n * dim_, f);
+    
+    fclose(f);
     return pomai::Status::Ok();
 }
 
 pomai::Status HnswIndex::Load(const std::string& path,
                                std::unique_ptr<HnswIndex>* out)
 {
-    // Read FAISS section
-    faiss::Index* raw = nullptr;
-    try {
-        raw = faiss::read_index(path.c_str());
-    } catch (const std::exception& ex) {
-        return pomai::Status::IOError(std::string("HNSW read failed: ") + ex.what());
-    }
-    auto* hnsw_idx = dynamic_cast<faiss::IndexHNSWFlat*>(raw);
-    if (!hnsw_idx) {
-        delete raw;
-        return pomai::Status::Corruption("File is not an IndexHNSWFlat: " + path);
-    }
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return pomai::Status::IOError("Cannot open " + path + " for reading");
 
-    // faiss::write_index writes an exact byte count; we need the offset of
-    // the id_map section. We use FAISS's reader to get the file size up to
-    // the index, then read the id_map from the remainder.
-    //
-    // Simplest approach: faiss::write_index / read_index via C FILE interface
-    // writes everything to the file from position 0; the id_map was appended.
-    // Use a second pass from the end file.
-    std::ifstream f(path, std::ios::binary);
-    if (!f) {
-        delete raw;
-        return pomai::Status::IOError("Cannot re-open for id_map: " + path);
-    }
+    auto idx = std::make_unique<pomai::hnsw::HNSW>();
+    idx->load(f);
 
-    // The id_map is at the tail: [uint64 n][VectorId × n]
-    // Seek backward from end of file.
-    f.seekg(0, std::ios::end);
-    const auto file_size = f.tellg();
-    if (file_size < static_cast<std::streamoff>(sizeof(uint64_t))) {
-        delete raw;
-        return pomai::Status::Corruption("File too small: " + path);
-    }
-    f.seekg(-static_cast<std::streamoff>(sizeof(uint64_t)), std::ios::end);
-    uint64_t n_ids = 0;
-    f.read(reinterpret_cast<char*>(&n_ids), sizeof(n_ids));
-    const auto id_bytes = static_cast<std::streamoff>(n_ids * sizeof(VectorId));
-    f.seekg(-(static_cast<std::streamoff>(sizeof(uint64_t)) + id_bytes),
-            std::ios::end);
-    std::vector<VectorId> id_map(n_ids);
-    f.read(reinterpret_cast<char*>(id_map.data()), id_bytes);
-    if (!f) {
-        delete raw;
-        return pomai::Status::IOError("id_map read failed: " + path);
-    }
+    uint32_t dim;
+    pomai::MetricType metric;
+    fread(&dim, sizeof(uint32_t), 1, f);
+    fread(&metric, sizeof(pomai::MetricType), 1, f);
+
+    size_t n;
+    fread(&n, sizeof(size_t), 1, f);
+    std::vector<VectorId> id_map(n);
+    fread(id_map.data(), sizeof(VectorId), n, f);
+    
+    std::vector<float> vector_pool(n * dim);
+    fread(vector_pool.data(), sizeof(float), n * dim, f);
+    
+    fclose(f);
 
     HnswOptions opts;
-    opts.M              = hnsw_idx->hnsw.nb_neighbors(0) / 2;
-    opts.ef_construction= hnsw_idx->hnsw.efConstruction;
-    opts.ef_search      = hnsw_idx->hnsw.efSearch;
+    opts.M = idx->M;
+    opts.ef_construction = idx->ef_construction;
+    opts.ef_search = idx->ef_search;
 
-    pomai::MetricType metric = (hnsw_idx->metric_type == faiss::METRIC_INNER_PRODUCT) 
-        ? pomai::MetricType::kInnerProduct : pomai::MetricType::kL2;
-
-    auto result       = std::make_unique<HnswIndex>(
-        static_cast<uint32_t>(hnsw_idx->d), opts, metric);
-    result->index_.reset(hnsw_idx);
+    auto result = std::make_unique<HnswIndex>(dim, opts, metric);
+    result->index_ = std::move(idx);
     result->id_map_ = std::move(id_map);
+    result->vector_pool_ = std::move(vector_pool);
+    
     *out = std::move(result);
     return pomai::Status::Ok();
 }

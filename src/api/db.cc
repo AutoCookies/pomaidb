@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "core/membrane/manager.h"
+#include "util/logging.h"
 
 namespace pomai
 {
@@ -17,8 +18,12 @@ namespace pomai
         explicit DbImpl(DBOptions opt) : mgr_(std::move(opt)) {}
 
         Status Init() {
+            POMAI_LOG_INFO("Opening PomaiDB at: {}", mgr_.GetOptions().path);
             auto st = mgr_.Open();
-            if (!st.ok()) return st;
+            if (!st.ok()) {
+                POMAI_LOG_ERROR("Failed to open PomaiDB: {}", st.message());
+                return st;
+            }
             return Status::Ok();
         }
 

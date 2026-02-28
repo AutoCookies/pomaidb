@@ -18,11 +18,9 @@
 #include "pomai/types.h"
 #include "pomai/options.h"
 
-// Forward-declare FAISS types to avoid pulling FAISS headers into every TU.
-namespace faiss {
-struct Index;
-struct IndexHNSWFlat;
-} // namespace faiss
+namespace pomai::hnsw {
+class HNSW;
+}
 
 namespace pomai::index {
 
@@ -85,10 +83,14 @@ private:
     uint32_t    dim_;
     HnswOptions opts_;
 
-    // Owned FAISS index (heap-allocated to avoid including faiss headers here)
-    std::unique_ptr<faiss::IndexHNSWFlat> index_;
+    // Owned native HNSW index
+    std::unique_ptr<pomai::hnsw::HNSW> index_;
 
-    // faiss internal idx → PomaiDB VectorId mapping (sequential, index = faiss id)
+    // Native HNSW requires us to manage the vector storage for distance calls
+    std::vector<float> vector_pool_;
+    pomai::MetricType metric_;
+    
+    // faiss internal idx → PomaiDB VectorId mapping
     std::vector<VectorId> id_map_;
 };
 

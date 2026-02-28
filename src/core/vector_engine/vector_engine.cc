@@ -160,13 +160,13 @@ Status VectorEngine::OpenLocked() {
         auto wal = std::make_unique<storage::Wal>(opt_.path, i, kWalSegmentBytes, opt_.fsync);
         auto st = wal->Open();
         if (!st.ok()) {
-            first_error = Status(st.code(), "vector_engine wal open failed: " + st.message());
+            first_error = Status(st.code(), std::string("vector_engine wal open failed: ") + st.message());
             break;
         }
         auto mem = std::make_unique<table::MemTable>(opt_.dim, kArenaBlockBytes);
         st = wal->ReplayInto(*mem);
         if (!st.ok()) {
-            first_error = Status(st.code(), "vector_engine wal replay failed: " + st.message());
+            first_error = Status(st.code(), std::string("vector_engine wal replay failed: ") + st.message());
             break;
         }
         auto shard_dir = (std::filesystem::path(opt_.path) / "shards" / std::to_string(i)).string();
@@ -179,7 +179,7 @@ Status VectorEngine::OpenLocked() {
 
         st = shard->Start();
         if (!st.ok()) {
-            first_error = Status(st.code(), "vector_engine shard start failed: " + st.message());
+            first_error = Status(st.code(), std::string("vector_engine shard start failed: ") + st.message());
             break;
         }
         shards_.push_back(std::move(shard));
@@ -232,9 +232,7 @@ void VectorEngine::MaybeWarmupAndInitRouting(std::span<const float> vec) {
         routing_current_ = routing_mutable_;
         routing_mode_.store(routing::RoutingMode::kReady);
         (void)routing::SaveRoutingTableAtomic(opt_.path, built, opt_.routing_keep_prev != 0);
-        util::Log(util::LogLevel::kInfo,
-                  "[routing] mode=READY warmup_size=" + std::to_string(warmup_count_) +
-                      " k=" + std::to_string(built.k));
+        POMAI_LOG_INFO("[routing] mode=READY warmup_size={} k={}", warmup_count_, built.k);
     });
 }
 
@@ -266,9 +264,7 @@ void VectorEngine::MaybePersistRoutingAsync() {
     if (search_pool_) {
         (void)search_pool_->Enqueue([this, snapshot]() {
             auto st = routing::SaveRoutingTableAtomic(opt_.path, *snapshot, opt_.routing_keep_prev != 0);
-            if (!st.ok()) {
-                util::Log(util::LogLevel::kWarn, "[routing] persist failed: " + st.message());
-            }
+                POMAI_LOG_WARN("[routing] persist failed: {}", st.message());
             routing_persist_inflight_.store(false, std::memory_order_release);
             return Status::Ok();
         });
@@ -564,7 +560,8 @@ Status VectorEngine::SearchInternal(std::span<const float> query,
 
     if (opts.zero_copy) {
         std::shared_ptr<pomai::Snapshot> active_snap;
-        GetSnapshot(&active_snap);
+        auto st_snap = GetSnapshot(&active_snap);
+        if (!st_snap.ok()) return st_snap;
         auto snap_wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(active_snap);
         if (snap_wrapper) {
             auto internal_snap = snap_wrapper->GetInternal();
@@ -666,7 +663,8 @@ Status VectorEngine::SearchBatch(std::span<const float> queries, uint32_t num_qu
     // 5. Zero-copy support
     if (opts.zero_copy) {
         std::shared_ptr<pomai::Snapshot> active_snap;
-        GetSnapshot(&active_snap);
+        auto st_snap = GetSnapshot(&active_snap);
+        if (!st_snap.ok()) return st_snap;
         auto snap_wrapper = std::dynamic_pointer_cast<SnapshotWrapper>(active_snap);
         if (snap_wrapper) {
             auto internal_snap = snap_wrapper->GetInternal();

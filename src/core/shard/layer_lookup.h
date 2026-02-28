@@ -7,7 +7,7 @@
 #include "core/shard/snapshot.h"
 #include "pomai/metadata.h"
 #include "pomai/types.h"
-#include "table/memtable.h"
+#include "util/slice.h"
 
 namespace pomai::core {
 
@@ -22,6 +22,7 @@ struct LookupResult {
     std::span<const float> vec{};
     std::vector<float> decoded_vec;
     pomai::Metadata meta{};
+    pomai::PinnableSlice pinnable_vec; // Holds pinned memory if zero-copy
 };
 
 // Canonical newest-wins lookup across shard layers.

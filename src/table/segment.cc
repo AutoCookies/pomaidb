@@ -7,6 +7,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <vector>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 namespace pomai::table
 {
@@ -66,8 +69,8 @@ namespace pomai::table
 
         // Open tmp file for streaming writes
         std::string tmp_path = path_ + ".tmp";
-        pomai::util::PosixFile file;
-        auto st = pomai::util::PosixFile::CreateTrunc(tmp_path, &file);
+        std::unique_ptr<storage::WritableFile> file;
+        auto st = storage::PosixIOProvider::NewWritableFile(tmp_path, &file);
         if (!st.ok()) return st;
 
         // Prepare header
@@ -93,7 +96,8 @@ namespace pomai::table
         }
         
         if (!training_data.empty()) {
-            quantizer.Train(training_data, training_data.size() / dim_);
+            auto train_st = quantizer.Train(training_data, training_data.size() / dim_);
+            if (!train_st.ok()) return train_st;
             h.quant_min = quantizer.GetGlobalMin();
             h.quant_inv_scale = quantizer.GetGlobalInvScale();
         } else {
@@ -134,10 +138,8 @@ namespace pomai::table
         }
 
         // Write header
-        st = file.PWrite(0, &h, sizeof(h));
+        st = file->Append(Slice(reinterpret_cast<const uint8_t*>(&h), sizeof(h)));
         if (!st.ok()) return st;
-
-        uint64_t offset = sizeof(SegmentHeader);
         
         // Incremental CRC computation
         uint32_t crc = 0;
@@ -147,108 +149,82 @@ namespace pomai::table
         if (h.version >= 5) {
             std::size_t pad_size = entries_start_offset - sizeof(SegmentHeader);
             std::vector<uint8_t> pad(pad_size, 0);
-            st = file.PWrite(offset, pad.data(), pad.size());
+            st = file->Append(Slice(pad.data(), pad.size()));
             if (!st.ok()) return st;
             crc = pomai::util::Crc32c(pad.data(), pad.size(), crc);
-            offset = entries_start_offset; // UPDATED: Correctly position offset for entries
         }
 
-        // Stream entries to disk (one at a time)
-        void* raw_buffer = nullptr;
-        if (posix_memalign(&raw_buffer, 4096, entry_size) != 0) {
-            return pomai::Status::IOError("posix_memalign failed");
-        }
-        
-        uint8_t* entry_buffer = static_cast<uint8_t*>(raw_buffer);
+        // Stream entries to disk
+        std::vector<uint8_t> entry_buffer(entry_size, 0);
 
         for (const auto& e : entries_) {
-            std::memset(entry_buffer, 0, entry_size);
+            std::memset(entry_buffer.data(), 0, entry_size);
             size_t cursor = 0;
             
             // ID (8 bytes)
-            const uint8_t* p_id = reinterpret_cast<const uint8_t*>(&e.id);
-            std::memcpy(entry_buffer + cursor, p_id, sizeof(e.id));
+            std::memcpy(entry_buffer.data() + cursor, &e.id, sizeof(e.id));
             cursor += sizeof(e.id);
             
-            // Flags + Padding (4 bytes: 1 flag + 3 pad)
+            // Flags + Padding (4 bytes)
             uint8_t flags = e.is_deleted ? kFlagTombstone : kFlagNone;
             entry_buffer[cursor++] = flags;
-            entry_buffer[cursor++] = 0;
-            entry_buffer[cursor++] = 0;
-            entry_buffer[cursor++] = 0;
+            cursor += 3; // padding
 
-            // Vector (dim * 1 bytes or dim * 4 bytes)
+            // Vector
             if (is_quantized) {
                 std::vector<uint8_t> encoded;
                 if (e.is_deleted) {
                     encoded.assign(dim_, 0); 
                 } else {
-                    std::span<const float> vec_span(e.vec.data, dim_);
-                    encoded = quantizer.Encode(vec_span);
+                    encoded = quantizer.Encode(e.vec.span());
                 }
-                std::memcpy(entry_buffer + cursor, encoded.data(), encoded.size());
+                std::memcpy(entry_buffer.data() + cursor, encoded.data(), encoded.size());
             } else {
                 if (e.is_deleted) {
-                    std::memcpy(entry_buffer + cursor, zero_buffer_.data(), dim_ * sizeof(float));
+                    std::memcpy(entry_buffer.data() + cursor, zero_buffer_.data(), dim_ * sizeof(float));
                 } else {
-                    std::memcpy(entry_buffer + cursor, e.vec.data, dim_ * sizeof(float));
+                    std::memcpy(entry_buffer.data() + cursor, e.vec.data, dim_ * sizeof(float));
                 }
             }
 
-            // Write entry
-            st = file.PWrite(offset, entry_buffer, entry_size);
-            if (!st.ok()) {
-                free(raw_buffer);
-                return st;
-            }
-            
-            // Update CRC incrementally
-            crc = pomai::util::Crc32c(entry_buffer, entry_size, crc);
-            
-            offset += entry_size;
+            st = file->Append(Slice(entry_buffer.data(), entry_size));
+            if (!st.ok()) return st;
+            crc = pomai::util::Crc32c(entry_buffer.data(), entry_size, crc);
         }
-        
-        free(raw_buffer);
 
         // Write Metadata Block
-        
         for (const auto& e : entries_) {
             offsets.push_back(blob.size());
             if (!e.meta.tenant.empty()) {
                 blob.insert(blob.end(), e.meta.tenant.begin(), e.meta.tenant.end());
             }
         }
-        offsets.push_back(blob.size()); // Final sentinel
+        offsets.push_back(blob.size());
 
         // Serialize offsets
-        st = file.PWrite(offset, offsets.data(), offsets.size() * sizeof(uint64_t));
+        st = file->Append(Slice(reinterpret_cast<const uint8_t*>(offsets.data()), offsets.size() * sizeof(uint64_t)));
         if (!st.ok()) return st;
         crc = pomai::util::Crc32c(reinterpret_cast<const uint8_t*>(offsets.data()), offsets.size() * sizeof(uint64_t), crc);
-        offset += offsets.size() * sizeof(uint64_t);
 
         // Serialize blob
         if (!blob.empty()) {
-            st = file.PWrite(offset, blob.data(), blob.size());
+            st = file->Append(Slice(reinterpret_cast<const uint8_t*>(blob.data()), blob.size()));
             if (!st.ok()) return st;
             crc = pomai::util::Crc32c(reinterpret_cast<const uint8_t*>(blob.data()), blob.size(), crc);
-            offset += blob.size();
         }
         
         // Write CRC footer
-        st = file.PWrite(offset, &crc, sizeof(crc));
+        st = file->Append(Slice(reinterpret_cast<const uint8_t*>(&crc), sizeof(crc)));
         if (!st.ok()) return st;
 
-        // Fsync data
-        st = file.SyncData();
+        st = file->Sync();
         if (!st.ok()) return st;
-        
-        st = file.Close();
+        st = file->Close();
         if (!st.ok()) return st;
 
-        // Rename to final path
-        if (rename(tmp_path.c_str(), path_.c_str()) != 0) {
-            return pomai::Status::IOError("rename failed");
-        }
+        std::error_code ec;
+        fs::rename(tmp_path, path_, ec);
+        if (ec) return pomai::Status::IOError("rename failed");
 
         return pomai::Status::Ok();
     }
@@ -336,28 +312,23 @@ namespace pomai::table
     // Reader Implementation
 
     SegmentReader::SegmentReader() = default;
-    SegmentReader::~SegmentReader() {
-        file_.Close();
-    }
+    SegmentReader::~SegmentReader() = default;
 
     pomai::Status SegmentReader::Open(std::string path, std::unique_ptr<SegmentReader> *out)
     {
         auto reader = std::unique_ptr<SegmentReader>(new SegmentReader());
         reader->path_ = path;
         
-        auto st = pomai::util::PosixFile::OpenRead(path, &reader->file_);
+        auto st = storage::PosixIOProvider::NewMemoryMappedFile(path, &reader->mmap_file_);
         if (!st.ok()) return st;
         
-        // Map file
-        const void* data = nullptr;
-        size_t size = 0;
-        st = reader->file_.Map(&data, &size);
-        if (!st.ok()) return st;
+        const uint8_t* data = reader->mmap_file_->Data();
+        size_t size = reader->mmap_file_->Size();
 
         if (size < sizeof(SegmentHeader)) return pomai::Status::Corruption("file too small");
 
         // Read Header from map
-        const SegmentHeader* h = static_cast<const SegmentHeader*>(data);
+        const SegmentHeader* h = reinterpret_cast<const SegmentHeader*>(data);
 
         if (strncmp(h->magic, kMagic, 12) != 0) return pomai::Status::Corruption("bad magic");
         
@@ -402,7 +373,7 @@ namespace pomai::table
             reader->metadata_offset_ = 0;
         }
 
-        reader->base_addr_ = static_cast<const uint8_t*>(data);
+        reader->base_addr_ = data;
         reader->file_size_ = size;
 
         // Verify size
@@ -467,16 +438,24 @@ namespace pomai::table
         return pomai::Status::NotFound("id not found in segment");
     }
 
-    pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec, pomai::Metadata* out_meta) const
+    pomai::Status SegmentReader::Get(pomai::VectorId id, pomai::PinnableSlice* out_vec, pomai::Metadata* out_meta) const
     {
-         auto res = Find(id, out_vec, out_meta);
-         if (res == FindResult::kFound) return pomai::Status::Ok();
+         const uint8_t* raw_payload = nullptr;
+         auto res = FindRaw(id, &raw_payload, out_meta);
+         if (res == FindResult::kFound) {
+             if (out_vec) {
+                 size_t bytes = is_quantized_ ? dim_ : (dim_ * sizeof(float));
+                 // Zero-copy: point directly to mmap
+                 out_vec->PinSelf(Slice(raw_payload, bytes));
+             }
+             return pomai::Status::Ok();
+         }
          if (res == FindResult::kFoundTombstone) return pomai::Status::NotFound("tombstone");
          return pomai::Status::NotFound("id not found in segment");
     }
 
-    // Backward compat overload
-    pomai::Status SegmentReader::Get(pomai::VectorId id, std::span<const float> *out_vec) const {
+    // Overload for convenience
+    pomai::Status SegmentReader::Get(pomai::VectorId id, pomai::PinnableSlice* out_vec) const {
         return Get(id, out_vec, nullptr);
     }
     

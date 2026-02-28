@@ -24,7 +24,7 @@
 #  include <immintrin.h>
 #endif
 
-// ARM NEON: use sse2neon shim from helio (maps SSE/AVX2 intrinsics to NEON)
+// ARM NEON: native intrinsics (maps SSE/AVX2 concepts to NEON)
 #if POMAI_ARM_SIMD
 #  include <arm_neon.h>
 #endif
@@ -349,5 +349,31 @@ namespace pomai::core
                    const float* db, std::size_t n, std::uint32_t dim,
                    float* results)
         { l2_batch_fn(query, db, n, dim, results); }
+
+    /**
+     * @brief Vectorized Batch Search (The "Orrify" Pattern).
+     * Distilled from DuckDB's vectorized execution.
+     */
+    void SearchBatch(std::span<const float> query, const FloatBatch& batch, 
+                     DistanceMetrics metric, float* results) {
+        if (batch.format() == VectorFormat::FLAT) {
+            if (metric == DistanceMetrics::DOT) {
+                DotBatch(query, batch.data(), batch.size(), batch.dim(), results);
+            } else {
+                L2SqBatch(query, batch.data(), batch.size(), batch.dim(), results);
+            }
+        } else if (batch.format() == VectorFormat::DICTIONARY) {
+            // Indirection (Selection Vector) processing
+            const uint32_t* sel = batch.selection();
+            for (uint32_t i = 0; i < batch.size(); ++i) {
+                const float* v = batch.get_vector(sel[i]);
+                if (metric == DistanceMetrics::DOT) {
+                    results[i] = Dot(query, {v, batch.dim()});
+                } else {
+                    results[i] = L2Sq(query, {v, batch.dim()});
+                }
+            }
+        }
+    }
 
 } // namespace pomai::core

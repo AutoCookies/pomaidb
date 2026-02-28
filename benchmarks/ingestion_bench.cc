@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<pomai::DB> db;
     auto st = pomai::DB::Open(opts, &db);
     if (!st.ok()) {
-        fprintf(stderr, "Open failed: %s\n", st.message().c_str());
+        fprintf(stderr, "Open failed: %s\n", st.message());
         return 1;
     }
     printf("DB opened with %u shards\n\n", opts.shard_count);
@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
             if (ids_batch.size() >= batch_size || i == num_vectors - 1) {
                 st = db->PutBatch(ids_batch, vecs_batch);
                 if (!st.ok()) {
-                     fprintf(stderr, "PutBatch failed at %u: %s\n", i, st.message().c_str());
+                     fprintf(stderr, "PutBatch failed at %u: %s\n", i, st.message());
                      return 1;
                 }
                 ids_batch.clear();
@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < num_vectors; ++i) {
             st = db->Put(i, vectors[i]);
             if (!st.ok()) {
-                fprintf(stderr, "Put failed at %u: %s\n", i, st.message().c_str());
+                fprintf(stderr, "Put failed at %u: %s\n", i, st.message());
                 return 1;
             }
             
