@@ -1385,8 +1385,37 @@ namespace pomai::core
             query_sums[q_idx] = s;
         }
 
-        // Process queries sequentially within this shard to avoid cache thrashing and oversubscription
-        // Parallelism comes from VectorEngine processing multiple shards at once.
+        // Parallelize query processing when we have a thread pool and multiple queries.
+        if (thread_pool_ && query_indices.size() > 1) {
+            const std::size_t num_workers = thread_pool_->Size();
+            // Use more chunks than workers (up to 8x) for better load balancing and CPU utilization.
+            const std::size_t num_chunks = std::min(8 * num_workers, query_indices.size());
+            const std::size_t chunk_size = std::max(std::size_t(1), (query_indices.size() + num_chunks - 1) / num_chunks);
+            std::vector<std::future<pomai::Status>> futures;
+            for (std::size_t start = 0; start < query_indices.size(); start += chunk_size) {
+                const std::size_t end = std::min(start + chunk_size, query_indices.size());
+                futures.push_back(thread_pool_->Enqueue([this, &queries, &query_indices, &query_sums,
+                                                        active, snap, topk, &opts, &shared_policy,
+                                                        use_visibility, out_results, start, end]() {
+                    for (std::size_t i = start; i < end; ++i) {
+                        const uint32_t q_idx = query_indices[i];
+                        std::span<const float> single_query(queries.data() + (q_idx * dim_), dim_);
+                        float q_sum = query_sums[q_idx];
+                        auto st = SearchLocalInternal(active, snap, single_query, q_sum, topk, opts,
+                                                      shared_policy, use_visibility, &(*out_results)[q_idx], false);
+                        if (!st.ok()) return st;
+                    }
+                    return pomai::Status::Ok();
+                }));
+            }
+            for (auto& f : futures) {
+                auto st = f.get();
+                if (!st.ok()) return st;
+            }
+            return pomai::Status::Ok();
+        }
+
+        // Sequential path: single query or no thread pool.
         for (uint32_t q_idx : query_indices) {
             std::span<const float> single_query(queries.data() + (q_idx * dim_), dim_);
             float q_sum = query_sums[q_idx];

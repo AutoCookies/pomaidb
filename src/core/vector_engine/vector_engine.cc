@@ -136,12 +136,8 @@ Status VectorEngine::OpenLocked() {
         if (hw == 0) {
             hw = 1;
         }
-        size_t target = hw > 1 ? (hw - 1) : 1;
-        // Do not cap by shard_count for batch searches. Queries can run in parallel.
-        threads = target;
-        if (threads == 0) {
-            threads = 1;
-        }
+        // Use all cores for search to maximize batch QPS.
+        threads = std::max(size_t(1), hw);
     }
     size_t segment_threads = std::max<size_t>(1, threads / 2);
     if (threads > 1) {

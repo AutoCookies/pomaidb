@@ -126,12 +126,14 @@ def run_pomai(base, queries, gt, lib_path: Path, repeats: int, metric: str):
     lib.pomai_options_init(ctypes.byref(opts))
     opts.struct_size = ctypes.sizeof(PomaiOptions)
     opts.path = str(tmpdir / "db").encode()
-    opts.shards = 4
+    # Use 1 shard for embedded benchmark: avoids 4x query work and 4x disk (no routing => every query would hit all shards).
+    opts.shards = 1
     opts.dim = base.shape[1]
+    opts.search_threads = os.cpu_count() or 8  # Use all cores for max QPS
     opts.index_type = 1 # HNSW
     opts.hnsw_m = 32
     opts.hnsw_ef_construction = 200
-    opts.hnsw_ef_search = 64
+    opts.hnsw_ef_search = 32  # Lower ef_search for higher QPS (recall still high at 100k scale)
     opts.adaptive_threshold = 0 
     opts.metric = 1 if metric == "ip" else 0
     check(lib.pomai_open(ctypes.byref(opts), ctypes.byref(db)))
@@ -206,7 +208,7 @@ def run_pomai(base, queries, gt, lib_path: Path, repeats: int, metric: str):
     rec = recall_at_k(pred_ids, gt, 10)
     return {
         "engine": "PomaiDB HNSW",
-        "params": {"shards": 4, "topk": 10, "M": 32, "efConstruction": 200, "efSearch": 64},
+        "params": {"shards": 1, "topk": 10, "M": 32, "efConstruction": 200, "efSearch": 32},
         "ingestion_time_s": ingestion_s,
         "index_build_time_s": build_s,
         "query_throughput_qps": float(np.mean(qps)),
