@@ -14,22 +14,22 @@ option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
 
 # =========================
 # Phase 3: mimalloc — vendored from third_party/mimalloc
-# (DragonflyDB patches pre-applied via: git apply patches/mimalloc-v2.2.4/*.patch)
+# (DragonflyDB patches pre-applied via: git apply patches/palloc-v2.2.4/*.patch)
 # =========================
-option(POMAI_USE_MIMALLOC "Use mimalloc as global allocator (MI_OVERRIDE=ON)" ON)
+option(POMAI_USE_PALLOC "Use palloc as global allocator (PALLOC_OVERRIDE=ON)" ON)
 
-if (POMAI_USE_MIMALLOC)
-  # mimalloc options — must be set BEFORE add_subdirectory
-  set(MI_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
-  set(MI_BUILD_OBJECT   OFF CACHE BOOL "" FORCE)
-  set(MI_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-  set(MI_OVERRIDE       ON  CACHE BOOL "" FORCE)   # replace malloc/free globally
-  set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
-  set(MI_USE_CXX        ON  CACHE BOOL "" FORCE)   # C++ new/delete overrides
-  add_subdirectory(third_party/mimalloc EXCLUDE_FROM_ALL)
-  message(STATUS "[pomai] mimalloc: enabled (static, MI_OVERRIDE=ON)")
+if (POMAI_USE_PALLOC)
+  # palloc options — must be set BEFORE add_subdirectory
+  set(PALLOC_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
+  set(PALLOC_BUILD_OBJECT   OFF CACHE BOOL "" FORCE)
+  set(PALLOC_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
+  set(PALLOC_OVERRIDE       ON  CACHE BOOL "" FORCE)   # replace malloc/free globally
+  set(PALLOC_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+  set(PALLOC_USE_CXX        ON  CACHE BOOL "" FORCE)   # C++ new/delete overrides
+  add_subdirectory(third_party/palloc EXCLUDE_FROM_ALL)
+  message(STATUS "[pomai] palloc: enabled (static, PALLOC_OVERRIDE=ON)")
 else()
-  message(STATUS "[pomai] mimalloc: disabled")
+  message(STATUS "[pomai] palloc: disabled")
 endif()
 
 
@@ -146,13 +146,13 @@ target_link_libraries(pomai_c_static PRIVATE pomai)
 # Safe model:
 #   - libpomai_c.so  -> NO mimalloc. Uses glibc malloc. Safe for ctypes/JNI/FFI.
 #   - libpomai_c.a   -> mimalloc-static. For standalone executables that own the heap.
-#   - test/bench exes -> inherit mimalloc from pomai_c_static.
+#   - test/bench exes -> inherit palloc from pomai_c_static.
 #
-if (POMAI_USE_MIMALLOC)
-  # Static wrapper: link mimalloc so executables that embed libpomai get the fast path.
-  target_link_libraries(pomai_c_static PRIVATE mimalloc-static)
-  target_compile_definitions(pomai_c_static PRIVATE POMAI_USE_MIMALLOC=1)
-  # Shared library: intentionally NO mimalloc link.
+if (POMAI_USE_PALLOC)
+  # Static wrapper: link palloc so executables that embed libpomai get the fast path.
+  target_link_libraries(pomai_c_static PRIVATE palloc-static)
+  target_compile_definitions(pomai_c_static PRIVATE POMAI_USE_PALLOC=1)
+  # Shared library: intentionally NO palloc link.
   # Internal allocations inside the .so use glibc, which is safe across FFI boundaries.
 endif()
 
