@@ -171,9 +171,11 @@ namespace pomai::storage
     static pomai::Status PWritevAll(int fd, std::uint64_t off, std::vector<iovec> iovecs)
     {
         std::size_t idx = 0;
+        const int iov_max = 1024; // Standard on Linux
         while (idx < iovecs.size())
         {
-            ssize_t w = ::pwritev(fd, &iovecs[idx], static_cast<int>(iovecs.size() - idx),
+            int batch_size = static_cast<int>(std::min<std::size_t>(iovecs.size() - idx, iov_max));
+            ssize_t w = ::pwritev(fd, &iovecs[idx], batch_size,
                                   static_cast<off_t>(off));
             if (w < 0)
             {
@@ -350,49 +352,52 @@ namespace pomai::storage
         if (ids.empty())
             return pomai::Status::Ok();  // No-op for empty batch
         
-        std::size_t total_bytes = 0;
+        std::size_t total_batch_bytes = 0;
         for (const auto& vec : vectors) {
-            total_bytes += sizeof(FrameHeader) + sizeof(RecordPrefix) + 
-                          vec.size_bytes() + sizeof(std::uint32_t);
+            total_batch_bytes += sizeof(FrameHeader) + sizeof(RecordPrefix) + 
+                                vec.size_bytes() + sizeof(std::uint32_t);
         }
         
         // Rotate if needed
-        auto st = RotateIfNeeded(total_bytes);
+        auto st = RotateIfNeeded(total_batch_bytes);
         if (!st.ok())
             return st;
         
-        std::uint64_t off = file_off_;
+        // Prepare consolidated iovecs to minimize context switches
+        struct TmpRecord {
+            FrameHeader fh;
+            RecordPrefix rp;
+            std::uint32_t crc;
+        };
+        std::vector<TmpRecord> tmps(ids.size());
+        std::vector<iovec> iovecs;
+        iovecs.reserve(ids.size() * 4);
+
         for (std::size_t i = 0; i < ids.size(); ++i) {
-            RecordPrefix rp{};
-            rp.seq = ++seq_;
-            rp.op = static_cast<std::uint8_t>(Op::kPut);
-            rp.id = ids[i];
-            rp.dim = vectors[i].dim;
+            tmps[i].rp.seq = ++seq_;
+            tmps[i].rp.op = static_cast<std::uint8_t>(Op::kPut);
+            tmps[i].rp.id = ids[i];
+            tmps[i].rp.dim = vectors[i].dim;
             
             const std::size_t payload_bytes = vectors[i].size_bytes();
             
-            FrameHeader fh{};
-            fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
+            tmps[i].fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + payload_bytes + sizeof(std::uint32_t));
             
-            std::uint32_t crc = pomai::util::Crc32c(&rp, sizeof(rp));
-            crc = pomai::util::Crc32c(vectors[i].data, payload_bytes, crc);
+            tmps[i].crc = pomai::util::Crc32c(&tmps[i].rp, sizeof(tmps[i].rp));
+            tmps[i].crc = pomai::util::Crc32c(vectors[i].data, payload_bytes, tmps[i].crc);
             
-            std::vector<iovec> iovecs;
-            iovecs.reserve(4);
-            iovecs.push_back({&fh, sizeof(fh)});
-            iovecs.push_back({&rp, sizeof(rp)});
+            iovecs.push_back({&tmps[i].fh, sizeof(tmps[i].fh)});
+            iovecs.push_back({&tmps[i].rp, sizeof(tmps[i].rp)});
             iovecs.push_back({const_cast<float *>(vectors[i].data), payload_bytes});
-            iovecs.push_back({&crc, sizeof(crc)});
-            
-            st = PWritevAll(impl_->file.fd(), off, std::move(iovecs));
-            if (!st.ok())
-                return st;
-            
-            off += sizeof(FrameHeader) + fh.len;
+            iovecs.push_back({&tmps[i].crc, sizeof(tmps[i].crc)});
         }
         
-        file_off_ += total_bytes;
-        bytes_in_seg_ += total_bytes;
+        st = PWritevAll(impl_->file.fd(), file_off_, std::move(iovecs));
+        if (!st.ok())
+            return st;
+        
+        file_off_ += total_batch_bytes;
+        bytes_in_seg_ += total_batch_bytes;
         
         // Single fsync for entire batch (KEY OPTIMIZATION)
         if (fsync_ == pomai::FsyncPolicy::kAlways)

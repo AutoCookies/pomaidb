@@ -7,8 +7,9 @@
 #endif
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
+#include <chrono>
+#include <deque>
+#include <future>
 
 #include "core/distance.h"
 #include "core/index/ivf_coarse.h"
@@ -197,6 +198,7 @@ namespace pomai::core
         struct CompactState {
             Phase phase{Phase::kBuild};
             std::vector<std::shared_ptr<table::SegmentReader>> input_segments;
+            std::deque<std::vector<float>> compact_buffers; // Stable pointers for builder views
             std::priority_queue<CompactCursor, std::vector<CompactCursor>, std::greater<CompactCursor>> heap;
             VectorId last_id{std::numeric_limits<VectorId>::max()};
             bool is_first{true};
@@ -210,11 +212,10 @@ namespace pomai::core
             std::uint64_t tombstones_purged{0};
             std::uint64_t old_versions_dropped{0};
             std::uint64_t live_entries_kept{0};
-            std::list<std::vector<float>> compact_buffers;
         };
 
-        BackgroundJob(Type t, FreezeState st) : type(t), state(std::move(st)) {}
-        BackgroundJob(Type t, CompactState st) : type(t), state(std::move(st)) {}
+        BackgroundJob(Type t, FreezeState st, std::promise<pomai::Status> p) : type(t), done(std::move(p)), state(std::move(st)) {}
+        BackgroundJob(Type t, CompactState st, std::promise<pomai::Status> p) : type(t), done(std::move(p)), state(std::move(st)) {}
 
         Type type;
         std::promise<pomai::Status> done;
@@ -576,13 +577,15 @@ namespace pomai::core
              if (seg->FindRaw(id, &raw_payload, nullptr) == table::SegmentReader::FindResult::kFound) {
                  out->raw_data_ptr = raw_payload;
                  out->dim = seg->Dim();
-                 if (seg->IsQuantized()) {
-                     out->quant_min = seg->GetQuantizer()->GetGlobalMin();
-                     out->quant_inv_scale = seg->GetQuantizer()->GetGlobalInvScale();
-                 } else {
-                     out->quant_min = 0;
-                     out->quant_inv_scale = 1.0f;
-                 }
+                  out->quant_type = static_cast<int>(seg->GetQuantType());
+                  if (seg->GetQuantType() == pomai::QuantizationType::kSq8) {
+                      auto* sq8 = static_cast<const core::ScalarQuantizer8Bit*>(seg->GetQuantizer());
+                      out->quant_min = sq8->GetGlobalMin();
+                      out->quant_inv_scale = sq8->GetGlobalInvScale();
+                  } else {
+                      out->quant_min = 0;
+                      out->quant_inv_scale = 1.0f;
+                  }
                  out->session_id = 0; // Filled later
                  return pomai::Status::Ok();
              }
@@ -876,8 +879,7 @@ namespace pomai::core
         state.memtables = frozen_mem_;
         state.target_frozen_count = frozen_mem_.size();
         state.wal_epoch_at_start = wal_epoch_;
-        auto job = std::make_unique<BackgroundJob>(BackgroundJob::Type::kFreeze, std::move(state));
-        job->done = std::move(c.done);
+        auto job = std::make_unique<BackgroundJob>(BackgroundJob::Type::kFreeze, std::move(state), std::move(c.done));
 
         background_job_ = std::move(job);
         return std::nullopt;
@@ -887,7 +889,7 @@ namespace pomai::core
     // HandleCompact: Budgeted background compaction
     // -------------------------
 
-    std::optional<pomai::Status> ShardRuntime::HandleCompact(CompactCmd & /*c*/)
+    std::optional<pomai::Status> ShardRuntime::HandleCompact(CompactCmd & c)
     {
         POMAI_LOG_INFO("[shard:{}] Starting background compaction", shard_id_);
         if (background_job_) return std::nullopt; // Keep in queue
@@ -909,15 +911,22 @@ namespace pomai::core
 
         // 2. Pick task
         auto task = compaction_manager_->PickCompaction(stats);
-        if (!task.valid) {
+        if (!task.valid && segments_.size() <= 1) {
             return pomai::Status::Ok(); // Nothing to compact
         }
 
-        // 3. Setup background job
+        // If manual compaction and we have multiple segments, force L0->L1
+        if (!task.valid) {
+            task.input_level = 0;
+            task.output_level = 1;
+            task.valid = true;
+        }
+
         BackgroundJob::CompactState state;
         // For now, compact all segments in L0 since we are simplifying.
         state.input_segments = segments_; 
-        background_job_ = std::make_unique<BackgroundJob>(BackgroundJob::Type::kCompact, std::move(state));
+        state.old_segments = segments_;
+        background_job_ = std::make_unique<BackgroundJob>(BackgroundJob::Type::kCompact, std::move(state), std::move(c.done));
 
         return std::nullopt; // Async
     }
@@ -1171,7 +1180,7 @@ namespace pomai::core
                             pomai::Metadata meta;
                             auto res = state.input_segments[top.seg_idx]->FindAndDecode(top.id, &vec_mapped, &vec_decoded, &meta);
                             if (res == table::SegmentReader::FindResult::kFound) {
-                                if (state.input_segments[top.seg_idx]->IsQuantized()) {
+                                if (state.input_segments[top.seg_idx]->GetQuantType() != pomai::QuantizationType::kNone) {
                                     state.compact_buffers.push_back(std::move(vec_decoded));
                                     vec_mapped = std::span<const float>(state.compact_buffers.back());
                                 }
@@ -1182,7 +1191,6 @@ namespace pomai::core
                                     state.filepath = (fs::path(shard_dir_) / state.filename).string();
                                     state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_, index_params_, metric_);
                                 }
-                                std::cout << "TEST_DEBUG COMPACT PRE-ADD id: " << top.id << " vec_mapped[0]: " << vec_mapped[0] << std::endl;
                                 auto st = state.builder->Add(top.id, pomai::VectorView(vec_mapped), false, meta);
                                 if (!st.ok()) {
                                     complete_job(pomai::Status::Internal(std::string("Compact: SegmentBuilder::Add failed: ") + st.message()));
@@ -1274,7 +1282,11 @@ namespace pomai::core
             } else if (state.phase == BackgroundJob::Phase::kCleanup) {
                 for (const auto& old : state.old_segments) {
                     std::error_code ec;
-                    fs::remove(old->Path(), ec);
+                    std::string p = old->Path();
+                    fs::remove(p, ec);
+                    if (ec) {
+                        // POMAI_LOG_ERROR("Cleanup failed: {}", ec.message());
+                    }
                 }
                 state.phase = BackgroundJob::Phase::kPublish;
             } else if (state.phase == BackgroundJob::Phase::kPublish) {
@@ -1501,9 +1513,16 @@ namespace pomai::core
                         return local.Drain();
                     }
                 }
-                if (seg->IsQuantized()) {
-                    float q_min = seg->GetQuantizer()->GetGlobalMin();
-                    float q_inv_scale = seg->GetQuantizer()->GetGlobalInvScale();
+                if (seg->GetQuantType() != pomai::QuantizationType::kNone) {
+                    const auto quant_type = seg->GetQuantType();
+                    float q_min = 0.0f;
+                    float q_inv_scale = 0.0f;
+                    if (quant_type == pomai::QuantizationType::kSq8) {
+                        auto* sq8 = static_cast<const core::ScalarQuantizer8Bit*>(seg->GetQuantizer());
+                        q_min = sq8->GetGlobalMin();
+                        q_inv_scale = sq8->GetGlobalInvScale();
+                    }
+
                     thread_local std::vector<uint32_t> cand_reuse;
                     cand_reuse.clear();
                     if (seg->Search(query, effective_nprobe, &cand_reuse).ok()) {
@@ -1513,7 +1532,21 @@ namespace pomai::core
                             const uint8_t* p = seg->GetBaseAddr() + seg->GetEntriesStartOffset() + idx * seg->GetEntrySize();
                             const uint8_t* codes_ptr = p + 12; // Assuming ID (8 bytes) + is_deleted (1 byte) + metadata_len (3 bytes) = 12 bytes offset
                             if (!(*(p+8) & 0x01)) { // not tombstone, assuming is_deleted is at offset 8
-                                local.Push(*(uint64_t*)p, pomai::core::DotSq8(query, std::span<const uint8_t>(codes_ptr, dim_), q_min, q_inv_scale, query_sum));
+                                float score = 0.0f;
+                                const bool is_ip = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine);
+                                if (quant_type == pomai::QuantizationType::kSq8) {
+                                    score = pomai::core::DotSq8(query, std::span<const uint8_t>(codes_ptr, dim_), q_min, q_inv_scale, query_sum);
+                                    if (!is_ip) {
+                                        // TODO: Implement L2 for SQ8 or decode. For now IP only in fast path.
+                                    }
+                                } else if (quant_type == pomai::QuantizationType::kFp16) {
+                                    if (is_ip) {
+                                        score = pomai::core::DotFp16(query, {reinterpret_cast<const uint16_t*>(codes_ptr), dim_});
+                                    } else {
+                                        score = -pomai::core::L2SqFp16(query, {reinterpret_cast<const uint16_t*>(codes_ptr), dim_});
+                                    }
+                                }
+                                local.Push(*(uint64_t*)p, score);
                             }
                         }
                         total_scanned.fetch_add(local_scanned, std::memory_order_relaxed);
@@ -1534,9 +1567,15 @@ namespace pomai::core
                     pomai::Metadata local_meta;
                     pomai::Metadata* meta_ptr = has_filters ? &local_meta : nullptr;
                     
-                    if (seg->IsQuantized()) {
-                        float q_min = seg->GetQuantizer()->GetGlobalMin();
-                        float q_inv_scale = seg->GetQuantizer()->GetGlobalInvScale();
+                    if (seg->GetQuantType() != pomai::QuantizationType::kNone) {
+                        const auto quant_type = seg->GetQuantType();
+                        float q_min = 0.0f;
+                        float q_inv_scale = 0.0f;
+                        if (quant_type == pomai::QuantizationType::kSq8) {
+                            auto* sq8 = static_cast<const core::ScalarQuantizer8Bit*>(seg->GetQuantizer());
+                            q_min = sq8->GetGlobalMin();
+                            q_inv_scale = sq8->GetGlobalInvScale();
+                        }
 
                         for (const uint32_t entry_idx : cand_idxs_reuse) {
                             ++local_scanned;
@@ -1552,7 +1591,20 @@ namespace pomai::core
                             }
                             if (has_filters && !seg_mask.Test(entry_idx)) continue;
 
-                            float score = pomai::core::DotSq8(query, codes, q_min, q_inv_scale, query_sum);
+                            float score = 0.0f;
+                            const bool is_ip = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine);
+                            if (quant_type == pomai::QuantizationType::kSq8) {
+                                score = pomai::core::DotSq8(query, codes, q_min, q_inv_scale, query_sum);
+                                if (!is_ip) {
+                                    // IP only for SQ8 for now.
+                                }
+                            } else if (quant_type == pomai::QuantizationType::kFp16) {
+                                if (is_ip) {
+                                    score = pomai::core::DotFp16(query, {reinterpret_cast<const uint16_t*>(codes.data()), codes.size()/2});
+                                } else {
+                                    score = -pomai::core::L2SqFp16(query, {reinterpret_cast<const uint16_t*>(codes.data()), codes.size()/2});
+                                }
+                            }
                             local.Push(id, score);
                         }
                     } else {

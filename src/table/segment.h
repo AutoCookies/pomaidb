@@ -13,6 +13,7 @@
 #include "pomai/metadata.h"
 #include "pomai/options.h"
 #include "pomai/quantization/scalar_quantizer.h"
+#include "pomai/quantization/half_float_quantizer.h"
 #include "core/storage/io_provider.h"
 #include "util/slice.h"
 
@@ -40,7 +41,7 @@ namespace pomai::table
         uint32_t count;
         uint32_t dim;
         uint32_t metadata_offset; // V3+: Offset to metadata block (0 if none)
-        uint8_t  is_quantized;    // V4+: 1 if vectors are SQ8 (uint8_t)
+        uint8_t  quant_type;      // V4+: QuantizationType (0=None, 1=SQ8, 2=FP16)
         uint8_t  reserved1[3];
         float    quant_min;       // SQ8 minimum bound
         float    quant_inv_scale; // SQ8 global inverse scale
@@ -65,8 +66,8 @@ namespace pomai::table
         pomai::Status Get(pomai::VectorId id, pomai::PinnableSlice* out_vec) const;
         
         // V4: Quantized raw lookup
-        bool IsQuantized() const { return is_quantized_; }
-        const core::ScalarQuantizer8Bit* GetQuantizer() const { return quantizer_.get(); }
+        pomai::QuantizationType GetQuantType() const { return quant_type_; }
+        const core::VectorQuantizer<float>* GetQuantizer() const { return quantizer_.get(); }
         pomai::Status GetQuantized(pomai::VectorId id, std::span<const uint8_t>* out_codes, pomai::Metadata* out_meta) const;
 
         enum class FindResult {
@@ -139,8 +140,8 @@ namespace pomai::table
                  std::span<const float> vec_span;
                  
                  if (!is_deleted) {
-                     if (is_quantized_) {
-                         std::span<const uint8_t> codes(static_cast<const uint8_t*>(vec_ptr), dim_);
+                     if (quant_type_ != pomai::QuantizationType::kNone) {
+                         size_t codes_bytes = dim_; if (quant_type_ == pomai::QuantizationType::kFp16) codes_bytes *= 2; std::span<const uint8_t> codes(static_cast<const uint8_t*>(vec_ptr), codes_bytes);
                          decoded = quantizer_->Decode(codes);
                          vec_span = decoded;
                      } else {
@@ -176,8 +177,8 @@ namespace pomai::table
         uint32_t metadata_offset_ = 0;
         
         // V4: Quantization properties
-        bool is_quantized_{false};
-        std::unique_ptr<core::ScalarQuantizer8Bit> quantizer_;
+        pomai::QuantizationType quant_type_{pomai::QuantizationType::kNone};
+        std::unique_ptr<core::VectorQuantizer<float>> quantizer_;
         
         const uint8_t* base_addr_ = nullptr;
         std::size_t file_size_ = 0;

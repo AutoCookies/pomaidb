@@ -148,7 +148,7 @@ namespace pomai::core
             if (st.ok()) {
                 current_id_ = id;
                 if (!is_deleted) {
-                    if (seg->IsQuantized()) {
+                    if (seg->GetQuantType() != pomai::QuantizationType::kNone) {
                         std::vector<float> decoded;
                         seg->FindAndDecode(id, nullptr, &decoded, nullptr);
                         current_vec_.assign(decoded.begin(), decoded.end());

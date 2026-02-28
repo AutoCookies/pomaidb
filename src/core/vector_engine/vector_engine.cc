@@ -316,20 +316,65 @@ Status VectorEngine::PutBatch(const std::vector<VectorId>& ids, const std::vecto
         shard_vecs[i].reserve(reserve_size);
     }
 
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (static_cast<uint32_t>(vectors[i].size()) != opt_.dim) {
-            return Status::InvalidArgument("vector_engine dim mismatch");
+    // Phase 2 Optimization: Batched Routing
+    // instead of N lock acquisitions/seqlock increments, we do 1 per batch.
+    if (!opt_.routing_enabled || routing_mode_.load() != routing::RoutingMode::kReady || !routing_current_) {
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (static_cast<uint32_t>(vectors[i].size()) != opt_.dim) {
+                return Status::InvalidArgument("vector_engine dim mismatch");
+            }
+            if (opt_.routing_enabled) MaybeWarmupAndInitRouting(vectors[i]);
+            const uint32_t s = ShardOf(ids[i], shard_count);
+            shard_ids[s].push_back(ids[i]);
+            shard_vecs[s].push_back(vectors[i]);
         }
-        const uint32_t s = RouteShardForVector(ids[i], vectors[i]);
-        shard_ids[s].push_back(ids[i]);
-        shard_vecs[s].push_back(vectors[i]);
+    } else {
+        auto table = routing_current_;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (static_cast<uint32_t>(vectors[i].size()) != opt_.dim) {
+                return Status::InvalidArgument("vector_engine dim mismatch");
+            }
+            const uint32_t s = table->RouteVector(vectors[i]);
+            shard_ids[s].push_back(ids[i]);
+            shard_vecs[s].push_back(vectors[i]);
+        }
+
+        shard_router_.Update([&]{
+            if (routing_mutable_) {
+                for (const auto& vec : vectors) {
+                    routing::OnlineUpdate(routing_mutable_.get(), vec);
+                }
+            }
+        });
+        puts_since_persist_ += static_cast<uint32_t>(ids.size());
+        MaybePersistRoutingAsync();
     }
+
+    // Phase 2 Optimization: Parallel Ingestion
+    // Fan out to all shards concurrently using the search thread pool.
+    std::vector<std::future<Status>> futures;
+    futures.reserve(shard_count);
 
     for (uint32_t i = 0; i < shard_count; ++i) {
         if (shard_ids[i].empty()) continue;
-        Status st = shards_[i]->PutBatch(shard_ids[i], shard_vecs[i]);
+        
+        auto task = [this, i, ids_ptr = &shard_ids[i], vecs_ptr = &shard_vecs[i]]() {
+            return shards_[i]->PutBatch(*ids_ptr, *vecs_ptr);
+        };
+
+        if (search_pool_) {
+            futures.push_back(search_pool_->Enqueue(std::move(task)));
+        } else {
+            Status st = task();
+            if (!st.ok()) return st;
+        }
+    }
+
+    for (auto& f : futures) {
+        Status st = f.get();
         if (!st.ok()) return st;
     }
+
     return Status::Ok();
 }
 

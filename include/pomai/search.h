@@ -24,6 +24,7 @@ namespace pomai
         uint32_t dim = 0;
         float quant_min = 0.0f;
         float quant_inv_scale = 0.0f;
+        int quant_type = 0; // 0=None, 1=SQ8, 2=FP16
         uint64_t session_id = 0;
     };
 

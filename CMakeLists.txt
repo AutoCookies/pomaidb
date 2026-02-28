@@ -58,6 +58,7 @@ add_library(pomai STATIC
   src/core/storage/compaction_manager.cc
 
   src/core/quantization/scalar_quantizer.cc
+  src/core/quantization/half_float_quantizer.cc
   src/core/index/ivf_coarse.cc
   src/core/index/ivf_flat.cc
   src/core/distance.cc
@@ -263,6 +264,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(segment_test tests/unit/segment_test.cc)
   pomai_setup_test(segment_test)
   pomai_add_labeled_test(segment_test "unit")
+
+  add_executable(fp16_test tests/unit/fp16_test.cc)
+  pomai_setup_test(fp16_test)
+  pomai_add_labeled_test(fp16_test "unit")
   
   add_executable(shard_manifest_test tests/unit/shard_manifest_test.cc)
   pomai_setup_test(shard_manifest_test)

@@ -54,12 +54,14 @@ LookupResult LookupById(const std::shared_ptr<table::MemTable>& active,
         if (st.ok()) {
             res.state = LookupState::kFound;
             // Map PinnableSlice data back to span<float> for existing consumers
-            if (!segment->IsQuantized()) {
+            if (segment->GetQuantType() == pomai::QuantizationType::kNone) {
                 res.vec = std::span<const float>(reinterpret_cast<const float*>(res.pinnable_vec.data()), static_cast<std::size_t>(dim));
             } else {
                 // If quantized, we still need to decode for the 'vec' span if requested.
                 // However, for pure zero-copy distillation, we prioritize the raw pinned data.
-                res.decoded_vec = segment->GetQuantizer()->Decode(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(res.pinnable_vec.data()), static_cast<std::size_t>(dim)));
+                size_t bytes = dim;
+                if (segment->GetQuantType() == pomai::QuantizationType::kFp16) bytes *= 2;
+                res.decoded_vec = segment->GetQuantizer()->Decode(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(res.pinnable_vec.data()), bytes));
                 res.vec = res.decoded_vec;
             }
             return res;

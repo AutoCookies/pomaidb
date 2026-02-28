@@ -28,7 +28,7 @@ POMAI_TEST(DB_SegmentLoading_ReadTest) {
     spec.name = membrane;
     spec.dim = dim;
     spec.shard_count = 1;
-    spec.metric = pomai::MetricType::kL2;
+    spec.metric = pomai::MetricType::kInnerProduct;
     
     POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, spec));
     
@@ -170,7 +170,9 @@ POMAI_TEST(DB_FreezeAndCompact) {
     fs::path shard_dir = fs::path(root) / "membranes" / membrane / "shards" / "0";
     int seg_count = 0;
     for (const auto& entry : fs::directory_iterator(shard_dir)) {
-        if (entry.path().extension() == ".dat") seg_count++;
+        if (entry.path().extension() == ".dat") {
+            seg_count++;
+        }
     }
     POMAI_EXPECT_EQ(seg_count, 1);
 }

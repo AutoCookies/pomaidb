@@ -30,6 +30,13 @@ namespace pomai
         kHnsw = 1,
     };
 
+    enum class QuantizationType : uint8_t
+    {
+        kNone = 0,
+        kSq8 = 1,
+        kFp16 = 2,
+    };
+
     struct IndexParams
     {
         IndexType type = IndexType::kIvfFlat;
@@ -44,6 +51,7 @@ namespace pomai
         // (guaranteeing 100% recall). Larger segments use HNSW graph traversal.
         // Default: 0 = always use HNSW when available (rely on ef_search for recall).
         uint32_t adaptive_threshold = 5000;
+        QuantizationType quant_type = QuantizationType::kNone;
     };
 
     struct DBOptions

@@ -80,29 +80,38 @@ namespace pomai::table
         h.version = 6; // V6: 64-byte alignment + IVF positional indices
         h.count = static_cast<uint32_t>(entries_.size());
         h.dim = dim_;
-        // Use quantization if requested in IndexParams (or by default)
-        const bool use_quantization = true; // For now keep default as it was intended, but fix logic
-        h.is_quantized = use_quantization ? 1 : 0;
+        // Use quantization if requested in IndexParams
+        const pomai::QuantizationType quant_type = index_params_.quant_type;
+        h.quant_type = static_cast<uint8_t>(quant_type);
         
         // Train Quantizer
-        core::ScalarQuantizer8Bit quantizer(dim_);
-        std::vector<float> training_data;
-        training_data.reserve(entries_.size() * dim_);
-        
-        for (const auto& e : entries_) {
-            if (!e.is_deleted) {
-                training_data.insert(training_data.end(), e.vec.data, e.vec.data + dim_);
-            }
+        std::unique_ptr<core::VectorQuantizer<float>> quantizer;
+        if (quant_type == pomai::QuantizationType::kSq8) {
+            quantizer = std::make_unique<pomai::core::ScalarQuantizer8Bit>(dim_);
+        } else if (quant_type == pomai::QuantizationType::kFp16) {
+            quantizer = std::make_unique<pomai::core::HalfFloatQuantizer>(dim_);
         }
-        
-        if (!training_data.empty()) {
-            auto train_st = quantizer.Train(training_data, training_data.size() / dim_);
-            if (!train_st.ok()) return train_st;
-            h.quant_min = quantizer.GetGlobalMin();
-            h.quant_inv_scale = quantizer.GetGlobalInvScale();
-        } else {
-            h.quant_min = 0.0f;
-            h.quant_inv_scale = 0.0f;
+
+        if (quantizer) {
+            std::vector<float> training_data;
+            training_data.reserve(entries_.size() * dim_);
+            
+            for (const auto& e : entries_) {
+                if (!e.is_deleted) {
+                    training_data.insert(training_data.end(), e.vec.data, e.vec.data + dim_);
+                }
+            }
+            
+            if (!training_data.empty()) {
+                auto train_st = quantizer->Train(training_data, training_data.size() / dim_);
+                if (!train_st.ok()) return train_st;
+                
+                if (quant_type == pomai::QuantizationType::kSq8) {
+                    auto* sq8 = static_cast<core::ScalarQuantizer8Bit*>(quantizer.get());
+                    h.quant_min = sq8->GetGlobalMin();
+                    h.quant_inv_scale = sq8->GetGlobalInvScale();
+                }
+            }
         }
         
         // Prepare metadata arrays
@@ -114,8 +123,11 @@ namespace pomai::table
         size_t entry_size = 0;
         uint32_t entries_start_offset = 0;
         
-        const bool is_quantized = (h.is_quantized != 0);
-        const size_t element_size = is_quantized ? sizeof(uint8_t) : sizeof(float);
+        const pomai::QuantizationType h_quant_type = static_cast<pomai::QuantizationType>(h.quant_type);
+        const bool is_quantized = (h_quant_type != pomai::QuantizationType::kNone);
+        size_t element_size = sizeof(float);
+        if (h_quant_type == pomai::QuantizationType::kSq8) element_size = sizeof(uint8_t);
+        else if (h_quant_type == pomai::QuantizationType::kFp16) element_size = sizeof(uint16_t);
 
         if (h.version >= 6) {
             size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * element_size;
@@ -174,9 +186,9 @@ namespace pomai::table
             if (is_quantized) {
                 std::vector<uint8_t> encoded;
                 if (e.is_deleted) {
-                    encoded.assign(dim_, 0); 
+                    encoded.assign(dim_ * element_size, 0); 
                 } else {
-                    encoded = quantizer.Encode(e.vec.span());
+                    encoded = quantizer->Encode(e.vec.span());
                 }
                 std::memcpy(entry_buffer.data() + cursor, encoded.data(), encoded.size());
             } else {
@@ -348,19 +360,24 @@ namespace pomai::table
         }
 
         if (h->version >= 4) {
-            reader->is_quantized_ = (h->is_quantized == 1);
+            reader->quant_type_ = static_cast<pomai::QuantizationType>(h->quant_type);
         } else {
-            reader->is_quantized_ = false;
+            reader->quant_type_ = pomai::QuantizationType::kNone;
         }
         
-        if (reader->is_quantized_) {
+        if (reader->quant_type_ != pomai::QuantizationType::kNone) {
             if (h->version < 5) {
-                reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(uint8_t);
+                const size_t elem_size = (reader->quant_type_ == pomai::QuantizationType::kFp16) ? 2 : 1;
+                reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * elem_size;
             }
             
-            // Initialize quantizer from explicitly serialized floats
-            reader->quantizer_ = std::make_unique<core::ScalarQuantizer8Bit>(h->dim);
-            reader->quantizer_->LoadState(h->quant_min, h->quant_inv_scale);
+            if (reader->quant_type_ == pomai::QuantizationType::kSq8) {
+                auto sq8 = std::make_unique<pomai::core::ScalarQuantizer8Bit>(h->dim);
+                sq8->LoadState(h->quant_min, h->quant_inv_scale);
+                reader->quantizer_ = std::move(sq8);
+            } else if (reader->quant_type_ == pomai::QuantizationType::kFp16) {
+                reader->quantizer_ = std::make_unique<pomai::core::HalfFloatQuantizer>(h->dim);
+            }
         } else {
             if (h->version < 5) {
                 reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * sizeof(float);
@@ -426,12 +443,14 @@ namespace pomai::table
 
     pomai::Status SegmentReader::GetQuantized(pomai::VectorId id, std::span<const uint8_t>* out_codes, pomai::Metadata* out_meta) const
     {
-        if (!is_quantized_) return pomai::Status::InvalidArgument("Segment is not quantized");
+        if (quant_type_ == pomai::QuantizationType::kNone) return pomai::Status::InvalidArgument("Segment is not quantized");
         
         const uint8_t* raw_payload = nullptr;
         auto res = FindRaw(id, &raw_payload, out_meta);
         if (res == FindResult::kFound) {
-            if (out_codes) *out_codes = std::span<const uint8_t>(raw_payload, dim_);
+            size_t bytes = dim_; // SQ8
+            if (quant_type_ == pomai::QuantizationType::kFp16) bytes *= 2;
+            if (out_codes) *out_codes = std::span<const uint8_t>(raw_payload, bytes);
             return pomai::Status::Ok();
         }
         if (res == FindResult::kFoundTombstone) return pomai::Status::NotFound("tombstone");
@@ -444,9 +463,11 @@ namespace pomai::table
          auto res = FindRaw(id, &raw_payload, out_meta);
          if (res == FindResult::kFound) {
              if (out_vec) {
-                 size_t bytes = is_quantized_ ? dim_ : (dim_ * sizeof(float));
+                 size_t bytes = dim_ * sizeof(float);
+                 if (quant_type_ == pomai::QuantizationType::kSq8) bytes = dim_;
+                 else if (quant_type_ == pomai::QuantizationType::kFp16) bytes = dim_ * 2;
                  // Zero-copy: point directly to mmap
-                 out_vec->PinSelf(Slice(raw_payload, bytes));
+                 out_vec->PinSlice(Slice(raw_payload, bytes), nullptr);
              }
              return pomai::Status::Ok();
          }
@@ -469,7 +490,7 @@ namespace pomai::table
         // For backwards compatibility and instances where we don't need a decoded buffer safely (e.g. tests)
         // If it's quantized, it will just flatly fail with this signature since span<const float>
         // implies pointing into mmap memory, which doesn't exist.
-        if (is_quantized_) return FindResult::kNotFound;
+        if (quant_type_ != pomai::QuantizationType::kNone) return FindResult::kNotFound;
         
         const uint8_t* raw_payload = nullptr;
         auto res = FindRaw(id, &raw_payload, out_meta);
@@ -493,9 +514,11 @@ namespace pomai::table
         }
         
         if (res == FindResult::kFound) {
-            if (is_quantized_) {
+            if (quant_type_ != pomai::QuantizationType::kNone) {
                 if (out_vec_decoded) {
-                    *out_vec_decoded = quantizer_->Decode(std::span<const uint8_t>(raw_payload, dim_));
+                    size_t bytes = dim_;
+                    if (quant_type_ == pomai::QuantizationType::kFp16) bytes *= 2;
+                    *out_vec_decoded = quantizer_->Decode(std::span<const uint8_t>(raw_payload, bytes));
                     if (out_vec_mapped) *out_vec_mapped = *out_vec_decoded;
                 }
             } else {
@@ -562,11 +585,13 @@ namespace pomai::table
         if (out_deleted) *out_deleted = is_deleted;
 
         if (out_codes) {
-             if (is_deleted || !is_quantized_) {
+             if (is_deleted || quant_type_ == pomai::QuantizationType::kNone) {
                  *out_codes = {};
              } else {
                  const uint8_t* code_ptr = p + 12;
-                 *out_codes = std::span<const uint8_t>(code_ptr, dim_);
+                 size_t bytes = dim_;
+                 if (quant_type_ == pomai::QuantizationType::kFp16) bytes *= 2;
+                 *out_codes = std::span<const uint8_t>(code_ptr, bytes);
              }
         }
         
@@ -595,7 +620,7 @@ namespace pomai::table
              if (is_deleted) {
                  *out_vec = {};
              } else {
-                 if (is_quantized_) {
+                 if (quant_type_ != pomai::QuantizationType::kNone) {
                      // ReadAt returning span<float> is incompatible with quantizer without allocation wrapper.
                      // The caller must decode using ForEach or GetQuantized. 
                      // We return an empty span here and rely on higher layers utilizing FindAndDecode across Segments.

@@ -22,6 +22,10 @@ namespace pomai::core
                  std::span<const uint8_t> codes,
                  float min_val, float inv_scale, float query_sum = 0.0f);
 
+    // Distances for FP16 quantized codes
+    float DotFp16(std::span<const float> query, std::span<const uint16_t> codes);
+    float L2SqFp16(std::span<const float> query, std::span<const uint16_t> codes);
+
     // ── Batch distances ──
     void DotBatch(std::span<const float> query,
                   const float* db,
