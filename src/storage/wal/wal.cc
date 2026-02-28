@@ -444,7 +444,7 @@ namespace pomai::storage
                 if (std::memcmp(hdr.magic, kWalMagic, sizeof(hdr.magic)) == 0)
                 {
                     if (hdr.version != kWalVersion)
-                        return pomai::Status::Corruption("wal version mismatch");
+                        return pomai::Status::Aborted("wal version mismatch");
                     off = sizeof(WalFileHeader);
                 }
             }

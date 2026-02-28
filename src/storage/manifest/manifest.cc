@@ -69,9 +69,9 @@ namespace pomai::storage
             if (!in.good())
                 return pomai::Status::IOError("read failed");
 
-            // CRC validation
+            // CRC validation (return kAborted for crash-safety: caller should not retry corrupted manifest)
             if (n < 4)
-                return pomai::Status::Corruption("file too short for CRC");
+                return pomai::Status::Aborted("file too short for CRC");
 
             uint32_t stored_crc;
             const size_t content_len = static_cast<size_t>(n) - 4;
@@ -87,7 +87,7 @@ namespace pomai::storage
 
             uint32_t computed = pomai::util::Crc32c(buf.data(), content_len);
             if (computed != stored_crc)
-                return pomai::Status::Corruption("CRC mismatch");
+                return pomai::Status::Aborted("CRC mismatch");
 
             *out = buf.substr(0, content_len);
             return pomai::Status::Ok();
@@ -195,9 +195,9 @@ namespace pomai::storage
             std::size_t p = sv.find('\n');
             std::string_view header = (p == std::string_view::npos) ? sv : sv.substr(0, p);
             
-            // Checking for v3
+            // Checking for v3 (kAborted for crash-safety: corrupted/invalid manifest)
             if (header != "pomai.manifest.v3")
-                return pomai::Status::Corruption("bad manifest header: expected v3");
+                return pomai::Status::Aborted("bad manifest header: expected v3");
             
             sv = (p == std::string_view::npos) ? std::string_view{} : sv.substr(p + 1);
 

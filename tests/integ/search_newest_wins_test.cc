@@ -26,7 +26,7 @@ POMAI_TEST(SearchNewestWins_DeterministicAndTombstone) {
     spec.name = membrane;
     spec.dim = dim;
     spec.shard_count = 1;
-    spec.metric = pomai::MetricType::kL2;
+    spec.metric = pomai::MetricType::kInnerProduct;  // exact match gives score 1.0; L2 would give 0
 
     POMAI_EXPECT_OK(pomai::storage::Manifest::CreateMembrane(root, spec));
 
@@ -79,7 +79,7 @@ POMAI_TEST(SearchNewestWins_DeterministicAndTombstone) {
         POMAI_EXPECT_OK(db->Search(membrane, vec_new, 5, &res));
         POMAI_EXPECT_TRUE(!res.hits.empty());
         POMAI_EXPECT_EQ(res.hits[0].id, target_id);
-        POMAI_EXPECT_TRUE(res.hits[0].score > 0.9f);
+        POMAI_EXPECT_TRUE(res.hits[0].score > 0.9f);  // IP: vec_new·vec_new = 1.0
     }
 
     {
