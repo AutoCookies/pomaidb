@@ -14,7 +14,7 @@
 #include "core/shard/mailbox.h"
 #include "core/shard/snapshot.h"
 #include "core/shard/shard_stats.h"
-#include "palloc.h"
+#include "palloc_compat.h"
 #include "pomai/metadata.h"
 #include "pomai/search.h"
 #include "pomai/iterator.h"

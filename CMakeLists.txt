@@ -13,21 +13,27 @@ option(POMAI_BUILD_TESTS "Build tests" OFF)
 option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
 
 # =========================
-# Phase 3: mimalloc — vendored from third_party/mimalloc
-# (DragonflyDB patches pre-applied via: git apply patches/palloc-v2.2.4/*.patch)
+# Phase 3: palloc (git submodule at third_party/palloc)
 # =========================
-option(POMAI_USE_PALLOC "Use palloc as global allocator (PALLOC_OVERRIDE=ON)" ON)
+option(POMAI_USE_PALLOC "Use palloc as global allocator (PA_OVERRIDE=ON)" ON)
+
+# Ensure POMAI_USE_PALLOC is defined for source code (0 or 1)
+add_compile_definitions(POMAI_USE_PALLOC=$<BOOL:${POMAI_USE_PALLOC}>)
 
 if (POMAI_USE_PALLOC)
-  # palloc options — must be set BEFORE add_subdirectory
-  set(PALLOC_BUILD_SHARED   OFF CACHE BOOL "" FORCE)
-  set(PALLOC_BUILD_OBJECT   OFF CACHE BOOL "" FORCE)
-  set(PALLOC_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-  set(PALLOC_OVERRIDE       ON  CACHE BOOL "" FORCE)   # replace malloc/free globally
-  set(PALLOC_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
-  set(PALLOC_USE_CXX        ON  CACHE BOOL "" FORCE)   # C++ new/delete overrides
+  if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/palloc/CMakeLists.txt)
+    message(FATAL_ERROR
+      "palloc submodule not initialized. Run:\n  git submodule update --init third_party/palloc")
+  endif()
+  # palloc submodule uses PA_* options — set BEFORE add_subdirectory
+  set(PA_BUILD_SHARED      OFF CACHE BOOL "" FORCE)
+  set(PA_BUILD_OBJECT      OFF CACHE BOOL "" FORCE)
+  set(PA_BUILD_TESTS       OFF CACHE BOOL "" FORCE)
+  set(PA_OVERRIDE          ON  CACHE BOOL "" FORCE)
+  set(PA_INSTALL_TOPLEVEL  OFF CACHE BOOL "" FORCE)
+  set(PA_USE_CXX           ON  CACHE BOOL "" FORCE)
   add_subdirectory(third_party/palloc EXCLUDE_FROM_ALL)
-  message(STATUS "[pomai] palloc: enabled (static, PALLOC_OVERRIDE=ON)")
+  message(STATUS "[pomai] palloc: enabled (static, PA_OVERRIDE=ON)")
 else()
   message(STATUS "[pomai] palloc: disabled")
 endif()
@@ -146,26 +152,27 @@ if (POMAI_USE_PALLOC)
   target_link_libraries(pomai_c_static PRIVATE palloc-static)
   target_compile_definitions(pomai_c_static PRIVATE POMAI_USE_PALLOC=1)
 
-  # Build palloc a second time with OVERRIDE=OFF for the shared library (no malloc override at dlopen).
+  # Build palloc a second time with PA_OVERRIDE=OFF for the shared library (no malloc override at dlopen).
   include(ExternalProject)
+  set(PALLOC_NOOVERRIDE_LIB "${CMAKE_BINARY_DIR}/palloc_nooverride-build/libpalloc.a")
   ExternalProject_Add(palloc_nooverride
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/palloc
     BINARY_DIR ${CMAKE_BINARY_DIR}/palloc_nooverride-build
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
-      -DPALLOC_OVERRIDE=OFF
-      -DPALLOC_BUILD_SHARED=OFF
-      -DPALLOC_BUILD_OBJECT=OFF
-      -DPALLOC_BUILD_TESTS=OFF
-      -DPALLOC_USE_CXX=ON
+      -DPA_OVERRIDE=OFF
+      -DPA_BUILD_SHARED=OFF
+      -DPA_BUILD_OBJECT=OFF
+      -DPA_BUILD_TESTS=OFF
+      -DPA_USE_CXX=ON
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
     INSTALL_COMMAND ""
-    BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/palloc_nooverride-build/libpalloc.a
+    BUILD_BYPRODUCTS ${PALLOC_NOOVERRIDE_LIB}
   )
   add_library(palloc-static-nooverride STATIC IMPORTED GLOBAL)
   set_target_properties(palloc-static-nooverride PROPERTIES
-    IMPORTED_LOCATION ${CMAKE_BINARY_DIR}/palloc_nooverride-build/libpalloc.a
+    IMPORTED_LOCATION ${PALLOC_NOOVERRIDE_LIB}
   )
   add_dependencies(palloc-static-nooverride palloc_nooverride)
   add_dependencies(pomai_c palloc_nooverride)
@@ -390,6 +397,7 @@ if (POMAI_BUILD_TESTS)
   add_executable(recovery_test tests/crash/recovery_test.cc)
   pomai_setup_test(recovery_test)
   pomai_add_labeled_test(recovery_test "crash")
+  set_tests_properties(recovery_test PROPERTIES TIMEOUT 90)
 
   # ---- Crash (Gate #2) ----
   if (POMAI_ENABLE_CRASH_TESTS)
@@ -417,7 +425,7 @@ if (POMAI_BUILD_TESTS)
     endif()
 
     add_test(NAME pomai_crash_replay COMMAND pomai_crash_test)
-    set_tests_properties(pomai_crash_replay PROPERTIES LABELS "crash")
+    set_tests_properties(pomai_crash_replay PROPERTIES LABELS "crash" TIMEOUT 60)
   endif()
 
   # ---- TSAN (Gate #3) ----

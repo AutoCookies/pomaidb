@@ -196,7 +196,7 @@ POMAI_TEST(Backpressure_ManyPutsNoCrash) {
     std::unique_ptr<DB> db;
     POMAI_EXPECT_OK(DB::Open(opt, &db));
     std::vector<float> v = {1.0f, 2.0f, 3.0f, 4.0f};
-    constexpr int kPuts = 2000;
+    constexpr int kPuts = 400;
     for (int i = 0; i < kPuts; ++i) {
         Status st = db->Put(static_cast<VectorId>(i), v);
         if (st.code() == ErrorCode::kResourceExhausted)

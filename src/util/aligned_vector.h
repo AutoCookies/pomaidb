@@ -1,7 +1,7 @@
 #include <vector>
 #include <cstddef>
 #include <cstring>
-#include "palloc.h"
+#include "palloc_compat.h"
 
 namespace pomai::util {
 

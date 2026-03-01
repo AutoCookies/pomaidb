@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/recovery_test.dir/tests/crash/recovery_test.cc.o CMakeFiles/recovery_test.dir/tests/common/test_runner.cc.o -o recovery_test  libpomai.a /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 

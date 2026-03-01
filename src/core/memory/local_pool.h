@@ -8,7 +8,7 @@
 #include <memory>
 #include <cassert>
 #include "core/concurrency/concurrency_macros.h"
-#include "palloc.h"
+#include "palloc_compat.h"
 
 namespace pomai::core::memory {
 

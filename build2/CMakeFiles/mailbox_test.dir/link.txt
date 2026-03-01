@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/mailbox_test.dir/tests/unit/mailbox_test.cc.o CMakeFiles/mailbox_test.dir/tests/common/test_runner.cc.o -o mailbox_test  libpomai.a /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 

@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup CMake
         uses: lukka/get-cmake@latest
@@ -21,13 +23,15 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: CTest
-        run: ctest --test-dir build --output-on-failure -C Release
+        run: ctest --test-dir build --output-on-failure -C Release --timeout 120
 
   tsan:
     name: tsan-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
       - name: Configure (TSAN)
@@ -44,13 +48,15 @@ jobs:
       - name: Build (TSAN)
         run: cmake --build build-tsan --parallel
       - name: TSAN workload tests
-        run: ctest --test-dir build-tsan --output-on-failure -L tsan
+        run: ctest --test-dir build-tsan --output-on-failure -L tsan --timeout 120
 
   asan:
     name: asan-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
       # POMAI_USE_PALLOC=OFF only here: ASan must intercept allocator; default build uses palloc.
@@ -68,13 +74,15 @@ jobs:
       - name: Build (ASan)
         run: cmake --build build-asan --parallel
       - name: Run tests (ASan)
-        run: ctest --test-dir build-asan --output-on-failure -C RelWithDebInfo -E "tsan|crash"
+        run: ctest --test-dir build-asan --output-on-failure -C RelWithDebInfo -E "tsan|crash" --timeout 120
 
   ubsan:
     name: ubsan-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
       # POMAI_USE_PALLOC=OFF only here: sanitizers need default allocator; default build uses palloc.
@@ -92,13 +100,15 @@ jobs:
       - name: Build (UBSan)
         run: cmake --build build-ubsan --parallel
       - name: Run tests (UBSan)
-        run: ctest --test-dir build-ubsan --output-on-failure -C RelWithDebInfo -E "tsan|crash"
+        run: ctest --test-dir build-ubsan --output-on-failure -C RelWithDebInfo -E "tsan|crash" --timeout 120
 
   python-ffi-smoke:
     name: python-ffi-smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Configure
         run: cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
       - name: Build shared C ABI
@@ -113,6 +123,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Configure
         run: cmake -S . -B build -DPOMAI_BUILD_TESTS=ON
       - name: Build perf harness
@@ -125,6 +137,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Install Python deps
         run: python3 -m pip install numpy
       - name: Configure

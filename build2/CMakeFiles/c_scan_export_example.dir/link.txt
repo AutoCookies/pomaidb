@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG CMakeFiles/c_scan_export_example.dir/examples/c_scan_export.c.o -o c_scan_export_example  -Wl,-rpath,/home/autocookie/pomaieco/pomaidb/build2 libpomai_c.so 

@@ -4,7 +4,7 @@
 #include <thread>
 #include "core/memory/local_pool.h"
 #include "core/index/hnsw_index.h"
-#include "palloc.h"
+#include "palloc_compat.h"
 
 using namespace pomai::core::memory;
 using namespace pomai::index;
