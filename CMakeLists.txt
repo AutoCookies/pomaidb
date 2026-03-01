@@ -25,6 +25,9 @@ if (POMAI_USE_PALLOC)
     message(FATAL_ERROR
       "palloc submodule not initialized. Run:\n  git submodule update --init third_party/palloc")
   endif()
+  # Apply designator-order fix for init.c (required when building with C++/PA_USE_CXX; submodule has wrong order)
+  set(PALLOC_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/palloc)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchPallocInit.cmake)
   # palloc submodule uses PA_* options — set BEFORE add_subdirectory
   set(PA_BUILD_SHARED      OFF CACHE BOOL "" FORCE)
   set(PA_BUILD_OBJECT      OFF CACHE BOOL "" FORCE)

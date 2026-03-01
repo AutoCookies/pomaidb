@@ -1,0 +1,37 @@
+--- a/src/init.c
++++ b/src/init.c
+@@ -14,24 +14,26 @@
+ // Empty page used to initialize the small free pages array
+ const pa_page_t _pa_page_empty = {
+   .slice_count = 0,
+   .slice_offset = 0,
+   .is_committed = false,
+   .is_huge = false,
+   .is_zero_init = false,
+   .retire_expire = 0,
+   .capacity = 0,
+   .used = 0,
+-  .reserved = 0,
+   .flags = { 0 },
+   .free_is_zero = false,
+   .block_size_shift = 0,
+   .free = NULL,
+   .local_free = NULL,
++  .xthread_free = PA_ATOMIC_VAR_INIT(0),
+   .block_size = 0,
++  #if (PA_PADDING || PA_ENCODE_FREELIST)
++  .keys = { 0, 0 },
++  #endif
++  .reserved = 0,
++  .heap_tag = 0,
+   .page_start = NULL,
+-  #if (PA_PADDING || PA_ENCODE_FREELIST)
+-  .keys = { 0, 0 },
+-  #endif
+-  .xthread_free = PA_ATOMIC_VAR_INIT(0),
+   .xheap = PA_ATOMIC_VAR_INIT(0),
+   .next = NULL,
+   .prev = NULL,
+   .padding = { 0 }
+ };
+
