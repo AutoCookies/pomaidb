@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/hnsw_pomaidb_test.dir/tests/unit/hnsw_pomaidb_test.cc.o CMakeFiles/hnsw_pomaidb_test.dir/tests/common/test_runner.cc.o -o hnsw_pomaidb_test  libpomai.a /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 

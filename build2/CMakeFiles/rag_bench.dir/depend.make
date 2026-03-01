@@ -1,2 +1,0 @@
-# Empty dependencies file for rag_bench.
-# This may be replaced when dependencies are built.

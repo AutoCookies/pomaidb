@@ -21,6 +21,14 @@ class PomaiOptions(ctypes.Structure):
         ('fsync_policy', ctypes.c_uint32),
         ('memory_budget_bytes', ctypes.c_uint64),
         ('deadline_ms', ctypes.c_uint32),
+        ('index_type', ctypes.c_uint8),
+        ('_pad1', ctypes.c_uint8 * 3),
+        ('hnsw_m', ctypes.c_uint32),
+        ('hnsw_ef_construction', ctypes.c_uint32),
+        ('hnsw_ef_search', ctypes.c_uint32),
+        ('adaptive_threshold', ctypes.c_uint32),
+        ('metric', ctypes.c_uint8),
+        ('_pad2', ctypes.c_uint8 * 3),
     ]
 
 class PomaiUpsert(ctypes.Structure):
@@ -42,6 +50,7 @@ class PomaiQuery(ctypes.Structure):
         ('filter_expression', ctypes.c_char_p),
         ('alpha', ctypes.c_float),
         ('deadline_ms', ctypes.c_uint32),
+        ('flags', ctypes.c_uint32),
     ]
 
 class PomaiSearchResults(ctypes.Structure):
@@ -51,6 +60,7 @@ class PomaiSearchResults(ctypes.Structure):
         ('ids', ctypes.POINTER(ctypes.c_uint64)),
         ('scores', ctypes.POINTER(ctypes.c_float)),
         ('shard_ids', ctypes.POINTER(ctypes.c_uint32)),
+        ('zero_copy_pointers', ctypes.c_void_p),  # pomai_semantic_pointer_t*; we ignore
     ]
 
 lib.pomai_options_init.argtypes = [ctypes.POINTER(PomaiOptions)]
@@ -83,7 +93,8 @@ def main():
         opts = PomaiOptions()
         lib.pomai_options_init(ctypes.byref(opts))
         opts.struct_size = ctypes.sizeof(PomaiOptions)
-        opts.path = td.encode('utf-8')
+        path_buf = ctypes.create_string_buffer(td.encode('utf-8') + b'\0')
+        opts.path = path_buf
         opts.shards = 1
         opts.dim = 8
 
@@ -109,8 +120,9 @@ def main():
         query.dim = 8
         query.topk = 2
         query.filter_expression = None
-        query.alpha = ctypes.c_float(0.0)
+        query.alpha = 0.0
         query.deadline_ms = 0
+        query.flags = 0
 
         out = ctypes.POINTER(PomaiSearchResults)()
         check_status(lib.pomai_search(db, ctypes.byref(query), ctypes.byref(out)))

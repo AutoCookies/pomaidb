@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/routing_engine_test.dir/tests/integ/routing_engine_test.cc.o CMakeFiles/routing_engine_test.dir/tests/common/test_runner.cc.o -o routing_engine_test  libpomai.a /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 

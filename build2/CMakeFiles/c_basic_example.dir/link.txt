@@ -1,1 +1,0 @@
-/usr/bin/cc -O3 -DNDEBUG CMakeFiles/c_basic_example.dir/examples/c_basic.c.o -o c_basic_example  -Wl,-rpath,/home/autocookie/pomaieco/pomaidb/build2 libpomai_c.so 

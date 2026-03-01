@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -O3 -DNDEBUG -shared -Wl,-soname,libpomai_c.so -o libpomai_c.so CMakeFiles/pomai_c.dir/src/capi/capi_status.cc.o CMakeFiles/pomai_c.dir/src/capi/capi_db.cc.o CMakeFiles/pomai_c.dir/src/capi/capi_scan.cc.o  libpomai.a /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 

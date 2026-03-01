@@ -45,6 +45,14 @@ class PomaiOptions(ctypes.Structure):
         ("fsync_policy", ctypes.c_uint32),
         ("memory_budget_bytes", ctypes.c_uint64),
         ("deadline_ms", ctypes.c_uint32),
+        ("index_type", ctypes.c_uint8),
+        ("_pad1", ctypes.c_uint8 * 3),
+        ("hnsw_m", ctypes.c_uint32),
+        ("hnsw_ef_construction", ctypes.c_uint32),
+        ("hnsw_ef_search", ctypes.c_uint32),
+        ("adaptive_threshold", ctypes.c_uint32),
+        ("metric", ctypes.c_uint8),
+        ("_pad2", ctypes.c_uint8 * 3),
     ]
 
 
@@ -68,6 +76,7 @@ class PomaiQuery(ctypes.Structure):
         ("filter_expression", ctypes.c_char_p),
         ("alpha", ctypes.c_float),
         ("deadline_ms", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
     ]
 
 
@@ -78,6 +87,7 @@ class PomaiSearchResults(ctypes.Structure):
         ("ids", ctypes.POINTER(ctypes.c_uint64)),
         ("scores", ctypes.POINTER(ctypes.c_float)),
         ("shard_ids", ctypes.POINTER(ctypes.c_uint32)),
+        ("zero_copy_pointers", ctypes.c_void_p),
     ]
 
 

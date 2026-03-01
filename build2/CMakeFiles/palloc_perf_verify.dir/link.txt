@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/palloc_perf_verify.dir/tests/palloc_perf_verify.cc.o -o palloc_perf_verify  libpomai.a -lpalloc-static -lpthread /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a 
