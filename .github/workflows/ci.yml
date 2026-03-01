@@ -40,7 +40,7 @@ jobs:
           CC: clang
           CXX: clang++
         run: >-
-          cmake -S . -B build-tsan -DPOMAI_BUILD_TESTS=ON -DPOMAI_USE_PALLOC=OFF
+          cmake -S . -B build-tsan -DPOMAI_BUILD_TESTS=ON -DPOMAI_BUILD_BENCH=OFF -DPOMAI_USE_PALLOC=OFF
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_C_FLAGS='-fsanitize=thread -fno-omit-frame-pointer'
           -DCMAKE_CXX_FLAGS='-fsanitize=thread -fno-omit-frame-pointer'
@@ -60,13 +60,13 @@ jobs:
           submodules: recursive
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
-      # POMAI_USE_PALLOC=OFF only here: ASan must intercept allocator; default build uses palloc.
+      # POMAI_USE_PALLOC=OFF: ASan must intercept allocator; default build uses palloc.
       - name: Configure (ASan)
         env:
           CC: clang
           CXX: clang++
         run: >-
-          cmake -S . -B build-asan -DPOMAI_BUILD_TESTS=ON -DPOMAI_USE_PALLOC=OFF
+          cmake -S . -B build-asan -DPOMAI_BUILD_TESTS=ON -DPOMAI_BUILD_BENCH=OFF -DPOMAI_USE_PALLOC=OFF
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_C_FLAGS='-fsanitize=address -fno-omit-frame-pointer'
           -DCMAKE_CXX_FLAGS='-fsanitize=address -fno-omit-frame-pointer'
@@ -86,13 +86,13 @@ jobs:
           submodules: recursive
       - name: Install clang
         run: sudo apt-get update && sudo apt-get install -y clang
-      # POMAI_USE_PALLOC=OFF only here: sanitizers need default allocator; default build uses palloc.
+      # POMAI_USE_PALLOC=OFF: UBSan/sanitizers need default allocator; default build uses palloc.
       - name: Configure (UBSan)
         env:
           CC: clang
           CXX: clang++
         run: >-
-          cmake -S . -B build-ubsan -DPOMAI_BUILD_TESTS=ON -DPOMAI_USE_PALLOC=OFF
+          cmake -S . -B build-ubsan -DPOMAI_BUILD_TESTS=ON -DPOMAI_BUILD_BENCH=OFF -DPOMAI_USE_PALLOC=OFF
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_C_FLAGS='-fsanitize=undefined -fno-omit-frame-pointer'
           -DCMAKE_CXX_FLAGS='-fsanitize=undefined -fno-omit-frame-pointer'

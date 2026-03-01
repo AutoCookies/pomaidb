@@ -94,7 +94,7 @@ def main():
         lib.pomai_options_init(ctypes.byref(opts))
         opts.struct_size = ctypes.sizeof(PomaiOptions)
         path_buf = ctypes.create_string_buffer(td.encode('utf-8') + b'\0')
-        opts.path = path_buf
+        opts.path = ctypes.cast(path_buf, ctypes.c_char_p)
         opts.shards = 1
         opts.dim = 8
 
