@@ -31,7 +31,7 @@ namespace {
 struct CliConfig {
     std::string path = "/tmp/pomai_bench_cbrs";
     uint64_t seed = 1337;
-    uint32_t shards = 4;
+    uint32_t units = 4;   // logical routing units (was: shards)
     uint32_t dim = 128;
     uint32_t n = 10000;
     uint32_t queries = 1000;
@@ -67,7 +67,7 @@ struct Row {
     uint32_t n = 0;
     uint32_t queries = 0;
     uint32_t topk = 0;
-    uint32_t shards = 0;
+    uint32_t units = 0;
     double ingest_sec = 0.0;
     double ingest_qps = 0.0;
     double warmup_sec = 0.0;
@@ -75,7 +75,7 @@ struct Row {
     double query_qps = 0.0;
     double p50_us = 0.0, p90_us = 0.0, p95_us = 0.0, p99_us = 0.0, p999_us = 0.0, p9999_us = -1.0;
     double recall1 = 0.0, recall10 = 0.0, recall100 = 0.0;
-    double routed_shards_avg = 0.0, routed_shards_p95 = 0.0;
+    double routed_units_avg = 0.0, routed_units_p95 = 0.0;
     double routed_probe_avg = 0.0, routed_probe_p95 = 0.0;
     double routed_buckets_avg = -1.0, routed_buckets_p95 = -1.0;
     long rss_open_kb = 0, rss_ingest_kb = 0, rss_query_kb = 0, peak_rss_kb = 0;
@@ -279,15 +279,15 @@ pomai::FsyncPolicy ParseFsync(const std::string& f) {
 
 void WriteCsv(const std::string& path, const std::vector<Row>& rows) {
     std::ofstream out(path);
-    out << "scenario,routing,dataset,dim,n,queries,topk,shards,ingest_sec,ingest_qps,warmup_sec,warmup_qps,query_qps,p50_us,p90_us,p95_us,p99_us,p999_us,p9999_us,recall1,recall10,recall100,routed_shards_avg,routed_shards_p95,routed_probe_avg,routed_probe_p95,routed_buckets_avg,routed_buckets_p95,rss_open_kb,rss_ingest_kb,rss_query_kb,peak_rss_kb,user_cpu_sec,sys_cpu_sec,verdict,error\n";
+    out << "scenario,routing,dataset,dim,n,queries,topk,units,ingest_sec,ingest_qps,warmup_sec,warmup_qps,query_qps,p50_us,p90_us,p95_us,p99_us,p999_us,p9999_us,recall1,recall10,recall100,routed_units_avg,routed_units_p95,routed_probe_avg,routed_probe_p95,routed_buckets_avg,routed_buckets_p95,rss_open_kb,rss_ingest_kb,rss_query_kb,peak_rss_kb,user_cpu_sec,sys_cpu_sec,verdict,error\n";
     for (const auto& r : rows) {
         out << r.scenario << ',' << r.routing << ',' << r.dataset << ',' << r.dim << ',' << r.n << ',' << r.queries
-            << ',' << r.topk << ',' << r.shards << ',' << r.ingest_sec << ',' << r.ingest_qps
+            << ',' << r.topk << ',' << r.units << ',' << r.ingest_sec << ',' << r.ingest_qps
             << ',' << r.warmup_sec << ',' << r.warmup_qps << ',' << r.query_qps
             << ',' << r.p50_us << ',' << r.p90_us << ',' << r.p95_us << ',' << r.p99_us << ',' << r.p999_us
             << ',' << r.p9999_us
             << ',' << r.recall1 << ',' << r.recall10 << ',' << r.recall100
-            << ',' << r.routed_shards_avg << ',' << r.routed_shards_p95
+            << ',' << r.routed_units_avg << ',' << r.routed_units_p95
             << ',' << r.routed_probe_avg << ',' << r.routed_probe_p95
             << ',' << r.routed_buckets_avg << ',' << r.routed_buckets_p95
             << ',' << r.rss_open_kb << ',' << r.rss_ingest_kb << ',' << r.rss_query_kb << ',' << r.peak_rss_kb
@@ -308,7 +308,7 @@ void WriteJson(const std::string& path, const std::vector<Row>& rows) {
             << "      \"n\": " << r.n << ",\n"
             << "      \"queries\": " << r.queries << ",\n"
             << "      \"topk\": " << r.topk << ",\n"
-            << "      \"shards\": " << r.shards << ",\n"
+            << "      \"units\": " << r.units << ",\n"
             << "      \"ingest_sec\": " << r.ingest_sec << ",\n"
             << "      \"ingest_qps\": " << r.ingest_qps << ",\n"
             << "      \"warmup_sec\": " << r.warmup_sec << ",\n"
@@ -317,7 +317,7 @@ void WriteJson(const std::string& path, const std::vector<Row>& rows) {
             << "      \"latency_us\": {\"p50\": " << r.p50_us << ", \"p90\": " << r.p90_us << ", \"p95\": " << r.p95_us
             << ", \"p99\": " << r.p99_us << ", \"p999\": " << r.p999_us << ", \"p9999\": " << r.p9999_us << "},\n"
             << "      \"recall\": {\"r1\": " << r.recall1 << ", \"r10\": " << r.recall10 << ", \"r100\": " << r.recall100 << "},\n"
-            << "      \"routed\": {\"shards_avg\": " << r.routed_shards_avg << ", \"shards_p95\": " << r.routed_shards_p95
+            << "      \"routed\": {\"units_avg\": " << r.routed_units_avg << ", \"units_p95\": " << r.routed_units_p95
             << ", \"probe_avg\": " << r.routed_probe_avg << ", \"probe_p95\": " << r.routed_probe_p95
             << ", \"buckets_avg\": " << r.routed_buckets_avg << ", \"buckets_p95\": " << r.routed_buckets_p95 << "},\n"
             << "      \"memory_kb\": {\"open\": " << r.rss_open_kb << ", \"ingest\": " << r.rss_ingest_kb << ", \"query\": " << r.rss_query_kb
@@ -339,7 +339,7 @@ Row RunScenario(const ScenarioConfig& sc) {
     row.dim = cfg.dim;
     row.queries = cfg.queries;
     row.topk = cfg.topk;
-    row.shards = cfg.shards;
+    row.units = cfg.units;
 
     fs::remove_all(cfg.path);
     fs::create_directories(cfg.path);
@@ -352,7 +352,8 @@ Row RunScenario(const ScenarioConfig& sc) {
     pomai::DBOptions opt;
     opt.path = cfg.path;
     opt.dim = cfg.dim;
-    opt.shard_count = cfg.shards;
+    // Legacy field; runtime is monolithic, but this benchmark still varies logical routing units.
+    opt.shard_count = cfg.units;
     opt.fsync = ParseFsync(cfg.fsync);
     opt.routing_enabled = cfg.routing != "fanout";
     opt.routing_k = cfg.k_global;
@@ -369,11 +370,11 @@ Row RunScenario(const ScenarioConfig& sc) {
         for (const auto& v : data.base) {
             for (float x : v) base_flat.push_back(x);
         }
-        const uint32_t rk = std::max(1u, cfg.k_global == 0 ? 2u * cfg.shards : cfg.k_global);
+        const uint32_t rk = std::max(1u, cfg.k_global == 0 ? 2u * cfg.units : cfg.k_global);
         auto base_tab = pomai::core::routing::BuildInitialTable(std::span<const float>(base_flat.data(), base_flat.size()),
                                                                 static_cast<uint32_t>(data.base.size()), cfg.dim,
-                                                                rk, cfg.shards, 5, static_cast<uint32_t>(cfg.seed));
-        if (cfg.dataset == "epoch_drift_hard" && cfg.shards > 1) {
+                                                                rk, cfg.units, 5, static_cast<uint32_t>(cfg.seed));
+        if (cfg.dataset == "epoch_drift_hard" && cfg.units > 1) {
             for (std::uint32_t cid = 0; cid < base_tab.k; ++cid) {
                 base_tab.owner_shard[cid] = 0;
             }
@@ -423,7 +424,7 @@ Row RunScenario(const ScenarioConfig& sc) {
     if (sc.epoch_drift) {
         db->Close();
         // Force publish new epoch with optional prev retention.
-        const uint32_t rk = std::max(1u, cfg.k_global == 0 ? 2u * cfg.shards : cfg.k_global);
+        const uint32_t rk = std::max(1u, cfg.k_global == 0 ? 2u * cfg.units : cfg.k_global);
         std::vector<float> drift_flat;
         drift_flat.reserve(static_cast<size_t>(data.drift_half.size()) * cfg.dim);
         for (const auto& v : data.drift_half) {
@@ -431,11 +432,11 @@ Row RunScenario(const ScenarioConfig& sc) {
         }
         auto tab = pomai::core::routing::BuildInitialTable(std::span<const float>(drift_flat.data(), drift_flat.size()),
                                                      static_cast<uint32_t>(data.drift_half.size()), cfg.dim,
-                                                     rk, cfg.shards, 5, static_cast<uint32_t>(cfg.seed));
-        if (cfg.dataset == "epoch_drift_hard" && cfg.shards > 1) {
-            const std::uint32_t forced_shard = cfg.shards - 1;
+                                                     rk, cfg.units, 5, static_cast<uint32_t>(cfg.seed));
+        if (cfg.dataset == "epoch_drift_hard" && cfg.units > 1) {
+            const std::uint32_t forced_unit = cfg.units - 1;
             for (std::uint32_t cid = 0; cid < tab.k; ++cid) {
-                tab.owner_shard[cid] = forced_shard;
+                tab.owner_shard[cid] = forced_unit;
             }
         }
         auto rst = pomai::core::routing::SaveRoutingTableAtomic(cfg.path + "/membranes/default", tab, cfg.routing != "cbrs_no_dual");
@@ -501,7 +502,7 @@ Row RunScenario(const ScenarioConfig& sc) {
 
     std::vector<double> lats;
     lats.reserve(cfg.queries);
-    std::vector<uint32_t> routed_shards, routed_probe;
+    std::vector<uint32_t> routed_units, routed_probe;
     std::vector<double> routed_buckets;
     double r1 = 0.0, r10 = 0.0, r100 = 0.0;
 
@@ -528,7 +529,7 @@ Row RunScenario(const ScenarioConfig& sc) {
             sres.hits.erase(it, sres.hits.end());
         }
         lats.push_back(std::chrono::duration<double, std::micro>(qe - qs).count());
-        routed_shards.push_back(sres.routed_shards_count);
+        routed_units.push_back(sres.routed_shards_count);
         routed_probe.push_back(sres.routing_probe_centroids);
         routed_buckets.push_back(static_cast<double>(sres.routed_buckets_count));
 
@@ -554,10 +555,10 @@ Row RunScenario(const ScenarioConfig& sc) {
     row.recall10 = r10 / cfg.queries;
     row.recall100 = r100 / cfg.queries;
 
-    std::vector<double> rs(routed_shards.begin(), routed_shards.end());
+    std::vector<double> rs(routed_units.begin(), routed_units.end());
     std::vector<double> rp(routed_probe.begin(), routed_probe.end());
-    row.routed_shards_avg = routed_shards.empty() ? 0.0 : std::accumulate(rs.begin(), rs.end(), 0.0) / rs.size();
-    row.routed_shards_p95 = Percentile(rs, 0.95);
+    row.routed_units_avg = routed_units.empty() ? 0.0 : std::accumulate(rs.begin(), rs.end(), 0.0) / rs.size();
+    row.routed_units_p95 = Percentile(rs, 0.95);
     row.routed_probe_avg = routed_probe.empty() ? 0.0 : std::accumulate(rp.begin(), rp.end(), 0.0) / rp.size();
     row.routed_probe_p95 = Percentile(rp, 0.95);
     row.routed_buckets_avg = routed_buckets.empty() ? 0.0 : std::accumulate(routed_buckets.begin(), routed_buckets.end(), 0.0) / routed_buckets.size();
@@ -578,7 +579,7 @@ Row RunScenario(const ScenarioConfig& sc) {
 
 std::vector<ScenarioConfig> BuildMatrixQuick(const CliConfig& cli) {
     std::vector<ScenarioConfig> out;
-    auto mk = [&](std::string base, std::string dataset, uint32_t n, uint32_t d, uint32_t shards,
+    auto mk = [&](std::string base, std::string dataset, uint32_t n, uint32_t d, uint32_t units,
                   uint32_t q, uint32_t topk, uint32_t clusters, bool epoch = false, uint32_t probe = 0) {
         for (const auto& routing : {"fanout", "cbrs", "cbrs_no_dual"}) {
             ScenarioConfig s;
@@ -588,7 +589,7 @@ std::vector<ScenarioConfig> BuildMatrixQuick(const CliConfig& cli) {
             s.cfg.routing = routing;
             s.cfg.n = n;
             s.cfg.dim = d;
-            s.cfg.shards = shards;
+            s.cfg.units = units;
             s.cfg.queries = q;
             s.cfg.topk = topk;
             s.cfg.clusters = clusters;
@@ -607,7 +608,7 @@ std::vector<ScenarioConfig> BuildMatrixQuick(const CliConfig& cli) {
 
 std::vector<ScenarioConfig> BuildMatrixFull(const CliConfig& cli) {
     std::vector<ScenarioConfig> out;
-    auto mk = [&](std::string base, std::string dataset, uint32_t n, uint32_t d, uint32_t shards,
+    auto mk = [&](std::string base, std::string dataset, uint32_t n, uint32_t d, uint32_t units,
                   uint32_t q, uint32_t topk, uint32_t clusters, bool epoch = false, uint32_t probe = 0) {
         for (const auto& routing : {"fanout", "cbrs", "cbrs_no_dual"}) {
             ScenarioConfig s;
@@ -617,7 +618,7 @@ std::vector<ScenarioConfig> BuildMatrixFull(const CliConfig& cli) {
             s.cfg.routing = routing;
             s.cfg.n = n;
             s.cfg.dim = d;
-            s.cfg.shards = shards;
+            s.cfg.units = units;
             s.cfg.queries = q;
             s.cfg.topk = topk;
             s.cfg.clusters = clusters;
@@ -651,7 +652,7 @@ void ParseArgs(int argc, char** argv, CliConfig* c) {
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
         if (a == "--path") c->path = next();
         else if (a == "--seed") c->seed = std::stoull(next());
-        else if (a == "--shards") c->shards = static_cast<uint32_t>(std::stoul(next()));
+        else if (a == "--units") c->units = static_cast<uint32_t>(std::stoul(next()));
         else if (a == "--dim") c->dim = static_cast<uint32_t>(std::stoul(next()));
         else if (a == "--n") c->n = static_cast<uint32_t>(std::stoul(next()));
         else if (a == "--queries") c->queries = static_cast<uint32_t>(std::stoul(next()));
@@ -701,8 +702,8 @@ int main(int argc, char** argv) {
         std::printf("\n=== Scenario: %s ===\n", s.name.c_str());
         auto row = RunScenario(s);
         rows.push_back(row);
-        std::printf("ingest_qps=%.1f query_qps=%.1f p99=%.1fus recall@10=%.4f routed_shards_avg=%.2f\n",
-                    row.ingest_qps, row.query_qps, row.p99_us, row.recall10, row.routed_shards_avg);
+        std::printf("ingest_qps=%.1f query_qps=%.1f p99=%.1fus recall@10=%.4f routed_units_avg=%.2f\n",
+                    row.ingest_qps, row.query_qps, row.p99_us, row.recall10, row.routed_units_avg);
     }
 
     // verdict vs fanout baseline by dataset+shape
@@ -724,7 +725,7 @@ int main(int argc, char** argv) {
             r.verdict = "FAIL";
         } else if (baseline && r.routing != "fanout") {
             const double latency_improve = (baseline->p99_us - r.p99_us) / std::max(1e-9, baseline->p99_us);
-            if (latency_improve >= 0.05 || r.routed_shards_avg <= baseline->shards * 0.5) r.verdict = "PASS";
+            if (latency_improve >= 0.05 || r.routed_units_avg <= baseline->units * 0.5) r.verdict = "PASS";
             else r.verdict = "WARN";
         } else {
             r.verdict = "PASS";
@@ -756,16 +757,16 @@ int main(int argc, char** argv) {
         uint32_t n;
         uint32_t queries;
         uint32_t topk;
-        uint32_t shards;
+        uint32_t units;
         bool operator<(const Key& other) const {
-            return std::tie(dataset, dim, n, queries, topk, shards) <
-                   std::tie(other.dataset, other.dim, other.n, other.queries, other.topk, other.shards);
+            return std::tie(dataset, dim, n, queries, topk, units) <
+                   std::tie(other.dataset, other.dim, other.n, other.queries, other.topk, other.units);
         }
     };
 
-    std::map<Key, std::vector<const Row*>> grouped;
-    for (const auto& r : rows) {
-        grouped[{r.dataset, r.dim, r.n, r.queries, r.topk, r.shards}].push_back(&r);
+        std::map<Key, std::vector<const Row*>> grouped;
+        for (const auto& r : rows) {
+            grouped[{r.dataset, r.dim, r.n, r.queries, r.topk, r.units}].push_back(&r);
     }
 
     std::printf("\n=== Summary (fanout vs cbrs vs cbrs_no_dual) ===\n");
@@ -781,13 +782,13 @@ int main(int argc, char** argv) {
         if (!fanout || !cbrs || !nodual) continue;
         const double p99_gain = (fanout->p99_us - cbrs->p99_us) / std::max(1e-9, fanout->p99_us);
         const double qps_gain = (cbrs->query_qps - fanout->query_qps) / std::max(1e-9, fanout->query_qps);
-        std::printf("\nDataset=%s dim=%u n=%u q=%u topk=%u shards=%u\n", key.dataset.c_str(), key.dim, key.n, key.queries, key.topk, key.shards);
-        std::printf("  fanout: p99=%.1fus qps=%.1f recall10=%.3f routed_shards_avg=%.2f rss=%.0fKB\n",
-                    fanout->p99_us, fanout->query_qps, fanout->recall10, fanout->routed_shards_avg, static_cast<double>(fanout->rss_query_kb));
-        std::printf("  cbrs:   p99=%.1fus qps=%.1f recall10=%.3f routed_shards_avg=%.2f rss=%.0fKB\n",
-                    cbrs->p99_us, cbrs->query_qps, cbrs->recall10, cbrs->routed_shards_avg, static_cast<double>(cbrs->rss_query_kb));
-        std::printf("  no_dual:p99=%.1fus qps=%.1f recall10=%.3f routed_shards_avg=%.2f rss=%.0fKB\n",
-                    nodual->p99_us, nodual->query_qps, nodual->recall10, nodual->routed_shards_avg, static_cast<double>(nodual->rss_query_kb));
+        std::printf("\nDataset=%s dim=%u n=%u q=%u topk=%u units=%u\n", key.dataset.c_str(), key.dim, key.n, key.queries, key.topk, key.units);
+        std::printf("  fanout: p99=%.1fus qps=%.1f recall10=%.3f routed_units_avg=%.2f rss=%.0fKB\n",
+                    fanout->p99_us, fanout->query_qps, fanout->recall10, fanout->routed_units_avg, static_cast<double>(fanout->rss_query_kb));
+        std::printf("  cbrs:   p99=%.1fus qps=%.1f recall10=%.3f routed_units_avg=%.2f rss=%.0fKB\n",
+                    cbrs->p99_us, cbrs->query_qps, cbrs->recall10, cbrs->routed_units_avg, static_cast<double>(cbrs->rss_query_kb));
+        std::printf("  no_dual:p99=%.1fus qps=%.1f recall10=%.3f routed_units_avg=%.2f rss=%.0fKB\n",
+                    nodual->p99_us, nodual->query_qps, nodual->recall10, nodual->routed_units_avg, static_cast<double>(nodual->rss_query_kb));
         std::printf("  improvement: p99_gain=%.2f%% qps_gain=%.2f%%\n", p99_gain * 100.0, qps_gain * 100.0);
     }
 
@@ -799,7 +800,7 @@ int main(int argc, char** argv) {
     for (const auto& r : rows) {
         std::printf("%-22s %-9s %-8.3f %-8.1f %-8.1f %-8.1f %-8.2f %-8s\n",
                     r.scenario.c_str(), r.routing.c_str(), r.recall10, r.p99_us, r.query_qps,
-                    r.ingest_qps, r.routed_shards_avg, r.verdict.c_str());
+                    r.ingest_qps, r.routed_units_avg, r.verdict.c_str());
     }
     std::printf("\nJSON: %s\nCSV: %s\n", cli.report_json.c_str(), cli.report_csv.c_str());
     return 0;

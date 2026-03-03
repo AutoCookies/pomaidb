@@ -59,7 +59,8 @@ int main(int argc, char** argv) {
     pomai::DBOptions opts;
     opts.path = "/tmp/ingestion_bench";
     opts.dim = dim;
-    opts.shard_count = 4;  // Single-threaded; fixed shard count
+    // Legacy field: must be >=1 but has no effect in monolithic runtime mode.
+    opts.shard_count = 1;
     opts.fsync = pomai::FsyncPolicy::kNever;  // Disable for max throughput
     
     std::unique_ptr<pomai::DB> db;
@@ -68,7 +69,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Open failed: %s\n", st.message());
         return 1;
     }
-    printf("DB opened with %u shards\n\n", opts.shard_count);
+    printf("DB opened (single-runtime, monolithic index)\n\n");
     
     // Benchmark ingestion
     printf("[3/3] Ingesting %u vectors...\n", num_vectors);

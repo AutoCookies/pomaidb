@@ -48,7 +48,8 @@ int main(int argc, char** argv)
     pomai::DBOptions opts;
     opts.path = "/tmp/rag_bench";
     opts.dim = dim;
-    opts.shard_count = 4;  // Single-threaded; fixed shard count
+    // Legacy field; monolithic runtime ignores any value >1.
+    opts.shard_count = 1;
     opts.fsync = pomai::FsyncPolicy::kNever;
 
     std::unique_ptr<pomai::DB> db;
@@ -61,7 +62,7 @@ int main(int argc, char** argv)
     pomai::MembraneSpec rag;
     rag.name = "rag";
     rag.dim = dim;
-    rag.shard_count = opts.shard_count;
+    rag.shard_count = opts.shard_count;  // kept for on-disk compatibility
     rag.kind = pomai::MembraneKind::kRag;
     st = db->CreateMembrane(rag);
     if (!st.ok() && st.code() != pomai::ErrorCode::kAlreadyExists) {

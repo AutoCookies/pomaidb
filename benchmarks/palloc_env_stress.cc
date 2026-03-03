@@ -143,7 +143,8 @@ static IngestResult IngestAndVerify(const std::string& db_path, size_t target_ve
   pomai::DBOptions opts;
   opts.path = db_path;
   opts.dim = static_cast<uint32_t>(kVectorDim);
-  opts.shard_count = 1;  // single shard so NewIterator (shards_[0]) sees all vectors
+  // Monolithic runtime: a single logical instance indexes all vectors.
+  opts.shard_count = 1;
   opts.fsync = pomai::FsyncPolicy::kNever;
 
   std::unique_ptr<pomai::DB> db;

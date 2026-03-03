@@ -23,7 +23,6 @@ int main(int argc, char** argv) {
     std::cout << "Starting Baseline Benchmark (single-threaded)..." << std::endl;
 
     const uint32_t dim = 128;
-    const uint32_t n_shards = 4;
     const size_t initial_count = 50000;
     const std::chrono::seconds duration(5);
 
@@ -32,7 +31,8 @@ int main(int argc, char** argv) {
     DBOptions opt;
     opt.path = "bench_baseline_db";
     opt.dim = dim;
-    opt.shard_count = n_shards;
+    // Legacy field; monolithic runtime uses a single logical instance.
+    opt.shard_count = 1;
 
     std::filesystem::remove_all(opt.path);
 
