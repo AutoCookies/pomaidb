@@ -1,38 +1,13 @@
-# File: .dockerignore
-. git
-.github
-*. md
-. gitignore
-.env
-. env.*
-
-# Build artifacts
-*.exe
-*.exe~
-*.dll
+# Exclude from Docker build context (faster COPY, smaller image context)
+# Keep .git so COPY . /src leaves a git repo and RUN git submodule update --init works
+.gitignore
+build
+*.o
+*.a
 *.so
-*.dylib
-cache-server
-*. test
-*.out
-
-# Test files
-*_test.go
-testdata/
-
-# IDE
-.vscode/
-. idea/
-*.swp
-*. swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Temp
-tmp/
-temp/
+.cursor
+*.md
+*.json
+out
 *.log
-data/
+.DS_Store

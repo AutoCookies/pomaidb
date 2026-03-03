@@ -16,5 +16,8 @@ namespace pomai::core
         
         std::vector<std::shared_ptr<table::MemTable>> frozen_memtables;
         std::vector<std::shared_ptr<table::SegmentReader>> segments;
+        // Optional: current live memtable for iteration (newest-first). When set,
+        // iterator reads from this first so unflushed data is visible.
+        std::shared_ptr<table::MemTable> live_memtable;
     };
 }

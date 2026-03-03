@@ -775,18 +775,29 @@ namespace pomai::core
     {
         (void)c;  // unused parameter
         
-        // Create iterator with current snapshot (point-in-time view)
-        auto snapshot = current_snapshot_;
-        
-        if (!snapshot) {
+        // Snapshot must exist (created in Start/LoadSegments or after rotate).
+        auto base = current_snapshot_;
+        if (!base) {
             IteratorReply reply;
             reply.st = pomai::Status::Internal("HandleIterator: snapshot is null");
             return reply;
         }
+
+        // Include live memtable in the iterator view so unflushed data is visible.
+        // Otherwise NewIterator() would see 0 vectors when all data is still in mem_.
+        std::shared_ptr<ShardSnapshot> snapshot;
+        if (mem_ && mem_->GetCount() > 0) {
+            snapshot = std::make_shared<ShardSnapshot>();
+            snapshot->version = base->version;
+            snapshot->created_at = base->created_at;
+            snapshot->segments = base->segments;
+            snapshot->frozen_memtables = base->frozen_memtables;
+            snapshot->live_memtable = mem_;
+        } else {
+            snapshot = base;
+        }
         
-        // Create ShardIterator
         auto shard_iter = std::make_unique<ShardIterator>(snapshot);
-        
         IteratorReply reply;
         reply.st = pomai::Status::Ok();
         reply.iterator = std::move(shard_iter);

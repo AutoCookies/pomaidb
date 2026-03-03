@@ -64,6 +64,7 @@ add_library(pomai STATIC
   src/table/memtable.cc
   src/storage/wal/wal.cc
   src/storage/manifest/manifest.cc
+  src/storage/storage_engine.cc
   src/table/segment.cc
   src/core/storage/compaction_manager.cc
 

@@ -1,11 +1,86 @@
+# PomaiDB — Hardware Simulation Lab (Torture Chamber)
+# Docker Compose V2. Simulates constrained Edge/IoT environments on a dev machine.
+#
+# Usage:
+#   docker compose build
+#   docker compose run --rm pomai-iot-starvation    # Service A
+#   docker compose run --rm pomai-edge-gateway       # Service B
+#   docker compose run --rm pomai-server-lite        # Service C
+#
+# Reports: mount ./bench to extract logs (e.g. command: ... | tee /bench/report.log).
+# blkio path: On some hosts use the actual block device (e.g. /dev/nvme0n1) if /dev/sda is not the backing device.
+
 services:
-  pomaidb-dev:
+  # ---------------------------------------------------------------------------
+  # Service A: $5 ESP32 / Pi Zero — minimal RAM, single throttled core, slow SD
+  # ---------------------------------------------------------------------------
+  pomai-iot-starvation:
     build:
       context: .
       dockerfile: Dockerfile
-    image: pomaidb/dev:local
-    container_name: pomaidb_dev
-    working_dir: /workspace/pomaidb
-    command: ctest --test-dir build --output-on-failure
+    image: pomaidb:edge
+    container_name: pomai-iot-starvation
+    mem_limit: 128m
+    cpus: 0.5
+    # Simulate cheap Class 4 SD: 1 MB/s write, 5 MB/s read
+    blkio_config:
+      device_read_bps:
+        - path: /dev/sda
+          rate: 5242880   # 5 MB/s
+      device_write_bps:
+        - path: /dev/sda
+          rate: 1048576   # 1 MB/s
     volumes:
-      - ./:/workspace/pomaidb
+      - ./bench:/bench
+    working_dir: /data
+    environment:
+      - POMAI_DATA_DIR=/data
+      - POMAI_REPORT_DIR=/bench
+      - POMAI_BENCH_LOW_MEMORY=1   # 128MB: run 5k/2k×5/20k instead of 100k/50k×50/1M
+    command: ["benchmark_a"]
+    # Optional: run and write report to /bench
+    # command: ["sh", "-c", "benchmark_a 2>&1 | tee /bench/iot-starvation.log"]
+
+  # ---------------------------------------------------------------------------
+  # Service B: Orange Pi / Raspberry Pi 4 — 512MB RAM, 2 CPUs, Class 10 SD
+  # ---------------------------------------------------------------------------
+  pomai-edge-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pomaidb:edge
+    container_name: pomai-edge-gateway
+    mem_limit: 512m
+    cpus: "2.0"
+    # Simulate Class 10 SD / eMMC: 10 MB/s write
+    blkio_config:
+      device_write_bps:
+        - path: /dev/sda
+          rate: 10485760  # 10 MB/s
+    volumes:
+      - ./bench:/bench
+    working_dir: /data
+    environment:
+      - POMAI_DATA_DIR=/data
+      - POMAI_REPORT_DIR=/bench
+    command: ["benchmark_a"]
+
+  # ---------------------------------------------------------------------------
+  # Service C: Baseline server (unbounded CPU/RAM, SSD-like I/O)
+  # ---------------------------------------------------------------------------
+  pomai-server-lite:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pomaidb:edge
+    container_name: pomai-server-lite
+    mem_limit: 2g
+    # No cpus limit — unbounded
+    # No blkio_config — full disk speed
+    volumes:
+      - ./bench:/bench
+    working_dir: /data
+    environment:
+      - POMAI_DATA_DIR=/data
+      - POMAI_REPORT_DIR=/bench
+    command: ["benchmark_a"]

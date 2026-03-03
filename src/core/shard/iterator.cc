@@ -94,20 +94,25 @@ namespace pomai::core
 
     bool ShardIterator::TryReadFromFrozenMem()
     {
-        // Iterate through frozen memtables (newest first)
-        while (source_idx_ < snapshot_->frozen_memtables.size()) {
-            const auto& fmem = snapshot_->frozen_memtables[source_idx_];
-            
+        // Newest-first: live_memtable (if set), then frozen_memtables[0], [1], ...
+        const bool has_live = snapshot_->live_memtable != nullptr;
+        const size_t num_frozen = snapshot_->frozen_memtables.size();
+
+        while (true) {
+            std::shared_ptr<table::MemTable> mem;
+            if (has_live && source_idx_ == 0) {
+                mem = snapshot_->live_memtable;
+            } else {
+                size_t frozen_idx = has_live ? source_idx_ - 1 : source_idx_;
+                if (frozen_idx >= num_frozen)
+                    return false;
+                mem = snapshot_->frozen_memtables[frozen_idx];
+            }
+
             // MemTable doesn't have indexed access, so we use IterateWithStatus
-            // We need to convert entry_idx_ to actual iteration
-            // 
-            // Strategy: Build vector of entries on first access to this memtable
-            // (This is inefficient but simple. Production-grade would use proper iterator)
-            
             size_t current_entry = 0;
             bool found = false;
-            
-            fmem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+            mem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
                 if (current_entry == entry_idx_) {
                     current_id_ = id;
                     if (!is_deleted) {
@@ -119,17 +124,13 @@ namespace pomai::core
                 }
                 current_entry++;
             });
-            
-            if (found) {
-                return true; // Found entry (live or tombstone)
-            }
-            
-            // No more entries in this memtable, move to next
+
+            if (found)
+                return true;
+
             source_idx_++;
             entry_idx_ = 0;
         }
-        
-        return false;
     }
 
     bool ShardIterator::TryReadFromSegment()
