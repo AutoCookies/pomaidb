@@ -6,6 +6,7 @@
 // Seqlock protects readers.
 
 #include "table/memtable.h"
+#include "palloc_compat.h"
 #include <cstring>
 #include <mutex>
 
@@ -16,24 +17,39 @@ static std::size_t AlignUp(std::size_t x, std::size_t a) {
 }
 
 void* Arena::Allocate(std::size_t n, std::size_t align) {
+    constexpr std::size_t kBlockAlign = 64;
     if (blocks_.empty() || AlignUp(blocks_.back().used, align) + n > block_bytes_) {
         Block b;
-        b.mem  = std::make_unique<std::byte[]>(block_bytes_);
+        if (heap_) {
+            b.mem = static_cast<std::byte*>(palloc_heap_malloc_aligned(heap_, block_bytes_, kBlockAlign));
+        } else {
+            b.mem = static_cast<std::byte*>(palloc_malloc_aligned(block_bytes_, kBlockAlign));
+        }
         b.used = 0;
-        blocks_.push_back(std::move(b));
+        blocks_.push_back(b);
     }
     auto& blk  = blocks_.back();
     blk.used   = AlignUp(blk.used, align);
-    void* p    = blk.mem.get() + blk.used;
+    void* p    = blk.mem + blk.used;
     blk.used  += n;
     return p;
+}
+
+void Arena::Clear() {
+    for (auto& b : blocks_) {
+        if (b.mem) {
+            palloc_free(b.mem);
+            b.mem = nullptr;
+        }
+    }
+    blocks_.clear();
 }
 
 // ------------------------------------------------
 // MemTable constructor
 // ------------------------------------------------
-MemTable::MemTable(std::uint32_t dim, std::size_t arena_block_bytes)
-    : dim_(dim), arena_(arena_block_bytes),
+MemTable::MemTable(std::uint32_t dim, std::size_t arena_block_bytes, palloc_heap_t* heap)
+    : dim_(dim), arena_(arena_block_bytes, heap),
       map_(/* initial_cap = */ 128)
 {}
 

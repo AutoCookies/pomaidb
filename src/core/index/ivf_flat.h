@@ -5,8 +5,10 @@
 #include <string>
 #include <span>
 #include <memory>
+
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "util/aligned_vector.h"
 
 namespace pomai::index {
 
@@ -52,8 +54,8 @@ private:
     size_t total_count_ = 0;
     bool trained_ = false;
 
-    // Centroids: nlist * dim (Row-major)
-    std::vector<float> centroids_;
+    // Centroids: nlist * dim (Row-major), palloc-backed for alignment
+    pomai::util::AlignedVector<float> centroids_;
     
     // Inverted Lists: nlist vectors of local indices
     std::vector<std::vector<uint32_t>> lists_;

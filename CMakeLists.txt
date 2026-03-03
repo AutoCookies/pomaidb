@@ -496,6 +496,14 @@ add_executable(ci_perf_bench benchmarks/ci_perf_bench.cc)
 target_link_libraries(ci_perf_bench PRIVATE ${POMAI_EXE_DEPS})
 target_include_directories(ci_perf_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# benchmark_a: Multi-Environment Stress Test (IoT / Edge / Cloud validation)
+add_executable(benchmark_a benchmarks/palloc_env_stress.cc)
+target_link_libraries(benchmark_a PRIVATE ${POMAI_EXE_DEPS})
+target_include_directories(benchmark_a PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if (POMAI_USE_PALLOC)
+  target_include_directories(benchmark_a PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/palloc/include)
+endif()
+
 # =========================
 # Tools
 # =========================

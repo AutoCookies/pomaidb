@@ -1,8 +1,9 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <vector>
+
+#include "palloc_compat.h"
 
 namespace pomai::table
 {
@@ -10,19 +11,23 @@ namespace pomai::table
     class Arena
     {
     public:
-        explicit Arena(std::size_t block_bytes) : block_bytes_(block_bytes) {}
+        explicit Arena(std::size_t block_bytes, palloc_heap_t* heap = nullptr)
+            : block_bytes_(block_bytes), heap_(heap) {}
+
+        ~Arena() { Clear(); }
 
         void *Allocate(std::size_t n, std::size_t align);
-        void Clear() { blocks_.clear(); }
+        void Clear();
 
     private:
         struct Block
         {
-            std::unique_ptr<std::byte[]> mem;
+            std::byte* mem = nullptr;
             std::size_t used = 0;
         };
 
         std::size_t block_bytes_;
+        palloc_heap_t* heap_;
         std::vector<Block> blocks_;
     };
 

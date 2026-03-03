@@ -61,7 +61,7 @@ class Seqlock {
 
 class MemTable {
 public:
-    MemTable(std::uint32_t dim, std::size_t arena_block_bytes);
+    MemTable(std::uint32_t dim, std::size_t arena_block_bytes, palloc_heap_t* heap = nullptr);
 
     pomai::Status Put(pomai::VectorId id, pomai::VectorView vec);
     pomai::Status Put(pomai::VectorId id, pomai::VectorView vec, const pomai::Metadata& meta);

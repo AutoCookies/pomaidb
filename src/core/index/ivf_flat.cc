@@ -38,13 +38,6 @@ IvfFlatIndex::IvfFlatIndex(uint32_t dim, Options opt)
 IvfFlatIndex::~IvfFlatIndex() = default;
 
 uint32_t IvfFlatIndex::FindNearestCentroid(std::span<const float> vec) const {
-    // Use DOT PRODUCT for assignment (max dot) as per requirement 
-    // "Compute distances to centroids" in Coarse stage.
-    // Assuming vectors are roughly normalized or standard angular distance.
-    // If requirement implies L2 for assignment, we can swap.
-    // "Phase 3: Coarse stage: Compute distances to centroids" -> ambiguous.
-    // But since audit showed Dot product usage in rest of system, let's use Dot.
-    
     float best_score = -std::numeric_limits<float>::infinity();
     uint32_t best_idx = 0;
     
@@ -95,14 +88,14 @@ pomai::Status IvfFlatIndex::Train(std::span<const float> data, size_t num_vector
         for (size_t i = 0; i < num_vectors; ++i) {
             std::span<const float> vec(&data[i * dim_], dim_);
             
-            float min_dist = std::numeric_limits<float>::max();
+            float max_score = -std::numeric_limits<float>::max();
             uint32_t best_c = 0;
             
             for (uint32_t c = 0; c < opt_.nlist; ++c) {
                 std::span<const float> cen(&centroids_[c * dim_], dim_);
-                float d = pomai::core::L2Sq(vec, cen);
-                if (d < min_dist) {
-                    min_dist = d;
+                float s = pomai::core::Dot(vec, cen);
+                if (s > max_score) {
+                    max_score = s;
                     best_c = c;
                 }
             }
@@ -137,7 +130,8 @@ pomai::Status IvfFlatIndex::Train(std::span<const float> data, size_t num_vector
                 std::copy(&centroids_[c * dim_], &centroids_[c * dim_] + dim_, &new_centroids[c * dim_]);
             }
         }
-        centroids_ = new_centroids;
+        centroids_.resize(new_centroids.size());
+        std::memcpy(centroids_.data(), new_centroids.data(), new_centroids.size() * sizeof(float));
     }
     
     trained_ = true;

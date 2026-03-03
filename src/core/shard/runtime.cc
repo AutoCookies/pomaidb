@@ -419,9 +419,9 @@ namespace pomai::core
         // Push old shared_ptr to frozen
         frozen_mem_.push_back(old_mem);
         
-        // Create new MemTable
+        // Create new MemTable (use shard's palloc heap for vector storage)
         // engine.cc uses kArenaBlockBytes = 1MB. Assuming 1MB here too.
-        auto new_mem = std::make_shared<table::MemTable>(dim_, 1u << 20);
+        auto new_mem = std::make_shared<table::MemTable>(dim_, 1u << 20, palloc_heap_);
         mem_.store(new_mem, std::memory_order_release);
         
         PublishSnapshot();
@@ -741,6 +741,8 @@ namespace pomai::core
                     break;
             }
 
+            // std::cout << "[ShardRuntime] Processing command..." << std::endl;
+
             ops_processed_.fetch_add(1, std::memory_order_relaxed);
 
             Command cmd = std::move(*opt);
@@ -1032,6 +1034,7 @@ namespace pomai::core
                 }
                 if (state.phase == BackgroundJob::Phase::kBuild) {
                     if (state.mem_index >= state.memtables.size()) {
+                        // std::cout << "[ShardRuntime] Freeze: Switching to CommitManifest" << std::endl;
                         state.phase = BackgroundJob::Phase::kCommitManifest;
                         continue;
                     }
@@ -1081,10 +1084,12 @@ namespace pomai::core
                     bg_budget.Consume();
 
                     if (state.builder->Count() >= kMaxSegmentEntries) {
+                        // std::cout << "[ShardRuntime] Freeze: Segment full, finalizing" << std::endl;
                         state.memtable_done_after_finalize = false;
                         state.phase = BackgroundJob::Phase::kFinalizeSegment;
                     }
                 } else if (state.phase == BackgroundJob::Phase::kFinalizeSegment) {
+                    // std::cout << "[ShardRuntime] Freeze: Finalizing segment..." << std::endl;
                     auto st = state.builder->BuildIndex();
                     if (!st.ok()) {
                         complete_job(pomai::Status::Internal(std::string("Freeze: BuildIndex failed: ") + st.message()));
@@ -1613,12 +1618,15 @@ namespace pomai::core
             
             thread_local std::vector<uint32_t> cand_idxs_reuse;
             cand_idxs_reuse.clear();
-            auto cand_status = seg->Search(query, effective_nprobe, &cand_idxs_reuse);
+            auto cand_status = pomai::Status::Ok();
+            if (seg->Count() >= index_params_.adaptive_threshold && seg->HasIndex()) {
+                cand_status = seg->Search(query, effective_nprobe, &cand_idxs_reuse);
+            }
             if (cand_status.ok() && !cand_idxs_reuse.empty()) {
                 std::sort(cand_idxs_reuse.begin(), cand_idxs_reuse.end());
                 cand_idxs_reuse.erase(std::unique(cand_idxs_reuse.begin(), cand_idxs_reuse.end()), cand_idxs_reuse.end());
 
-                if (cand_idxs_reuse.size() >= min_candidates || !allow_fallback) {
+                if (!cand_idxs_reuse.empty()) {
                     used_candidates = true;
                     pomai::Metadata local_meta;
                     pomai::Metadata* meta_ptr = has_filters ? &local_meta : nullptr;
