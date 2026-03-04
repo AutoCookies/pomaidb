@@ -176,7 +176,7 @@ class FlatHashMemMap {
   K      sentinel_;
 
   size_t threshold() const noexcept {
-    return static_cast<size_t>(cap_ * kMaxLoadFactor);
+    return (cap_ * 3u) / 4u;  // 0.75 load factor without float conversion
   }
 
   size_t BucketOf(const K& k) const noexcept {

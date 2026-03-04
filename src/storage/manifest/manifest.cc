@@ -317,9 +317,9 @@ namespace pomai::storage
                 if (toks[0] == "name") {
                     // verify name matches?
                 } else if (toks[0] == "shards") {
-                    if (toks.size() > 1) ParseU32(toks[1], &spec->shard_count);
+                    if (toks.size() > 1) (void)ParseU32(toks[1], &spec->shard_count);
                 } else if (toks[0] == "dim") {
-                    if (toks.size() > 1) ParseU32(toks[1], &spec->dim);
+                    if (toks.size() > 1) (void)ParseU32(toks[1], &spec->dim);
                 } else if (toks[0] == "metric") {
                     if (toks.size() > 1) {
                         if (toks[1] == "IP") spec->metric = pomai::MetricType::kInnerProduct;
@@ -333,17 +333,17 @@ namespace pomai::storage
                 } else if (toks[0] == "index_params") {
                     if (toks.size() == 3) {
                          spec->index_params.type = pomai::IndexType::kIvfFlat;
-                         ParseU32(toks[1], &spec->index_params.nlist);
-                         ParseU32(toks[2], &spec->index_params.nprobe);
+                         (void)ParseU32(toks[1], &spec->index_params.nlist);
+                         (void)ParseU32(toks[2], &spec->index_params.nprobe);
                     } else if (toks.size() >= 7) {
                          uint32_t type_val = 0;
-                         ParseU32(toks[1], &type_val);
+                         (void)ParseU32(toks[1], &type_val);
                          spec->index_params.type = (type_val == 1) ? pomai::IndexType::kHnsw : pomai::IndexType::kIvfFlat;
-                         ParseU32(toks[2], &spec->index_params.nlist);
-                         ParseU32(toks[3], &spec->index_params.nprobe);
-                         ParseU32(toks[4], &spec->index_params.hnsw_m);
-                         ParseU32(toks[5], &spec->index_params.hnsw_ef_construction);
-                         ParseU32(toks[6], &spec->index_params.hnsw_ef_search);
+                         (void)ParseU32(toks[2], &spec->index_params.nlist);
+                         (void)ParseU32(toks[3], &spec->index_params.nprobe);
+                         (void)ParseU32(toks[4], &spec->index_params.hnsw_m);
+                         (void)ParseU32(toks[5], &spec->index_params.hnsw_ef_construction);
+                         (void)ParseU32(toks[6], &spec->index_params.hnsw_ef_search);
                     }
                 }
             }

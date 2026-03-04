@@ -90,8 +90,8 @@ POMAI_TEST(Database_CorruptWalReplayFailsOpen) {
         POMAI_EXPECT_TRUE(st.ok());
         // Write something so WAL exists
         std::vector<float> vec = {1, 2, 3, 4};
-        db->Put(1, vec);
-        db->Close();
+        POMAI_EXPECT_OK(db->Put(1, vec));
+        POMAI_EXPECT_OK(db->Close());
     }
 
     // 2. Corrupt the WAL file

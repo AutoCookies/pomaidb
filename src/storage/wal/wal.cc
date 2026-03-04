@@ -548,7 +548,7 @@ namespace pomai::storage
     pomai::Status Wal::Reset()
     {
         if (impl_) {
-            impl_->file.Close();
+            (void)impl_->file.Close();
             delete impl_;
             impl_ = nullptr;
         }

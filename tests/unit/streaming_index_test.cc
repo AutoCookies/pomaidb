@@ -29,16 +29,16 @@ POMAI_TEST(IvfCoarseTest_StreamingIndexCentroidShift) {
     // Verify candidate retrieval works for base cases
     std::vector<pomai::VectorId> cands;
     std::vector<float> q_a = {0.9f, 0.1f};
-    index.SelectCandidates(q_a, &cands);
+    POMAI_EXPECT_OK(index.SelectCandidates(q_a, &cands));
     POMAI_EXPECT_TRUE(cands.size() > 0);
-    
+
     // Now, stream 100 updates heavily skewed towards the Y-axis but barely closer to Cluster A.
     // Over time, competitive learning should drag Cluster A's centroid from {1, 0} towards {0.5, 0.866}.
     std::vector<float> skewed_vec = {0.5f, 0.866f}; // Normalized 60 degree angle
-    
+
     // Capture state before drift
     std::vector<pomai::VectorId> pre_drift_cands;
-    index.SelectCandidates(skewed_vec, &pre_drift_cands);
+    POMAI_EXPECT_OK(index.SelectCandidates(skewed_vec, &pre_drift_cands));
 
     std::cout << "Drifting index with SOM learning..." << std::endl;
     for (int i = 0; i < 100; i++) {
@@ -48,7 +48,7 @@ POMAI_TEST(IvfCoarseTest_StreamingIndexCentroidShift) {
     }
 
     std::vector<pomai::VectorId> post_drift_cands;
-    index.SelectCandidates(skewed_vec, &post_drift_cands);
+    POMAI_EXPECT_OK(index.SelectCandidates(skewed_vec, &post_drift_cands));
     
     // SOM forces the centroid closer to the streamed inputs, meaning when queried at that coordinate,
     // accuracy, proximity, and hit rate will generally favor the new location heavily over the old initialization.

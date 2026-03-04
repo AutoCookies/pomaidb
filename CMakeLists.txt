@@ -35,6 +35,7 @@ if (POMAI_USE_PALLOC)
   set(PA_OVERRIDE          ON  CACHE BOOL "" FORCE)
   set(PA_INSTALL_TOPLEVEL  OFF CACHE BOOL "" FORCE)
   set(PA_USE_CXX           ON  CACHE BOOL "" FORCE)
+  set(PALLOC_BUILD_MODE "" CACHE STRING "palloc build mode (legacy for pomaidb)" FORCE)
   add_subdirectory(third_party/palloc EXCLUDE_FROM_ALL)
   message(STATUS "[pomai] palloc: enabled (static, PA_OVERRIDE=ON)")
 else()
@@ -99,6 +100,7 @@ target_include_directories(pomai
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+  SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/palloc/include
 )
@@ -164,6 +166,7 @@ if (POMAI_USE_PALLOC)
     BINARY_DIR ${CMAKE_BINARY_DIR}/palloc_nooverride-build
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+      -DPALLOC_BUILD_MODE=
       -DPA_OVERRIDE=OFF
       -DPA_BUILD_SHARED=OFF
       -DPA_BUILD_OBJECT=OFF
@@ -211,7 +214,11 @@ endif()
 if (MSVC)
   target_compile_options(pomai PRIVATE /W4 /permissive-)
 else()
-  target_compile_options(pomai PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  # Strict warnings for pomaidb code; then suppress vendored third_party (simd, palloc) warnings
+  target_compile_options(pomai PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    -Wno-cpp -Wno-unknown-pragmas -Wno-conversion -Wno-float-conversion -Wno-unused-function
+    )
 endif()
 
 # =========================

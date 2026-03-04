@@ -695,7 +695,7 @@ namespace pomai::core
     // HandleFreeze: Budgeted background freeze pipeline
     // -------------------------
 
-    std::optional<pomai::Status> VectorRuntime::HandleFreeze(FreezeCmd &c)
+    std::optional<pomai::Status> VectorRuntime::HandleFreeze(FreezeCmd & /*c*/)
     {
         if (background_job_) {
             return pomai::Status::Busy("background job already running");
@@ -730,7 +730,7 @@ namespace pomai::core
     // HandleCompact: Budgeted background compaction
     // -------------------------
 
-    std::optional<pomai::Status> VectorRuntime::HandleCompact(CompactCmd & c)
+    std::optional<pomai::Status> VectorRuntime::HandleCompact(CompactCmd & /*c*/)
     {
         POMAI_LOG_INFO("[runtime:{}] Starting background compaction", runtime_id_);
         if (background_job_) return std::nullopt; // Keep in queue
@@ -1239,7 +1239,7 @@ namespace pomai::core
             SearchMergePolicy& merge_policy,
             bool use_visibility,
             std::vector<pomai::SearchHit> *out,
-            bool use_pool)
+            bool /*use_pool*/)
     {
         out->clear();
         out->reserve(topk);
@@ -1265,18 +1265,15 @@ namespace pomai::core
         // -------------------------
         // Phase 2: Parallel scoring over authoritative sources
         // -------------------------
-        std::uint64_t scored_scanned = 0;
         std::vector<pomai::SearchHit> candidates;
 
         bool has_filters = !opts.filters.empty();
-        const std::size_t min_candidates = has_filters ? std::max<std::size_t>(static_cast<std::size_t>(topk) * 50u, 2000u) : (static_cast<std::size_t>(topk) * 10u);
         uint32_t effective_nprobe = index_params_.nprobe == 0 ? 1 : index_params_.nprobe;
-        
+
         // If we expect to hit many candidates but nprobe is small, try to increase nprobe instead of full scan
         if (has_filters && effective_nprobe < 8) {
             effective_nprobe = std::min<uint32_t>(32u, effective_nprobe * 8); // Heuristic to avoid brute force
         }
-        bool allow_fallback = true;
 
         auto score_memtable = [&](const std::shared_ptr<table::MemTable>& mem) {
             if (!mem) {

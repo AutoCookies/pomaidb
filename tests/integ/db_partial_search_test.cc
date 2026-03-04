@@ -38,17 +38,17 @@ POMAI_TEST(PartialFailure_SearchResultHasErrorsField) {
     spec.name = "default";
     spec.dim = 4;
     spec.shard_count = 2;
-    db->CreateMembrane(spec);
-    db->OpenMembrane("default");
+    POMAI_EXPECT_OK(db->CreateMembrane(spec));
+    POMAI_EXPECT_OK(db->OpenMembrane("default"));
 
     // Insert data into both shards
     auto v1 = MakeVec(4, 1.0f);
     auto v2 = MakeVec(4, 2.0f);
-    
+
     // ID routing: assuming simple modulo sharding
     // We want to insert into both shards
-    db->Put("default", 1, v1); // Shard 1 % 2 = 1
-    db->Put("default", 2, v2); // Shard 2 % 2 = 0
+    POMAI_EXPECT_OK(db->Put("default", 1, v1)); // Shard 1 % 2 = 1
+    POMAI_EXPECT_OK(db->Put("default", 2, v2)); // Shard 2 % 2 = 0
     
     // Search should succeed
     SearchResult res;
@@ -60,7 +60,7 @@ POMAI_TEST(PartialFailure_SearchResultHasErrorsField) {
     // Verify hits are present
     POMAI_EXPECT_TRUE(!res.hits.empty());
     
-    db->Close();
+    POMAI_EXPECT_OK(db->Close());
 }
 
 POMAI_TEST(PartialFailure_EmptyErrorsOnSuccess) {
@@ -71,18 +71,18 @@ POMAI_TEST(PartialFailure_EmptyErrorsOnSuccess) {
     opt.fsync = FsyncPolicy::kNever;
 
     std::unique_ptr<DB> db;
-    DB::Open(opt, &db);
+    POMAI_EXPECT_OK(DB::Open(opt, &db));
     MembraneSpec spec;
     spec.name = "default";
     spec.dim = 4;
     spec.shard_count = 4;
-    db->CreateMembrane(spec);
-    db->OpenMembrane("default");
+    POMAI_EXPECT_OK(db->CreateMembrane(spec));
+    POMAI_EXPECT_OK(db->OpenMembrane("default"));
 
     // Insert across all shards
     for (int i = 0; i < 100; ++i) {
         auto v = MakeVec(4, static_cast<float>(i));
-        db->Put("default", i, v);
+        POMAI_EXPECT_OK(db->Put("default", i, v));
     }
 
     // Search

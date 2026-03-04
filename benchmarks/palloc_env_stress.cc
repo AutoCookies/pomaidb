@@ -233,7 +233,7 @@ void RunEnvB(EnvReport* report) {
   long rss_after_last  = 0;
   uint64_t t0 = ClockNs();
   size_t total_ingested = 0;
-  size_t last_verified = 0;
+  size_t total_verified = 0;
   bool all_ok = true;
   int failed_cycle = -1;
 
@@ -244,7 +244,7 @@ void RunEnvB(EnvReport* report) {
       std::string path = std::string("/tmp/benchmark_a_env_b_") + std::to_string(cycle);
       IngestResult r = IngestAndVerify(path, per_cycle);
       total_ingested += r.ingested;
-      last_verified = r.verified;
+      total_verified += r.verified;
       if (r.verified != per_cycle || r.ingested != per_cycle) {
         all_ok = false;
         if (failed_cycle < 0) failed_cycle = cycle;
@@ -260,7 +260,7 @@ void RunEnvB(EnvReport* report) {
     err_msg = std::string("FAIL: exception: ") + e.what();
     report->message = err_msg.c_str();
     report->vectors_allocated = total_ingested;
-    report->vectors_verified  = last_verified;
+    report->vectors_verified  = total_verified;
     report->peak_rss_bytes    = GetPeakRssBytes();
     if (total_ingested > 0 && (ClockNs() - t0) > 0)
       report->throughput_vec_per_sec = static_cast<double>(total_ingested) * 1e9 / static_cast<double>(ClockNs() - t0);
@@ -269,14 +269,14 @@ void RunEnvB(EnvReport* report) {
     report->passed = 0;
     report->message = "FAIL: unknown exception";
     report->vectors_allocated = total_ingested;
-    report->vectors_verified  = last_verified;
+    report->vectors_verified  = total_verified;
     report->peak_rss_bytes    = GetPeakRssBytes();
     return;
   }
 
   uint64_t elapsed_ns = ClockNs() - t0;
   report->vectors_allocated = total_ingested;
-  report->vectors_verified  = last_verified;  // per-cycle verified; all cycles expect 50k
+  report->vectors_verified  = total_verified;
   report->peak_rss_bytes    = rss_after_last;
   if (total_ingested > 0 && elapsed_ns > 0)
     report->throughput_vec_per_sec = static_cast<double>(total_ingested) * 1e9 / static_cast<double>(elapsed_ns);
