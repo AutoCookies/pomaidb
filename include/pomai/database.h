@@ -30,6 +30,7 @@ struct EmbeddedOptions {
     std::uint32_t dim = 512;
     MetricType metric = MetricType::kL2;
     FsyncPolicy fsync = FsyncPolicy::kNever;
+    /** Index/quantization params. Use IndexParams::ForEdge() for low-memory edge devices. */
     IndexParams index_params;
 
     /** Memtable backpressure: max size in MiB before rejecting Put (0 = from env or default). */
@@ -45,6 +46,11 @@ struct EmbeddedOptions {
 /**
  * Database: thin wrapper around one StorageEngine and one vector index.
  * Single-threaded only; caller serializes access or runs on one thread.
+ *
+ * Visibility and staleness: Search and Get use the latest published snapshot
+ * (updated after Freeze/Compact). During heavy ingestion, reads may be at most
+ * one freeze cycle behind the most recent Put. Use GetSnapshot + NewIterator
+ * for a fixed point-in-time view. Deletes are tombstones; "newest wins" per id.
  */
 class Database {
 public:

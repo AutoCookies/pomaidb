@@ -134,6 +134,13 @@ For the smallest footprint on embedded devices:
 2. **Slim palloc submodule** (saves ~6MB): after clone, run `./scripts/slim_palloc_submodule.sh` so `third_party/palloc` omits `media/`, `test/`, `bench/`, and `contrib/`.
 3. **Optional sparse checkout of pomaidb**: for a production embedded build you can exclude `benchmarks/`, `examples/`, or `tools/` via your own sparse-checkout if you do not need them at build time.
 
+### Edge deployments & failure semantics
+
+For recommended settings on real edge devices (build flags, durability policies, backpressure, and how PomaiDB behaves on power loss), see:
+
+- `docs/EDGE_DEPLOYMENT.md` — **edge-device configuration & failure behavior**
+- `docs/FAILURE_SEMANTICS.md` — low-level WAL / manifest crash semantics
+
 ### Docker: run benchmarks
 
 Build the image, then run benchmarks in constrained (IoT/Edge) or server-style containers:

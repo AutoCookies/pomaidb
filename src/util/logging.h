@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 #include <format>
 #include <source_location>
@@ -16,6 +17,22 @@ namespace pomai::util
         kError,
         kFatal
     };
+
+    /**
+     * Fatal handler invoked when a message is logged at kFatal.
+     * Default behavior is to abort(); edge/embedded code can set a custom handler
+     * (e.g. log and return, or invoke a watchdog) instead of terminating.
+     */
+    using FatalHandler = void (*)(const std::string& message);
+
+    /**
+     * Set the fatal handler. Pass nullptr to restore the default (abort).
+     * Thread-safety: set before any fatal log; handler is read when fatal is logged.
+     */
+    void SetFatalHandler(FatalHandler handler);
+
+    /** Return the current fatal handler (never nullptr; default aborts). */
+    FatalHandler GetFatalHandler();
 
     /**
      * @brief Premium Logger for PomaiDB.

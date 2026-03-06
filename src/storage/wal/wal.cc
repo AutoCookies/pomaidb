@@ -83,7 +83,12 @@ namespace pomai::storage
 
     pomai::Status Wal::Open()
     {
-        fs::create_directories(db_path_);
+        // Ensure WAL directory exists.
+        std::error_code dir_ec;
+        fs::create_directories(db_path_, dir_ec);
+        if (dir_ec) {
+            return pomai::Status::IoError("WAL create_directories failed");
+        }
 
         gen_ = 0;
         while (fs::exists(SegmentPath(gen_)))
@@ -142,8 +147,21 @@ namespace pomai::storage
 
         if (impl_)
         {
-            (void)impl_->file.SyncData();
-            (void)impl_->file.Close();
+            // Best-effort durability on closing current segment; surface serious I/O errors.
+            auto st_sync = impl_->file.SyncData();
+            auto st_close = impl_->file.Close();
+            if (!st_sync.ok()) {
+                impl_->~Impl();
+                palloc_free(impl_);
+                impl_ = nullptr;
+                return st_sync;
+            }
+            if (!st_close.ok()) {
+                impl_->~Impl();
+                palloc_free(impl_);
+                impl_ = nullptr;
+                return st_close;
+            }
             impl_->~Impl();
             palloc_free(impl_);
             impl_ = nullptr;

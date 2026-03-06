@@ -6,7 +6,6 @@
 #include "core/quantization/pomai_pq.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -21,12 +20,14 @@ namespace pomai::core {
 // ── Constructor ────────────────────────────────────────────────────────────────
 ProductQuantizer::ProductQuantizer(uint32_t dim, uint32_t M, uint32_t nbits)
     : dim_(dim), M_(M), nbits_(nbits),
-      ksub_(1u << nbits),
-      dsub_(dim / M),
-      code_size_((M * nbits + 7) / 8)
+      ksub_(nbits == 8 ? (1u << 8) : 0u),
+      dsub_(M != 0 ? dim / M : 0),
+      code_size_(M != 0 && nbits != 0 ? (M * nbits + 7) / 8 : 0)
 {
-    assert(dim_ % M_ == 0 && "dim must be divisible by M");
-    assert(nbits_ == 8 && "only PQ8 (8-bit codes) supported");
+    if (M_ == 0 || dim_ % M_ != 0 || nbits_ != 8) {
+        invalid_ = true;
+        return;
+    }
     centroids_.resize(static_cast<std::size_t>(M_) * ksub_ * dsub_, 0.0f);
 }
 
@@ -92,6 +93,8 @@ void KMeans(const float* data, std::size_t n, uint32_t d,
 // ── Training ──────────────────────────────────────────────────────────────────
 pomai::Status ProductQuantizer::Train(const float* data, std::size_t n, int max_iter)
 {
+    if (invalid_)
+        return pomai::Status::InvalidArgument("ProductQuantizer: dim must be divisible by M and nbits must be 8");
     if (n < ksub_)
         return pomai::Status::InvalidArgument(
             "PQ training requires at least ksub=" + std::to_string(ksub_) + " vectors");
@@ -120,6 +123,7 @@ pomai::Status ProductQuantizer::Train(const float* data, std::size_t n, int max_
 // ── Encoding ──────────────────────────────────────────────────────────────────
 void ProductQuantizer::Encode(const float* x, uint8_t* code) const
 {
+    if (invalid_) return;
     for (uint32_t m = 0; m < M_; ++m) {
         const float* xm = x + m * dsub_;
         float best_d = std::numeric_limits<float>::max();
@@ -139,6 +143,7 @@ void ProductQuantizer::Encode(const float* x, uint8_t* code) const
 void ProductQuantizer::EncodeBatch(const float* x, std::size_t n,
                                    uint8_t* codes) const
 {
+    if (invalid_) return;
     for (std::size_t i = 0; i < n; ++i)
         Encode(x + i * dim_, codes + i * code_size_);
 }
@@ -146,6 +151,7 @@ void ProductQuantizer::EncodeBatch(const float* x, std::size_t n,
 // ── Decoding ──────────────────────────────────────────────────────────────────
 void ProductQuantizer::Decode(const uint8_t* code, float* x) const
 {
+    if (invalid_) return;
     for (uint32_t m = 0; m < M_; ++m)
         std::memcpy(x + m * dsub_, GetCentroid(m, code[m]), dsub_ * sizeof(float));
 }
@@ -153,6 +159,7 @@ void ProductQuantizer::Decode(const uint8_t* code, float* x) const
 // ── ADC: precompute distance tables ──────────────────────────────────────────
 void ProductQuantizer::ComputeL2Table(const float* x, float* table) const
 {
+    if (invalid_) return;
     for (uint32_t m = 0; m < M_; ++m) {
         const float* xm = x + m * dsub_;
         float* tab_m = table + m * ksub_;
@@ -169,6 +176,7 @@ void ProductQuantizer::ComputeL2Table(const float* x, float* table) const
 
 void ProductQuantizer::ComputeIPTable(const float* x, float* table) const
 {
+    if (invalid_) return;
     for (uint32_t m = 0; m < M_; ++m) {
         const float* xm = x + m * dsub_;
         float* tab_m = table + m * ksub_;
@@ -184,6 +192,7 @@ void ProductQuantizer::ComputeIPTable(const float* x, float* table) const
 float ProductQuantizer::ScoreFromTable(const float* table,
                                        const uint8_t* code) const
 {
+    if (invalid_) return 0.0f;
     float s = 0.0f;
     for (uint32_t m = 0; m < M_; ++m)
         s += table[m * ksub_ + code[m]];
@@ -194,6 +203,7 @@ void ProductQuantizer::ScoreAllFromTable(const float* table,
                                          const uint8_t* codes, std::size_t n,
                                          float* out) const
 {
+    if (invalid_) return;
     for (std::size_t i = 0; i < n; ++i)
         out[i] = ScoreFromTable(table, codes + i * code_size_);
 }
@@ -201,6 +211,8 @@ void ProductQuantizer::ScoreAllFromTable(const float* table,
 // ── Persistence ───────────────────────────────────────────────────────────────
 pomai::Status ProductQuantizer::Save(const std::string& path) const
 {
+    if (invalid_)
+        return pomai::Status::InvalidArgument("ProductQuantizer: invalid configuration (dim % M != 0 or nbits != 8)");
     std::ofstream f(path, std::ios::binary);
     if (!f) return pomai::Status::IOError("Cannot open PQ file for write: " + path);
     const uint32_t magic = 0x504D4151; // 'PMAQ'
@@ -226,6 +238,8 @@ pomai::Status ProductQuantizer::Load(const std::string& path,
     f.read(reinterpret_cast<char*>(&nbits),  sizeof(nbits));
     if (magic != 0x504D4151u)
         return pomai::Status::Corruption("Bad PQ magic in " + path);
+    if (dim == 0 || M == 0 || (dim % M) != 0 || nbits != 8)
+        return pomai::Status::Corruption("Invalid PQ parameters in file (dim % M != 0 or nbits != 8)");
     auto pq = std::make_unique<ProductQuantizer>(dim, M, nbits);
     const std::size_t cent_sz = pq->centroids_.size() * sizeof(float);
     f.read(reinterpret_cast<char*>(pq->centroids_.data()), cent_sz);

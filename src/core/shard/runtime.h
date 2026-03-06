@@ -229,6 +229,11 @@ namespace pomai::core
         std::unique_ptr<BackgroundJob> background_job_;
         std::optional<pomai::Status> last_background_result_;  // Set when background job completes (single-threaded)
         std::uint64_t wal_epoch_{0};
+
+        // Reusable scratch buffers for search hot path (single-threaded; avoids per-query allocations).
+        mutable std::vector<pomai::SearchHit> search_candidates_scratch_;
+        mutable std::vector<std::vector<pomai::SearchHit>> search_segment_hits_scratch_;
+        mutable std::vector<float> search_query_sums_scratch_;
     };
 
 } // namespace pomai::core

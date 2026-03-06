@@ -25,7 +25,7 @@ namespace pomai::util
     {
         if (this != &other)
         {
-            Close();
+            (void)Close();
             fd_ = other.fd_;
             other.fd_ = -1;
         }

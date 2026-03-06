@@ -236,6 +236,9 @@ void RunEnvB(EnvReport* report) {
   size_t total_verified = 0;
   bool all_ok = true;
   int failed_cycle = -1;
+  double first_cycle_throughput = 0.0;
+  double last_cycle_throughput = 0.0;
+  double min_cycle_throughput = 0.0;
 
   try {
     for (int cycle = 0; cycle < num_cycles; ++cycle) {
@@ -245,13 +248,17 @@ void RunEnvB(EnvReport* report) {
       IngestResult r = IngestAndVerify(path, per_cycle);
       total_ingested += r.ingested;
       total_verified += r.verified;
+      if (cycle == 0) first_cycle_throughput = r.throughput_vec_per_sec;
+      last_cycle_throughput = r.throughput_vec_per_sec;
+      if (r.throughput_vec_per_sec > 0.0 && (min_cycle_throughput == 0.0 || r.throughput_vec_per_sec < min_cycle_throughput))
+        min_cycle_throughput = r.throughput_vec_per_sec;
       if (r.verified != per_cycle || r.ingested != per_cycle) {
         all_ok = false;
         if (failed_cycle < 0) failed_cycle = cycle;
       }
       if (cycle == 0) rss_after_first = GetPeakRssBytes();
       rss_after_last = GetPeakRssBytes();
-      printf("ingested=%zu verified=%zu\n", r.ingested, r.verified);
+      printf("ingested=%zu verified=%zu  %.1f Vec/s\n", r.ingested, r.verified, r.throughput_vec_per_sec);
       fflush(stdout);
     }
   } catch (const std::exception& e) {
@@ -281,6 +288,18 @@ void RunEnvB(EnvReport* report) {
   if (total_ingested > 0 && elapsed_ns > 0)
     report->throughput_vec_per_sec = static_cast<double>(total_ingested) * 1e9 / static_cast<double>(elapsed_ns);
 
+  // Report per-cycle ingestion rate so we can check it does not degrade over time (constant vector size).
+  if (num_cycles > 0 && first_cycle_throughput > 0.0) {
+    printf("  Per-cycle ingestion (Vec/s): first=%.1f last=%.1f min=%.1f",
+           first_cycle_throughput, last_cycle_throughput, min_cycle_throughput);
+    const double ratio = (first_cycle_throughput > 0.0) ? (last_cycle_throughput / first_cycle_throughput) : 0.0;
+    if (ratio < 0.75)
+      printf("  [WARN: last cycle %.0f%% of first — ingestion rate reduced over time]\n", ratio * 100.0);
+    else
+      printf("  [OK: rate stable]\n");
+    fflush(stdout);
+  }
+
   if (!all_ok) {
     report->passed = 0;
     static std::string fail_msg;
@@ -299,6 +318,10 @@ void RunEnvB(EnvReport* report) {
     if (growth <= 0.15) {
       report->passed  = 1;
       report->message = "Peak RSS stable (no leak); all cycles verified";
+      if (first_cycle_throughput > 0.0 && last_cycle_throughput >= 0.75 * first_cycle_throughput)
+        report->message = "Peak RSS stable (no leak); all cycles verified; ingestion rate stable";
+      else if (first_cycle_throughput > 0.0 && last_cycle_throughput < 0.75 * first_cycle_throughput)
+        report->message = "Peak RSS stable (no leak); all cycles verified; WARN: ingestion rate degraded over cycles";
     } else {
       report->passed  = 0;
       report->message = "FAIL: RSS growth suggests leak";

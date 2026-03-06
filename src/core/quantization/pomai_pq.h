@@ -35,6 +35,8 @@ public:
     uint32_t dsub()  const { return dsub_; }
     uint32_t code_size() const { return code_size_; }
     bool     trained()   const { return trained_; }
+    /// False if constructor was given invalid args (dim not divisible by M, or nbits != 8).
+    bool     is_valid()  const { return !invalid_; }
 
     // ── Training ──────────────────────────────────────────────────────────────
     /// Train on `n` vectors. Each row is `dim` contiguous floats.
@@ -76,6 +78,7 @@ public:
 private:
     uint32_t dim_, M_, nbits_, ksub_, dsub_, code_size_;
     bool trained_ = false;
+    bool invalid_ = false;  // true when constructor args were invalid (no assert/abort)
     std::vector<float> centroids_;  // M × ksub × dsub (row-major: [m][k][d])
 
     const float* GetCentroid(uint32_t m, uint32_t k) const {

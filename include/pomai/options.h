@@ -55,6 +55,29 @@ namespace pomai
         // Default: 0 = always use HNSW when available (rely on ef_search for recall).
         uint32_t adaptive_threshold = 5000;
         QuantizationType quant_type = QuantizationType::kNone;
+
+        /** Default index params (balanced quality/memory). */
+        static IndexParams Default() {
+            return IndexParams{};
+        }
+
+        /**
+         * Low-memory preset for edge/embedded devices.
+         * Fewer IVF centroids, smaller HNSW graph and ef, lower adaptive threshold
+         * so more segments use brute-force (predictable, smaller index memory).
+         */
+        static IndexParams ForEdge() {
+            IndexParams p;
+            p.type = IndexType::kIvfFlat;
+            p.nlist = 16;
+            p.nprobe = 4;
+            p.hnsw_m = 16;
+            p.hnsw_ef_construction = 100;
+            p.hnsw_ef_search = 32;
+            p.adaptive_threshold = 2000;
+            p.quant_type = QuantizationType::kNone;
+            return p;
+        }
     };
 
     struct DBOptions

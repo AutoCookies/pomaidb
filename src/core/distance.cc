@@ -16,6 +16,19 @@
 // SimSIMD: by default uses compile-time dispatch (best for current arch).
 // For portable binaries with runtime dispatch (AVX2/AVX512/NEON/SVE), build with
 // -DSIMSIMD_DYNAMIC_DISPATCH=1 and link SimSIMD's dynamic dispatch object.
+#if !((defined(__GNUC__) || defined(__clang__)) && (defined(__ARM_ARCH) || defined(__aarch64__)) && defined(__ARM_FP16_FORMAT_IEEE)) && \
+    !(((defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__)) && defined(__AVX512FP16__)))
+#ifndef SIMSIMD_NATIVE_F16
+#define SIMSIMD_NATIVE_F16 0
+#endif
+#endif
+
+#if !((defined(__GNUC__) || defined(__clang__)) && (defined(__ARM_ARCH) || defined(__aarch64__)) && defined(__ARM_BF16_FORMAT_ALTERNATIVE)) && \
+    !(((defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__)) && defined(__AVX512BF16__)))
+#ifndef SIMSIMD_NATIVE_BF16
+#define SIMSIMD_NATIVE_BF16 0
+#endif
+#endif
 #include "simd/simsimd.h"
 
 namespace pomai::core {

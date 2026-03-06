@@ -2,9 +2,30 @@
 #include <iostream>
 #include <iomanip>
 #include <filesystem>
+#include <cstdlib>
 
 namespace pomai::util
 {
+    namespace
+    {
+        void DefaultFatalHandler(const std::string& /*message*/)
+        {
+            std::abort();
+        }
+
+        FatalHandler g_fatal_handler = DefaultFatalHandler;
+    }
+
+    void SetFatalHandler(FatalHandler handler)
+    {
+        g_fatal_handler = handler ? handler : DefaultFatalHandler;
+    }
+
+    FatalHandler GetFatalHandler()
+    {
+        return g_fatal_handler;
+    }
+
     Logger::Logger() : min_level_(LogLevel::kWarn)
     {
         const char* env = std::getenv("POMAI_LOG_LEVEL");
@@ -36,13 +57,12 @@ namespace pomai::util
 
     void Logger::Write(LogLevel level, std::source_location loc, const std::string& message)
     {
-
         // 1. Timestamp
         auto now = std::chrono::system_clock::now();
         auto in_time_t = std::chrono::system_clock::to_time_t(now);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
-        std::cout << "[" << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S") 
+        std::cout << "[" << std::put_time(std::localtime(&in_time_t), "%Y-%m-%d %H:%M:%S")
                   << "." << std::setfill('0') << std::setw(3) << ms.count() << "] ";
 
         // 2. Level with Color
@@ -64,11 +84,8 @@ namespace pomai::util
 
         // 4. Message
         std::cout << message << std::endl;
-        
-        if (level == LogLevel::kFatal) std::abort();
-    }
 
-    // Compat for older calls if any (manual Log function was in之前的 util/logging.h)
-    // We already updated the header, but if any .cc still calls the old Log(level, msg)
-    // we should bridge it or fix them.
+        if (level == LogLevel::kFatal)
+            GetFatalHandler()(message);
+    }
 }

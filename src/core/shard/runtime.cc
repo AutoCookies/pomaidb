@@ -32,7 +32,12 @@ namespace pomai::core
 
     namespace {
         constexpr std::chrono::milliseconds kBackgroundPoll{5};
+        // Per-tick work budget for background freeze/compact (kept small so callers stay responsive).
         constexpr std::chrono::milliseconds kBackgroundBudget{2};
+        // Upper bound on how long a single synchronous Freeze()/Compact() call will spend in background work
+        // before timing out and aborting the job. Prevents unbounded stalls on edge devices while leaving
+        // enough room for index builds on slower hardware.
+        constexpr std::chrono::seconds kBackgroundMaxSyncDuration{120};
         constexpr std::size_t kBackgroundMaxEntriesPerTick = 2048;
         constexpr std::size_t kMaxSegmentEntries = 20000;
         constexpr std::size_t kMaxFrozenMemtables = 4;
@@ -653,15 +658,10 @@ namespace pomai::core
         if (!st.ok())
             return st;
 
-        // Need to mark delete in frozen?
-        // Frozen memtables are immutable. We can't delete in them.
-        // We add a "Delete" record to active memtable (tombstone).
-        // Since we search Active AFTER Frozen? No, we search Newer first.
-        // Order: Active -> Frozen (New->Old) -> Segments.
-        // But `Search` using `Snapshot` does NOT see Active.
-        // So `Search` will see the OLD value in Frozen/Segments if Active has Tombstone.
-        // This is STALENESS. "Reads may observe a slightly stale snapshot".
-        // This is consistent.
+        // Tombstones live in the active memtable only; frozen/segments are immutable.
+        // Search order: Active -> Frozen (newest first) -> Segments. Snapshot does not
+        // include the active memtable's tail, so reads may lag by at most one freeze
+        // cycle. Visibility: "newest wins" per id; deletes are applied as tombstones.
         
         (void)ivf_->Delete(c.id);
         return pomai::Status::Ok();
@@ -702,10 +702,18 @@ namespace pomai::core
         auto job = std::make_unique<BackgroundJob>(BackgroundJob::Type::kFreeze, std::move(state));
         background_job_ = std::move(job);
         last_background_result_.reset();
+        const auto start = std::chrono::steady_clock::now();
         while (background_job_) {
-            PumpBackgroundWork(std::chrono::hours(1));
+            PumpBackgroundWork(kBackgroundBudget);
+            if (std::chrono::steady_clock::now() - start > kBackgroundMaxSyncDuration) {
+                CancelBackgroundJob("Freeze timed out");
+                break;
+            }
         }
-        return last_background_result_.has_value() ? last_background_result_ : std::optional<pomai::Status>(pomai::Status::Ok());
+        if (last_background_result_.has_value()) {
+            return last_background_result_;
+        }
+        return std::optional<pomai::Status>(pomai::Status::Aborted("Freeze timed out"));
     }
 
     // -------------------------
@@ -751,10 +759,18 @@ namespace pomai::core
         auto job = std::make_unique<BackgroundJob>(BackgroundJob::Type::kCompact, std::move(state));
         background_job_ = std::move(job);
         last_background_result_.reset();
+        const auto start = std::chrono::steady_clock::now();
         while (background_job_) {
-            PumpBackgroundWork(std::chrono::hours(1));
+            PumpBackgroundWork(kBackgroundBudget);
+            if (std::chrono::steady_clock::now() - start > kBackgroundMaxSyncDuration) {
+                CancelBackgroundJob("Compaction timed out");
+                break;
+            }
         }
-        return last_background_result_.has_value() ? last_background_result_ : std::optional<pomai::Status>(pomai::Status::Ok());
+        if (last_background_result_.has_value()) {
+            return last_background_result_;
+        }
+        return std::optional<pomai::Status>(pomai::Status::Aborted("Compaction timed out"));
     }
 
     IteratorReply VectorRuntime::HandleIterator(IteratorCmd &c)
@@ -1188,18 +1204,19 @@ namespace pomai::core
             }
         }
 
-        std::vector<float> query_sums(queries.size() / dim_, 0.0f);
+        const std::size_t num_queries = queries.size() / dim_;
+        search_query_sums_scratch_.resize(num_queries, 0.0f);
         for (uint32_t q_idx : query_indices) {
             std::span<const float> q(queries.data() + q_idx * dim_, dim_);
             float s = 0.0f;
             for (float f : q) s += f;
-            query_sums[q_idx] = s;
+            search_query_sums_scratch_[q_idx] = s;
         }
 
         // Sequential path (single-threaded event loop).
         for (uint32_t q_idx : query_indices) {
             std::span<const float> single_query(queries.data() + (q_idx * dim_), dim_);
-            float q_sum = query_sums[q_idx];
+            float q_sum = search_query_sums_scratch_[q_idx];
             auto st = SearchLocalInternal(active, snap, single_query, q_sum, topk, opts, shared_policy, use_visibility, &(*out_results)[q_idx], false);
             if (!st.ok()) return st;
         }
@@ -1245,9 +1262,10 @@ namespace pomai::core
         }
 
         // -------------------------
-        // Phase 2: Parallel scoring over authoritative sources
+        // Phase 2: Parallel scoring over authoritative sources (reuse scratch to reduce allocations)
         // -------------------------
-        std::vector<pomai::SearchHit> candidates;
+        search_candidates_scratch_.clear();
+        search_candidates_scratch_.reserve(std::min(static_cast<std::size_t>(topk) * 4, static_cast<std::size_t>(4096)));
 
         bool has_filters = !opts.filters.empty();
         uint32_t effective_nprobe = index_params_.nprobe == 0 ? 1 : index_params_.nprobe;
@@ -1359,9 +1377,11 @@ namespace pomai::core
                                 float score = 0.0f;
                                 const bool is_ip = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine);
                                 if (quant_type == pomai::QuantizationType::kSq8) {
-                                    score = pomai::core::DotSq8(query, std::span<const uint8_t>(codes_ptr, dim_), q_min, q_inv_scale, query_sum);
-                                    if (!is_ip) {
-                                        // TODO: Implement L2 for SQ8 or decode. For now IP only in fast path.
+                                    if (is_ip) {
+                                        score = pomai::core::DotSq8(query, std::span<const uint8_t>(codes_ptr, dim_), q_min, q_inv_scale, query_sum);
+                                    } else {
+                                        const float q_max = q_min + 255.0f * q_inv_scale;
+                                        score = -pomai::core::L2SqSq8(query, std::span<const uint8_t>(codes_ptr, dim_), q_min, q_max);
                                     }
                                 } else if (quant_type == pomai::QuantizationType::kFp16) {
                                     if (is_ip) {
@@ -1421,9 +1441,11 @@ namespace pomai::core
                             float score = 0.0f;
                             const bool is_ip = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine);
                             if (quant_type == pomai::QuantizationType::kSq8) {
-                                score = pomai::core::DotSq8(query, codes, q_min, q_inv_scale, query_sum);
-                                if (!is_ip) {
-                                    // IP only for SQ8 for now.
+                                if (is_ip) {
+                                    score = pomai::core::DotSq8(query, codes, q_min, q_inv_scale, query_sum);
+                                } else {
+                                    const float q_max = q_min + 255.0f * q_inv_scale;
+                                    score = -pomai::core::L2SqSq8(query, codes, q_min, q_max);
                                 }
                             } else if (quant_type == pomai::QuantizationType::kFp16) {
                                 if (is_ip) {
@@ -1509,38 +1531,39 @@ namespace pomai::core
         {
             auto [hits, scanned] = score_memtable(active);
             total_scanned += scanned;
-            candidates.insert(candidates.end(), hits.begin(), hits.end());
+            search_candidates_scratch_.insert(search_candidates_scratch_.end(), hits.begin(), hits.end());
         }
 
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
             auto [hits, scanned] = score_memtable(*it);
             total_scanned += scanned;
-            candidates.insert(candidates.end(), hits.begin(), hits.end());
+            search_candidates_scratch_.insert(search_candidates_scratch_.end(), hits.begin(), hits.end());
         }
 
-        std::vector<std::vector<pomai::SearchHit>> segment_hits(snap->segments.size());
+        search_segment_hits_scratch_.resize(snap->segments.size());
         for (std::size_t i = 0; i < snap->segments.size(); ++i) {
-            segment_hits[i] = score_segment(snap->segments[i]);
+            search_segment_hits_scratch_[i].clear();
+            search_segment_hits_scratch_[i] = score_segment(snap->segments[i]);
         }
 
         last_query_candidates_scanned_ += total_scanned;
 
-        for (const auto& hits : segment_hits) {
-            candidates.insert(candidates.end(), hits.begin(), hits.end());
+        for (const auto& hits : search_segment_hits_scratch_) {
+            search_candidates_scratch_.insert(search_candidates_scratch_.end(), hits.begin(), hits.end());
         }
 
-        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        std::sort(search_candidates_scratch_.begin(), search_candidates_scratch_.end(), [](const auto& a, const auto& b) {
             if (a.score != b.score) {
                 return a.score > b.score;
             }
             return a.id < b.id;
         });
 
-        if (candidates.size() > topk) {
-            candidates.resize(topk);
+        if (search_candidates_scratch_.size() > topk) {
+            search_candidates_scratch_.resize(topk);
         }
 
-        out->assign(candidates.begin(), candidates.end());
+        out->assign(search_candidates_scratch_.begin(), search_candidates_scratch_.end());
         return pomai::Status::Ok();
     }
 } // namespace pomai::core

@@ -11,11 +11,27 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(POMAI_BUILD_TESTS "Build tests" OFF)
 option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
+
 # Prefer integer (SQ8/FP16) distance paths where data is quantized; reduces float use on embedded.
 option(POMAI_PREFER_INTEGER_MATH "Prefer integer/SQ8/FP16 paths for distance (embedded)" ON)
 
+# Edge-oriented build profile for constrained devices.
+# When enabled, we bias towards smaller binaries and lower memory/debug overhead.
+option(POMAI_EDGE_BUILD "Optimize PomaiDB build for edge devices (size/footprint)" OFF)
+
+# Strict build mode: treat project warnings as errors (useful for CI/hardening).
+# We keep a couple of warning categories non-fatal to tolerate intentional diagnostics
+# from some vendored headers included by the core.
+option(POMAI_STRICT "Treat warnings as errors for PomaiDB code" OFF)
+
 # Ensure POMAI_PREFER_INTEGER_MATH is defined for source code (0 or 1)
 add_compile_definitions(POMAI_PREFER_INTEGER_MATH=$<BOOL:${POMAI_PREFER_INTEGER_MATH}>)
+
+if (POMAI_EDGE_BUILD)
+  add_compile_definitions(POMAI_EDGE_BUILD=1)
+  # Favor size over speed and strip most debug info in edge builds.
+  add_compile_options(-Os -g0)
+endif()
 
 
 # =========================
@@ -79,6 +95,13 @@ target_include_directories(pomai
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
+# Vendored code: keep strict warnings for PomaiDB, but avoid breaking builds on
+# third_party sources when POMAI_STRICT is enabled.
+if (POMAI_STRICT AND NOT MSVC)
+  set_source_files_properties(third_party/pomaidb_hnsw/hnsw.cc PROPERTIES COMPILE_OPTIONS
+    "-Wno-error;-Wno-shadow;-Wno-unused-parameter;-Wno-unused-but-set-variable")
+endif()
+
 # OpenMP for parallel builds if needed
 find_package(OpenMP QUIET)
 if (OpenMP_CXX_FOUND)
@@ -88,11 +111,29 @@ endif()
 if (MSVC)
   target_compile_options(pomai PRIVATE /W4 /permissive-)
 else()
-  # Strict warnings for pomaidb code; then suppress vendored third_party (simd) warnings
+  # Strict warnings for pomaidb code; then suppress vendored third_party (simd) warnings.
+  # We do not use / -Werror globally because some third_party headers intentionally emit #warning.
   target_compile_options(pomai PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    -Wunused-parameter -Wunused-variable
     -Wno-cpp -Wno-unknown-pragmas -Wno-conversion -Wno-float-conversion -Wno-unused-function
+  )
+endif()
+
+if (POMAI_STRICT)
+  if (MSVC)
+    target_compile_options(pomai PRIVATE /WX)
+  else()
+    target_compile_options(pomai PRIVATE
+      -Werror
+      # Some vendored headers use extensions that trigger pedantic/cpp warnings.
+      -Wno-error=pedantic
+      -Wno-error=cpp
+      # third_party/simd uses #warning; pre-C++23 this triggers -Wc++23-extensions.
+      # We disable that warning category entirely to keep strict builds usable.
+      -Wno-c++23-extensions
     )
+  endif()
 endif()
 
 
@@ -133,8 +174,24 @@ if (MSVC)
   target_compile_options(pomai_c PRIVATE /W4 /permissive-)
   target_compile_options(pomai_c_static PRIVATE /W4 /permissive-)
 else()
-  target_compile_options(pomai_c PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
-  target_compile_options(pomai_c_static PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+  target_compile_options(pomai_c PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    -Wunused-parameter -Wunused-variable
+  )
+  target_compile_options(pomai_c_static PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion -Wshadow
+    -Wunused-parameter -Wunused-variable
+  )
+endif()
+
+if (POMAI_STRICT)
+  if (MSVC)
+    target_compile_options(pomai_c PRIVATE /WX)
+    target_compile_options(pomai_c_static PRIVATE /WX)
+  else()
+    target_compile_options(pomai_c PRIVATE -Werror -Wno-error=pedantic -Wno-error=cpp -Wno-c++23-extensions)
+    target_compile_options(pomai_c_static PRIVATE -Werror -Wno-error=pedantic -Wno-error=cpp -Wno-c++23-extensions)
+  endif()
 endif()
 
 # =========================
@@ -269,6 +326,18 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(db_partial_search_test)
   pomai_add_labeled_test(db_partial_search_test "integ")
 
+  add_executable(db_backpressure_test tests/integ/db_backpressure_test.cc)
+  pomai_setup_test(db_backpressure_test)
+  pomai_add_labeled_test(db_backpressure_test "integ")
+
+  add_executable(db_edge_workload_test tests/integ/db_edge_workload_test.cc)
+  pomai_setup_test(db_edge_workload_test)
+  pomai_add_labeled_test(db_edge_workload_test "integ")
+
+  add_executable(db_error_paths_test tests/integ/db_error_paths_test.cc)
+  pomai_setup_test(db_error_paths_test)
+  pomai_add_labeled_test(db_error_paths_test "integ")
+
   add_executable(routing_engine_test tests/integ/routing_engine_test.cc)
   pomai_setup_test(routing_engine_test)
   pomai_add_labeled_test(routing_engine_test "integ")
@@ -355,6 +424,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(shard_runtime_tsan_test tests/tsan/shard_runtime_tsan_test.cc)
   pomai_setup_test(shard_runtime_tsan_test)
   pomai_add_labeled_test(shard_runtime_tsan_test "tsan")
+
+  add_executable(backpressure_tsan_test tests/tsan/backpressure_tsan_test.cc)
+  pomai_setup_test(backpressure_tsan_test)
+  pomai_add_labeled_test(backpressure_tsan_test "tsan")
 
   add_executable(basic_workload_tsan_test tests/tsan/basic_workload_tsan_test.cc)
   pomai_setup_test(basic_workload_tsan_test)
