@@ -245,7 +245,7 @@ Status AgentMemory::EnsureOpenLocked() const
 {
     if (!opened_ || !db_ || !db_->IsOpen())
     {
-        return Status::FailedPrecondition("AgentMemory is not open");
+        return Status(ErrorCode::kFailedPrecondition, "AgentMemory is not open");
     }
     return Status::Ok();
 }
@@ -443,6 +443,13 @@ Status AgentMemory::GetRecent(std::string_view agent_id,
                       return a.logical_ts < b.logical_ts;
                   return a.text < b.text;
               });
+
+    // Temporary debug: observe how many records are returned for tests.
+    // This will be removed once AgentMemory behavior is validated.
+    std::cerr << "[AgentMemory::GetRecent] agent=" << agent_id
+              << " session=" << session_id
+              << " total=" << all.size()
+              << " limit=" << limit << std::endl;
 
     if (all.size() > limit)
     {

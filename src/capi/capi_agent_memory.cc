@@ -12,7 +12,7 @@
 
 namespace {
 
-struct pomai_agent_memory_t {
+struct AgentMemoryHandle {
     std::unique_ptr<pomai::AgentMemory> mem;
 };
 
@@ -57,13 +57,13 @@ pomai_status_t* pomai_agent_memory_open(
         return ToCStatus(st);
     }
 
-    void* raw = palloc_malloc_aligned(sizeof(pomai_agent_memory_t), alignof(pomai_agent_memory_t));
+    void* raw = palloc_malloc_aligned(sizeof(AgentMemoryHandle), alignof(AgentMemoryHandle));
     if (!raw) {
         return MakeStatus(POMAI_STATUS_RESOURCE_EXHAUSTED, "agent_memory handle allocation failed");
     }
-    auto* handle = new (raw) pomai_agent_memory_t();
+    auto* handle = new (raw) AgentMemoryHandle();
     handle->mem = std::move(mem);
-    *out_mem = handle;
+    *out_mem = reinterpret_cast<pomai_agent_memory_t*>(handle);
     return nullptr;
 }
 
@@ -72,8 +72,9 @@ pomai_status_t* pomai_agent_memory_close(
     if (mem == nullptr) {
         return nullptr;
     }
-    mem->~pomai_agent_memory_t();
-    palloc_free(mem);
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
+    handle->~AgentMemoryHandle();
+    palloc_free(handle);
     return nullptr;
 }
 
@@ -87,6 +88,8 @@ pomai_status_t* pomai_agent_memory_append(
     if (record->agent_id == nullptr || record->embedding == nullptr || record->dim == 0) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "agent_id and embedding must be set");
     }
+
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
 
     pomai::AgentMemoryRecord rec;
     rec.agent_id = record->agent_id;
@@ -104,7 +107,7 @@ pomai_status_t* pomai_agent_memory_append(
     }
 
     pomai::VectorId id = 0;
-    auto st = mem->mem->AppendMessage(rec, &id);
+    auto st = handle->mem->AppendMessage(rec, &id);
     if (!st.ok()) {
         return ToCStatus(st);
     }
@@ -128,6 +131,8 @@ pomai_status_t* pomai_agent_memory_append_batch(
     if (records == nullptr) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "records must be non-null");
     }
+
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
 
     std::vector<pomai::AgentMemoryRecord> batch;
     batch.reserve(n);
@@ -153,7 +158,7 @@ pomai_status_t* pomai_agent_memory_append_batch(
     }
 
     std::vector<pomai::VectorId> ids;
-    auto st = mem->mem->AppendBatch(batch, &ids);
+    auto st = handle->mem->AppendBatch(batch, &ids);
     if (!st.ok()) {
         return ToCStatus(st);
     }
@@ -175,8 +180,10 @@ pomai_status_t* pomai_agent_memory_get_recent(
     if (mem == nullptr || agent_id == nullptr || out == nullptr) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "mem/agent_id/out must be non-null");
     }
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
+
     std::vector<pomai::AgentMemoryRecord> recs;
-    auto st = mem->mem->GetRecent(agent_id,
+    auto st = handle->mem->GetRecent(agent_id,
                                   session_id ? session_id : std::string_view(),
                                   limit,
                                   &recs);
@@ -300,8 +307,10 @@ pomai_status_t* pomai_agent_memory_search(
     q.embedding.assign(query->embedding, query->embedding + query->dim);
     q.topk = query->topk;
 
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
+
     pomai::AgentMemorySearchResult res;
-    auto st = mem->mem->SemanticSearch(q, &res);
+    auto st = handle->mem->SemanticSearch(q, &res);
     if (!st.ok()) {
         return ToCStatus(st);
     }
@@ -406,7 +415,8 @@ pomai_status_t* pomai_agent_memory_prune_old(
     if (mem == nullptr || agent_id == nullptr) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "mem/agent_id must be non-null");
     }
-    auto st = mem->mem->PruneOld(agent_id, keep_last_n, min_ts_to_keep);
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
+    auto st = handle->mem->PruneOld(agent_id, keep_last_n, min_ts_to_keep);
     return ToCStatus(st);
 }
 
@@ -416,7 +426,8 @@ pomai_status_t* pomai_agent_memory_prune_device(
     if (mem == nullptr) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "mem must be non-null");
     }
-    auto st = mem->mem->PruneDeviceWide(target_total_bytes);
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
+    auto st = handle->mem->PruneDeviceWide(target_total_bytes);
     return ToCStatus(st);
 }
 
@@ -425,7 +436,8 @@ pomai_status_t* pomai_agent_memory_freeze_if_needed(
     if (mem == nullptr) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "mem must be non-null");
     }
-    auto st = mem->mem->FreezeIfNeeded();
+    auto* handle = reinterpret_cast<AgentMemoryHandle*>(mem);
+    auto st = handle->mem->FreezeIfNeeded();
     return ToCStatus(st);
 }
 
