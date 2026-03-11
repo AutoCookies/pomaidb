@@ -58,6 +58,57 @@ POMAI_API void pomai_iter_free(pomai_iter_t* iter);
 // Utils
 POMAI_API void pomai_free(void* p);
 
+// AgentMemory: high-level context/memory backend for local agents
+
+POMAI_API pomai_status_t* pomai_agent_memory_open(
+    const pomai_agent_memory_options_t* opts,
+    pomai_agent_memory_t** out_mem);
+
+POMAI_API pomai_status_t* pomai_agent_memory_close(
+    pomai_agent_memory_t* mem);
+
+POMAI_API pomai_status_t* pomai_agent_memory_append(
+    pomai_agent_memory_t* mem,
+    const pomai_agent_memory_record_t* record,
+    uint64_t* out_id);
+
+POMAI_API pomai_status_t* pomai_agent_memory_append_batch(
+    pomai_agent_memory_t* mem,
+    const pomai_agent_memory_record_t* records,
+    size_t n,
+    uint64_t* out_ids);
+
+POMAI_API pomai_status_t* pomai_agent_memory_get_recent(
+    pomai_agent_memory_t* mem,
+    const char* agent_id,
+    const char* session_id,
+    size_t limit,
+    pomai_agent_memory_result_set_t** out);
+
+POMAI_API void pomai_agent_memory_result_set_free(
+    pomai_agent_memory_result_set_t* result);
+
+POMAI_API pomai_status_t* pomai_agent_memory_search(
+    pomai_agent_memory_t* mem,
+    const pomai_agent_memory_query_t* query,
+    pomai_agent_memory_search_result_t** out);
+
+POMAI_API void pomai_agent_memory_search_result_free(
+    pomai_agent_memory_search_result_t* result);
+
+POMAI_API pomai_status_t* pomai_agent_memory_prune_old(
+    pomai_agent_memory_t* mem,
+    const char* agent_id,
+    size_t keep_last_n,
+    int64_t min_ts_to_keep);
+
+POMAI_API pomai_status_t* pomai_agent_memory_prune_device(
+    pomai_agent_memory_t* mem,
+    uint64_t target_total_bytes);
+
+POMAI_API pomai_status_t* pomai_agent_memory_freeze_if_needed(
+    pomai_agent_memory_t* mem);
+
 #ifdef __cplusplus
 }
 #endif

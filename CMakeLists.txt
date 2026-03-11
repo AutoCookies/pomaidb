@@ -46,6 +46,7 @@ message(STATUS "[pomai] Native HNSW: enabled")
 add_library(pomai STATIC
   src/api/db.cc
   src/database.cc
+  src/agent/agent_memory.cc
   src/core/vector_engine/vector_engine.cc
   src/core/shard/runtime.cc
   src/core/shard/layer_lookup.cc
@@ -144,6 +145,7 @@ set(POMAI_C_API_SOURCES
   src/capi/capi_status.cc
   src/capi/capi_db.cc
   src/capi/capi_scan.cc
+  src/capi/capi_agent_memory.cc
 )
 
 add_library(pomai_c SHARED ${POMAI_C_API_SOURCES})
@@ -257,6 +259,14 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(memtable_test)
   pomai_add_labeled_test(memtable_test "unit")
 
+  add_executable(agent_memory_core_test tests/unit/agent_memory_core_test.cc)
+  pomai_setup_test(agent_memory_core_test)
+  pomai_add_labeled_test(agent_memory_core_test "unit")
+
+  add_executable(agent_memory_concurrency_test tests/unit/agent_memory_concurrency_test.cc)
+  pomai_setup_test(agent_memory_concurrency_test)
+  pomai_add_labeled_test(agent_memory_concurrency_test "unit")
+
   add_executable(mailbox_test tests/unit/mailbox_test.cc)
   pomai_setup_test(mailbox_test)
   pomai_add_labeled_test(mailbox_test "unit")
@@ -337,6 +347,14 @@ if (POMAI_BUILD_TESTS)
   add_executable(db_error_paths_test tests/integ/db_error_paths_test.cc)
   pomai_setup_test(db_error_paths_test)
   pomai_add_labeled_test(db_error_paths_test "integ")
+
+  add_executable(agent_memory_basic_test tests/integ/agent_memory_basic_test.cc)
+  pomai_setup_test(agent_memory_basic_test)
+  pomai_add_labeled_test(agent_memory_basic_test "integ")
+
+  add_executable(agent_memory_capi_test tests/integ/agent_memory_capi_test.cc)
+  pomai_setup_test(agent_memory_capi_test)
+  pomai_add_labeled_test(agent_memory_capi_test "integ")
 
   add_executable(routing_engine_test tests/integ/routing_engine_test.cc)
   pomai_setup_test(routing_engine_test)
