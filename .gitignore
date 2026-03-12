@@ -35,6 +35,7 @@ build
 ./data
 ./.history
 venv
+.venv
 ./*build
 ./build*
 .venv-benchmark

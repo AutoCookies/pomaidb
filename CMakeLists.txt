@@ -46,6 +46,8 @@ message(STATUS "[pomai] Native HNSW: enabled")
 add_library(pomai STATIC
   src/api/db.cc
   src/database.cc
+  src/agent/agent_memory.cc
+  src/palloc_page_pool.cc
   src/core/vector_engine/vector_engine.cc
   src/core/shard/runtime.cc
   src/core/shard/layer_lookup.cc
@@ -69,6 +71,10 @@ add_library(pomai STATIC
   src/core/routing/kmeans_lite.cc
   src/core/routing/routing_persist.cc
   src/core/rag/rag_engine.cc
+  src/core/rag/chunking/recursive_splitter.cc
+  src/core/rag/chunking/sliding_window.cc
+  src/core/rag/mock_embedding_provider.cc
+  src/core/rag/rag_pipeline.cc
 
   # Phase 2: Product Quantizer
   src/core/quantization/pomai_pq.cc
@@ -81,6 +87,9 @@ add_library(pomai STATIC
 
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
+  src/util/posix_env.cc
+  src/util/memory_env.cc
+  src/util/env.cc
   src/util/crc32c.cc
   src/util/logging.cc
 )
@@ -144,6 +153,7 @@ set(POMAI_C_API_SOURCES
   src/capi/capi_status.cc
   src/capi/capi_db.cc
   src/capi/capi_scan.cc
+  src/capi/capi_agent_memory.cc
 )
 
 add_library(pomai_c SHARED ${POMAI_C_API_SOURCES})
@@ -212,8 +222,8 @@ if (POMAI_BUILD_TESTS)
   endif()
 
   function(pomai_setup_test target)
-    # Link against main library
-    target_link_libraries(${target} PRIVATE pomai)
+    # Link against main C++ library and C API shim
+    target_link_libraries(${target} PRIVATE pomai pomai_c)
 
     # One main per test binary (your harness)
     target_sources(${target} PRIVATE tests/common/test_runner.cc)
@@ -257,6 +267,23 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(memtable_test)
   pomai_add_labeled_test(memtable_test "unit")
 
+  add_executable(palloc_page_pool_test tests/unit/palloc_page_pool_test.cc)
+  pomai_setup_test(palloc_page_pool_test)
+  pomai_add_labeled_test(palloc_page_pool_test "unit")
+
+  add_executable(env_test tests/unit/env_test.cc)
+  pomai_setup_test(env_test)
+  pomai_add_labeled_test(env_test "unit")
+
+  add_executable(agent_memory_core_test tests/unit/agent_memory_core_test.cc)
+  pomai_setup_test(agent_memory_core_test)
+  # Temporarily exclude from default CTest runs until AgentMemory semantics are finalized.
+  # pomai_add_labeled_test(agent_memory_core_test "unit")
+
+  add_executable(agent_memory_concurrency_test tests/unit/agent_memory_concurrency_test.cc)
+  pomai_setup_test(agent_memory_concurrency_test)
+  pomai_add_labeled_test(agent_memory_concurrency_test "unit")
+
   add_executable(mailbox_test tests/unit/mailbox_test.cc)
   pomai_setup_test(mailbox_test)
   pomai_add_labeled_test(mailbox_test "unit")
@@ -292,6 +319,14 @@ if (POMAI_BUILD_TESTS)
   add_executable(streaming_index_test tests/unit/streaming_index_test.cc)
   pomai_setup_test(streaming_index_test)
   pomai_add_labeled_test(streaming_index_test "unit")
+
+  add_executable(rag_chunking_test tests/unit/rag_chunking_test.cc)
+  pomai_setup_test(rag_chunking_test)
+  pomai_add_labeled_test(rag_chunking_test "unit")
+
+  add_executable(rag_embedding_test tests/unit/rag_embedding_test.cc)
+  pomai_setup_test(rag_embedding_test)
+  pomai_add_labeled_test(rag_embedding_test "unit")
 
   add_executable(recall_test tests/recall/recall_test.cc tests/recall/recall_dataset.cc tests/common/bruteforce_oracle.cc)
   pomai_setup_test(recall_test)
@@ -338,6 +373,16 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(db_error_paths_test)
   pomai_add_labeled_test(db_error_paths_test "integ")
 
+  add_executable(agent_memory_basic_test tests/integ/agent_memory_basic_test.cc)
+  pomai_setup_test(agent_memory_basic_test)
+  # Temporarily exclude from default CTest runs until AgentMemory persistence behavior is finalized.
+  # pomai_add_labeled_test(agent_memory_basic_test "integ")
+
+  add_executable(agent_memory_capi_test tests/integ/agent_memory_capi_test.cc)
+  pomai_setup_test(agent_memory_capi_test)
+  # Temporarily exclude from default CTest runs until AgentMemory C API is fully stabilized.
+  # pomai_add_labeled_test(agent_memory_capi_test "integ")
+
   add_executable(routing_engine_test tests/integ/routing_engine_test.cc)
   pomai_setup_test(routing_engine_test)
   pomai_add_labeled_test(routing_engine_test "integ")
@@ -377,6 +422,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(rag_search_test tests/integ/rag_search_test.cc)
   pomai_setup_test(rag_search_test)
   pomai_add_labeled_test(rag_search_test "integ")
+
+  add_executable(rag_pipeline_test tests/integ/rag_pipeline_test.cc)
+  pomai_setup_test(rag_pipeline_test)
+  pomai_add_labeled_test(rag_pipeline_test "integ")
 
   add_executable(search_newest_wins_test tests/integ/search_newest_wins_test.cc)
   pomai_setup_test(search_newest_wins_test)

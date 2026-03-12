@@ -23,6 +23,7 @@ namespace pomai
         TokenBlob tokens; // REQUIRED
         std::optional<VectorView> vec; // OPTIONAL; caller retains ownership of vec memory
         TokenOffsets offsets; // OPTIONAL
+        std::string chunk_text; // OPTIONAL; stored for RetrieveContext formatting; empty = not stored
         Metadata meta;
     };
 
@@ -58,6 +59,7 @@ namespace pomai
         float score = 0.0f;
         std::uint32_t token_matches = 0;
         TokenOffsets offsets;
+        std::string chunk_text; // optional; from stored chunk text when present
     };
 
     struct RagSearchResult

@@ -1,12 +1,12 @@
 #include "core/vector_engine/vector_engine.h"
 
-#include <filesystem>
 #include <utility>
 
 #include "core/distance.h"
 #include "core/memory/pin_manager.h"
 #include "core/shard/runtime.h"
 #include "core/snapshot_wrapper.h"
+#include "pomai/env.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 
@@ -58,18 +58,14 @@ Status VectorEngine::OpenLocked() {
         return Status::InvalidArgument("vector_engine requires dim > 0");
     }
 
-    std::error_code ec;
-    if (!std::filesystem::exists(opt_.path, ec)) {
-        if (!std::filesystem::create_directories(opt_.path, ec)) {
-            return Status::IOError("vector_engine create_directories failed");
-        }
-    } else if (ec) {
-        return Status::IOError("vector_engine stat failed: " + ec.message());
-    }
+    pomai::Env* env = opt_.env ? opt_.env : pomai::Env::Default();
+    Status st_env = env->CreateDirIfMissing(opt_.path);
+    if (!st_env.ok())
+        return Status::IOError("vector_engine CreateDirIfMissing failed");
 
     auto wal = std::make_unique<storage::Wal>(
-        opt_.path, /*log_id=*/0u, kWalSegmentBytes, opt_.fsync);
-    auto st = wal->Open();
+        env, opt_.path, /*log_id=*/0u, kWalSegmentBytes, opt_.fsync);
+    Status st = wal->Open();
     if (!st.ok()) return st;
 
     auto mem = std::make_unique<table::MemTable>(

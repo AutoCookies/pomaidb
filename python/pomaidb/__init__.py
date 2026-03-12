@@ -13,6 +13,7 @@ from pathlib import Path
 __all__ = [
     "open_db", "close", "put_batch", "freeze", "search_batch",
     "create_rag_membrane", "put_chunk", "search_rag",
+    "ingest_document", "retrieve_context",
     "PomaiDBError",
 ]
 
@@ -129,6 +130,15 @@ def _register_api(lib):
     lib.pomai_status_free.restype = None
 
     # RAG types
+    class PomaiRagChunkOptions(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("max_chunk_bytes", ctypes.c_size_t),
+            ("max_doc_bytes", ctypes.c_size_t),
+            ("max_chunks_per_batch", ctypes.c_size_t),
+            ("overlap_bytes", ctypes.c_size_t),
+        ]
+
     class PomaiRagChunk(ctypes.Structure):
         _fields_ = [
             ("struct_size", ctypes.c_uint32),
@@ -138,6 +148,8 @@ def _register_api(lib):
             ("token_count", ctypes.c_size_t),
             ("vector", ctypes.POINTER(ctypes.c_float)),
             ("dim", ctypes.c_uint32),
+            ("chunk_text", ctypes.c_char_p),
+            ("chunk_text_len", ctypes.c_size_t),
         ]
 
     class PomaiRagQuery(ctypes.Structure):
@@ -164,6 +176,8 @@ def _register_api(lib):
             ("doc_id", ctypes.c_uint64),
             ("score", ctypes.c_float),
             ("token_matches", ctypes.c_uint32),
+            ("chunk_text", ctypes.c_char_p),
+            ("chunk_text_len", ctypes.c_size_t),
         ]
 
     class PomaiRagSearchResult(ctypes.Structure):
@@ -185,10 +199,33 @@ def _register_api(lib):
     lib.pomai_rag_search_result_free.argtypes = [ctypes.POINTER(PomaiRagSearchResult)]
     lib.pomai_rag_search_result_free.restype = None
 
+    lib.pomai_rag_pipeline_create.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+        ctypes.POINTER(PomaiRagChunkOptions), ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.pomai_rag_pipeline_create.restype = ctypes.c_void_p
+    lib.pomai_rag_ingest_document.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t]
+    lib.pomai_rag_ingest_document.restype = ctypes.c_void_p
+    lib.pomai_rag_retrieve_context.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.pomai_rag_retrieve_context.restype = ctypes.c_void_p
+    lib.pomai_rag_retrieve_context_buf.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32,
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.pomai_rag_retrieve_context_buf.restype = ctypes.c_void_p
+    lib.pomai_rag_pipeline_free.argtypes = [ctypes.c_void_p]
+    lib.pomai_rag_pipeline_free.restype = None
+    lib.pomai_free.argtypes = [ctypes.c_void_p]
+    lib.pomai_free.restype = None
+
     lib._pomai_options = PomaiOptions
     lib._pomai_upsert = PomaiUpsert
     lib._pomai_query = PomaiQuery
     lib._pomai_search_results = PomaiSearchResults
+    lib._pomai_rag_chunk_options = PomaiRagChunkOptions
     lib._pomai_rag_chunk = PomaiRagChunk
     lib._pomai_rag_query = PomaiRagQuery
     lib._pomai_rag_search_options = PomaiRagSearchOptions
@@ -315,6 +352,8 @@ def put_chunk(db, membrane_name, chunk_id, doc_id, token_ids, vector=None):
     else:
         chunk.vector = None
         chunk.dim = 0
+    chunk.chunk_text = None
+    chunk.chunk_text_len = 0
     _check(_lib.pomai_put_chunk(db, membrane_name.encode("utf-8"), ctypes.byref(chunk)))
 
 
@@ -354,7 +393,54 @@ def search_rag(db, membrane_name, token_ids=None, vector=None, topk=10, candidat
         hits = []
         for i in range(result.hit_count):
             h = result.hits[i]
-            hits.append((h.chunk_id, h.doc_id, h.score, h.token_matches))
+            chunk_text = None
+            if h.chunk_text and h.chunk_text_len:
+                chunk_text = ctypes.string_at(h.chunk_text, h.chunk_text_len).decode("utf-8", errors="replace")
+            hits.append((h.chunk_id, h.doc_id, h.score, h.token_matches, chunk_text))
         return hits
     finally:
         _lib.pomai_rag_search_result_free(ctypes.byref(result))
+
+
+def ingest_document(db, membrane_name, doc_id, text, *, max_chunk_bytes=512, max_doc_bytes=4 * 1024 * 1024):
+    """Ingest a document into the RAG membrane: chunk, embed (mock), tokenize, store. Offline; no external API."""
+    _ensure_lib()
+    opts = _lib._pomai_rag_chunk_options()
+    opts.struct_size = ctypes.sizeof(_lib._pomai_rag_chunk_options())
+    opts.max_chunk_bytes = max_chunk_bytes
+    opts.max_doc_bytes = max_doc_bytes
+    opts.max_chunks_per_batch = 32
+    opts.overlap_bytes = 0
+    pipeline = ctypes.c_void_p()
+    dim = 4  # match mock embedder; membrane dim must match
+    _check(_lib.pomai_rag_pipeline_create(db, membrane_name.encode("utf-8"), dim, ctypes.byref(opts), ctypes.byref(pipeline)))
+    try:
+        text_buf = text.encode("utf-8")
+        _check(_lib.pomai_rag_ingest_document(pipeline, int(doc_id), text_buf, len(text_buf)))
+    finally:
+        _lib.pomai_rag_pipeline_free(pipeline)
+
+
+def retrieve_context(db, membrane_name, query, top_k=5, *, embedding_dim=4):
+    """Retrieve context for a query: embed query, search RAG, return concatenated chunk text. Offline."""
+    _ensure_lib()
+    opts = _lib._pomai_rag_chunk_options()
+    opts.struct_size = ctypes.sizeof(_lib._pomai_rag_chunk_options())
+    opts.max_chunk_bytes = 512
+    opts.max_doc_bytes = 4 * 1024 * 1024
+    opts.max_chunks_per_batch = 32
+    opts.overlap_bytes = 0
+    pipeline = ctypes.c_void_p()
+    _check(_lib.pomai_rag_pipeline_create(db, membrane_name.encode("utf-8"), embedding_dim, ctypes.byref(opts), ctypes.byref(pipeline)))
+    try:
+        query_buf = query.encode("utf-8")
+        # Use caller-provided buffer to avoid cross-DLL free issues
+        max_len = 65536
+        out_buf = ctypes.create_string_buffer(max_len)
+        out_len = ctypes.c_size_t()
+        _check(_lib.pomai_rag_retrieve_context_buf(pipeline, query_buf, len(query_buf), top_k, out_buf, max_len, ctypes.byref(out_len)))
+        if out_len.value == 0:
+            return ""
+        return out_buf.value[:out_len.value].decode("utf-8", errors="replace")
+    finally:
+        _lib.pomai_rag_pipeline_free(pipeline)

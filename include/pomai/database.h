@@ -23,10 +23,13 @@ namespace pomai {
 
 // Forward declaration: single-instance storage (one Arena, one WAL, one index).
 class StorageEngine;
+class Env;
 
 // Embedded database options: no sharding, no routing, no thread count.
 struct EmbeddedOptions {
     std::string path;
+    /** VFS for file I/O; nullptr = use Env::Default(). */
+    Env* env = nullptr;
     std::uint32_t dim = 512;
     MetricType metric = MetricType::kL2;
     FsyncPolicy fsync = FsyncPolicy::kNever;

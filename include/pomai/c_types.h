@@ -26,10 +26,12 @@ extern "C" {
 
 // Opaque handles
 typedef struct pomai_db_t pomai_db_t;
+typedef struct pomai_rag_pipeline_t pomai_rag_pipeline_t;
 typedef struct pomai_snapshot_t pomai_snapshot_t;
 typedef struct pomai_iter_t pomai_iter_t;
 typedef struct pomai_txn_t pomai_txn_t;
 typedef struct pomai_status_t pomai_status_t;
+typedef struct pomai_agent_memory_t pomai_agent_memory_t;
 
 #define POMAI_QUERY_FLAG_ZERO_COPY 1
 
@@ -123,6 +125,15 @@ POMAI_API pomai_status_t* pomai_search_batch(
 
 POMAI_API void pomai_search_batch_free(pomai_search_results_t* results, size_t num_queries);
 
+// RAG pipeline chunk options (for pomai_rag_pipeline_create)
+typedef struct {
+    uint32_t struct_size;
+    size_t max_chunk_bytes;
+    size_t max_doc_bytes;
+    size_t max_chunks_per_batch;
+    size_t overlap_bytes;
+} pomai_rag_chunk_options_t;
+
 // RAG: chunk and query types
 typedef struct {
     uint32_t struct_size;
@@ -132,6 +143,8 @@ typedef struct {
     size_t token_count;
     const float* vector;
     uint32_t dim;  // 0 if no vector
+    const char* chunk_text;   // optional; stored for RetrieveContext (NULL or empty = not stored)
+    size_t chunk_text_len;
 } pomai_rag_chunk_t;
 
 typedef struct {
@@ -155,6 +168,8 @@ typedef struct {
     uint64_t doc_id;
     float score;
     uint32_t token_matches;
+    char* chunk_text;   // optional; from stored chunk text (caller must pomai_free)
+    size_t chunk_text_len;
 } pomai_rag_hit_t;
 
 typedef struct {
@@ -168,6 +183,53 @@ typedef struct {
     bool has_start_id;
     uint32_t deadline_ms;
 } pomai_scan_options_t;
+
+// AgentMemory C API types
+
+typedef struct {
+    uint32_t struct_size;
+    const char* path;
+    uint32_t dim;
+    uint8_t metric; // 0 = L2, 1 = InnerProduct, 2 = Cosine
+    uint32_t max_messages_per_agent;
+    uint64_t max_device_bytes;
+} pomai_agent_memory_options_t;
+
+typedef struct {
+    uint32_t struct_size;
+    const char* agent_id;
+    const char* session_id;
+    const char* kind;        // "message" | "summary" | "knowledge"
+    int64_t logical_ts;
+    const char* text;
+    const float* embedding;
+    uint32_t dim;
+} pomai_agent_memory_record_t;
+
+typedef struct {
+    uint32_t struct_size;
+    const char* agent_id;
+    const char* session_id;  // NULL or empty for "any session"
+    const char* kind;        // NULL or empty for "any kind"
+    int64_t min_ts;
+    int64_t max_ts;
+    const float* embedding;
+    uint32_t dim;
+    uint32_t topk;
+} pomai_agent_memory_query_t;
+
+typedef struct {
+    uint32_t struct_size;
+    size_t count;
+    pomai_agent_memory_record_t* records;
+} pomai_agent_memory_result_set_t;
+
+typedef struct {
+    uint32_t struct_size;
+    size_t count;
+    pomai_agent_memory_record_t* records;
+    float* scores;
+} pomai_agent_memory_search_result_t;
 
 #ifdef __cplusplus
 }

@@ -5,7 +5,7 @@
 
 #include "palloc_compat.h"
 #include "pomai/c_status.h"
-#include "pomai/database.h"
+#include "pomai/pomai.h"
 #include "pomai/snapshot.h"
 #include "pomai/iterator.h"
 
@@ -15,7 +15,7 @@ struct pomai_status_t {
 };
 
 struct pomai_db_t {
-    std::unique_ptr<pomai::Database> db;
+    std::unique_ptr<pomai::DB> db;
 };
 
 struct pomai_snapshot_t {

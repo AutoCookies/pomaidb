@@ -267,7 +267,13 @@ public:
         opts.shard_count = 1;
         opts.path = "/tmp/pomai_bench_" + config_.dataset_size;
         opts.fsync = pomai::FsyncPolicy::kNever;  // Disable fsync for benchmark
-        
+        // Index params tuned for recall >= 95% (trade latency for accuracy)
+        opts.index_params.nlist = 64;
+        opts.index_params.nprobe = 64;  // probe all buckets for small/medium
+        opts.index_params.hnsw_ef_search = 256;
+        opts.index_params.hnsw_ef_construction = 200;
+        opts.index_params.adaptive_threshold = 5000;
+
         // Clean up old data
         fs::remove_all(opts.path);
         

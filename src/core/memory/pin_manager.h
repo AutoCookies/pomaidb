@@ -4,6 +4,8 @@
 #include <memory>
 #include <unordered_map>
 
+#include "palloc_page_pool.h"
+
 #include "pomai/snapshot.h"
 
 namespace pomai::core {

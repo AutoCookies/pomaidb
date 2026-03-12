@@ -39,6 +39,7 @@ namespace pomai::core
             pomai::TokenOffsets offsets;
             std::vector<float> embedding;
             bool has_vector = false;
+            std::string chunk_text;  // optional; for RetrieveContext
             pomai::Metadata meta;
         };
 

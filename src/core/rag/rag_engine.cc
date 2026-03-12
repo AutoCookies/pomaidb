@@ -98,6 +98,7 @@ namespace pomai::core
         record.doc_id = chunk.doc_id;
         record.tokens = chunk.tokens;
         record.offsets = chunk.offsets;
+        record.chunk_text = chunk.chunk_text;
         record.meta = chunk.meta;
         if (chunk.vec.has_value()) {
             record.embedding.assign(chunk.vec->data, chunk.vec->data + chunk.vec->dim);
@@ -191,6 +192,7 @@ namespace pomai::core
             hit.score = score;
             hit.token_matches = candidate.token_matches;
             hit.offsets = record.offsets;
+            hit.chunk_text = record.chunk_text;
             hits.push_back(std::move(hit));
             token_budget_used += token_count;
         }

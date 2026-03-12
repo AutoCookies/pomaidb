@@ -1,0 +1,4 @@
+# PomaiDB Python / benchmarks
+# Real CIFAR-10 pickle files may require numpy when loading
+numpy>=1.20
+-e python/

@@ -36,6 +36,14 @@ class PomaiOptions(ctypes.Structure):
         ("fsync_policy", ctypes.c_uint32),
         ("memory_budget_bytes", ctypes.c_uint64),
         ("deadline_ms", ctypes.c_uint32),
+        ("index_type", ctypes.c_uint8),
+        ("_pad1", ctypes.c_uint8 * 3),
+        ("hnsw_m", ctypes.c_uint32),
+        ("hnsw_ef_construction", ctypes.c_uint32),
+        ("hnsw_ef_search", ctypes.c_uint32),
+        ("adaptive_threshold", ctypes.c_uint32),
+        ("metric", ctypes.c_uint8),
+        ("_pad2", ctypes.c_uint8 * 3),
     ]
 
 
@@ -59,6 +67,19 @@ class PomaiQuery(ctypes.Structure):
         ("filter_expression", ctypes.c_char_p),
         ("alpha", ctypes.c_float),
         ("deadline_ms", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+# Opaque; only used as pointer in search results
+class _PomaiSemanticPointer(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("raw_data_ptr", ctypes.c_void_p),
+        ("dim", ctypes.c_uint32),
+        ("quant_min", ctypes.c_float),
+        ("quant_inv_scale", ctypes.c_float),
+        ("session_id", ctypes.c_uint64),
     ]
 
 
@@ -69,6 +90,7 @@ class PomaiSearchResults(ctypes.Structure):
         ("ids", ctypes.POINTER(ctypes.c_uint64)),
         ("scores", ctypes.POINTER(ctypes.c_float)),
         ("shard_ids", ctypes.POINTER(ctypes.c_uint32)),
+        ("zero_copy_pointers", ctypes.POINTER(ctypes.POINTER(_PomaiSemanticPointer))),
     ]
 
 
@@ -449,8 +471,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--topk", type=int, default=5)
     p.add_argument("--shards", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--download", action="store_true")
-    p.add_argument("--allow-fake-fallback", action="store_true", default=True)
+    p.add_argument("--download", action="store_true", default=True,
+                   help="Download CIFAR-10 if not present (default: True, use real dataset)")
+    p.add_argument("--no-download", action="store_false", dest="download",
+                   help="Do not download; use existing data only (fails if missing)")
+    p.add_argument("--allow-fake-fallback", action="store_true",
+                   help="If real CIFAR-10 load fails, use synthetic data instead")
     return p.parse_args()
 
 

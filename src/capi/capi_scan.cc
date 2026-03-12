@@ -33,7 +33,7 @@ pomai_status_t* pomai_get_snapshot(pomai_db_t* db, pomai_snapshot_t** out_snap) 
     }
 
     std::shared_ptr<pomai::Snapshot> snap;
-    auto st = db->db->GetSnapshot(&snap);
+    auto st = db->db->GetSnapshot("__default__", &snap);
     if (!st.ok()) {
         return ToCStatus(st);
     }
@@ -69,7 +69,7 @@ pomai_status_t* pomai_scan(
     }
 
     std::unique_ptr<pomai::SnapshotIterator> iter;
-    auto st = db->db->NewIterator(snap->snap, &iter);
+    auto st = db->db->NewIterator("__default__", snap->snap, &iter);
     if (!st.ok()) {
         return ToCStatus(st);
     }

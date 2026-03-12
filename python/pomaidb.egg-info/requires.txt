@@ -1,0 +1,4 @@
+
+[dev]
+numpy
+pytest

@@ -30,7 +30,7 @@ namespace
     const std::string path = pomai::test::TempDir("pomai-vector_runtime_tsan_test");
 
     auto wal = std::make_unique<pomai::storage::Wal>(
-        path, runtime_id,
+        pomai::Env::Default(), path, runtime_id,
         /*wal_segment_bytes*/ (1u << 20),
         /*fsync*/ pomai::FsyncPolicy::kNever);
 
