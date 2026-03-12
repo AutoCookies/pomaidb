@@ -47,6 +47,7 @@ add_library(pomai STATIC
   src/api/db.cc
   src/database.cc
   src/agent/agent_memory.cc
+  src/palloc_page_pool.cc
   src/core/vector_engine/vector_engine.cc
   src/core/shard/runtime.cc
   src/core/shard/layer_lookup.cc
@@ -82,6 +83,9 @@ add_library(pomai STATIC
 
   # Gate #1/#2 utilities (linked into libpomai)
   src/util/posix_file.cc
+  src/util/posix_env.cc
+  src/util/memory_env.cc
+  src/util/env.cc
   src/util/crc32c.cc
   src/util/logging.cc
 )
@@ -258,6 +262,14 @@ if (POMAI_BUILD_TESTS)
   add_executable(memtable_test tests/unit/memtable_test.cc)
   pomai_setup_test(memtable_test)
   pomai_add_labeled_test(memtable_test "unit")
+
+  add_executable(palloc_page_pool_test tests/unit/palloc_page_pool_test.cc)
+  pomai_setup_test(palloc_page_pool_test)
+  pomai_add_labeled_test(palloc_page_pool_test "unit")
+
+  add_executable(env_test tests/unit/env_test.cc)
+  pomai_setup_test(env_test)
+  pomai_add_labeled_test(env_test "unit")
 
   add_executable(agent_memory_core_test tests/unit/agent_memory_core_test.cc)
   pomai_setup_test(agent_memory_core_test)

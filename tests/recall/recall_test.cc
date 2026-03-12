@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include "core/shard/runtime.h"
+#include "pomai/env.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 #include "table/segment.h"
@@ -65,7 +66,7 @@ POMAI_TEST(Recall_Clustered_Basic) {
     std::string path = pomai::test::TempDir("recall_test_harness");
     uint32_t shard_id = 0;
     
-    auto wal = std::make_unique<storage::Wal>(path, shard_id, 1u << 20, FsyncPolicy::kNever);
+    auto wal = std::make_unique<storage::Wal>(pomai::Env::Default(), path, shard_id, 1u << 20, FsyncPolicy::kNever);
     POMAI_EXPECT_OK(wal->Open());
     
     auto mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);
@@ -163,7 +164,7 @@ POMAI_TEST(Recall_Uniform_Hard) {
     std::string path = pomai::test::TempDir("recall_test_uniform");
     uint32_t shard_id = 0;
     
-    auto wal = std::make_unique<storage::Wal>(path, shard_id, 1u << 20, FsyncPolicy::kNever);
+    auto wal = std::make_unique<storage::Wal>(pomai::Env::Default(), path, shard_id, 1u << 20, FsyncPolicy::kNever);
     POMAI_EXPECT_OK(wal->Open());
     
     auto mem = std::make_unique<MemTable>(dopt.dim, 1u << 20);

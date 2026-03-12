@@ -1,11 +1,13 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "palloc_compat.h"
+#include "pomai/env.h"
 #include "pomai/metadata.h"
 #include "pomai/options.h"
 #include "pomai/status.h"
@@ -22,8 +24,9 @@ namespace pomai::storage
     class Wal
     {
     public:
-        /** \a heap optional; when null, uses global palloc aligned allocator (mmap-backed). */
-        Wal(std::string db_path,
+        /** \a env VFS for file I/O; nullptr = use Env::Default(). \a heap optional. */
+        Wal(pomai::Env* env,
+            std::string db_path,
             std::uint32_t shard_id,
             std::size_t segment_bytes,
             pomai::FsyncPolicy fsync,
@@ -54,6 +57,7 @@ namespace pomai::storage
         std::string SegmentPath(std::uint64_t gen) const;
         pomai::Status RotateIfNeeded(std::size_t add_bytes);
 
+        pomai::Env* env_ = nullptr;
         std::string db_path_;
         std::uint32_t shard_id_;
         std::size_t segment_bytes_;
@@ -66,9 +70,8 @@ namespace pomai::storage
         std::size_t bytes_in_seg_ = 0;
 
         palloc_heap_t* heap_ = nullptr;
-        // POSIX file (append by pwrite at tracked offset)
         class Impl;
-        Impl *impl_ = nullptr;
+        Impl* impl_ = nullptr;
         std::vector<std::uint8_t> scratch_;
     };
 

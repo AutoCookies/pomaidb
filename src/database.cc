@@ -4,12 +4,12 @@
 #include "pomai/database.h"
 
 #include <cstdlib>
-#include <filesystem>
 #include <utility>
 
 #include "core/distance.h"
 #include "core/shard/runtime.h"
 #include "core/snapshot_wrapper.h"
+#include "pomai/env.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
 #include "util/logging.h"
@@ -52,20 +52,16 @@ public:
     Status Open(const EmbeddedOptions& options) {
         if (runtime_) return Status::InvalidArgument("already opened");
 
-        std::error_code ec;
-        if (!std::filesystem::exists(options.path, ec)) {
-            if (!std::filesystem::create_directories(options.path, ec))
-                return Status::IOError("create_directories failed");
-        } else if (ec) {
-            return Status::IOError("stat failed: " + ec.message());
-        }
+        pomai::Env* env = options.env ? options.env : pomai::Env::Default();
+        Status st = env->CreateDirIfMissing(options.path);
+        if (!st.ok()) return st;
 
         if (options.dim == 0)
             return Status::InvalidArgument("dim must be > 0");
 
         auto wal = std::make_unique<storage::Wal>(
-            options.path, 0u, kWalSegmentBytes, options.fsync);
-        auto st = wal->Open();
+            env, options.path, 0u, kWalSegmentBytes, options.fsync);
+        st = wal->Open();
         if (!st.ok()) return st;
 
         auto mem = std::make_unique<table::MemTable>(
