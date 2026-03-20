@@ -46,7 +46,7 @@ message(STATUS "[pomai] Native HNSW: enabled")
 add_library(pomai STATIC
   src/api/db.cc
   src/database.cc
-  src/agent/agent_memory.cc
+  src/core/rag/agent_memory.cc
   src/palloc_page_pool.cc
   src/core/vector_engine/vector_engine.cc
   src/core/shard/runtime.cc
@@ -538,7 +538,7 @@ target_include_directories(benchmark_a PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 # =========================
 # Tools
 # =========================
-add_executable(pomai_inspect src/tools/pomai_inspect.cc)
+add_executable(pomai_inspect src/core/inspect.cc)
 target_link_libraries(pomai_inspect PRIVATE ${POMAI_EXE_DEPS})
 target_include_directories(pomai_inspect PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}/include
