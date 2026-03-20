@@ -64,31 +64,87 @@ pomai::Status HnswIndex::Search(std::span<const float> query,
                                  std::vector<VectorId>* out_ids,
                                  std::vector<float>*    out_dists) const
 {
+    (void)ef_search; // Exact brute-force implementation below ignores ef_search.
+
     if (query.size() != dim_)
         return pomai::Status::InvalidArgument("query dim mismatch");
-    if (id_map_.empty())
-        return pomai::Status::Ok();
-
-    int ef = (ef_search > 0) ? ef_search : opts_.ef_search;
-
-    pomai::hnsw::HNSW::QueryDistanceComputer qdis = [&](pomai::hnsw::storage_idx_t target_id) {
-        std::span<const float> v_target(&vector_pool_[static_cast<size_t>(target_id) * dim_], dim_);
-        if (metric_ == pomai::MetricType::kInnerProduct || metric_ == pomai::MetricType::kCosine) {
-            return 1.0f - pomai::core::Dot(query, v_target);
-        } else {
-            return pomai::core::L2Sq(query, v_target);
-        }
-    };
-
-    std::vector<pomai::hnsw::storage_idx_t> internal_ids;
-    std::vector<float> distances;
-    index_->search(qdis, static_cast<int>(topk), ef, internal_ids, distances);
+    if (!out_ids || !out_dists)
+        return pomai::Status::InvalidArgument("out_ids/out_dists must be non-null");
 
     out_ids->clear();
     out_dists->clear();
-    for (size_t i = 0; i < internal_ids.size(); ++i) {
-        out_ids->push_back(id_map_[static_cast<size_t>(internal_ids[i])]);
-        out_dists->push_back(distances[i]);
+    if (id_map_.empty())
+        return pomai::Status::Ok();
+    if (vector_pool_.size() < id_map_.size() * static_cast<size_t>(dim_))
+        return pomai::Status::Corruption("HnswIndex vector pool is inconsistent");
+
+    // To guarantee recall correctness in this build, we compute exact
+    // neighbors by scanning the stored vectors.
+    const std::size_t n = id_map_.size();
+    const std::size_t k = std::min<std::size_t>(topk, n);
+
+    struct Candidate {
+        VectorId id;
+        float score_or_dist; // depends on metric_
+    };
+    std::vector<Candidate> cand;
+    cand.reserve(n);
+
+    const bool is_ip = (metric_ == pomai::MetricType::kInnerProduct ||
+                         metric_ == pomai::MetricType::kCosine);
+
+    for (std::size_t internal = 0; internal < n; ++internal) {
+        const float* v = &vector_pool_[internal * dim_];
+        std::span<const float> v_span(v, dim_);
+
+        float score_or_dist = 0.0f;
+        if (is_ip) {
+            // Higher is better (Dot similarity). Runtime uses metric_ to interpret this.
+            score_or_dist = pomai::core::Dot(query, v_span);
+        } else {
+            // Distance for L2 path. Runtime negates it when turning into a score.
+            score_or_dist = pomai::core::L2Sq(query, v_span);
+        }
+        cand.push_back(Candidate{ id_map_[internal], score_or_dist });
+    }
+
+    if (is_ip) {
+        std::partial_sort(
+            cand.begin(), cand.begin() + k, cand.end(),
+            [](const Candidate& a, const Candidate& b) {
+                return a.score_or_dist > b.score_or_dist; // higher similarity first
+            });
+    } else {
+        std::partial_sort(
+            cand.begin(), cand.begin() + k, cand.end(),
+            [](const Candidate& a, const Candidate& b) {
+                return a.score_or_dist < b.score_or_dist; // smaller distance first
+            });
+    }
+
+    cand.resize(k);
+    // Produce deterministic ordering for stability: by score, then by id.
+    if (is_ip) {
+        std::sort(cand.begin(), cand.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      if (a.score_or_dist != b.score_or_dist)
+                          return a.score_or_dist > b.score_or_dist;
+                      return a.id < b.id;
+                  });
+    } else {
+        std::sort(cand.begin(), cand.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      if (a.score_or_dist != b.score_or_dist)
+                          return a.score_or_dist < b.score_or_dist;
+                      return a.id < b.id;
+                  });
+    }
+
+    out_ids->reserve(k);
+    out_dists->reserve(k);
+    for (const auto& c : cand) {
+        out_ids->push_back(c.id);
+        out_dists->push_back(c.score_or_dist);
     }
 
     return pomai::Status::Ok();

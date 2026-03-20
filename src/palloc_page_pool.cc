@@ -295,11 +295,17 @@ palloc_page_pool* palloc_page_pool_create(const palloc_page_pool_options* in_opt
       palloc_malloc_aligned(sizeof(palloc_page_pool), alignof(palloc_page_pool)));
   if (!pool) return nullptr;
 
+  // `palloc_page_pool` is a C++ type containing non-trivial members (mutex,
+  // vectors, etc.). We must construct it; treating raw memory as a live
+  // object is undefined behavior and breaks under ASan.
+  new (pool) palloc_page_pool{};
+
   palloc_page_pool_impl& impl = pool->impl;
   impl.page_size = opts.page_size;
   impl.capacity_bytes = opts.capacity_bytes;
   impl.max_resident_pages = opts.capacity_bytes / opts.page_size;
   if (impl.max_resident_pages == 0) {
+    pool->~palloc_page_pool();
     palloc_free(pool);
     return nullptr;
   }
@@ -307,6 +313,7 @@ palloc_page_pool* palloc_page_pool_create(const palloc_page_pool_options* in_opt
   impl.arena = static_cast<uint8_t*>(
       palloc_malloc_aligned(impl.max_resident_pages * impl.page_size, opts.page_size));
   if (!impl.arena) {
+    pool->~palloc_page_pool();
     palloc_free(pool);
     return nullptr;
   }
@@ -326,8 +333,7 @@ palloc_page_pool* palloc_page_pool_create(const palloc_page_pool_options* in_opt
 
 void palloc_page_pool_destroy(palloc_page_pool* pool) {
   if (!pool) return;
-  // Manually call impl destructor, then free raw storage.
-  pool->impl.~palloc_page_pool_impl();
+  pool->~palloc_page_pool();
   palloc_free(pool);
 }
 

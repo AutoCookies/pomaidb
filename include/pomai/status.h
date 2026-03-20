@@ -28,19 +28,16 @@ enum class ErrorCode : uint8_t {
  */
 class [[nodiscard]] Status {
  public:
-  Status() noexcept : code_(ErrorCode::kOk), subcode_(0), state_(nullptr) {}
-  
-  Status(ErrorCode code, std::string_view msg = "") noexcept
-      : code_(code), subcode_(0), state_(msg.empty() ? nullptr : msg.data()) {
-      // Note: This assumes msg points to a static string or outlives Status.
-      // For a truly robust Lean DB, we prefer static messages.
-  }
+  Status() noexcept : code_(ErrorCode::kOk), subcode_(0), message_() {}
+
+  Status(ErrorCode code, std::string_view msg = "")
+      : code_(code), subcode_(0), message_(msg) {}
 
   bool ok() const noexcept { return code_ == ErrorCode::kOk; }
   ErrorCode code() const noexcept { return code_; }
   
   const char* message() const noexcept {
-    return state_ ? state_ : "";
+    return message_.empty() ? "" : message_.c_str();
   }
 
   // --- Canonical Factories ---
@@ -64,9 +61,9 @@ class [[nodiscard]] Status {
     if (ok()) return "OK";
     std::string s = "Error: ";
     s += std::to_string(static_cast<int>(code_));
-    if (state_) {
+    if (!message_.empty()) {
         s += " (";
-        s += state_;
+        s += message_;
         s += ")";
     }
     return s;
@@ -75,7 +72,9 @@ class [[nodiscard]] Status {
  private:
   ErrorCode code_;
   uint8_t subcode_;
-  const char* state_; // Points to a static string or owned state (if extended)
+  // Owns the error message so `Status::message()` remains valid after
+  // the constructor argument (often a temporary std::string) goes away.
+  std::string message_;
 };
 
 } // namespace pomai

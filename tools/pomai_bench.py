@@ -151,6 +151,9 @@ class PomaiClient:
         opts.path = str(db_path).encode("utf-8")
         opts.shards = shards
         opts.dim = dim
+        # The benchmark's brute-force oracle uses a dot product (IP).
+        # Match the DB's metric to avoid recall gate failures.
+        opts.metric = 1  # 1 = inner product
         if use_hnsw:
             opts.index_type = 1  # HNSW (match cross_engine / benchmark_all.sh)
             opts.hnsw_m = hnsw_m
@@ -409,7 +412,8 @@ def recall_metrics(oracle: Sequence[Sequence[int]], approx: List[List[int]]) -> 
 
 def ensure_recall_gates(metrics: RecallMetrics) -> None:
     # Recall benchmark uses HNSW (ef_search=32) to match cross_engine; expect high recall.
-    min_recall = 0.85
+    # Hard gate: trust benchmark must achieve very high recall.
+    min_recall = 0.95
     if metrics.recall_at_1 < min_recall or metrics.recall_at_10 < min_recall or metrics.recall_at_100 < min_recall:
         raise SystemExit(
             "Recall gate failed: "
