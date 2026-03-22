@@ -159,6 +159,13 @@ public:
                           const SearchOptions& opts, uint32_t k_hops,
                           std::vector<SearchResult>* out);
 
+    /**
+     * @brief Unified Multi-modal Search: Vector search + Graph context.
+     * Uses QueryPlanner to orchestrate the retrieval.
+     */
+    Status SearchMultiModal(const MultiModalQuery& query, SearchResult* out);
+    Status SearchMultiModal(std::string_view membrane, const MultiModalQuery& query, SearchResult* out);
+
     Status MaybeApplyBackpressure();
 
     /** Graph Operations */

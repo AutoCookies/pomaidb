@@ -15,7 +15,9 @@
 namespace pomai::core
 {
 
-    MembraneManager::MembraneManager(pomai::DBOptions base) : base_(std::move(base)) {}
+    MembraneManager::MembraneManager(pomai::DBOptions base) : base_(std::move(base)) {
+        planner_ = std::make_unique<QueryPlanner>(this);
+    }
     MembraneManager::~MembraneManager() = default;
 
     Status MembraneManager::Open()
@@ -436,6 +438,10 @@ namespace pomai::core
         if (state->spec.kind != pomai::MembraneKind::kRag)
             return Status::InvalidArgument("RAG membrane required for SearchRag");
         return state->rag_engine->Search(query, opts, out);
+    }
+
+    Status MembraneManager::SearchMultiModal(std::string_view membrane, const MultiModalQuery& query, SearchResult* out) {
+        return planner_ ? planner_->Execute(membrane, query, out) : Status::InvalidArgument("not opened");
     }
 
     Status MembraneManager::AddVertex(std::string_view membrane, VertexId id, TagId tag, const Metadata& meta)

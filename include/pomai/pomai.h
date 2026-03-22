@@ -57,6 +57,7 @@ namespace pomai
         virtual Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
                                    uint32_t topk, const SearchOptions& opts, std::vector<SearchResult>* out) = 0;
         virtual Status SearchRag(const RagQuery& query, const RagSearchOptions& opts, RagSearchResult *out) = 0;
+        virtual Status SearchMultiModal(const MultiModalQuery& query, SearchResult* out) = 0; // Added
 
         // Membrane API
         virtual Status CreateMembrane(const MembraneSpec &spec) = 0;
@@ -97,6 +98,7 @@ namespace pomai
                                    uint32_t topk, const SearchOptions& opts, std::vector<SearchResult>* out) = 0;
         virtual Status SearchRag(std::string_view membrane, const RagQuery& query,
                                  const RagSearchOptions& opts, RagSearchResult *out) = 0;
+        virtual Status SearchMultiModal(std::string_view membrane, const MultiModalQuery& query, SearchResult* out) = 0; // Added
 
         virtual Status Freeze(std::string_view membrane) = 0;
         virtual Status Compact(std::string_view membrane) = 0;

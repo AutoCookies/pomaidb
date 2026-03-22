@@ -184,6 +184,10 @@ namespace pomai
             return mgr_.SearchRag(core::MembraneManager::kDefaultMembrane, query, opts, out);
         }
 
+        Status SearchMultiModal(const MultiModalQuery& query, SearchResult* out) override {
+            return mgr_.SearchMultiModal(core::MembraneManager::kDefaultMembrane, query, out);
+        }
+
         Status SearchBatch(std::span<const float> queries, uint32_t num_queries,
                            uint32_t topk, std::vector<SearchResult>* out) override
         {
@@ -226,6 +230,10 @@ namespace pomai
                          const RagSearchOptions& opts, RagSearchResult *out) override
         {
             return mgr_.SearchRag(membrane, query, opts, out);
+        }
+
+        Status SearchMultiModal(std::string_view membrane, const MultiModalQuery& query, SearchResult* out) override {
+            return mgr_.SearchMultiModal(membrane, query, out);
         }
 
         Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries,

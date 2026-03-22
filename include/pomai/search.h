@@ -51,4 +51,17 @@ namespace pomai
         }
     };
 
+    /**
+     * @brief Unified Multi-modal Query specification.
+     */
+    struct MultiModalQuery {
+        std::vector<float> vector;      // Query vector
+        uint32_t top_k = 10;            // Vector search k
+        uint32_t graph_hops = 2;        // BFS hops from vector seeds
+        EdgeType edge_type = 0;         // Optional filter (0 = all)
+        
+        // Potential future filters
+        std::string filter_expression;
+    };
+
 } // namespace pomai

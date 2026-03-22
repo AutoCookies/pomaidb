@@ -9,12 +9,12 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/iterator.h"
-#include "pomai/iterator.h"
 #include "pomai/metadata.h"
 #include "pomai/snapshot.h"
 #include "pomai/rag.h"
 #include "pomai/hooks.h"
 #include "pomai/graph.h"
+#include "core/query/query_planner.h"
 
 namespace pomai {
     class GraphMembrane;
@@ -26,7 +26,7 @@ namespace pomai::core
     class RagEngine;
     class SyncReceiver;
 
-    class MembraneManager
+    class MembraneManager : public IQueryEngine
     {
     public:
         explicit MembraneManager(pomai::DBOptions base);
@@ -49,7 +49,7 @@ namespace pomai::core
         Status ListMembranes(std::vector<std::string> *out) const;
 
         Status Put(std::string_view membrane, VectorId id, std::span<const float> vec);
-        Status Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta); // Overload
+        Status Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta);
         Status PutVector(std::string_view membrane, VectorId id, std::span<const float> vec);
         Status PutVector(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta);
         Status PutChunk(std::string_view membrane, const pomai::RagChunk& chunk);
@@ -57,22 +57,27 @@ namespace pomai::core
                         const std::vector<VectorId>& ids,
                         const std::vector<std::span<const float>>& vectors);
         Status Get(std::string_view membrane, VectorId id, std::vector<float> *out);
-        Status Get(std::string_view membrane, VectorId id, std::vector<float> *out, Metadata* out_meta); // Added
+        Status Get(std::string_view membrane, VectorId id, std::vector<float> *out, Metadata* out_meta);
         Status Exists(std::string_view membrane, VectorId id, bool *exists);
         Status Delete(std::string_view membrane, VectorId id);
+        
+        // IQueryEngine implementation
+        Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out) override;
+        Status GetNeighbors(std::string_view membrane, VertexId src, std::vector<Neighbor>* out) override;
+        Status GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<Neighbor>* out) override;
+
+        // Overloads
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
-        Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
         Status SearchVector(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);
         Status SearchVector(std::string_view membrane, std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out);
         Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, std::uint32_t topk, std::vector<pomai::SearchResult>* out);
         Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, std::uint32_t topk, const SearchOptions& opts, std::vector<pomai::SearchResult>* out);
         Status SearchRag(std::string_view membrane, const pomai::RagQuery& query, const pomai::RagSearchOptions& opts, pomai::RagSearchResult *out);
+        Status SearchMultiModal(std::string_view membrane, const MultiModalQuery& query, SearchResult* out);
         
         // Graph Operations
         Status AddVertex(std::string_view membrane, VertexId id, TagId tag, const Metadata& meta);
         Status AddEdge(std::string_view membrane, VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta);
-        Status GetNeighbors(std::string_view membrane, VertexId src, std::vector<Neighbor>* out);
-        Status GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<Neighbor>* out);
 
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);
@@ -108,6 +113,7 @@ namespace pomai::core
 
         // For now: keep engines in-memory; later you can add lazy-open by manifest.
         std::unordered_map<std::string, MembraneState> membranes_;
+        std::unique_ptr<QueryPlanner> planner_;
     };
 
 } // namespace pomai::core
