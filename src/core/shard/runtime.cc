@@ -11,7 +11,8 @@
 #include "core/index/ivf_coarse.h"
 #include "storage/wal/wal.h"
 #include "table/memtable.h"
-#include "table/segment.h" // Added
+#include "table/segment.h" 
+#include "core/index/hnsw_index.h"
 #include "core/shard/iterator.h"
 #include "core/shard/manifest.h"
 #include "core/shard/layer_lookup.h"
@@ -1255,6 +1256,89 @@ namespace pomai::core
         return pomai::Status::Ok();
     }
 
+    pomai::Status VectorRuntime::SearchLexical(const std::string& query,
+                                               std::uint32_t topk,
+                                               std::vector<LexicalHit> *out)
+    {
+        if (!out) return Status::InvalidArgument("out null");
+        auto snap = GetSnapshot(); // Use GetSnapshot to ensure thread-safe access
+        if (!snap) return Status::Aborted("not started");
+        auto active = mem_; // mem_ is atomic, so direct access is fine
+
+        std::unordered_map<VectorId, float> merged_scores;
+        
+        // Visibility policy: Newest Wins
+        SearchMergePolicy merge_policy;
+        std::size_t reserve_hint = 0;
+        if (active) reserve_hint += active->GetCount();
+        for (const auto& frozen : snap->frozen_memtables) reserve_hint += frozen->GetCount();
+        for (const auto& seg : snap->segments) reserve_hint += seg->Count();
+        merge_policy.Reserve(reserve_hint);
+
+        // Build the "Newest Wins" map
+        if (active) {
+            const void* src = active.get();
+            active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
+                merge_policy.RecordIfUnresolved(id, is_deleted, src);
+            });
+        }
+        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
+            const void* src = it->get();
+            (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
+                merge_policy.RecordIfUnresolved(id, is_deleted, src);
+            });
+        }
+        for (const auto& seg : snap->segments) {
+            const void* src = seg.get();
+            seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
+                merge_policy.RecordIfUnresolved(id, is_deleted, src);
+            });
+        }
+
+        auto add_hits = [&](const std::vector<LexicalHit>& hits, const void* source) {
+            for (const auto& h : hits) {
+                const auto* entry = merge_policy.Find(h.id);
+                if (!entry || entry->source != source || entry->is_tombstone) {
+                    continue; // Skip if not visible or deleted
+                }
+                // Heuristic: sum scores across layers. In a production system, 
+                // we'd use a more sophisticated merge (BM25 across all shards).
+                merged_scores[h.id] += h.score;
+            }
+        };
+
+        // 1. Search Active MemTable
+        std::vector<LexicalHit> tmp;
+        if (active) {
+            (void)active->SearchLexical(query, topk * 2, &tmp);
+            add_hits(tmp, active.get());
+        }
+
+        // 2. Search Frozen MemTables
+        for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
+            tmp.clear();
+            (void)(*it)->SearchLexical(query, topk * 2, &tmp);
+            add_hits(tmp, it->get());
+        }
+
+        // 3. Search Segments
+        for (const auto& seg : snap->segments) {
+            tmp.clear();
+            (void)seg->SearchLexical(query, topk * 2, &tmp);
+            add_hits(tmp, seg.get());
+        }
+
+        if (merged_scores.empty()) return Status::Ok();
+
+        for (const auto& kv : merged_scores) {
+            out->push_back({kv.first, kv.second});
+        }
+        std::sort(out->begin(), out->end(), [](auto& a, auto& b){ return a.score > b.score; });
+        if (out->size() > topk) out->resize(topk);
+        
+        return Status::Ok();
+    }
+
 // -------------------------
     // SearchLocalInternal: DB-grade 1-pass merge scan
     // -------------------------
@@ -1313,30 +1397,57 @@ namespace pomai::core
             const void* source = mem.get();
             LocalTopK local(topk);
             std::uint64_t local_scanned = 0;
-            mem->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
-                ++local_scanned;
-                if (is_deleted) {
-                    return;
+
+            uint64_t min_ts = 0, max_ts = 0;
+            bool has_temporal = false;
+            for (const auto& f : opts.filters) {
+                if (f.field == "timestamp") {
+                    min_ts = f.min_ts;
+                    max_ts = f.max_ts;
+                    has_temporal = true;
+                    break;
                 }
-                if (use_visibility) {
-                    const auto* entry = merge_policy.Find(id);
-                    if (!entry || entry->source != source || entry->is_tombstone) {
-                        return;
+            }
+
+            if (has_temporal) {
+                std::vector<VectorId> ids;
+                mem->GetByTimeRange(min_ts, max_ts, &ids);
+                for (VectorId id : ids) {
+                    const float* vec_ptr = nullptr;
+                    Metadata meta_obj;
+                    auto st = mem->Get(id, &vec_ptr, &meta_obj);
+                    if (!st.ok()) continue;
+                    
+                    ++local_scanned;
+                    if (use_visibility) {
+                        const auto* entry = merge_policy.Find(id);
+                        if (!entry || entry->source != source || entry->is_tombstone) continue;
                     }
+                    if (!core::FilterEvaluator::Matches(meta_obj, opts)) continue;
+
+                    float score = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine)
+                                      ? pomai::core::Dot(query, std::span<const float>(vec_ptr, dim_))
+                                      : -pomai::core::L2Sq(query, std::span<const float>(vec_ptr, dim_));
+                    local.Push(id, score);
                 }
-                const pomai::Metadata default_meta;
-                const pomai::Metadata& m = meta ? *meta : default_meta;
-                if (!core::FilterEvaluator::Matches(m, opts)) {
-                    return;
-                }
-                float score = 0.0f;
-                if (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine) {
-                    score = pomai::core::Dot(query, vec);
-                } else {
-                    score = -pomai::core::L2Sq(query, vec);
-                }
-                local.Push(id, score);
-            });
+            } else {
+                mem->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta) {
+                    ++local_scanned;
+                    if (is_deleted) return;
+                    if (use_visibility) {
+                        const auto* entry = merge_policy.Find(id);
+                        if (!entry || entry->source != source || entry->is_tombstone) return;
+                    }
+                    const pomai::Metadata default_meta;
+                    const pomai::Metadata& m = meta ? *meta : default_meta;
+                    if (!core::FilterEvaluator::Matches(m, opts)) return;
+                    
+                    float score = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine)
+                                      ? pomai::core::Dot(query, vec)
+                                      : -pomai::core::L2Sq(query, vec);
+                    local.Push(id, score);
+                });
+            }
             return std::make_pair(local.Drain(), local_scanned);
         };
 
@@ -1420,6 +1531,8 @@ namespace pomai::core
                                     } else {
                                         score = -pomai::core::L2SqFp16(query, {reinterpret_cast<const uint16_t*>(codes_ptr), dim_});
                                     }
+                                } else if (quant_type == pomai::QuantizationType::kBit) {
+                                    score = pomai::core::DotBit(query, std::span<const uint8_t>(codes_ptr, (dim_ + 7) / 8));
                                 }
                                 local.Push(*(uint64_t*)p, score);
                             }

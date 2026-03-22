@@ -13,6 +13,7 @@
 #include "pomai/snapshot.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "core/query/lexical_index.h"
 
 namespace pomai::core {
 
@@ -73,6 +74,9 @@ public:
                   std::uint32_t topk,
                   const SearchOptions& opts,
                   pomai::SearchResult* out);
+    Status SearchLexical(const std::string& query,
+                        std::uint32_t topk,
+                        std::vector<LexicalHit>* out);
     Status SearchBatch(std::span<const float> queries,
                        std::uint32_t num_queries,
                        std::uint32_t topk,

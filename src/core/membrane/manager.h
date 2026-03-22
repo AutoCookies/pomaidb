@@ -63,8 +63,9 @@ namespace pomai::core
         
         // IQueryEngine implementation
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, const SearchOptions& opts, pomai::SearchResult *out) override;
-        Status GetNeighbors(std::string_view membrane, VertexId src, std::vector<Neighbor>* out) override;
-        Status GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<Neighbor>* out) override;
+        Status SearchLexical(std::string_view membrane, const std::string& query, uint32_t topk, std::vector<LexicalHit>* out) override;
+        Status GetNeighbors(std::string_view membrane, VertexId src, std::vector<pomai::Neighbor>* out) override;
+        Status GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<pomai::Neighbor>* out) override;
 
         // Overloads
         Status Search(std::string_view membrane, std::span<const float> query, std::uint32_t topk, pomai::SearchResult *out);

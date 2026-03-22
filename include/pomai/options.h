@@ -37,6 +37,7 @@ namespace pomai
         kNone = 0,
         kSq8 = 1,
         kFp16 = 2,
+        kBit = 3, // Binary Quantization (1-bit sign)
     };
 
     /** When true, vectors are stored as SQ8 (int8) with per-vector min/max for ~4x memory reduction. */

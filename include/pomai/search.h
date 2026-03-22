@@ -55,10 +55,17 @@ namespace pomai
      * @brief Unified Multi-modal Query specification.
      */
     struct MultiModalQuery {
-        std::vector<float> vector;      // Query vector
-        uint32_t top_k = 10;            // Vector search k
-        uint32_t graph_hops = 2;        // BFS hops from vector seeds
-        EdgeType edge_type = 0;         // Optional filter (0 = all)
+        std::vector<float> vector;      // Semantic query vector (Dense)
+        std::string keywords;           // Keyword query string (Lexical/BM25)
+        float alpha = 0.5f;             // Weight: alpha*Vector + (1-alpha)*Lexical
+        
+        uint32_t top_k = 10;            
+        uint32_t graph_hops = 2;        
+        EdgeType edge_type = 0;         
+
+        // Temporal Filtering
+        uint64_t start_ts = 0;
+        uint64_t end_ts = 0;
         
         // Potential future filters
         std::string filter_expression;

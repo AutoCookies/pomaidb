@@ -53,18 +53,37 @@ void BitsetMask::BuildFromSegment(const table::SegmentReader& seg,
     }
 
     // Filtered path: We need to read metadata per entry.
-    // Use ReadAt with metadata — sequential index scan is cache-friendly.
+    // OPTIMIZATION: If we have a timestamp range filter, use the temporal index.
+    uint64_t min_ts = 0, max_ts = 0;
+    bool has_temporal = false;
+    for (const auto& f : opts.filters) {
+        if (f.field == "timestamp") {
+            min_ts = f.min_ts;
+            max_ts = f.max_ts;
+            has_temporal = true;
+            break;
+        }
+    }
+
+    if (has_temporal) {
+        std::vector<uint32_t> temporal_indices;
+        if (seg.SearchTemporal(min_ts, max_ts, &temporal_indices).ok()) {
+            Metadata tmp_meta;
+            bool tmp_deleted;
+            for (uint32_t idx : temporal_indices) {
+                if (seg.ReadAtMetadata(idx, &tmp_deleted, &tmp_meta).ok() && !tmp_deleted && opts.Matches(tmp_meta)) {
+                    Set(idx);
+                }
+            }
+        }
+        return;
+    }
+
+    // Fallback: Full sequential index scan is cache-friendly.
     VectorId tmp_id;
     bool tmp_deleted;
     Metadata tmp_meta;
-
     for (uint32_t i = 0; i < n; ++i) {
-        // ReadAt with non-null meta_ptr reads the metadata block.
-        // For quantized segments we use ReadAtCodes; for float we use ReadAt.
-        // Both overloads accept (index, id*, vec*, deleted*, meta*).
-        //
-        // We call the float overload — if quantized the vec span will still be
-        // valid but we ignore it; the important output is out_meta + deleted.
         std::span<const float> ignored_vec;
         auto st = seg.ReadAt(i, &tmp_id, &ignored_vec, &tmp_deleted, &tmp_meta);
         if (!st.ok() || tmp_deleted) continue;

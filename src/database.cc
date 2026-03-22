@@ -119,6 +119,11 @@ Status StorageEngine::Search(std::string_view /*membrane*/, std::span<const floa
     return st;
 }
 
+Status StorageEngine::SearchLexical(std::string_view /*membrane*/, const std::string& query, uint32_t topk, std::vector<core::LexicalHit>* out) {
+    if (!runtime_ || !out) return Status::InvalidArgument("invalid args");
+    return runtime_->SearchLexical(query, topk, out);
+}
+
 Status StorageEngine::Search(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult* out) {
     return Search("__default__", query, topk, opts, out);
 }
@@ -135,19 +140,19 @@ Status StorageEngine::AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_
     return graph_runtime_ ? graph_runtime_->AddEdge(src, dst, type, rank, meta) : Status::InvalidArgument("no graph");
 }
 
-Status StorageEngine::GetNeighbors(std::string_view /*membrane*/, VertexId src, std::vector<Neighbor>* out) {
+Status StorageEngine::GetNeighbors(std::string_view /*membrane*/, VertexId src, std::vector<pomai::Neighbor>* out) {
     return GetNeighbors(src, out);
 }
 
-Status StorageEngine::GetNeighbors(std::string_view /*membrane*/, VertexId src, EdgeType type, std::vector<Neighbor>* out) {
+Status StorageEngine::GetNeighbors(std::string_view /*membrane*/, VertexId src, EdgeType type, std::vector<pomai::Neighbor>* out) {
     return GetNeighbors(src, type, out);
 }
 
-Status StorageEngine::GetNeighbors(VertexId src, std::vector<Neighbor>* out) {
+Status StorageEngine::GetNeighbors(VertexId src, std::vector<pomai::Neighbor>* out) {
     return graph_runtime_ ? graph_runtime_->GetNeighbors(src, out) : Status::InvalidArgument("no graph");
 }
 
-Status StorageEngine::GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out) {
+Status StorageEngine::GetNeighbors(VertexId src, EdgeType type, std::vector<pomai::Neighbor>* out) {
     return graph_runtime_ ? graph_runtime_->GetNeighbors(src, type, out) : Status::InvalidArgument("no graph");
 }
 

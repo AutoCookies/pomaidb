@@ -13,10 +13,12 @@
 #pragma once
 #include <cstdint>
 #include <span>
+#include <map>
 #include <unordered_map>
 #include "pomai/metadata.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "core/query/lexical_index.h"
 #include "table/arena.h"
 #include "table/flat_hash_memmap.h"
 #include "third_party/hash/xxhash64.h"
@@ -135,6 +137,25 @@ public:
         });
     }
 
+    /**
+     * @brief Range scan by timestamp.
+     */
+    void GetByTimeRange(uint64_t start, uint64_t end, std::vector<pomai::VectorId>* out) const {
+        if (!out) return;
+        auto it_start = temporal_index_.lower_bound(start);
+        auto it_end = temporal_index_.upper_bound(end);
+        for (auto it = it_start; it != it_end; ++it) {
+            out->push_back(it->second);
+        }
+    }
+
+    /**
+     * @brief Search by keyword.
+     */
+    void SearchLexical(const std::string& query, uint32_t topk, std::vector<core::LexicalHit>* out) const {
+         lexical_index_.Search(query, topk, out);
+    }
+
 private:
     // Single-writer fast iteration — no lock needed (writer is sole mutator).
     template <class Fn>
@@ -154,6 +175,8 @@ private:
     mutable FlatHashMemMap<pomai::VectorId, float*, XxHash64ForVectorId> map_;
 
     mutable std::unordered_map<pomai::VectorId, pomai::Metadata> metadata_;
+    mutable std::multimap<uint64_t, pomai::VectorId> temporal_index_;
+    mutable core::LexicalIndex lexical_index_;
     Seqlock seqlock_;
 };
 

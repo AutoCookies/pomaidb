@@ -1,7 +1,12 @@
 #include "table/segment.h"
 #include "util/crc32c.h"
 #include "core/index/ivf_flat.h"
+#include "core/index/hnsw_index.h"
+#include "core/query/lexical_index.h"
 #include "palloc_compat.h"
+#include "pomai/quantization/bit_quantizer.h"
+#include "pomai/quantization/scalar_quantizer.h"
+#include "pomai/quantization/half_float_quantizer.h"
 
 #include <algorithm>
 #include <cstring>
@@ -91,6 +96,8 @@ namespace pomai::table
             quantizer = std::make_unique<pomai::core::ScalarQuantizer8Bit>(dim_);
         } else if (quant_type == pomai::QuantizationType::kFp16) {
             quantizer = std::make_unique<pomai::core::HalfFloatQuantizer>(dim_);
+        } else if (quant_type == pomai::QuantizationType::kBit) {
+            quantizer = std::make_unique<pomai::core::BitQuantizer>(dim_);
         }
 
         if (quantizer) {
@@ -115,10 +122,6 @@ namespace pomai::table
             }
         }
         
-        // Prepare metadata arrays
-        std::vector<uint64_t> offsets;
-        std::vector<char> blob;
-        offsets.reserve(entries_.size() + 1);
         
         // V5 variables
         size_t entry_size = 0;
@@ -126,26 +129,28 @@ namespace pomai::table
         
         const pomai::QuantizationType h_quant_type = static_cast<pomai::QuantizationType>(h.quant_type);
         const bool is_quantized = (h_quant_type != pomai::QuantizationType::kNone);
-        size_t element_size = sizeof(float);
-        if (h_quant_type == pomai::QuantizationType::kSq8) element_size = sizeof(uint8_t);
-        else if (h_quant_type == pomai::QuantizationType::kFp16) element_size = sizeof(uint16_t);
+        
+        size_t vec_bytes = dim_ * sizeof(float);
+        if (h_quant_type == pomai::QuantizationType::kSq8) vec_bytes = dim_;
+        else if (h_quant_type == pomai::QuantizationType::kFp16) vec_bytes = dim_ * 2;
+        else if (h_quant_type == pomai::QuantizationType::kBit) vec_bytes = (dim_ + 7) / 8;
 
         if (h.version >= 6) {
-            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * element_size;
+            size_t unpadded_size = sizeof(uint64_t) + 4 + vec_bytes;
             entry_size = (unpadded_size + 63) & ~63; // 64-byte alignment
             entries_start_offset = 128; // Small header + alignment
             h.entry_size = static_cast<uint32_t>(entry_size);
             h.entries_start_offset = entries_start_offset;
             h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
         } else if (h.version >= 5) {
-            size_t unpadded_size = sizeof(uint64_t) + 4 + dim_ * element_size;
+            size_t unpadded_size = sizeof(uint64_t) + 4 + vec_bytes;
             entry_size = (unpadded_size + 4095) & ~4095;
             entries_start_offset = 4096;
             h.entry_size = static_cast<uint32_t>(entry_size);
             h.entries_start_offset = entries_start_offset;
             h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
         } else {
-            entry_size = sizeof(uint64_t) + 4 + dim_ * element_size;
+            entry_size = sizeof(uint64_t) + 4 + vec_bytes;
             entries_start_offset = sizeof(SegmentHeader);
             h.metadata_offset = static_cast<uint32_t>(entries_start_offset + entries_.size() * entry_size);
         }
@@ -187,7 +192,7 @@ namespace pomai::table
             if (is_quantized) {
                 std::vector<uint8_t> encoded;
                 if (e.is_deleted) {
-                    encoded.assign(dim_ * element_size, 0); 
+                    encoded.assign(vec_bytes, 0); 
                 } else {
                     encoded = quantizer->Encode(e.vec.span());
                 }
@@ -205,26 +210,67 @@ namespace pomai::table
             crc = pomai::util::Crc32c(entry_buffer.data(), entry_size, crc);
         }
 
-        // Write Metadata Block
-        for (const auto& e : entries_) {
+        // Prepare Metadata Block (Structured)
+        std::vector<uint64_t> offsets;
+        std::vector<uint8_t> blob;
+        offsets.reserve(entries_.size() + 1);
+
+        struct TimeEntry { uint64_t ts; uint32_t idx; };
+        std::vector<TimeEntry> time_entries;
+        time_entries.reserve(entries_.size());
+
+        for (uint32_t i = 0; i < entries_.size(); ++i) {
             offsets.push_back(blob.size());
-            if (!e.meta.tenant.empty()) {
-                blob.insert(blob.end(), e.meta.tenant.begin(), e.meta.tenant.end());
-            }
+            const auto& e = entries_[i];
+            
+            uint8_t mbuf[32]; // Fixed part (src_vid, timestamp, lat, lon)
+            std::memcpy(mbuf, &e.meta.src_vid, 8);
+            std::memcpy(mbuf + 8, &e.meta.timestamp, 8);
+            std::memcpy(mbuf + 16, &e.meta.lat, 8);
+            std::memcpy(mbuf + 24, &e.meta.lon, 8);
+            blob.insert(blob.end(), mbuf, mbuf + 32);
+
+            auto add_str = [&](const std::string& s) {
+                uint32_t len = static_cast<uint32_t>(s.size());
+                uint8_t lbuf[4];
+                std::memcpy(lbuf, &len, 4);
+                blob.insert(blob.end(), lbuf, lbuf + 4);
+                if (len > 0) blob.insert(blob.end(), s.begin(), s.end());
+            };
+
+            add_str(e.meta.tenant);
+            add_str(e.meta.text);
+            add_str(e.meta.payload);
+
+            time_entries.push_back({e.meta.timestamp, i});
         }
         offsets.push_back(blob.size());
 
-        // Serialize offsets
+        std::sort(time_entries.begin(), time_entries.end(), [](const TimeEntry& a, const TimeEntry& b){
+            return a.ts < b.ts;
+        });
+
+        h.temporal_index_offset = static_cast<uint32_t>(h.metadata_offset + offsets.size() * 8 + blob.size());
+
+        // Rewrite Header with correct offsets
+        st = file->Pwrite(0, Slice(reinterpret_cast<const uint8_t*>(&h), sizeof(h)));
+        if (!st.ok()) return st;
+
+        // Write Metadata Block
         st = file->Append(Slice(reinterpret_cast<const uint8_t*>(offsets.data()), offsets.size() * sizeof(uint64_t)));
         if (!st.ok()) return st;
         crc = pomai::util::Crc32c(reinterpret_cast<const uint8_t*>(offsets.data()), offsets.size() * sizeof(uint64_t), crc);
 
-        // Serialize blob
         if (!blob.empty()) {
-            st = file->Append(Slice(reinterpret_cast<const uint8_t*>(blob.data()), blob.size()));
+            st = file->Append(Slice(blob.data(), blob.size()));
             if (!st.ok()) return st;
-            crc = pomai::util::Crc32c(reinterpret_cast<const uint8_t*>(blob.data()), blob.size(), crc);
+            crc = pomai::util::Crc32c(blob.data(), blob.size(), crc);
         }
+
+        // Write Temporal Index
+        st = file->Append(Slice(reinterpret_cast<const uint8_t*>(time_entries.data()), time_entries.size() * sizeof(TimeEntry)));
+        if (!st.ok()) return st;
+        crc = pomai::util::Crc32c(reinterpret_cast<const uint8_t*>(time_entries.data()), time_entries.size() * sizeof(TimeEntry), crc);
         
         // Write CRC footer
         st = file->Append(Slice(reinterpret_cast<const uint8_t*>(&crc), sizeof(crc)));
@@ -376,6 +422,10 @@ namespace pomai::table
             reader->entries_start_offset_ = sizeof(SegmentHeader);
         }
 
+        if (h->version >= 6) {
+             reader->temporal_index_offset_ = h->temporal_index_offset;
+        }
+
         if (h->version >= 4) {
             reader->quant_type_ = static_cast<pomai::QuantizationType>(h->quant_type);
         } else {
@@ -384,8 +434,11 @@ namespace pomai::table
         
         if (reader->quant_type_ != pomai::QuantizationType::kNone) {
             if (h->version < 5) {
-                const size_t elem_size = (reader->quant_type_ == pomai::QuantizationType::kFp16) ? 2 : 1;
-                reader->entry_size_ = sizeof(uint64_t) + 4 + h->dim * elem_size;
+                size_t vec_bytes = h->dim * sizeof(float);
+                if (reader->quant_type_ == pomai::QuantizationType::kSq8) vec_bytes = h->dim;
+                else if (reader->quant_type_ == pomai::QuantizationType::kFp16) vec_bytes = h->dim * 2;
+                else if (reader->quant_type_ == pomai::QuantizationType::kBit) vec_bytes = (h->dim + 7) / 8;
+                reader->entry_size_ = sizeof(uint64_t) + 4 + vec_bytes;
             }
             
             if (reader->quant_type_ == pomai::QuantizationType::kSq8) {
@@ -394,6 +447,8 @@ namespace pomai::table
                 reader->quantizer_ = std::move(sq8);
             } else if (reader->quant_type_ == pomai::QuantizationType::kFp16) {
                 reader->quantizer_ = std::make_unique<pomai::core::HalfFloatQuantizer>(h->dim);
+            } else if (reader->quant_type_ == pomai::QuantizationType::kBit) {
+                reader->quantizer_ = std::make_unique<pomai::core::BitQuantizer>(h->dim);
             }
         } else {
             if (h->version < 5) {
@@ -443,12 +498,59 @@ namespace pomai::table
         return index_->Search(query, nprobe, out_candidates);
     }
 
+    pomai::Status SegmentReader::SearchTemporal(uint64_t start_ts, uint64_t end_ts, std::vector<uint32_t>* out_indices) const
+    {
+        if (!out_indices) return pomai::Status::InvalidArgument("null ptr");
+        if (temporal_index_offset_ == 0 || count_ == 0) return pomai::Status::Ok();
+
+        struct TimeEntry { uint64_t ts; uint32_t idx; };
+        const TimeEntry* t_base = reinterpret_cast<const TimeEntry*>(base_addr_ + temporal_index_offset_);
+
+        auto it_start = std::lower_bound(t_base, t_base + count_, start_ts, [](const TimeEntry& e, uint64_t ts){
+            return e.ts < ts;
+        });
+        auto it_end = std::upper_bound(t_base, t_base + count_, end_ts, [](uint64_t ts, const TimeEntry& e){
+            return ts < e.ts;
+        });
+
+        for (auto it = it_start; it != it_end; ++it) {
+            out_indices->push_back(it->idx);
+        }
+        return pomai::Status::Ok();
+    }
+
+    pomai::Status SegmentReader::SearchLexical(const std::string& query, uint32_t topk, std::vector<core::LexicalHit>* out) const
+    {
+        EnsureLexicalIndexBuilt();
+        if (lexical_index_) {
+            lexical_index_->Search(query, topk, out);
+        }
+        return pomai::Status::Ok();
+    }
+
+    void SegmentReader::EnsureLexicalIndexBuilt() const {
+        std::lock_guard<std::mutex> lock(lexical_init_mutex_);
+        if (lexical_index_) return;
+        
+        lexical_index_ = std::make_unique<core::LexicalIndex>();
+        if (metadata_offset_ == 0 || count_ == 0) return;
+        
+        for (uint32_t i = 0; i < count_; i++) {
+            Metadata meta;
+            GetMetadata(i, &meta);
+            if (!meta.text.empty()) {
+                VectorId vid;
+                std::memcpy(&vid, base_addr_ + entries_start_offset_ + i * entry_size_, 8);
+                lexical_index_->Add(vid, meta.text);
+            }
+        }
+    }
+
     void SegmentReader::GetMetadata(uint32_t index, pomai::Metadata* out) const
     {
         if (metadata_offset_ == 0 || index >= count_) return;
         
         const uint8_t* meta_offsets_base = base_addr_ + metadata_offset_;
-        // Blob starts after (count_ + 1) offsets
         const char* meta_blob = reinterpret_cast<const char*>(meta_offsets_base + (count_ + 1) * sizeof(uint64_t));
 
         uint64_t start = 0;
@@ -457,7 +559,28 @@ namespace pomai::table
         std::memcpy(&end, meta_offsets_base + (index + 1) * sizeof(uint64_t), sizeof(end));
         
         if (end > start) {
-            out->tenant = std::string(meta_blob + start, end - start);
+            const uint8_t* blob_ptr = reinterpret_cast<const uint8_t*>(meta_blob + start);
+            std::memcpy(&out->src_vid, blob_ptr, 8);
+            std::memcpy(&out->timestamp, blob_ptr + 8, 8);
+            std::memcpy(&out->lat, blob_ptr + 16, 8);
+            std::memcpy(&out->lon, blob_ptr + 24, 8);
+            
+            size_t cursor = 32;
+            auto read_str = [&](std::string* s) {
+                uint32_t len = 0;
+                std::memcpy(&len, blob_ptr + cursor, 4);
+                cursor += 4;
+                if (len > 0) {
+                    *s = std::string(reinterpret_cast<const char*>(blob_ptr + cursor), len);
+                    cursor += len;
+                } else {
+                    *s = "";
+                }
+            };
+            
+            read_str(&out->tenant);
+            read_str(&out->text);
+            read_str(&out->payload);
         }
     }
 
@@ -470,11 +593,18 @@ namespace pomai::table
         if (res == FindResult::kFound) {
             size_t bytes = dim_; // SQ8
             if (quant_type_ == pomai::QuantizationType::kFp16) bytes *= 2;
+            else if (quant_type_ == pomai::QuantizationType::kBit) bytes = (dim_ + 7) / 8;
             if (out_codes) *out_codes = std::span<const uint8_t>(raw_payload, bytes);
             return pomai::Status::Ok();
         }
         if (res == FindResult::kFoundTombstone) return pomai::Status::NotFound("tombstone");
         return pomai::Status::NotFound("id not found in segment");
+    }    pomai::Status SegmentReader::ReadAtMetadata(uint32_t index, bool* out_deleted, pomai::Metadata* out_meta) const {
+        if (index >= count_) return pomai::Status::InvalidArgument("index out of range");
+        const uint8_t* p = base_addr_ + entries_start_offset_ + index * entry_size_;
+        if (out_deleted) *out_deleted = (*(p + 8) & 0x01);
+        if (out_meta) GetMetadata(index, out_meta);
+        return pomai::Status::Ok();
     }
 
     pomai::Status SegmentReader::Get(pomai::VectorId id, pomai::PinnableSlice* out_vec, pomai::Metadata* out_meta) const
@@ -486,6 +616,7 @@ namespace pomai::table
                  size_t bytes = dim_ * sizeof(float);
                  if (quant_type_ == pomai::QuantizationType::kSq8) bytes = dim_;
                  else if (quant_type_ == pomai::QuantizationType::kFp16) bytes = dim_ * 2;
+                 else if (quant_type_ == pomai::QuantizationType::kBit) bytes = (dim_ + 7) / 8;
                  // Zero-copy: point directly to mmap
                  out_vec->PinSlice(Slice(raw_payload, bytes), nullptr);
              }
@@ -611,6 +742,7 @@ namespace pomai::table
                  const uint8_t* code_ptr = p + 12;
                  size_t bytes = dim_;
                  if (quant_type_ == pomai::QuantizationType::kFp16) bytes *= 2;
+                 else if (quant_type_ == pomai::QuantizationType::kBit) bytes = (dim_ + 7) / 8;
                  *out_codes = std::span<const uint8_t>(code_ptr, bytes);
              }
         }

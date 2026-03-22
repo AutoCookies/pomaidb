@@ -18,8 +18,8 @@
 #include "util/slice.h"
 
 // Forward declare in correct namespace
-namespace pomai::index { class IvfFlatIndex; }
-#include "core/index/hnsw_index.h"
+namespace pomai::index { class HnswIndex; class IvfFlatIndex; }
+namespace pomai::core { class LexicalIndex; struct LexicalHit; }
 
 namespace pomai::table
 {
@@ -36,18 +36,19 @@ namespace pomai::table
 
     struct SegmentHeader
     {
-        char magic[12]; // "pomai.seg.v1"
-        uint32_t version; // 4
+        char magic[12]; // "pomai.seg.v2" 
+        uint32_t version; // 6
         uint32_t count;
         uint32_t dim;
-        uint32_t metadata_offset; // V3+: Offset to metadata block (0 if none)
-        uint8_t  quant_type;      // V4+: QuantizationType (0=None, 1=SQ8, 2=FP16)
+        uint32_t metadata_offset; // structured metadata (src_vid, timestamp, tenant)
+        uint8_t  quant_type;      
         uint8_t  reserved1[3];
-        float    quant_min;       // SQ8 minimum bound
-        float    quant_inv_scale; // SQ8 global inverse scale
-        uint32_t entries_start_offset; // V5+: Start of entries block (must be 4096-aligned)
-        uint32_t entry_size;           // V5+: Padded entry size
-        uint32_t reserved2[2];
+        float    quant_min;       
+        float    quant_inv_scale; 
+        uint32_t entries_start_offset; 
+        uint32_t entry_size;           
+        uint32_t temporal_index_offset; // V6+: Sorted (timestamp, index) pairs
+        uint32_t reserved2[1];
     };
 
     // Flags
@@ -93,13 +94,17 @@ namespace pomai::table
         pomai::Status Search(std::span<const float> query, uint32_t nprobe, 
                              std::vector<uint32_t>* out_candidates) const;
 
-        bool HasIndex() const { return index_ != nullptr; }
+        // Temporal Range Search
+        pomai::Status SearchTemporal(uint64_t start_ts, uint64_t end_ts, std::vector<uint32_t>* out_indices) const;
 
+        // Lexical / Keyword Search (BM25)
+        pomai::Status SearchLexical(const std::string& query, uint32_t topk, std::vector<core::LexicalHit>* out) const;
         
         // Read entry at index [0, Count()-1]
         pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted, pomai::Metadata* out_meta) const;
         pomai::Status ReadAtCodes(uint32_t index, pomai::VectorId* out_id, std::span<const uint8_t>* out_codes, bool* out_deleted, pomai::Metadata* out_meta) const;
         pomai::Status ReadAt(uint32_t index, pomai::VectorId* out_id, std::span<const float>* out_vec, bool* out_deleted) const;
+        pomai::Status ReadAtMetadata(uint32_t index, bool* out_deleted, pomai::Metadata* out_meta) const;
 
 
         // Iteration
@@ -136,7 +141,28 @@ namespace pomai::table
                      std::memcpy(&start, meta_offsets_base + i * sizeof(uint64_t), sizeof(start));
                      std::memcpy(&end, meta_offsets_base + (i + 1) * sizeof(uint64_t), sizeof(end));
                      if (end > start) {
-                         meta_obj.tenant = std::string(meta_blob + start, end - start);
+                         const uint8_t* blob_ptr = reinterpret_cast<const uint8_t*>(meta_blob + start);
+                         std::memcpy(&meta_obj.src_vid, blob_ptr, 8);
+                         std::memcpy(&meta_obj.timestamp, blob_ptr + 8, 8);
+                         std::memcpy(&meta_obj.lat, blob_ptr + 16, 8);
+                         std::memcpy(&meta_obj.lon, blob_ptr + 24, 8);
+                         
+                         size_t cursor = 32;
+                         auto read_str = [&](std::string* s) {
+                             uint32_t len = 0;
+                             std::memcpy(&len, blob_ptr + cursor, 4);
+                             cursor += 4;
+                             if (len > 0) {
+                                 *s = std::string(reinterpret_cast<const char*>(blob_ptr + cursor), len);
+                                 cursor += len;
+                             } else {
+                                 *s = "";
+                             }
+                         };
+                         
+                         read_str(&meta_obj.tenant);
+                         read_str(&meta_obj.text);
+                         read_str(&meta_obj.payload);
                          meta_ptr = &meta_obj;
                      }
                  }
@@ -146,7 +172,10 @@ namespace pomai::table
                  
                  if (!is_deleted) {
                      if (quant_type_ != pomai::QuantizationType::kNone) {
-                         size_t codes_bytes = dim_; if (quant_type_ == pomai::QuantizationType::kFp16) codes_bytes *= 2; std::span<const uint8_t> codes(static_cast<const uint8_t*>(vec_ptr), codes_bytes);
+                         size_t codes_bytes = dim_;
+                         if (quant_type_ == pomai::QuantizationType::kFp16) codes_bytes *= 2;
+                         else if (quant_type_ == pomai::QuantizationType::kBit) codes_bytes = (dim_ + 7) / 8;
+                         std::span<const uint8_t> codes(static_cast<const uint8_t*>(vec_ptr), codes_bytes);
                          decoded = quantizer_->Decode(codes);
                          vec_span = decoded;
                      } else {
@@ -169,6 +198,8 @@ namespace pomai::table
         std::size_t GetEntrySize() const { return entry_size_; }
 
         const pomai::index::HnswIndex* GetHnswIndex() const { return hnsw_index_.get(); }
+        bool HasIndex() const { return index_ != nullptr; }
+        bool HasHnswIndex() const { return hnsw_index_ != nullptr; }
 
     private:
         SegmentReader();
@@ -180,6 +211,7 @@ namespace pomai::table
         std::size_t entry_size_ = 0;
         uint32_t entries_start_offset_ = 0;
         uint32_t metadata_offset_ = 0;
+        uint32_t temporal_index_offset_ = 0;
         
         // V4: Quantization properties
         pomai::QuantizationType quant_type_{pomai::QuantizationType::kNone};
@@ -191,8 +223,13 @@ namespace pomai::table
         std::unique_ptr<pomai::index::IvfFlatIndex> index_;
         std::unique_ptr<pomai::index::HnswIndex> hnsw_index_;
         
-        // Internal helper
+        // V7: Lexical Index support
+        mutable std::unique_ptr<core::LexicalIndex> lexical_index_;
+        mutable std::mutex lexical_init_mutex_;
+        
+        // Internal helpers
         void GetMetadata(uint32_t index, pomai::Metadata* out) const;
+        void EnsureLexicalIndexBuilt() const;
     };
 
     class SegmentBuilder

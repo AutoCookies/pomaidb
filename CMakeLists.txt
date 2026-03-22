@@ -51,6 +51,7 @@ add_library(pomai STATIC
   src/core/vector_engine/vector_engine.cc
   src/core/shard/runtime.cc
   src/core/query/query_planner.cc
+  src/core/query/heuristic_engine.cc
   src/core/shard/layer_lookup.cc
   src/core/shard/iterator.cc
   src/core/shard/manifest.cc
@@ -66,9 +67,11 @@ add_library(pomai STATIC
 
   src/core/quantization/scalar_quantizer.cc
   src/core/quantization/half_float_quantizer.cc
+  src/core/quantization/bit_quantizer.cc
   src/core/index/ivf_coarse.cc
   src/core/index/ivf_flat.cc
   src/core/distance.cc
+  src/core/query/lexical_index.cc
 
   src/core/routing/routing_table.cc
   src/core/routing/kmeans_lite.cc
@@ -550,6 +553,11 @@ target_link_libraries(graph_bench PRIVATE ${POMAI_EXE_DEPS})
 target_include_directories(graph_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(ci_perf_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
+# Quantization Comparison Benchmark
+add_executable(quantization_bench benchmarks/quantization_comp_bench.cc)
+target_link_libraries(quantization_bench PRIVATE ${POMAI_EXE_DEPS})
+target_include_directories(quantization_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
 # benchmark_a: Multi-Environment Stress Test (IoT / Edge / Cloud validation)
 add_executable(benchmark_a benchmarks/palloc_env_stress.cc)
 target_link_libraries(benchmark_a PRIVATE ${POMAI_EXE_DEPS})
@@ -574,6 +582,12 @@ if (POMAI_BUILD_TESTS)
   target_sources(c_api_test PRIVATE tests/common/test_runner.cc)
   target_include_directories(c_api_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME c_api_test COMMAND c_api_test)
+
+  add_executable(accuracy_test tests/accuracy_test.cc)
+  target_link_libraries(accuracy_test PRIVATE pomai_c_static)
+  target_sources(accuracy_test PRIVATE tests/common/test_runner.cc)
+  target_include_directories(accuracy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME accuracy_test COMMAND accuracy_test)
 endif()
 
 add_executable(c_basic_example examples/c_basic.c)
@@ -583,6 +597,10 @@ target_include_directories(c_basic_example PRIVATE include)
 add_executable(c_scan_export_example examples/c_scan_export.c)
 target_link_libraries(c_scan_export_example PRIVATE pomai_c)
 target_include_directories(c_scan_export_example PRIVATE include)
+
+add_executable(pomai_multimodal_demo examples/pomai_multimodal_demo.cpp)
+target_link_libraries(pomai_multimodal_demo PRIVATE pomai)
+target_include_directories(pomai_multimodal_demo PRIVATE include)
 
 install(TARGETS pomai pomai_c pomai_c_static
   ARCHIVE DESTINATION lib

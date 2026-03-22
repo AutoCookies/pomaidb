@@ -81,13 +81,33 @@ pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec,
     float* dst = static_cast<float*>(arena_.Allocate(vec.size_bytes(), alignof(float)));
     std::memcpy(dst, vec.data, vec.size_bytes());
 
-    // Writer holds seqlock during map mutation.
     seqlock_.BeginWrite();
     map_.Put(id, dst);
     seqlock_.EndWrite();
 
-    if (!meta.tenant.empty()) {
+    // Temporal Index Management
+    auto it_old = metadata_.find(id);
+    if (it_old != metadata_.end()) {
+        uint64_t old_ts = it_old->second.timestamp;
+        if (old_ts > 0) {
+            auto range = temporal_index_.equal_range(old_ts);
+            for (auto it = range.first; it != range.second; ++it) {
+                if (it->second == id) {
+                    temporal_index_.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!meta.tenant.empty() || meta.src_vid != 0 || meta.timestamp != 0 || !meta.text.empty()) {
         metadata_[id] = meta;
+        if (meta.timestamp > 0) {
+            temporal_index_.insert({meta.timestamp, id});
+        }
+        if (!meta.text.empty()) {
+            lexical_index_.Add(id, meta.text);
+        }
     } else {
         metadata_.erase(id);
     }
@@ -133,6 +153,21 @@ pomai::Status MemTable::Delete(pomai::VectorId id) {
     map_.Put(id, nullptr); // nullptr = tombstone
     seqlock_.EndWrite();
 
+    auto it = metadata_.find(id);
+    if (it != metadata_.end()) {
+        uint64_t ts = it->second.timestamp;
+        if (ts > 0) {
+            auto range = temporal_index_.equal_range(ts);
+            for (auto search_it = range.first; search_it != range.second; ++search_it) {
+                if (search_it->second == id) {
+                    temporal_index_.erase(search_it);
+                    break;
+                }
+            }
+        }
+    }
+
+    lexical_index_.Remove(id);
     metadata_.erase(id);
     return pomai::Status::Ok();
 }
@@ -182,6 +217,8 @@ void MemTable::Clear() {
     seqlock_.EndWrite();
 
     metadata_.clear();
+    temporal_index_.clear();
+    lexical_index_.Clear();
     arena_.Clear();
 }
 

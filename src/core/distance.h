@@ -36,6 +36,13 @@ namespace pomai::core
     float DotFp16(std::span<const float> query, std::span<const uint16_t> codes);
     float L2SqFp16(std::span<const float> query, std::span<const uint16_t> codes);
 
+    // ── Binary Quantization (1-bit; optimized specifically for edge memory reduction) ──
+    /** 32x smaller than float vectors. Encodes sign bit. */
+    void BitQuantize(std::span<const float> vec, uint8_t* out_codes);
+    /** Hamming distance but returning a dot-product-like score (higher=better). */
+    float DotBit(std::span<const float> query, std::span<const uint8_t> codes);
+    float HammingDist(std::span<const uint8_t> a, std::span<const uint8_t> b);
+
     // ── Batch distances ──
     void DotBatch(std::span<const float> query,
                   const float* db,

@@ -43,6 +43,35 @@ float DotSq8Scalar(std::span<const float> q, std::span<const uint8_t> c,
     return sum * inv_scale + q_sum * min_val;
 }
 
+// ── Binary Quantization (1-bit; optimized specifically for edge memory reduction) ──
+void BitQuantizeImpl(std::span<const float> vec, uint8_t* out_codes) {
+    std::uint32_t dim = static_cast<std::uint32_t>(vec.size());
+    std::uint32_t byte_count = (dim + 7) / 8;
+    std::memset(out_codes, 0, byte_count);
+    for (uint32_t i = 0; i < dim; ++i) {
+        if (vec[i] > 0) {
+            out_codes[i / 8] |= (1 << (i % 8));
+        }
+    }
+}
+
+float HammingDistImpl(std::span<const uint8_t> a, std::span<const uint8_t> b) {
+    uint32_t dist = 0;
+    size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; i++) {
+        dist += __builtin_popcount(a[i] ^ b[i]);
+    }
+    return static_cast<float>(dist);
+}
+
+float DotBitImpl(std::span<const float> query, std::span<const uint8_t> codes) {
+    // Optimized: pre-quantize query and use Hamming
+    std::vector<uint8_t> q_codes((query.size() + 7) / 8);
+    BitQuantizeImpl(query, q_codes.data());
+    // Smaller Hamming distance = higher score
+    return static_cast<float>(query.size()) - HammingDistImpl(q_codes, codes);
+}
+
 // ── F32: use SimSIMD (with runtime dispatch when SIMSIMD_DYNAMIC_DISPATCH=1) ──
 float DotSimSIMD(std::span<const float> a, std::span<const float> b) {
     const std::size_t n = a.size();
@@ -199,6 +228,18 @@ void SearchBatch(std::span<const float> query, const FloatBatch& batch,
             results[i] = static_cast<float>(d);
         }
     }
+}
+
+void BitQuantize(std::span<const float> vec, uint8_t* out_codes) {
+    BitQuantizeImpl(vec, out_codes);
+}
+
+float HammingDist(std::span<const uint8_t> a, std::span<const uint8_t> b) {
+    return HammingDistImpl(a, b);
+}
+
+float DotBit(std::span<const float> query, std::span<const uint8_t> codes) {
+    return DotBitImpl(query, codes);
 }
 
 }  // namespace pomai::core

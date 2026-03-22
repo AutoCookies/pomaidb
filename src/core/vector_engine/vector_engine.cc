@@ -384,5 +384,14 @@ Status VectorEngine::SearchBatch(std::span<const float> queries,
     return Status::Ok();
 }
 
+Status VectorEngine::SearchLexical(const std::string& query,
+                                   std::uint32_t topk,
+                                   std::vector<LexicalHit>* out) {
+    auto st = EnsureOpen();
+    if (!st.ok()) return st;
+    if (!out) return Status::InvalidArgument("vector_engine lexical output is null");
+    return runtime_->SearchLexical(query, topk, out);
+}
+
 } // namespace pomai::core
 

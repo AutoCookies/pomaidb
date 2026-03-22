@@ -408,6 +408,13 @@ namespace pomai::core
         return state->vector_engine->Search(query, topk, opts, out);
     }
 
+    Status MembraneManager::SearchLexical(std::string_view membrane, const std::string& query, uint32_t topk, std::vector<LexicalHit>* out) {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->vector_engine) return Status::InvalidArgument("VECTOR membrane required for SearchLexical");
+        return state->vector_engine->SearchLexical(query, topk, out);
+    }
+
     Status MembraneManager::SearchBatch(std::string_view membrane, std::span<const float> queries,
                                         uint32_t num_queries, std::uint32_t topk, std::vector<pomai::SearchResult> *out)
     {
@@ -460,19 +467,17 @@ namespace pomai::core
         return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->AddEdge(src, dst, type, rank, meta);
     }
 
-    Status MembraneManager::GetNeighbors(std::string_view membrane, VertexId src, std::vector<Neighbor>* out)
-    {
+    Status MembraneManager::GetNeighbors(std::string_view membrane, VertexId src, std::vector<pomai::Neighbor>* out) {
         auto *state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
-        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        if (!state->graph_engine) return Status::InvalidArgument("GRAPH membrane required for GetNeighbors");
         return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->GetNeighbors(src, out);
     }
 
-    Status MembraneManager::GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<Neighbor>* out)
-    {
+    Status MembraneManager::GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<pomai::Neighbor>* out) {
         auto *state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
-        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        if (!state->graph_engine) return Status::InvalidArgument("GRAPH membrane required for GetNeighbors");
         return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->GetNeighbors(src, type, out);
     }
 

@@ -12,7 +12,8 @@
 #include "core/shard/shard_stats.h"  // RuntimeStats
 #include "pomai/metadata.h"
 #include "pomai/search.h"
-#include "pomai/iterator.h"
+#include "core/shard/iterator.h"
+#include "core/query/lexical_index.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
 #include "pomai/options.h"
@@ -142,6 +143,10 @@ namespace pomai::core
                              std::uint32_t topk,
                              const SearchOptions& opts,
                              std::vector<pomai::SearchHit> *out); // Overload
+
+        pomai::Status SearchLexical(const std::string& query,
+                                   std::uint32_t topk,
+                                   std::vector<LexicalHit> *out);
 
         pomai::Status SearchBatchLocal(std::span<const float> queries,
                                        const std::vector<uint32_t>& query_indices,

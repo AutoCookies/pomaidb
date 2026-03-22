@@ -38,4 +38,7 @@ run ./bin/bench_cbrs
 # 7. Multi-environment stress (use low-memory for shorter run)
 run env POMAI_BENCH_LOW_MEMORY=1 ./benchmark_a
 
+# 8. Quantization Comparison (Recall@1, Recall@10, Throughput)
+run ./quantization_bench
+
 echo "All benchmarks completed."
