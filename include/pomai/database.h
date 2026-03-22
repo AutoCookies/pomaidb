@@ -18,6 +18,13 @@
 #include "pomai/snapshot.h"
 #include "pomai/status.h"
 #include "pomai/types.h"
+#include "pomai/hooks.h"
+#include "pomai/graph.h"
+#include "pomai/options.h"
+
+namespace pomai::core {
+    class SyncReceiver;
+}
 
 namespace pomai {
 
@@ -44,6 +51,9 @@ struct EmbeddedOptions {
     bool auto_freeze_on_pressure = true;
     /** Memtable flush threshold in MiB; when exceeded, auto-freeze runs. 0 = use pressure percent of max_memtable_mb. */
     std::uint32_t memtable_flush_threshold_mb = 64u;
+
+    /** If true, automatically link vectors to src_vid via AutoEdgeHook. */
+    bool enable_auto_edge = false;
 };
 
 /**
@@ -134,17 +144,46 @@ public:
     Status Search(std::span<const float> query, std::uint32_t topk,
                   const SearchOptions& opts,
                   SearchResult* out);
-
     /** Batch search (multiple queries). */
     Status SearchBatch(std::span<const float> queries, std::uint32_t num_queries,
                        std::uint32_t topk, const SearchOptions& opts,
                        std::vector<SearchResult>* out);
+    
+    /** 
+     * @brief GraphRAG Search: Vector hit + K-hop Graph expansion.
+     * 1. Performs Vector Search to find start nodes.
+     * 2. Expands neighborhood by k-hops.
+     * 3. Returns combined context (hits + related entities).
+     */
+    Status SearchGraphRAG(std::span<const float> query, std::uint32_t topk,
+                          const SearchOptions& opts, uint32_t k_hops,
+                          std::vector<SearchResult>* out);
+
+    Status MaybeApplyBackpressure();
+
+    /** Graph Operations */
+    Status AddVertex(VertexId id, TagId tag, const Metadata& meta);
+    Status AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta);
+    Status GetNeighbors(VertexId src, std::vector<Neighbor>* out);
+    Status GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out);
 
     /** Snapshot (point-in-time view). */
     Status GetSnapshot(std::shared_ptr<Snapshot>* out);
     /** Iterator over snapshot; snap must be from GetSnapshot(). */
     Status NewIterator(const std::shared_ptr<Snapshot>& snap,
                       std::unique_ptr<SnapshotIterator>* out);
+
+    /**
+     * @brief Register a post-ingestion hook.
+     * Hooks are called after a successful Put or AddVector.
+     */
+    void AddPostPutHook(std::shared_ptr<PostPutHook> hook);
+
+    /** 
+     * @brief Register a receiver for WAL-based edge-to-cloud synchronization.
+     * The database will periodically push new entries to this receiver.
+     */
+    void RegisterSyncReceiver(std::shared_ptr<core::SyncReceiver> receiver);
 
     [[nodiscard]] bool IsOpen() const { return opened_; }
 
@@ -153,12 +192,16 @@ private:
     bool opened_ = false;
 
     /** When memtable exceeds threshold: return ResourceExhausted or Freeze() if auto. Single-threaded. */
-    Status MaybeApplyBackpressure();
+    // Threshold check
 
     // Memtable backpressure (set in Open from options or env). Single-threaded: no lock.
     std::size_t max_memtable_bytes_ = 0;
     std::size_t pressure_threshold_bytes_ = 0;
     bool auto_freeze_on_pressure_ = false;
+
+    // Internal scheduler and task management
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace pomai

@@ -1,4 +1,5 @@
 #pragma once
+#include "pomai/snapshot.h"
 #include <vector>
 #include <memory>
 #include <chrono>
@@ -7,7 +8,7 @@
 
 namespace pomai::core
 {
-    struct VectorSnapshot
+    struct VectorSnapshot : public pomai::Snapshot
     {
         // Snapshot holds shared ownership of immutable data.
         // Frozen memtables are read-only.

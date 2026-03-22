@@ -21,8 +21,9 @@ constexpr std::size_t kWalSegmentBytes = 64u << 20; // 64 MiB
 
 VectorEngine::VectorEngine(pomai::DBOptions opt,
                            pomai::MembraneKind kind,
-                           pomai::MetricType metric)
-    : opt_(std::move(opt)), kind_(kind), metric_(metric) {}
+                           pomai::MetricType metric,
+                           uint64_t sync_lsn)
+    : opt_(std::move(opt)), kind_(kind), metric_(metric), sync_lsn_(sync_lsn) {}
 
 VectorEngine::~VectorEngine() = default;
 
@@ -86,7 +87,8 @@ Status VectorEngine::OpenLocked() {
         metric_,
         std::move(wal),
         std::move(mem),
-        opt_.index_params);
+        opt_.index_params,
+        sync_lsn_); // Added
 
     runtime_ = std::move(rt);
     st = runtime_->Start();
@@ -206,6 +208,16 @@ Status VectorEngine::Compact() {
     auto st = EnsureOpen();
     if (!st.ok()) return st;
     return runtime_->Compact();
+}
+
+Status VectorEngine::PushSync(SyncReceiver* receiver) {
+    auto st = EnsureOpen();
+    if (!st.ok()) return st;
+    return runtime_->PushSync(receiver);
+}
+
+uint64_t VectorEngine::GetLastSyncedLSN() const {
+    return runtime_ ? runtime_->GetLastSyncedLSN() : sync_lsn_;
 }
 
 std::size_t VectorEngine::MemTableBytesUsed() const noexcept {

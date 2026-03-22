@@ -30,6 +30,10 @@ namespace pomai::storage
         static pomai::Status GetMembrane(std::string_view root_path,
                                          std::string_view name,
                                          pomai::MembraneSpec *out);
+
+        static pomai::Status UpdateSyncLSN(std::string_view root_path,
+                                           std::string_view name,
+                                           uint64_t lsn);
     };
 
 } // namespace pomai::storage

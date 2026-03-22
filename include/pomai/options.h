@@ -23,6 +23,7 @@ namespace pomai
     {
         kVector = 0,
         kRag = 1,
+        kGraph = 2,
     };
 
     enum class IndexType : uint8_t
@@ -94,6 +95,9 @@ namespace pomai
         uint32_t memtable_flush_threshold_mb = 64u;
         /** If true, when memtable exceeds threshold the vector engine will Freeze() before accepting more writes. */
         bool auto_freeze_on_pressure = true;
+    
+    // Multi-modal Triggers
+    bool enable_auto_edge = false; // If true, automatically link vectors to src_vid
         /** Optional hard cap for memtable size in MiB (0 = unlimited, derive behavior from flush threshold only). */
         uint32_t max_memtable_mb = 0;
         uint32_t search_threads = 0; // 0 => auto
@@ -116,6 +120,7 @@ namespace pomai
         MetricType metric = MetricType::kL2;
         IndexParams index_params;
         MembraneKind kind = MembraneKind::kVector;
+        uint64_t sync_lsn = 0;
     };
 
 } // namespace pomai

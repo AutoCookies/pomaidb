@@ -1,55 +1,55 @@
 #pragma once
 #include <cstdint>
+#include "pomai/types.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
 
 namespace pomai
 {
-    // Simplified metadata: single string field for MVP
-    // Can be extended to multi-field later
+    /**
+     * @brief Metadata associated with a vector or vertex.
+     */
     struct Metadata
     {
-        std::string tenant; // Primary use case: multi-tenancy filtering
+        std::string tenant;   // Primary use case: multi-tenancy filtering
+        VertexId src_vid = 0; // Source vertex ID for automatic linkage (0 = none)
         
         Metadata() = default;
-        explicit Metadata(std::string t) : tenant(std::move(t)) {}
+        explicit Metadata(std::string t, VertexId s = 0) 
+            : tenant(std::move(t)), src_vid(s) {}
         
         bool operator==(const Metadata& other) const {
-            return tenant == other.tenant;
+            return tenant == other.tenant && src_vid == other.src_vid;
         }
     };
     
-    // Filter predicate (simplified: EQ only for MVP)
     struct Filter
     {
-        std::string field;  // For MVP, only "tenant" is supported
-        std::string value;  // Expected value
+        std::string field;
+        std::string value;
         
         Filter() = default;
         Filter(std::string f, std::string v) 
             : field(std::move(f)), value(std::move(v)) {}
         
-        // Evaluate filter against metadata
         bool Matches(const Metadata& meta) const {
             if (field == "tenant") {
                 return meta.tenant == value;
             }
-            return true; // Unknown fields don't filter
+            return true;
         }
     };
     
-    // Search options with filters
     struct SearchOptions
     {
-        std::vector<Filter> filters; // AND semantics
+        std::vector<Filter> filters;
         bool force_fanout = false;
         uint32_t routing_probe_override = 0;
         bool zero_copy = false;
         
         SearchOptions() = default;
         
-        // Check if metadata passes all filters
         bool Matches(const Metadata& meta) const {
             for (const auto& filter : filters) {
                 if (!filter.Matches(meta)) {

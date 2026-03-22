@@ -17,6 +17,7 @@
 namespace pomai::core {
 
 class VectorRuntime;
+class SyncReceiver;
 
 // Monolithic, single-threaded vector engine for one membrane.
 // One WAL, one MemTable, one VectorRuntime — no partitioning.
@@ -24,7 +25,8 @@ class VectorEngine {
 public:
     explicit VectorEngine(pomai::DBOptions opt,
                           pomai::MembraneKind kind,
-                          pomai::MetricType metric);
+                          pomai::MetricType metric,
+                          uint64_t sync_lsn = 0);
     ~VectorEngine();
 
     VectorEngine(const VectorEngine&) = delete;
@@ -81,6 +83,9 @@ public:
                        const SearchOptions& opts,
                        std::vector<pomai::SearchResult>* out);
 
+    Status PushSync(SyncReceiver* receiver);
+    uint64_t GetLastSyncedLSN() const;
+
     /** Current active memtable bytes used for this membrane (for backpressure). */
     std::size_t MemTableBytesUsed() const noexcept;
 
@@ -98,6 +103,7 @@ private:
     pomai::MembraneKind kind_;
     pomai::MetricType metric_;
     bool opened_{false};
+    uint64_t sync_lsn_{0};
 
     std::unique_ptr<VectorRuntime> runtime_;
 };

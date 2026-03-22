@@ -60,6 +60,8 @@ add_library(pomai STATIC
   src/storage/storage_engine.cc
   src/table/segment.cc
   src/core/storage/compaction_manager.cc
+  src/core/storage/sync_provider.cc
+  src/core/concurrency/scheduler.cc
 
   src/core/quantization/scalar_quantizer.cc
   src/core/quantization/half_float_quantizer.cc
@@ -320,6 +322,14 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(streaming_index_test)
   pomai_add_labeled_test(streaming_index_test "unit")
 
+  add_executable(edge_platform_test tests/unit/edge_platform_test.cc)
+  pomai_setup_test(edge_platform_test)
+  pomai_add_labeled_test(edge_platform_test "unit")
+
+  add_executable(graph_rag_test tests/unit/graph_rag_test.cc)
+  pomai_setup_test(graph_rag_test)
+  pomai_add_labeled_test(graph_rag_test "unit")
+
   add_executable(rag_chunking_test tests/unit/rag_chunking_test.cc)
   pomai_setup_test(rag_chunking_test)
   pomai_add_labeled_test(rag_chunking_test "unit")
@@ -390,6 +400,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(manifest_test tests/unit/manifest_test.cc)
   pomai_setup_test(manifest_test)
   pomai_add_labeled_test(manifest_test "unit")
+
+  add_executable(multi_modal_test tests/unit/multi_modal_test.cc)
+  pomai_setup_test(multi_modal_test)
+  pomai_add_labeled_test(multi_modal_test "unit")
 
   add_executable(membrane_test tests/integ/membrane_test.cc)
   pomai_setup_test(membrane_test)
@@ -528,6 +542,11 @@ set_target_properties(bench_cbrs PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BIN
 # Deterministic CI benchmark for perf gate
 add_executable(ci_perf_bench benchmarks/ci_perf_bench.cc)
 target_link_libraries(ci_perf_bench PRIVATE ${POMAI_EXE_DEPS})
+
+# GraphRAG Benchmark
+add_executable(graph_bench benchmarks/graph_bench.cc)
+target_link_libraries(graph_bench PRIVATE ${POMAI_EXE_DEPS})
+target_include_directories(graph_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(ci_perf_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # benchmark_a: Multi-Environment Stress Test (IoT / Edge / Cloud validation)

@@ -39,6 +39,7 @@ namespace pomai::index
 
 namespace pomai::core
 {
+    class SyncReceiver;
 
     // Single-threaded command payloads (no std::promise; handlers return directly).
     struct PutCmd
@@ -75,6 +76,10 @@ namespace pomai::core
 
     struct FreezeCmd {};
     struct CompactCmd {};
+    struct SyncCmd
+    {
+        SyncReceiver* receiver{nullptr};
+    };
 
     struct IteratorReply
     {
@@ -84,7 +89,7 @@ namespace pomai::core
 
     struct IteratorCmd {};
 
-    using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, FreezeCmd, CompactCmd, IteratorCmd>;
+    using Command = std::variant<PutCmd, DelCmd, BatchPutCmd, FlushCmd, SearchCmd, FreezeCmd, CompactCmd, IteratorCmd, SyncCmd>;
 
     class SearchMergePolicy;
 
@@ -98,7 +103,8 @@ namespace pomai::core
                      pomai::MetricType metric,
                      std::unique_ptr<storage::Wal> wal,
                      std::unique_ptr<table::MemTable> mem,
-                     const pomai::IndexParams& index_params);
+                     const pomai::IndexParams& index_params,
+                     uint64_t sync_lsn = 0);
                      
         ~VectorRuntime();
 
@@ -143,6 +149,13 @@ namespace pomai::core
                                        const SearchOptions& opts,
                                        std::vector<std::vector<pomai::SearchHit>>* out_results);
 
+        pomai::Status PushSync(SyncReceiver* receiver);
+        void SetLastSyncedLSN(uint64_t lsn) { last_synced_lsn_ = lsn; }
+        uint64_t GetLastSyncedLSN() const { return last_synced_lsn_; }
+
+        pomai::Status BeginBatch();
+        pomai::Status EndBatch();
+
         std::uint64_t GetOpsProcessed() const { return ops_processed_; }
         std::uint64_t LastQueryCandidatesScanned() const { return last_query_candidates_scanned_; }
 
@@ -162,6 +175,7 @@ namespace pomai::core
         pomai::Status HandleFlush(FlushCmd &c);
         std::optional<pomai::Status> HandleFreeze(FreezeCmd &c);
         std::optional<pomai::Status> HandleCompact(CompactCmd &c);
+        pomai::Status HandleSync(SyncCmd &c);
         IteratorReply HandleIterator(IteratorCmd &c);
         SearchReply HandleSearch(SearchCmd &c);
         // GetReply HandleGet(GetCmd &c); // Deprecated
@@ -229,6 +243,7 @@ namespace pomai::core
         std::unique_ptr<BackgroundJob> background_job_;
         std::optional<pomai::Status> last_background_result_;  // Set when background job completes (single-threaded)
         std::uint64_t wal_epoch_{0};
+        std::uint64_t last_synced_lsn_{0};
 
         // Reusable scratch buffers for search hot path (single-threaded; avoids per-query allocations).
         mutable std::vector<pomai::SearchHit> search_candidates_scratch_;

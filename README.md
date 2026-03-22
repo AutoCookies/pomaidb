@@ -57,6 +57,29 @@ The built-in RAG pipeline needs **no external API**. You ingest documents (text 
 
 ---
 
+## Performance
+
+PomaiDB is engineered for high-efficiency ingestion and low-latency retrieval on edge hardware. Below are representative benchmarks.
+
+**Run Device (Edge-class laptop):**
+- **Model:** HP ProBook 450 G5
+- **CPU:** Intel(R) Core(TM) i7-8550U @ 1.80GHz (8 cores)
+- **RAM:** 16GB
+- **Storage:** SATA SSD
+
+| Benchmark | Workload | Result |
+| --- | --- | --- |
+| **Vector Ingestion** | Sequential Put (128-dim) | ~60,000 vectors/sec |
+| **Vertex Ingestion** | Add graph nodes | **~67,200 ops/sec** |
+| **Edge Ingestion** | Add random graph edges | **~70,500 ops/sec** |
+| **SearchGraphRAG** | Vector Search + 2-hop Graph | **~2.7 ms (avg)** |
+| **Hybrid RAG** | Lexical + Vector search | **~0.4 ms (avg)** |
+| **Recall@10** | ANN Accuracy (10K/128d) | 100% |
+
+*Note: Benchmarks run with `FsyncPolicy::kNever` for maximum throughput. Performance on SD cards will vary based on write speed class.*
+
+---
+
 ## Installation & Usage
 
 ### Build
@@ -201,7 +224,7 @@ cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc)
 ../scripts/run_benchmarks_one_by_one.sh
 ```
 
-Or run individual executables: `./bench_baseline`, `./comprehensive_bench --dataset small`, `./ingestion_bench 10000 128`, `./rag_bench 100 64 32`, `./ci_perf_bench`, `./benchmark_a` (use `POMAI_BENCH_LOW_MEMORY=1` for a shorter run).
+Or run individual executables: `./bench_baseline`, `./comprehensive_bench --dataset small`, `./ingestion_bench 10000 128`, `./rag_bench 100 64 32`, `./graph_bench 10000 10000 50000`, `./ci_perf_bench`, `./benchmark_a` (use `POMAI_BENCH_LOW_MEMORY=1` for a shorter run).
 
 **Python CIFAR-10 benchmark (end-to-end):** Create a venv, install from `requirements.txt`, build the C library, then run the benchmark (uses ctypes against `libpomai_c.so`; downloads real CIFAR-10 by default):
 

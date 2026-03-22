@@ -24,6 +24,7 @@
 #include "pomai/metadata.h" // Added
 #include "util/posix_file.h" // Added for FsyncDir
 #include "util/logging.h"
+#include "core/storage/sync_provider.h"
 
 namespace pomai::core
 {
@@ -230,7 +231,8 @@ namespace pomai::core
                                pomai::MetricType metric,
                                std::unique_ptr<storage::Wal> wal,
                                std::unique_ptr<table::MemTable> mem,
-                               const pomai::IndexParams& index_params)
+                               const pomai::IndexParams& index_params,
+                               std::uint64_t sync_lsn)
         : runtime_id_(runtime_id),
           data_dir_(std::move(data_dir)),
           dim_(dim),
@@ -238,7 +240,8 @@ namespace pomai::core
           metric_(metric),
           wal_(std::move(wal)),
           mem_(std::move(mem)),
-          index_params_(index_params)
+          index_params_(index_params),
+          last_synced_lsn_(sync_lsn)
     {
         pomai::index::IvfCoarse::Options opt;
         opt.nlist = index_params_.nlist;
@@ -604,6 +607,34 @@ namespace pomai::core
             out->clear();
         }
         return st;
+    }
+
+    pomai::Status VectorRuntime::PushSync(SyncReceiver* receiver)
+    {
+        if (!started_) return pomai::Status::Aborted("shard not started");
+        SyncCmd cmd;
+        cmd.receiver = receiver;
+        return HandleSync(cmd);
+    }
+
+    pomai::Status VectorRuntime::HandleSync(SyncCmd &c)
+    {
+        if (!c.receiver) return pomai::Status::InvalidArgument("receiver null");
+        
+        WalStreamer streamer(data_dir_, runtime_id_);
+        uint64_t new_lsn = last_synced_lsn_;
+        auto st = streamer.PushSince(last_synced_lsn_, c.receiver, &new_lsn);
+        if (st.ok()) {
+            last_synced_lsn_ = new_lsn;
+        }
+        return st;
+    }
+    pomai::Status VectorRuntime::BeginBatch() {
+        return wal_ ? wal_->BeginBatch() : pomai::Status::Ok();
+    }
+
+    pomai::Status VectorRuntime::EndBatch() {
+        return wal_ ? wal_->EndBatch() : pomai::Status::Ok();
     }
 
     // -------------------------

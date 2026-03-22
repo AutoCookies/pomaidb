@@ -14,7 +14,10 @@ namespace pomai::storage {
     {
         kPut = 1,
         kDel = 2,
-        kPutMeta = 3
+        kPutMeta = 3,
+        kRawKV = 4,
+        kBatchStart = 5,
+        kBatchEnd = 6
     };
 
 #pragma pack(push, 1)
@@ -335,9 +338,50 @@ namespace pomai::storage {
             return impl_->file->Sync();
         return pomai::Status::Ok();
     }
+    pomai::Status Wal::AppendRawKV(std::uint8_t op, pomai::Slice key, pomai::Slice value)
+    {
+        RecordPrefix rp{};
+        rp.seq = ++seq_;
+        rp.op = op;
+        rp.id = 0;
+        rp.dim = 0;
 
+        std::uint32_t klen = static_cast<std::uint32_t>(key.size());
+        std::uint32_t vlen = static_cast<std::uint32_t>(value.size());
 
+        FrameHeader fh{};
+        fh.len = static_cast<std::uint32_t>(sizeof(RecordPrefix) + 8 + klen + vlen + sizeof(std::uint32_t));
 
+        std::uint32_t crc = pomai::util::Crc32c(&rp, sizeof(rp));
+        crc = pomai::util::Crc32c(&klen, 4, crc);
+        crc = pomai::util::Crc32c(&vlen, 4, crc);
+        crc = pomai::util::Crc32c(key.data(), klen, crc);
+        crc = pomai::util::Crc32c(value.data(), vlen, crc);
+
+        const std::size_t total_bytes = sizeof(FrameHeader) + fh.len;
+        auto st = RotateIfNeeded(total_bytes);
+        if (!st.ok()) return st;
+
+        std::vector<Iov> iovecs;
+        iovecs.reserve(7);
+        iovecs.push_back({&fh, sizeof(fh)});
+        iovecs.push_back({&rp, sizeof(rp)});
+        iovecs.push_back({&klen, 4});
+        iovecs.push_back({&vlen, 4});
+        iovecs.push_back(Iov{(void*)key.data(), (std::size_t)klen});
+        iovecs.push_back(Iov{(void*)value.data(), (std::size_t)vlen});
+        iovecs.push_back(Iov{&crc, sizeof(crc)});
+
+        st = AppendIovecs(impl_->file.get(), iovecs);
+        if (!st.ok()) return st;
+
+        file_off_ += total_bytes;
+        bytes_in_seg_ += total_bytes;
+
+        if (fsync_ == pomai::FsyncPolicy::kAlways)
+            return impl_->file->Sync();
+        return pomai::Status::Ok();
+    }
 
 
     pomai::Status Wal::AppendBatch(const std::vector<pomai::VectorId>& ids,
@@ -565,6 +609,17 @@ namespace pomai::storage {
         file_off_ = 0;
         bytes_in_seg_ = 0;
         return Open();
+    }
+
+
+    pomai::Status Wal::BeginBatch()
+    {
+        return AppendRawKV(static_cast<std::uint8_t>(Op::kBatchStart), {}, {});
+    }
+
+    pomai::Status Wal::EndBatch()
+    {
+        return AppendRawKV(static_cast<std::uint8_t>(Op::kBatchEnd), {}, {});
     }
 
 } // namespace pomai::storage

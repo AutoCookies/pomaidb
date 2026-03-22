@@ -42,6 +42,9 @@ namespace pomai::storage
         pomai::Status AppendPut(pomai::VectorId id, pomai::VectorView vec, const pomai::Metadata& meta); // Added
         pomai::Status AppendDelete(pomai::VectorId id);
         
+        /** Generic KV append for Graph and other metadata. */
+        pomai::Status AppendRawKV(std::uint8_t op, pomai::Slice key, pomai::Slice value);
+        
         // Batch append: Write multiple Put records with single fsync (5-10x faster)
         pomai::Status AppendBatch(const std::vector<pomai::VectorId>& ids,
                                   const std::vector<pomai::VectorView>& vectors);
@@ -52,6 +55,12 @@ namespace pomai::storage
         // Closes current log, deletes all WAL files, and resets state.
         // Used after successful MemTable flush to segments.
         pomai::Status Reset();
+        
+        // Transaction support: group multiple records into one atomic sync unit.
+        pomai::Status BeginBatch();
+        pomai::Status EndBatch();
+
+        std::uint64_t GetLastLSN() const { return seq_; }
 
     private:
         std::string SegmentPath(std::uint64_t gen) const;

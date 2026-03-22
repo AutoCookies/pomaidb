@@ -278,7 +278,7 @@ namespace pomai::storage
                    std::to_string(spec.index_params.hnsw_m) + " " +
                    std::to_string(spec.index_params.hnsw_ef_construction) + " " +
                    std::to_string(spec.index_params.hnsw_ef_search) + "\n";
-
+            out += "sync_lsn " + std::to_string(spec.sync_lsn) + "\n";
             return AtomicWriteFile(MembraneManifestPath(root_path, spec.name), out);
         }
 
@@ -342,8 +342,16 @@ namespace pomai::storage
                          (void)ParseU32(toks[2], &spec->index_params.nlist);
                          (void)ParseU32(toks[3], &spec->index_params.nprobe);
                          (void)ParseU32(toks[4], &spec->index_params.hnsw_m);
-                         (void)ParseU32(toks[5], &spec->index_params.hnsw_ef_construction);
-                         (void)ParseU32(toks[6], &spec->index_params.hnsw_ef_search);
+                          (void)ParseU32(toks[5], &spec->index_params.hnsw_ef_construction);
+                          (void)ParseU32(toks[6], &spec->index_params.hnsw_ef_search);
+                     }
+                } else if (toks[0] == "sync_lsn") {
+                    if (toks.size() > 1) {
+                         // ParseU32 only handles 32 bits, but seq yields 64. 
+                         // For now let's add a ParseU64 or just use stoull.
+                         try {
+                            spec->sync_lsn = std::stoull(std::string(toks[1]));
+                         } catch(...) {}
                     }
                 }
             }
@@ -484,6 +492,16 @@ namespace pomai::storage
 
         // Now load detailed spec from membrane specific manifest
         return LoadMembraneManifest(root_path, name, out);
+    }
+
+    pomai::Status Manifest::UpdateSyncLSN(std::string_view root_path, std::string_view name, uint64_t lsn) {
+        pomai::MembraneSpec spec;
+        auto st = GetMembrane(root_path, name, &spec);
+        if (!st.ok()) return st;
+
+        if (spec.sync_lsn == lsn) return pomai::Status::Ok(); // Already there
+        spec.sync_lsn = lsn;
+        return WriteMembraneManifest(root_path, spec);
     }
 
 } // namespace pomai::storage

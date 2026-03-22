@@ -11,6 +11,7 @@ namespace pomai
     {
         VectorId id = 0;
         float score = 0.0f; // higher is better
+        std::vector<uint64_t> related_ids; // K-hop neighbors
     };
 
     struct ShardError

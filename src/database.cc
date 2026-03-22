@@ -1,398 +1,424 @@
-// PomaiDB Embedded: single-instance storage engine implementation.
-// One Arena, one WAL, one index — strictly sequential data flow.
-
 #include "pomai/database.h"
-
-#include <cstdlib>
-#include <utility>
-
-#include "core/distance.h"
-#include "core/shard/runtime.h"
-#include "core/snapshot_wrapper.h"
+#include "pomai/options.h"
+#include "pomai/status.h"
+#include "pomai/hooks.h"
 #include "pomai/env.h"
+#include "core/membrane/manager.h"
+#include "core/concurrency/scheduler.h"
+#include "core/graph/graph_membrane_impl.h"
+#include "core/shard/runtime.h"
+#include "src/table/memtable.h"
 #include "storage/wal/wal.h"
-#include "table/memtable.h"
-#include "util/logging.h"
+#include "core/hooks/auto_edge_hook.h"
+#include "core/graph/bitset_frontier.h"
+#include <memory>
+#include <vector>
+#include <queue>
+#include <unordered_set>
+#include <iostream>
 
 namespace pomai {
 
-namespace {
-
-constexpr std::size_t kArenaBlockBytes = 1u << 20;  // 1 MiB
-constexpr std::size_t kWalSegmentBytes = 64u << 20; // 64 MiB
-
-constexpr std::size_t kDefaultMaxMemtableMbNormal = 256u;
-constexpr std::size_t kDefaultMaxMemtableMbLowMem = 64u;
-constexpr std::uint8_t kDefaultPressureThresholdPercent = 80u;
-
-// Parse optional env int; 0 or unset = use default.
-static std::uint32_t EnvU32(const char* name, std::uint32_t default_val) {
-    const char* v = std::getenv(name);
-    if (!v || v[0] == '\0') return static_cast<std::uint32_t>(default_val);
-    return static_cast<std::uint32_t>(std::atoi(v));
-}
-
-static bool EnvBool(const char* name, bool default_val) {
-    const char* v = std::getenv(name);
-    if (!v || v[0] == '\0') return default_val;
-    return (v[0] == '1' || v[0] == 't' || v[0] == 'T');
-}
-
-} // namespace
-
-// Single-instance storage: one WAL, one MemTable, one VectorRuntime.
 class StorageEngine {
 public:
-    StorageEngine() = default;
-    ~StorageEngine() = default;
-
-    StorageEngine(const StorageEngine&) = delete;
-    StorageEngine& operator=(const StorageEngine&) = delete;
-
     Status Open(const EmbeddedOptions& options) {
-        if (runtime_) return Status::InvalidArgument("already opened");
-
-        pomai::Env* env = options.env ? options.env : pomai::Env::Default();
-        Status st = env->CreateDirIfMissing(options.path);
+        auto env = options.env ? options.env : Env::Default();
+        auto v_path = options.path + "/vectors";
+        
+        // Wal(env, path, shard_id, segment_bytes, fsync, heap)
+        auto wal = std::make_unique<storage::Wal>(env, v_path, 0, 1024ULL * 1024 * 1024, options.fsync);
+        auto st = wal->Open();
         if (!st.ok()) return st;
 
-        if (options.dim == 0)
-            return Status::InvalidArgument("dim must be > 0");
-
-        auto wal = std::make_unique<storage::Wal>(
-            env, options.path, 0u, kWalSegmentBytes, options.fsync);
-        st = wal->Open();
+        auto mem = std::make_unique<table::MemTable>(options.dim, 128ULL * 1024 * 1024);
+        
+        runtime_ = std::make_unique<core::VectorRuntime>(
+            0, v_path, options.dim, 
+            MembraneKind::kVector,
+            options.metric, std::move(wal), std::move(mem), options.index_params);
+            
+        st = runtime_->Start();
         if (!st.ok()) return st;
 
-        auto mem = std::make_unique<table::MemTable>(
-            options.dim, kArenaBlockBytes);
-        st = wal->ReplayInto(*mem);
+        auto g_path = options.path + "/graph";
+        auto g_wal = std::make_unique<storage::Wal>(env, g_path, 1, 1024ULL * 1024 * 1024, options.fsync);
+        st = g_wal->Open();
         if (!st.ok()) return st;
 
-        std::string data_dir = options.path;
-        auto rt = std::make_unique<core::VectorRuntime>(
-            0u, std::move(data_dir), options.dim,
-            MembraneKind::kVector, options.metric,
-            std::move(wal), std::move(mem), options.index_params);
-        runtime_ = std::move(rt);
-        return runtime_->Start();
+        graph_runtime_ = std::make_unique<core::GraphMembraneImpl>(std::move(g_wal));
+        return Status::Ok();
     }
 
-    void Close() { runtime_.reset(); }
+    void Close() {
+        runtime_.reset();
+        graph_runtime_.reset();
+    }
+
+    Status Flush() { return runtime_ ? runtime_->Flush() : Status::Ok(); }
+    Status Freeze() { return runtime_ ? runtime_->Freeze() : Status::Ok(); }
 
     Status Append(VectorId id, std::span<const float> vec) {
-        return runtime_ ? runtime_->Put(id, vec)
-                       : Status::InvalidArgument("not opened");
+        if (!runtime_) return Status::InvalidArgument("not opened");
+        (void)runtime_->BeginBatch();
+        auto st = runtime_->Put(id, vec);
+        if (st.ok()) {
+            for (auto& h : hooks_) h->OnPostPut(id, vec, Metadata());
+        }
+        (void)runtime_->EndBatch();
+        return st;
     }
 
-    Status Append(VectorId id, std::span<const float> vec,
-                  const Metadata& meta) {
-        return runtime_ ? runtime_->Put(id, vec, meta)
-                        : Status::InvalidArgument("not opened");
+    Status Append(VectorId id, std::span<const float> vec, const Metadata& meta) {
+        if (!runtime_) return Status::InvalidArgument("not opened");
+        (void)runtime_->BeginBatch();
+        auto st = runtime_->Put(id, vec, meta);
+        if (st.ok()) {
+            for (auto& h : hooks_) h->OnPostPut(id, vec, meta);
+        }
+        (void)runtime_->EndBatch();
+        return st;
     }
 
-    Status AppendBatch(const std::vector<VectorId>& ids,
-                       const std::vector<std::span<const float>>& vectors) {
-        return runtime_ ? runtime_->PutBatch(ids, vectors)
-                        : Status::InvalidArgument("not opened");
+    Status AppendBatch(const std::vector<VectorId>& ids, const std::vector<std::span<const float>>& vectors) {
+        if (!runtime_) return Status::InvalidArgument("not opened");
+        (void)runtime_->BeginBatch();
+        auto st = runtime_->PutBatch(ids, vectors);
+        if (st.ok()) {
+            for (size_t i = 0; i < ids.size(); ++i) {
+                for (auto& h : hooks_) h->OnPostPut(ids[i], vectors[i], Metadata());
+            }
+        }
+        (void)runtime_->EndBatch();
+        return st;
     }
 
-    Status Get(VectorId id, std::vector<float>* out,
-               Metadata* out_meta) {
-        return runtime_ ? runtime_->Get(id, out, out_meta)
-                        : Status::InvalidArgument("not opened");
+    Status Get(VectorId id, std::vector<float>* out, Metadata* meta) {
+        return runtime_ ? runtime_->Get(id, out, meta) : Status::InvalidArgument("not opened");
     }
 
     Status Exists(VectorId id, bool* exists) {
-        return runtime_ ? runtime_->Exists(id, exists)
-                       : Status::InvalidArgument("not opened");
+        return runtime_ ? runtime_->Exists(id, exists) : Status::InvalidArgument("not opened");
     }
 
     Status Delete(VectorId id) {
-        return runtime_ ? runtime_->Delete(id)
-                        : Status::InvalidArgument("not opened");
+        return runtime_ ? runtime_->Delete(id) : Status::InvalidArgument("not opened");
     }
 
-    Status Flush() {
-        return runtime_ ? runtime_->Flush()
-                        : Status::InvalidArgument("not opened");
+    Status Search(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult* out) {
+        if (!runtime_ || !out) return Status::InvalidArgument("invalid args");
+        std::vector<SearchHit> hits;
+        auto st = runtime_->Search(query, topk, opts, &hits);
+        if (st.ok()) {
+            out->hits = std::move(hits);
+            out->routed_shards_count = 1;
+        }
+        return st;
     }
 
-    Status Freeze() {
-        return runtime_ ? runtime_->Freeze()
-                        : Status::InvalidArgument("not opened");
+    Status PushSync(core::SyncReceiver* receiver) {
+        return runtime_ ? runtime_->PushSync(receiver) : Status::Ok();
     }
 
-    std::size_t MemTableBytesUsed() const {
-        return runtime_ ? runtime_->MemTableBytesUsed() : 0u;
+    Status AddVertex(VertexId id, TagId tag, const Metadata& meta) {
+        return graph_runtime_ ? graph_runtime_->AddVertex(id, tag, meta) : Status::InvalidArgument("no graph");
+    }
+
+    Status AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta) {
+        return graph_runtime_ ? graph_runtime_->AddEdge(src, dst, type, rank, meta) : Status::InvalidArgument("no graph");
+    }
+
+    Status GetNeighbors(VertexId src, std::vector<Neighbor>* out) {
+        return graph_runtime_ ? graph_runtime_->GetNeighbors(src, out) : Status::InvalidArgument("no graph");
+    }
+
+    Status GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out) {
+        return graph_runtime_ ? graph_runtime_->GetNeighbors(src, type, out) : Status::InvalidArgument("no graph");
     }
 
     Status GetSnapshot(std::shared_ptr<Snapshot>* out) {
+        if (!out) return Status::InvalidArgument("out pointer is null");
         if (!runtime_) return Status::InvalidArgument("not opened");
-        if (!out) return Status::InvalidArgument("output is null");
-        auto internal = runtime_->GetSnapshot();
-        *out = std::make_shared<core::SnapshotWrapper>(std::move(internal));
+        auto v_snap = runtime_->GetSnapshot();
+        if (!v_snap) return Status::Internal("failed to get snapshot");
+        *out = std::move(v_snap);
         return Status::Ok();
     }
 
-    Status NewIterator(const std::shared_ptr<Snapshot>& snap,
-                       std::unique_ptr<SnapshotIterator>* out) {
+    Status NewIterator(const std::shared_ptr<Snapshot>& snap, std::unique_ptr<SnapshotIterator>* out) {
         if (!runtime_) return Status::InvalidArgument("not opened");
-        if (!out) return Status::InvalidArgument("output is null");
-        if (!snap) return Status::InvalidArgument("snapshot is null");
-        auto* wrapper = dynamic_cast<core::SnapshotWrapper*>(snap.get());
-        if (!wrapper) return Status::InvalidArgument("invalid snapshot type");
-        return runtime_->NewIterator(wrapper->GetInternal(), out);
+        auto v_snap = std::static_pointer_cast<core::VectorSnapshot>(snap);
+        return runtime_->NewIterator(v_snap, out);
     }
 
-    Status Search(std::span<const float> query, std::uint32_t topk,
-                  const SearchOptions& opts,
-                  SearchResult* out) {
-        if (!runtime_) return Status::InvalidArgument("not opened");
-        if (!out) return Status::InvalidArgument("output is null");
-        out->Clear();
-        out->hits.clear();
-        std::vector<SearchHit> hits;
-        auto st = runtime_->Search(query, topk, opts, &hits);
-        if (!st.ok()) return st;
-        out->hits = std::move(hits);
-        out->routed_shards_count = 1;
-        out->routed_buckets_count = 0;
-        return Status::Ok();
+    std::size_t GetMemTableBytesUsed() const {
+        return runtime_ ? runtime_->GetStats().mem_used : 0;
     }
 
-    Status SearchBatch(std::span<const float> queries, std::uint32_t num_queries,
-                      std::uint32_t topk, const SearchOptions& opts,
-                      std::vector<SearchResult>* out) {
-        if (!runtime_) return Status::InvalidArgument("not opened");
-        if (!out) return Status::InvalidArgument("output is null");
-        out->clear();
-        out->resize(num_queries);
-        if (num_queries == 0 || topk == 0) return Status::Ok();
-        std::vector<uint32_t> indices(num_queries);
-        for (uint32_t i = 0; i < num_queries; ++i) indices[i] = i;
-        std::vector<std::vector<SearchHit>> per_query;
-        auto st = runtime_->SearchBatchLocal(queries, indices, topk, opts, &per_query);
-        if (!st.ok()) return st;
-        for (uint32_t i = 0; i < num_queries; ++i) {
-            (*out)[i].hits = std::move(per_query[i]);
-            (*out)[i].routed_shards_count = 1;
-        }
-        return Status::Ok();
+    void AddPostPutHook(std::shared_ptr<PostPutHook> hook) {
+        hooks_.push_back(std::move(hook));
     }
 
 private:
     std::unique_ptr<core::VectorRuntime> runtime_;
+    std::unique_ptr<core::GraphMembraneImpl> graph_runtime_;
+    std::vector<std::shared_ptr<PostPutHook>> hooks_;
 };
 
-// -----------------------------------------------------------------------------
-// Database
-// -----------------------------------------------------------------------------
+// Tasks
+class SyncTask : public core::DatabaseTask {
+public:
+    SyncTask(StorageEngine* engine, std::shared_ptr<core::SyncReceiver> receiver)
+        : engine_(engine), receiver_(std::move(receiver)) {}
+    Status Run() override { return engine_->PushSync(receiver_.get()); }
+    std::string Name() const override { return "SyncTask"; }
+private:
+    StorageEngine* engine_;
+    std::shared_ptr<core::SyncReceiver> receiver_;
+};
 
-Database::Database() = default;
+class MaintenanceTask : public core::DatabaseTask {
+public:
+    explicit MaintenanceTask(Database* db) : db_(db) {}
+    Status Run() override { return db_->MaybeApplyBackpressure(); }
+    std::string Name() const override { return "Maintenance"; }
+private:
+    Database* db_;
+};
 
-Database::~Database() {
-    (void)Close();
-}
+struct Database::Impl {
+    core::TaskScheduler scheduler;
+    std::shared_ptr<core::SyncReceiver> sync_receiver;
+};
+
+Database::Database() : opened_(false), impl_(std::make_unique<Impl>()) {}
+Database::~Database() { (void)Close(); }
 
 Status Database::Open(const EmbeddedOptions& options) {
-    if (opened_) return Status::InvalidArgument("already opened");
-    if (options.path.empty())
-        return Status::InvalidArgument("path empty");
-    if (options.dim == 0)
-        return Status::InvalidArgument("dim must be > 0");
+    if (opened_) return Status::InvalidArgument("already open");
+    if (options.dim == 0) return Status::InvalidArgument("dimension must be greater than 0");
+    if (options.path.empty()) return Status::InvalidArgument("path cannot be empty");
+    
+    std::uint32_t max_mb = options.max_memtable_mb;
+    if (max_mb == 0) max_mb = 128u; // Default
+    max_memtable_bytes_ = max_mb * 1024ULL * 1024ULL;
+    
+    std::uint8_t threshold_pct = options.pressure_threshold_percent;
+    if (threshold_pct == 0) threshold_pct = 80u;
+    pressure_threshold_bytes_ = (max_memtable_bytes_ * threshold_pct) / 100u;
+    
+    auto_freeze_on_pressure_ = options.auto_freeze_on_pressure;
 
-    core::InitDistance();
     storage_engine_ = std::make_unique<StorageEngine>();
     auto st = storage_engine_->Open(options);
-    if (!st.ok()) {
-        storage_engine_.reset();
-        return st;
-    }
-
-    // Memtable backpressure: from options or env. 0 = disabled (no limit).
-    std::size_t max_mb = options.max_memtable_mb != 0
-        ? options.max_memtable_mb
-        : EnvU32("POMAI_MAX_MEMTABLE_MB",
-                 EnvBool("POMAI_BENCH_LOW_MEMORY", false) ? kDefaultMaxMemtableMbLowMem
-                                                          : kDefaultMaxMemtableMbNormal);
-    max_memtable_bytes_ = max_mb * 1024u * 1024u;
-    if (options.memtable_flush_threshold_mb != 0) {
-        pressure_threshold_bytes_ = options.memtable_flush_threshold_mb * 1024u * 1024u;
-    } else {
-        std::uint8_t pct = options.pressure_threshold_percent != 0
-            ? options.pressure_threshold_percent
-            : static_cast<std::uint8_t>(EnvU32("POMAI_MEMTABLE_PRESSURE_THRESHOLD", kDefaultPressureThresholdPercent));
-        if (pct > 100u) pct = 100u;
-        pressure_threshold_bytes_ = (max_memtable_bytes_ * pct) / 100u;
-    }
-    auto_freeze_on_pressure_ = options.auto_freeze_on_pressure || EnvBool("POMAI_AUTO_FREEZE_ON_PRESSURE", true);
+    if (!st.ok()) return st;
 
     opened_ = true;
+    if (impl_->sync_receiver) {
+        impl_->scheduler.RegisterPeriodic(std::make_unique<SyncTask>(storage_engine_.get(), impl_->sync_receiver), std::chrono::seconds(10));
+    }
+    impl_->scheduler.RegisterPeriodic(std::make_unique<MaintenanceTask>(this), std::chrono::seconds(5));
+    
+    if (options.enable_auto_edge) {
+        AddPostPutHook(std::make_shared<core::AutoEdgeHook>(this));
+    }
     return Status::Ok();
 }
 
 Status Database::Close() {
     if (!opened_) return Status::Ok();
-    if (storage_engine_) storage_engine_->Close();
+    storage_engine_->Close();
     storage_engine_.reset();
     opened_ = false;
     return Status::Ok();
 }
 
-Status Database::Flush() {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->Flush();
-}
+Status Database::Flush() { return opened_ ? storage_engine_->Flush() : Status::InvalidArgument("closed"); }
+Status Database::Freeze() { return opened_ ? storage_engine_->Freeze() : Status::InvalidArgument("closed"); }
 
-Status Database::Freeze() {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->Freeze();
+Status Database::TryFreezeIfPressured() {
+    if (!opened_) return Status::InvalidArgument("closed");
+    if (GetMemTableBytesUsed() > pressure_threshold_bytes_) {
+        return Freeze();
+    }
+    return Status::Ok();
 }
 
 Status Database::MaybeApplyBackpressure() {
-    if (max_memtable_bytes_ == 0) return Status::Ok();
-    const std::size_t used = storage_engine_->MemTableBytesUsed();
-    if (used < pressure_threshold_bytes_) return Status::Ok();
-    if (auto_freeze_on_pressure_) {
-        const unsigned used_mb = static_cast<unsigned>(used / (1024u * 1024u));
-        POMAI_LOG_WARN("Memtable pressure detected (Usage: {} MB). Triggering Auto-Freeze.", used_mb);
-        return storage_engine_->Freeze();
+    if (!opened_) return Status::InvalidArgument("closed");
+    if (GetMemTableBytesUsed() > pressure_threshold_bytes_) {
+        if (auto_freeze_on_pressure_) {
+            return Freeze();
+        } else {
+            return Status::ResourceExhausted("memtable pressure");
+        }
     }
-    return Status::ResourceExhausted(
-        "Memtable pressure high - call Freeze() or TryFreezeIfPressured()");
-}
-
-Status Database::TryFreezeIfPressured() {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    if (max_memtable_bytes_ == 0) return Status::Ok();
-    if (storage_engine_->MemTableBytesUsed() < pressure_threshold_bytes_)
-        return Status::Ok();
-    return storage_engine_->Freeze();
+    return Status::Ok();
 }
 
 std::size_t Database::GetMemTableBytesUsed() const {
-    return storage_engine_ ? storage_engine_->MemTableBytesUsed() : 0u;
-}
-
-Status Database::GetSnapshot(std::shared_ptr<Snapshot>* out) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->GetSnapshot(out);
-}
-
-Status Database::NewIterator(const std::shared_ptr<Snapshot>& snap,
-                             std::unique_ptr<SnapshotIterator>* out) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->NewIterator(snap, out);
+    return opened_ ? storage_engine_->GetMemTableBytesUsed() : 0;
 }
 
 Status Database::AddVector(VectorId id, std::span<const float> vec) {
-    if (!opened_) return Status::InvalidArgument("not opened");
+    if (!opened_) return Status::InvalidArgument("closed");
     auto st = MaybeApplyBackpressure();
     if (!st.ok()) return st;
-    return storage_engine_->Append(id, vec);
+    st = storage_engine_->Append(id, vec);
+    impl_->scheduler.Poll();
+    return st;
 }
 
-Status Database::AddVector(VectorId id, std::span<const float> vec,
-                          const Metadata& meta) {
-    if (!opened_) return Status::InvalidArgument("not opened");
+Status Database::AddVector(VectorId id, std::span<const float> vec, const Metadata& meta) {
+    if (!opened_) return Status::InvalidArgument("closed");
     auto st = MaybeApplyBackpressure();
     if (!st.ok()) return st;
-    return storage_engine_->Append(id, vec, meta);
+    st = storage_engine_->Append(id, vec, meta);
+    impl_->scheduler.Poll();
+    return st;
 }
 
-Status Database::AddVectorBatch(
-    const std::vector<VectorId>& ids,
-    const std::vector<std::span<const float>>& vectors) {
-    if (!opened_) return Status::InvalidArgument("not opened");
+Status Database::AddVectorBatch(const std::vector<VectorId>& ids, const std::vector<std::span<const float>>& vectors) {
+    if (!opened_) return Status::InvalidArgument("closed");
     auto st = MaybeApplyBackpressure();
     if (!st.ok()) return st;
-    return storage_engine_->AppendBatch(ids, vectors);
+    st = storage_engine_->AppendBatch(ids, vectors);
+    impl_->scheduler.Poll();
+    return st;
 }
 
-Status Database::PutBatch(const std::vector<VectorId>& ids,
-                          const std::vector<std::vector<float>>& vectors) {
-    if (!opened_) return Status::InvalidArgument("not opened");
+Status Database::PutBatch(const std::vector<VectorId>& ids, const std::vector<std::vector<float>>& vectors) {
+    if (!opened_) return Status::InvalidArgument("closed");
     auto st = MaybeApplyBackpressure();
     if (!st.ok()) return st;
-    if (ids.size() != vectors.size())
-        return Status::InvalidArgument("PutBatch: ids and vectors size mismatch");
-    if (ids.empty()) return Status::Ok();
+    if (ids.size() != vectors.size()) return Status::InvalidArgument("mismatch");
     std::vector<std::span<const float>> spans;
-    spans.reserve(ids.size());
-    for (const auto& v : vectors)
-        spans.push_back(std::span<const float>(v));
-    return storage_engine_->AppendBatch(ids, spans);
+    for (const auto& v : vectors) spans.push_back(v);
+    st = storage_engine_->AppendBatch(ids, spans);
+    impl_->scheduler.Poll();
+    return st;
 }
 
-Status Database::PutBatch(std::span<const VectorId> ids,
-                          std::span<const float> vectors,
-                          std::size_t dimension) {
-    if (!opened_) return Status::InvalidArgument("not opened");
+Status Database::PutBatch(std::span<const VectorId> ids, std::span<const float> vectors, std::size_t dimension) {
+    if (!opened_) return Status::InvalidArgument("closed");
     auto st = MaybeApplyBackpressure();
     if (!st.ok()) return st;
-    if (dimension == 0) {
-        return Status::InvalidArgument("PutBatch: dimension must be > 0");
-    }
-    if (ids.empty()) return Status::Ok();
-    const std::size_t expected = static_cast<std::size_t>(ids.size()) * dimension;
-    if (vectors.size() != expected) {
-        return Status::InvalidArgument("PutBatch: ids * dimension mismatch");
-    }
-
-    // Zero-copy: build spans into the flattened buffer without copying vector data.
+    if (dimension == 0 || ids.empty() || vectors.size() != ids.size() * dimension) return Status::InvalidArgument("invalid args");
     std::vector<VectorId> owned_ids(ids.begin(), ids.end());
     std::vector<std::span<const float>> spans;
-    spans.reserve(ids.size());
-    for (std::size_t i = 0; i < ids.size(); ++i) {
-        const float* base = vectors.data() + i * dimension;
-        spans.emplace_back(base, dimension);
-    }
-    return storage_engine_->AppendBatch(owned_ids, spans);
+    for (size_t i = 0; i < ids.size(); ++i) spans.emplace_back(vectors.data() + i * dimension, dimension);
+    st = storage_engine_->AppendBatch(owned_ids, spans);
+    impl_->scheduler.Poll();
+    return st;
 }
 
-Status Database::Get(VectorId id, std::vector<float>* out) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->Get(id, out, nullptr);
-}
-
-Status Database::Get(VectorId id, std::vector<float>* out,
-                    Metadata* out_meta) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->Get(id, out, out_meta);
-}
+Status Database::Get(VectorId id, std::vector<float>* out) { return opened_ ? storage_engine_->Get(id, out, nullptr) : Status::InvalidArgument("closed"); }
+Status Database::Get(VectorId id, std::vector<float>* out, Metadata* meta) { return opened_ ? storage_engine_->Get(id, out, meta) : Status::InvalidArgument("closed"); }
 
 Status Database::Exists(VectorId id, bool* exists) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->Exists(id, exists);
+    return opened_ ? storage_engine_->Exists(id, exists) : Status::InvalidArgument("closed");
 }
 
 Status Database::Delete(VectorId id) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->Delete(id);
+    if (!opened_) return Status::InvalidArgument("closed");
+    auto st = storage_engine_->Delete(id);
+    impl_->scheduler.Poll();
+    return st;
 }
 
-Status Database::Search(std::span<const float> query,
-                        std::uint32_t topk,
-                        SearchResult* out) {
-    return Search(query, topk, SearchOptions{}, out);
+Status Database::Search(std::span<const float> query, uint32_t topk, SearchResult* out) {
+    return Search(query, topk, SearchOptions(), out);
 }
 
-Status Database::Search(std::span<const float> query,
-                        std::uint32_t topk,
-                        const SearchOptions& opts,
-                        SearchResult* out) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->Search(query, topk, opts, out);
+Status Database::Search(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult* out) {
+    return opened_ ? storage_engine_->Search(query, topk, opts, out) : Status::InvalidArgument("closed");
 }
 
-Status Database::SearchBatch(std::span<const float> queries,
-                             std::uint32_t num_queries,
-                             std::uint32_t topk,
-                             const SearchOptions& opts,
-                             std::vector<SearchResult>* out) {
-    if (!opened_) return Status::InvalidArgument("not opened");
-    return storage_engine_->SearchBatch(queries, num_queries, topk, opts, out);
+Status Database::SearchBatch(std::span<const float> queries, uint32_t num_queries, uint32_t topk, const SearchOptions& opts, std::vector<SearchResult>* out) {
+    if (!opened_) return Status::InvalidArgument("closed");
+    if (!out) return Status::InvalidArgument("out null");
+    out->resize(num_queries);
+    size_t dim = queries.size() / num_queries;
+    for (uint32_t i = 0; i < num_queries; ++i) {
+        auto st = storage_engine_->Search(queries.subspan(i * dim, dim), topk, opts, &(*out)[i]);
+        if (!st.ok()) return st;
+    }
+    return Status::Ok();
+}
+
+Status Database::SearchGraphRAG(std::span<const float> query, uint32_t topk, const SearchOptions& opts, uint32_t k_hops, std::vector<SearchResult>* out) {
+    if (!opened_) return Status::InvalidArgument("closed");
+    SearchResult vres;
+    auto st = storage_engine_->Search(query, topk, opts, &vres);
+    if (!st.ok()) return st;
+    
+    for (auto& hit : vres.hits) {
+        core::BitsetFrontier frontier(1024);
+        core::BitsetFrontier seen(1024);
+        frontier.Set(hit.id);
+        seen.Set(hit.id);
+
+        for (uint32_t h = 0; h < k_hops; ++h) {
+            core::BitsetFrontier next(1024);
+            std::vector<VertexId> current_ids = frontier.ToIds();
+            for (VertexId vid : current_ids) {
+                std::vector<Neighbor> nb;
+                if (storage_engine_->GetNeighbors(vid, &nb).ok()) {
+                    for (const auto& n : nb) {
+                        if (!seen.IsSet(n.id)) {
+                            next.Set(n.id);
+                            seen.Set(n.id);
+                            hit.related_ids.push_back(n.id);
+                        }
+                    }
+                }
+            }
+            if (next.IsEmpty()) break;
+            frontier = std::move(next);
+        }
+    }
+    if (out) { out->clear(); out->push_back(std::move(vres)); }
+    return Status::Ok();
+}
+
+Status Database::AddVertex(VertexId id, TagId tag, const Metadata& meta) {
+    if (!opened_) return Status::InvalidArgument("closed");
+    auto st = storage_engine_->AddVertex(id, tag, meta);
+    impl_->scheduler.Poll();
+    return st;
+}
+
+Status Database::AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta) {
+    if (!opened_) return Status::InvalidArgument("closed");
+    auto st = storage_engine_->AddEdge(src, dst, type, rank, meta);
+    impl_->scheduler.Poll();
+    return st;
+}
+
+Status Database::GetNeighbors(VertexId src, std::vector<Neighbor>* out) {
+    return opened_ ? storage_engine_->GetNeighbors(src, out) : Status::InvalidArgument("closed");
+}
+
+Status Database::GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out) {
+    return opened_ ? storage_engine_->GetNeighbors(src, type, out) : Status::InvalidArgument("closed");
+}
+
+Status Database::GetSnapshot(std::shared_ptr<Snapshot>* out) {
+    return opened_ ? storage_engine_->GetSnapshot(out) : Status::InvalidArgument("closed");
+}
+
+Status Database::NewIterator(const std::shared_ptr<Snapshot>& snap, std::unique_ptr<SnapshotIterator>* out) {
+    return opened_ ? storage_engine_->NewIterator(snap, out) : Status::InvalidArgument("closed");
+}
+
+void Database::RegisterSyncReceiver(std::shared_ptr<core::SyncReceiver> receiver) {
+    impl_->sync_receiver = std::move(receiver);
+    if (opened_ && storage_engine_) {
+        impl_->scheduler.RegisterPeriodic(std::make_unique<SyncTask>(storage_engine_.get(), impl_->sync_receiver), std::chrono::seconds(10));
+    }
+}
+
+void Database::AddPostPutHook(std::shared_ptr<PostPutHook> hook) {
+    if (opened_) storage_engine_->AddPostPutHook(std::move(hook));
 }
 
 } // namespace pomai

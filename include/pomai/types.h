@@ -10,6 +10,10 @@ namespace pomai
 
     using VectorId = std::uint64_t;
 
+    using VertexId = std::uint64_t;
+    using TagId = std::uint32_t;
+    using EdgeType = std::uint32_t;
+
     /**
      * VectorView: Borrowed view of float vectors.
      * Enforces or assumes NEON-compatible alignment (16-byte) where required by kernels.

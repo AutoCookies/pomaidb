@@ -9,6 +9,7 @@
 #include "pomai/iterator.h"  // For SnapshotIterator
 #include "storage/manifest/manifest.h"
 #include "util/logging.h"
+#include "src/core/graph/graph_membrane_impl.h"
 
 
 namespace pomai::core
@@ -46,9 +47,12 @@ namespace pomai::core
             MembraneState state;
             state.spec = loaded_spec;
             if (loaded_spec.kind == pomai::MembraneKind::kVector) {
-                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind, loaded_spec.metric);
-            } else {
+                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind, loaded_spec.metric, loaded_spec.sync_lsn);
+            } else if (loaded_spec.kind == pomai::MembraneKind::kRag) {
                 state.rag_engine = std::make_unique<RagEngine>(opt, loaded_spec);
+            } else {
+                std::unique_ptr<storage::Wal> wal = std::make_unique<storage::Wal>(opt.env, opt.path, 0, 64 * 1024 * 1024, opt.fsync);
+                state.graph_engine = std::make_unique<GraphMembraneImpl>(std::move(wal));
             }
             membranes_.emplace(spec.name, std::move(state));
             st = Status::Ok(); // clear error
@@ -88,9 +92,12 @@ namespace pomai::core
                 MembraneState state;
                 state.spec = mspec;
                 if (mspec.kind == pomai::MembraneKind::kVector) {
-                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind, mspec.metric);
-                } else {
+                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind, mspec.metric, mspec.sync_lsn);
+                } else if (mspec.kind == pomai::MembraneKind::kRag) {
                     state.rag_engine = std::make_unique<RagEngine>(opt, mspec);
+                } else {
+                    std::unique_ptr<storage::Wal> wal = std::make_unique<storage::Wal>(opt.env, opt.path, 0, 64 * 1024 * 1024, opt.fsync);
+                    state.graph_engine = std::make_unique<GraphMembraneImpl>(std::move(wal));
                 }
                 membranes_.emplace(name, std::move(state));
             }
@@ -179,9 +186,12 @@ namespace pomai::core
         MembraneState state;
         state.spec = spec;
         if (spec.kind == pomai::MembraneKind::kVector) {
-            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind, spec.metric);
-        } else {
+            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind, spec.metric, spec.sync_lsn);
+        } else if (spec.kind == pomai::MembraneKind::kRag) {
             state.rag_engine = std::make_unique<RagEngine>(opt, spec);
+        } else {
+            std::unique_ptr<storage::Wal> wal = std::make_unique<storage::Wal>(opt.env, opt.path, 0, 64 * 1024 * 1024, opt.fsync);
+            state.graph_engine = std::make_unique<GraphMembraneImpl>(std::move(wal));
         }
         membranes_.emplace(spec.name, std::move(state));
         return Status::Ok();
@@ -215,8 +225,11 @@ namespace pomai::core
             return Status::NotFound("membrane not found");
         if (state->spec.kind == pomai::MembraneKind::kVector) {
             return state->vector_engine->Open();
+        } else if (state->spec.kind == pomai::MembraneKind::kRag) {
+            return state->rag_engine->Open();
         }
-        return state->rag_engine->Open();
+        // GraphMembrane loads on Create/Restore for now
+        return Status::Ok();
     }
 
     Status MembraneManager::CloseMembrane(std::string_view name)
@@ -261,7 +274,13 @@ namespace pomai::core
             return Status::InvalidArgument("VECTOR membrane required for PutVector");
         auto st = MaybeApplyBackpressure(state);
         if (!st.ok()) return st;
-        return state->vector_engine->Put(id, vec);
+        st = state->vector_engine->Put(id, vec);
+        if (st.ok()) {
+            for (auto& hook : state->hooks) {
+                hook->OnPostPut(id, vec, Metadata());
+            }
+        }
+        return st;
     }
 
     Status MembraneManager::PutVector(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta)
@@ -273,7 +292,13 @@ namespace pomai::core
             return Status::InvalidArgument("VECTOR membrane required for PutVector");
         auto st = MaybeApplyBackpressure(state);
         if (!st.ok()) return st;
-        return state->vector_engine->Put(id, vec, meta);
+        st = state->vector_engine->Put(id, vec, meta);
+        if (st.ok()) {
+            for (auto& hook : state->hooks) {
+                hook->OnPostPut(id, vec, meta);
+            }
+        }
+        return st;
     }
 
     Status MembraneManager::PutChunk(std::string_view membrane, const pomai::RagChunk& chunk)
@@ -299,7 +324,15 @@ namespace pomai::core
             return Status::InvalidArgument("VECTOR membrane required for PutBatch");
         auto st = MaybeApplyBackpressure(state);
         if (!st.ok()) return st;
-        return state->vector_engine->PutBatch(ids, vectors);
+        st = state->vector_engine->PutBatch(ids, vectors);
+        if (st.ok()) {
+            for (size_t i = 0; i < ids.size(); ++i) {
+                for (auto& hook : state->hooks) {
+                    hook->OnPostPut(ids[i], vectors[i], Metadata());
+                }
+            }
+        }
+        return st;
     }
 
     Status MembraneManager::Get(std::string_view membrane, VectorId id, std::vector<float> *out)
@@ -405,6 +438,38 @@ namespace pomai::core
         return state->rag_engine->Search(query, opts, out);
     }
 
+    Status MembraneManager::AddVertex(std::string_view membrane, VertexId id, TagId tag, const Metadata& meta)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->AddVertex(id, tag, meta);
+    }
+
+    Status MembraneManager::AddEdge(std::string_view membrane, VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->AddEdge(src, dst, type, rank, meta);
+    }
+
+    Status MembraneManager::GetNeighbors(std::string_view membrane, VertexId src, std::vector<Neighbor>* out)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->GetNeighbors(src, out);
+    }
+
+    Status MembraneManager::GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<Neighbor>* out)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->GetNeighbors(src, type, out);
+    }
+
     Status MembraneManager::Freeze(std::string_view membrane)
     {
         auto *state = GetMembraneOrNull(membrane);
@@ -451,6 +516,32 @@ namespace pomai::core
         if (state->spec.kind != pomai::MembraneKind::kVector)
             return Status::InvalidArgument("VECTOR membrane required for iterator");
         return state->vector_engine->NewIterator(snap, out);
+    }
+
+    Status MembraneManager::PushSync(std::string_view name, SyncReceiver* receiver)
+    {
+        auto *state = GetMembraneOrNull(name);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->vector_engine) return Status::InvalidArgument("sync only supported for VECTOR membranes");
+
+        auto st = state->vector_engine->PushSync(receiver);
+        if (st.ok()) {
+            uint64_t current_lsn = state->vector_engine->GetLastSyncedLSN();
+            if (current_lsn > state->spec.sync_lsn) {
+                state->spec.sync_lsn = current_lsn;
+                // Update persistent manifest
+                (void)storage::Manifest::UpdateSyncLSN(base_.path, name, current_lsn);
+            }
+        }
+        return st;
+    }
+
+    void MembraneManager::AddPostPutHook(std::string_view membrane, std::shared_ptr<PostPutHook> hook)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (state) {
+            state->hooks.push_back(std::move(hook));
+        }
     }
 
     Status MembraneManager::MaybeApplyBackpressure(MembraneState* state)

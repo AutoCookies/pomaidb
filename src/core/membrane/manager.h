@@ -13,12 +13,18 @@
 #include "pomai/metadata.h"
 #include "pomai/snapshot.h"
 #include "pomai/rag.h"
+#include "pomai/hooks.h"
+#include "pomai/graph.h"
 
+namespace pomai {
+    class GraphMembrane;
+}
 namespace pomai::core
 {
 
     class VectorEngine;
     class RagEngine;
+    class SyncReceiver;
 
     class MembraneManager
     {
@@ -61,11 +67,19 @@ namespace pomai::core
         Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, std::uint32_t topk, std::vector<pomai::SearchResult>* out);
         Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, std::uint32_t topk, const SearchOptions& opts, std::vector<pomai::SearchResult>* out);
         Status SearchRag(std::string_view membrane, const pomai::RagQuery& query, const pomai::RagSearchOptions& opts, pomai::RagSearchResult *out);
+        
+        // Graph Operations
+        Status AddVertex(std::string_view membrane, VertexId id, TagId tag, const Metadata& meta);
+        Status AddEdge(std::string_view membrane, VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta);
+        Status GetNeighbors(std::string_view membrane, VertexId src, std::vector<Neighbor>* out);
+        Status GetNeighbors(std::string_view membrane, VertexId src, EdgeType type, std::vector<Neighbor>* out);
 
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);
         Status NewIterator(std::string_view membrane, std::unique_ptr<pomai::SnapshotIterator> *out);
-        Status GetSnapshot(std::string_view membrane, std::shared_ptr<pomai::Snapshot>* out);
+        Status GetSnapshot(std::string_view name, std::shared_ptr<pomai::Snapshot> *out);
+        Status PushSync(std::string_view name, SyncReceiver* receiver);
+        void AddPostPutHook(std::string_view membrane, std::shared_ptr<PostPutHook> hook);
         Status NewIterator(std::string_view membrane, const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out);
 
         const pomai::DBOptions& GetOptions() const { return base_; }
@@ -79,6 +93,8 @@ namespace pomai::core
             pomai::MembraneSpec spec;
             std::unique_ptr<VectorEngine> vector_engine;
             std::unique_ptr<RagEngine> rag_engine;
+            std::unique_ptr<pomai::GraphMembrane> graph_engine;
+            std::vector<std::shared_ptr<PostPutHook>> hooks;
         };
 
         MembraneState *GetMembraneOrNull(std::string_view name);
