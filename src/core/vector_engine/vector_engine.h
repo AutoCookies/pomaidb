@@ -15,6 +15,10 @@
 #include "pomai/types.h"
 #include "core/query/lexical_index.h"
 
+namespace pomai::compute::vulkan {
+class VulkanComputeContext;
+}
+
 namespace pomai::core {
 
 class VectorRuntime;
@@ -110,6 +114,9 @@ private:
     uint64_t sync_lsn_{0};
 
     std::unique_ptr<VectorRuntime> runtime_;
+
+    /// Optional Vulkan compute/memory context when `vulkan_enable_memory_bridge` is set.
+    std::unique_ptr<pomai::compute::vulkan::VulkanComputeContext> vulkan_ctx_;
 };
 
 } // namespace pomai::core

@@ -76,6 +76,8 @@ POMAI_API pomai_status_t* pomai_iter_get_record(const pomai_iter_t* iter, pomai_
 POMAI_API void pomai_iter_free(pomai_iter_t* iter);
 
 // Utils
+/** Release a zero-copy semantic pointer session (see POMAI_QUERY_FLAG_ZERO_COPY). */
+POMAI_API void pomai_release_pointer(uint64_t session_id);
 POMAI_API void pomai_free(void* p);
 
 // AgentMemory: high-level context/memory backend for local agents

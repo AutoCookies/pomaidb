@@ -10,6 +10,7 @@ package main
 /*
 #cgo CFLAGS: -I${SRCDIR}/../include
 #cgo LDFLAGS: -L${SRCDIR}/../build -lpomai_c
+#include <stdlib.h>
 #include "pomai/c_api.h"
 */
 import "C"
@@ -18,6 +19,7 @@ import (
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"runtime"
 	"unsafe"
 )
 
@@ -35,27 +37,38 @@ func main() {
 	C.pomai_options_init(&opts)
 	opts.struct_size = C.uint32_t(unsafe.Sizeof(opts))
 	opts.path = C.CString(filepath.Clean("/tmp/pomai_example_go"))
-	opts.shards = 4
+	defer C.free(unsafe.Pointer(opts.path))
+	opts.shards = 1
 	opts.dim = 8
-	opts.search_threads = 2
+	opts.search_threads = 0
 
 	var db *C.pomai_db_t
 	checkStatus(C.pomai_open(&opts, &db))
 
-	rand.Seed(2024)
+	r := rand.New(rand.NewSource(2024))
 	dim := int(opts.dim)
 	n := 100
 	vectors := make([][]float32, n)
-	upserts := make([]C.pomai_upsert_t, n)
 	for i := 0; i < n; i++ {
 		vec := make([]float32, dim)
 		for j := 0; j < dim; j++ {
-			vec[j] = rand.Float32()*2 - 1
+			vec[j] = r.Float32()*2 - 1
 		}
 		vectors[i] = vec
+	}
+
+	// Pin vector backing stores so cgo can pass pointers into libpomai_c (Go 1.21+).
+	var pinner runtime.Pinner
+	for i := range vectors {
+		pinner.Pin(&vectors[i][0])
+	}
+	defer pinner.Unpin()
+
+	upserts := make([]C.pomai_upsert_t, n)
+	for i := 0; i < n; i++ {
 		upserts[i].struct_size = C.uint32_t(unsafe.Sizeof(upserts[i]))
 		upserts[i].id = C.uint64_t(i)
-		upserts[i].vector = (*C.float)(unsafe.Pointer(&vec[0]))
+		upserts[i].vector = (*C.float)(unsafe.Pointer(&vectors[i][0]))
 		upserts[i].dim = C.uint32_t(dim)
 		upserts[i].metadata = nil
 		upserts[i].metadata_len = 0
@@ -63,14 +76,27 @@ func main() {
 	checkStatus(C.pomai_put_batch(db, &upserts[0], C.size_t(n)))
 	checkStatus(C.pomai_freeze(db))
 
+	var qp runtime.Pinner
+	qp.Pin(&vectors[0][0])
+	defer qp.Unpin()
+
 	query := C.pomai_query_t{}
 	query.struct_size = C.uint32_t(unsafe.Sizeof(query))
 	query.vector = (*C.float)(unsafe.Pointer(&vectors[0][0]))
 	query.dim = C.uint32_t(dim)
 	query.topk = 5
 	query.filter_expression = nil
+	query.partition_device_id = nil
+	query.partition_location_id = nil
+	query.as_of_ts = 0
+	query.as_of_lsn = 0
+	query.aggregate_op = 0
+	query.aggregate_field = nil
+	query.aggregate_topk = 0
+	query.mesh_detail_preference = 0
 	query.alpha = 1.0
 	query.deadline_ms = 0
+	query.flags = 0
 
 	var results *C.pomai_search_results_t
 	checkStatus(C.pomai_search(db, &query, &results))

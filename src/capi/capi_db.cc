@@ -372,6 +372,7 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     w->pub.pruned_shards_count = res.pruned_shards_count;
     w->pub.aggregate_value = 0.0;
     w->pub.aggregate_op = 0;
+    w->pub.mesh_lod_level = 0;
     if (!res.aggregates.empty()) {
         w->pub.aggregate_value = res.aggregates.front().value;
         w->pub.aggregate_op = static_cast<uint32_t>(res.aggregates.front().op);
@@ -484,6 +485,7 @@ pomai_status_t* pomai_search_batch(pomai_db_t* db, const pomai_query_t* queries,
         }
         pub.aggregate_value = 0.0;
         pub.aggregate_op = 0;
+        pub.mesh_lod_level = 0;
         if (!res.aggregates.empty()) {
             pub.aggregate_value = res.aggregates.front().value;
             pub.aggregate_op = static_cast<uint32_t>(res.aggregates.front().op);

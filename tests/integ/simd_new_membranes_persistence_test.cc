@@ -33,6 +33,10 @@ POMAI_TEST(SimdNewMembranes_Persistence_Restart) {
         double vol = 0.0;
         POMAI_EXPECT_OK(db->MeshVolume("mesh", 1, &vol));
         POMAI_EXPECT_TRUE(vol >= 0.0);
+        MeshQueryOptions hi;
+        hi.detail = MeshDetailPreference::kHighDetail;
+        POMAI_EXPECT_OK(db->MeshVolume("mesh", 1, hi, &vol));
+        POMAI_EXPECT_TRUE(vol >= 0.0);
         POMAI_EXPECT_OK(db->Close());
     }
 }

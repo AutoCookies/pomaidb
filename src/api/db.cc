@@ -296,6 +296,15 @@ namespace pomai
         Status MeshVolume(std::string_view membrane, uint64_t mesh_id, double* out) override {
             return mgr_.MeshVolume(membrane, mesh_id, out);
         }
+        Status MeshRmsd(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, const MeshQueryOptions& opts, double* out) override {
+            return mgr_.MeshRmsd(membrane, mesh_a, mesh_b, opts, out);
+        }
+        Status MeshIntersect(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, const MeshQueryOptions& opts, bool* out) override {
+            return mgr_.MeshIntersect(membrane, mesh_a, mesh_b, opts, out);
+        }
+        Status MeshVolume(std::string_view membrane, uint64_t mesh_id, const MeshQueryOptions& opts, double* out) override {
+            return mgr_.MeshVolume(membrane, mesh_id, opts, out);
+        }
         Status SparsePut(std::string_view membrane, uint64_t id, const SparseEntry& entry) override {
             return mgr_.SparsePut(membrane, id, entry);
         }

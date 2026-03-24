@@ -158,22 +158,36 @@ pomai::Status IvfFlatIndex::Search(std::span<const float> query, uint32_t nprobe
         return pomai::Status::Ok(); 
         // NOTE: In our design, "not trained" means index shouldn't exist.
     }
-    
+
+    out->clear();
+    out->reserve(std::min(total_count_, static_cast<size_t>(1u << 20))); // cap reserve for pathological nlist
+
+    const uint32_t K = std::min(nprobe, opt_.nlist);
+
+    // Fast path: probing every list yields the full posting union (each vector lives in exactly one list).
+    // Skip centroid dot products + partial_sort — hot in configs that set nprobe == nlist (e.g. max-recall).
+    if (K >= opt_.nlist) {
+        for (uint32_t c = 0; c < opt_.nlist; ++c) {
+            const auto& lst = lists_[c];
+            out->insert(out->end(), lst.begin(), lst.end());
+        }
+        return pomai::Status::Ok();
+    }
+
     // 1. Score Centroids
     thread_local std::vector<std::pair<float, uint32_t>> scores_reuse;
     scores_reuse.clear();
     scores_reuse.reserve(opt_.nlist);
-    
+
     for (uint32_t c = 0; c < opt_.nlist; ++c) {
         std::span<const float> cen(&centroids_[c * dim_], dim_);
         float s = pomai::core::Dot(query, cen);
         scores_reuse.push_back({s, c});
     }
-    
+
     // 2. Select Top nprobe
-    uint32_t K = std::min(nprobe, opt_.nlist);
     std::partial_sort(scores_reuse.begin(), scores_reuse.begin() + K, scores_reuse.end(), std::greater<>());
-    
+
     // 3. Gather
     for (uint32_t k = 0; k < K; ++k) {
         uint32_t c = scores_reuse[k].second;

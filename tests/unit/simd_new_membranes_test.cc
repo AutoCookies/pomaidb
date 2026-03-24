@@ -37,6 +37,10 @@ POMAI_TEST(SimdNewMembranes_BasicOps) {
     double rmsd = 0.0;
     POMAI_EXPECT_OK(db->MeshRmsd("mesh", 1, 2, &rmsd));
     POMAI_EXPECT_TRUE(rmsd <= 1e-6);
+    MeshQueryOptions hi_detail;
+    hi_detail.detail = MeshDetailPreference::kHighDetail;
+    POMAI_EXPECT_OK(db->MeshRmsd("mesh", 1, 2, hi_detail, &rmsd));
+    POMAI_EXPECT_TRUE(rmsd <= 1e-6);
 
     SparseEntry se1{{1,3,8}, {1.0f, 2.0f, 1.0f}};
     SparseEntry se2{{1,2,8}, {1.0f, 1.0f, 3.0f}};

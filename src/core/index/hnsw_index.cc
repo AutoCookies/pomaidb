@@ -64,8 +64,6 @@ pomai::Status HnswIndex::Search(std::span<const float> query,
                                  std::vector<VectorId>* out_ids,
                                  std::vector<float>*    out_dists) const
 {
-    (void)ef_search; // Exact brute-force implementation below ignores ef_search.
-
     if (query.size() != dim_)
         return pomai::Status::InvalidArgument("query dim mismatch");
     if (!out_ids || !out_dists)
@@ -73,78 +71,88 @@ pomai::Status HnswIndex::Search(std::span<const float> query,
 
     out_ids->clear();
     out_dists->clear();
+    if (topk == 0)
+        return pomai::Status::Ok();
     if (id_map_.empty())
         return pomai::Status::Ok();
     if (vector_pool_.size() < id_map_.size() * static_cast<size_t>(dim_))
         return pomai::Status::Corruption("HnswIndex vector pool is inconsistent");
 
-    // To guarantee recall correctness in this build, we compute exact
-    // neighbors by scanning the stored vectors.
     const std::size_t n = id_map_.size();
-    const std::size_t k = std::min<std::size_t>(topk, n);
-
-    struct Candidate {
-        VectorId id;
-        float score_or_dist; // depends on metric_
-    };
-    std::vector<Candidate> cand;
-    cand.reserve(n);
+    const std::size_t k = std::min<std::size_t>(static_cast<std::size_t>(topk), n);
 
     const bool is_ip = (metric_ == pomai::MetricType::kInnerProduct ||
-                         metric_ == pomai::MetricType::kCosine);
+                        metric_ == pomai::MetricType::kCosine);
 
-    for (std::size_t internal = 0; internal < n; ++internal) {
-        const float* v = &vector_pool_[internal * dim_];
+    // Graph ANN search (same distance semantics as Add()).
+    pomai::hnsw::HNSW::QueryDistanceComputer qdis = [&](pomai::hnsw::storage_idx_t internal_id) -> float {
+        const float* v = &vector_pool_[static_cast<size_t>(internal_id) * dim_];
         std::span<const float> v_span(v, dim_);
-
-        float score_or_dist = 0.0f;
         if (is_ip) {
-            // Higher is better (Dot similarity). Runtime uses metric_ to interpret this.
-            score_or_dist = pomai::core::Dot(query, v_span);
-        } else {
-            // Distance for L2 path. Runtime negates it when turning into a score.
-            score_or_dist = pomai::core::L2Sq(query, v_span);
+            return 1.0f - pomai::core::Dot(query, v_span);
         }
-        cand.push_back(Candidate{ id_map_[internal], score_or_dist });
+        return pomai::core::L2Sq(query, v_span);
+    };
+
+    const int ef_cfg = ef_search > 0 ? ef_search : opts_.ef_search;
+    const int ef_use = std::max(ef_cfg, static_cast<int>(k));
+
+    std::vector<pomai::hnsw::storage_idx_t> internal_ids;
+    std::vector<float> internal_dists;
+    index_->search(qdis, static_cast<int>(k), ef_use, internal_ids, internal_dists);
+
+    if (internal_ids.empty()) {
+        // Extremely small graphs / edge cases: fall back to exact top-k.
+        struct Candidate {
+            VectorId id;
+            float score_or_dist;
+        };
+        std::vector<Candidate> cand;
+        cand.reserve(n);
+        for (std::size_t internal = 0; internal < n; ++internal) {
+            const float* v = &vector_pool_[internal * dim_];
+            std::span<const float> v_span(v, dim_);
+            float score_or_dist = is_ip ? pomai::core::Dot(query, v_span)
+                                        : pomai::core::L2Sq(query, v_span);
+            cand.push_back(Candidate{ id_map_[internal], score_or_dist });
+        }
+        if (is_ip) {
+            std::partial_sort(
+                cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(k), cand.end(),
+                [](const Candidate& a, const Candidate& b) {
+                    return a.score_or_dist > b.score_or_dist;
+                });
+        } else {
+            std::partial_sort(
+                cand.begin(), cand.begin() + static_cast<std::ptrdiff_t>(k), cand.end(),
+                [](const Candidate& a, const Candidate& b) {
+                    return a.score_or_dist < b.score_or_dist;
+                });
+        }
+        cand.resize(k);
+        out_ids->reserve(k);
+        out_dists->reserve(k);
+        for (const auto& c : cand) {
+            out_ids->push_back(c.id);
+            out_dists->push_back(c.score_or_dist);
+        }
+        return pomai::Status::Ok();
     }
 
-    if (is_ip) {
-        std::partial_sort(
-            cand.begin(), cand.begin() + k, cand.end(),
-            [](const Candidate& a, const Candidate& b) {
-                return a.score_or_dist > b.score_or_dist; // higher similarity first
-            });
-    } else {
-        std::partial_sort(
-            cand.begin(), cand.begin() + k, cand.end(),
-            [](const Candidate& a, const Candidate& b) {
-                return a.score_or_dist < b.score_or_dist; // smaller distance first
-            });
-    }
-
-    cand.resize(k);
-    // Produce deterministic ordering for stability: by score, then by id.
-    if (is_ip) {
-        std::sort(cand.begin(), cand.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      if (a.score_or_dist != b.score_or_dist)
-                          return a.score_or_dist > b.score_or_dist;
-                      return a.id < b.id;
-                  });
-    } else {
-        std::sort(cand.begin(), cand.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      if (a.score_or_dist != b.score_or_dist)
-                          return a.score_or_dist < b.score_or_dist;
-                      return a.id < b.id;
-                  });
-    }
-
-    out_ids->reserve(k);
-    out_dists->reserve(k);
-    for (const auto& c : cand) {
-        out_ids->push_back(c.id);
-        out_dists->push_back(c.score_or_dist);
+    out_ids->reserve(internal_ids.size());
+    out_dists->reserve(internal_dists.size());
+    for (size_t i = 0; i < internal_ids.size(); ++i) {
+        const auto ii = internal_ids[i];
+        if (ii < 0 || static_cast<size_t>(ii) >= id_map_.size()) {
+            continue;
+        }
+        out_ids->push_back(id_map_[static_cast<size_t>(ii)]);
+        // Runtime expects dot similarity for IP/Cosine, and L2^2 for L2 (negated to score).
+        if (is_ip) {
+            out_dists->push_back(1.0f - internal_dists[i]);
+        } else {
+            out_dists->push_back(internal_dists[i]);
+        }
     }
 
     return pomai::Status::Ok();

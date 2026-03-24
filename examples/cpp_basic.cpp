@@ -7,9 +7,10 @@
 #include <vector>
 
 int main() {
+    // Remove any previous DB first for a clean run, e.g.: rm -rf /tmp/pomai_example_cpp
     const std::string path = "/tmp/pomai_example_cpp";
     const uint32_t dim = 8;
-    const uint32_t shards = 4;
+    const uint32_t shards = 1; // monolithic runtime; single shard is typical
 
     pomai::DBOptions opt;
     opt.path = path;
@@ -40,7 +41,7 @@ int main() {
             return 1;
         }
     }
-    st = db->Freeze();
+    st = db->Freeze("__default__");
     if (!st.ok()) {
         std::cerr << "Freeze failed: " << st.message() << "\n";
         return 1;
@@ -58,6 +59,10 @@ int main() {
         std::cout << "  id=" << hit.id << " score=" << hit.score << "\n";
     }
 
-    db->Close();
+    st = db->Close();
+    if (!st.ok()) {
+        std::cerr << "Close failed: " << st.message() << "\n";
+        return 1;
+    }
     return 0;
 }

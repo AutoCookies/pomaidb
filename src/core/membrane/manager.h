@@ -17,6 +17,8 @@
 #include "core/query/query_planner.h"
 #include "core/query/query_orchestrator.h"
 #include "core/lifecycle/semantic_lifecycle.h"
+#include "core/concurrency/scheduler.h"
+#include "core/mesh/mesh_engine.h"
 
 namespace pomai {
     class GraphMembrane;
@@ -111,6 +113,9 @@ namespace pomai::core
         Status MeshRmsd(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, double* out);
         Status MeshIntersect(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, bool* out);
         Status MeshVolume(std::string_view membrane, uint64_t mesh_id, double* out);
+        Status MeshRmsd(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, const MeshQueryOptions& opts, double* out);
+        Status MeshIntersect(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, const MeshQueryOptions& opts, bool* out);
+        Status MeshVolume(std::string_view membrane, uint64_t mesh_id, const MeshQueryOptions& opts, double* out);
         Status SparsePut(std::string_view membrane, uint64_t id, const pomai::SparseEntry& entry);
         Status SparseDot(std::string_view membrane, uint64_t a, uint64_t b, double* out);
         Status SparseIntersect(std::string_view membrane, uint64_t a, uint64_t b, uint32_t* out);
@@ -135,6 +140,7 @@ namespace pomai::core
         Status NewIterator(std::string_view membrane, const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out);
 
         const pomai::DBOptions& GetOptions() const { return base_; }
+        void RunMeshLodSlice();
 
         // Default membrane convenience: use name "__default__"
         static constexpr std::string_view kDefaultMembrane = "__default__";
@@ -164,6 +170,7 @@ namespace pomai::core
 
         /** Backpressure helper: if enabled and over threshold, Freeze() before writes. */
         Status MaybeApplyBackpressure(MembraneState* state);
+        void PollMaintenance();
 
         pomai::DBOptions base_;
         bool opened_ = false;
@@ -171,6 +178,7 @@ namespace pomai::core
         // For now: keep engines in-memory; later you can add lazy-open by manifest.
         std::unordered_map<std::string, MembraneState> membranes_;
         std::unique_ptr<QueryOrchestrator> orchestrator_;
+        TaskScheduler scheduler_;
     };
 
 } // namespace pomai::core

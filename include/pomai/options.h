@@ -35,6 +35,12 @@ namespace pomai
         kBitset = 11,
     };
 
+    enum class MeshDetailPreference : uint8_t
+    {
+        kAutoLatencyFirst = 0,
+        kHighDetail = 1,
+    };
+
     enum class IndexType : uint8_t
     {
         kIvfFlat = 0,
@@ -140,6 +146,9 @@ namespace pomai
         uint32_t max_blob_bytes_mb = 64;
         uint32_t max_spatial_points = 20000;
         uint32_t max_mesh_objects = 4000;
+        uint32_t mesh_lod_build_interval_ms = 50;
+        uint32_t mesh_lod_jobs_per_tick = 1;
+        uint32_t mesh_lod_max_queue = 1024;
         uint32_t max_sparse_entries = 20000;
         uint32_t max_bitset_bytes_mb = 64;
 
@@ -148,6 +157,12 @@ namespace pomai
         uint64_t write_budget_bytes_per_hour = 0; // 0 = disabled
         uint32_t endurance_freeze_delay_ms = 0;
         float endurance_compaction_bias = 1.0f; // >1 delays compaction under high wear.
+
+        // Vulkan memory bridge (Phase 1 GPU prep; optional, off by default).
+        bool vulkan_enable_memory_bridge = false;
+        bool vulkan_prefer_unified_memory = true;
+        uint32_t vulkan_staging_pool_mb = 16;
+        uint64_t vulkan_zero_copy_min_bytes = 4096;
     };
 
     // One membrane = one logical collection.

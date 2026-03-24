@@ -4,9 +4,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**The predictable edge database for vectors + multimodal memory.**
+**The predictable edge-native database for multimodal AI memory.**
 
-PomaiDB is an **embedded, single-threaded edge database** written in C++20, built for edge devices, IoT gateways, and environments where stability, hardware longevity, and deterministic behavior matter more than theoretical peak throughput. It combines **log-structured storage**, **zero-copy reads**, **typed membranes** (Vector/RAG/Graph/Text/TimeSeries/KeyValue/Sketch/Blob), and an **offline-first Edge RAG pipeline** so you can run search + retrieval entirely on-device—no cloud APIs, no random writes, no surprise OOMs.
+PomaiDB is an **embedded, single-threaded edge database** written in C++20 for IoT gateways, robotics, industrial edge, and offline AI appliances. It combines **log-structured storage**, **zero-copy reads**, **typed membranes** (`kVector`, `kRag`, `kGraph`, `kText`, `kTimeSeries`, `kKeyValue`, `kSketch`, `kBlob`, `kSpatial`, `kMesh`, `kSparse`, `kBitset`), an **inference-only AI path** (no model training required), and an **offline-first RAG pipeline** so retrieval and memory operations stay on-device.
 
 ---
 
@@ -14,15 +14,17 @@ PomaiDB is an **embedded, single-threaded edge database** written in C++20, buil
 
 PomaiDB is a **small-footprint, production-ready vector store** that runs natively on ARM64 (Raspberry Pi, Orange Pi, Jetson) and x86_64. It is designed to be **linked into your application** as a static or shared library and driven via a simple C++ API or a C API with Python bindings. Unlike distributed or server-oriented vector databases, PomaiDB assumes a **single process, single thread of execution**: one event loop, one storage engine, one logical database. That constraint is intentional. It yields predictable latency, trivial concurrency reasoning, and an I/O model that flash storage (SD cards, eMMC) can sustain for years.
 
-**Core capabilities:**
+**Core capabilities (current):**
 
 - **Vector ingestion and search** — Put vectors (with optional metadata), run approximate nearest-neighbor search (ANN) with configurable index types (IVF, HNSW), batch search, and point queries. All with optional scalar quantization (SQ8) to cut memory and bandwidth.
 - **Membranes** — Logical collections with separate dimensions, sharding, and indexes. Supported kinds: `kVector`, `kRag`, `kGraph`, `kText`, `kTimeSeries`, `kKeyValue`, `kSketch`, `kBlob`, `kSpatial`, `kMesh`, `kSparse`, `kBitset`.
-- **Typed membrane APIs** — Native C++ APIs for time-series range queries, KV state storage, sketch counters/seen checks/unique estimates, and blob read/write/delete.
+- **Mesh LOD manager** — `kMesh` now supports asynchronous multi-LOD generation (high-poly + decimated levels) driven by `TaskScheduler`, with latency-first auto selection and explicit high-detail override per mesh query.
+- **Typed membrane APIs** — Native C++ + C APIs across all supported membrane kinds with strict low-RAM caps.
 - **Hybrid & multimodal search** — `QueryOrchestrator` supports vector + lexical + graph traversal paths with heuristic execution ordering, bounded frontier RAM, and metadata partition hints (`device_id`/`location_id`).
-- **Edge analytical aggregates (mini-OLAP)** — `Sum`, `Avg`, `Min`, `Max`, `Count`, `Top-K` over post-filter result sets (inference-only, no training).
+- **Edge analytical aggregates (mini-OLAP)** — `Sum`, `Avg`, `Min`, `Max`, `Count`, `Top-K` over planner/runtime post-filter result sets.
 - **Virtual time-travel** — query constraints by `as_of_ts` and `as_of_lsn` for replay/debug style reads.
-- **Hardware wear-aware maintenance** — write-byte counters (WAL + segment writes) and endurance-aware compaction biasing for flash longevity.
+- **Hardware wear-aware maintenance** — write-byte counters at WAL/segment layers and endurance-aware compaction biasing for flash longevity.
+- **No-train AI dispatch** — deterministic heuristic inference path can classify/score all current membrane datatypes without any training step.
 - **Offline-first Edge RAG** — Ingest documents (chunk → embed → store) and retrieve context (embed query → search → format chunk text) entirely on-device. Zero-copy chunking, a pluggable `EmbeddingProvider` (mock for tests; ready for a small local model), and strict memory limits so the pipeline fits in 64–128 MB RAM.
 - **Virtual File System (VFS)** — Storage and environment operations go through abstract `Env` and file interfaces. Default backend is POSIX; an in-memory backend (`InMemoryEnv`) supports tests and non-POSIX targets. No direct `<unistd.h>` or `<fcntl.h>` in core code.
 - **Zero-OOM philosophy** — Bounded memtable size, backpressure (auto-freeze when over threshold), and optional integration with **palloc** for arena-style allocation and hard memory caps. Runtime caps include lifecycle entries, text docs, query frontier, KV entries, sketch entries, and blob bytes.
@@ -52,21 +54,22 @@ The built-in RAG pipeline needs **no external API**. You ingest documents (text 
 
 ---
 
-## Technical Highlights
+## Technical Highlights (Current Architecture)
 
-- **Architecture** — Shared-nothing, single-threaded event loop. One logical thread; no worker threads or thread pools in the core path. Full DB implementation (`DbImpl`) with membrane manager supports typed multi-membrane workloads; C API and Python bindings use this same engine.
+- **Architecture** — Shared-nothing, single-threaded event loop. One logical thread, deterministic sequencing. `DbImpl` + `MembraneManager` + `QueryPlanner/QueryOrchestrator` provide typed multi-membrane execution for C++, C, and Python bindings.
 - **Storage** — Log-structured, append-only. Tombstone-based deletion; sequential flush of in-memory buffer to disk. Optional explicit `Flush()` from the application loop. VFS abstraction (`Env`, `SequentialFile`, `RandomAccessFile`, `WritableFile`, optional `FileMapping`) so core code has no OS-specific includes.
 - **Memory** — Optional **palloc** (mmap-backed or custom allocator). Core and C API can use palloc for control structures and large buffers; RAG pipeline uses configurable limits and batch sizes. Arena-backed buffers for ingestion; optional hard limits for embedded and edge deployments.
 - **I/O** — Sequential write-behind; zero-copy reads (mmap where available via VFS, or buffered I/O). Designed for SD-card and eMMC longevity first, NVMe-friendly by construction.
 - **RAG** — Zero-copy chunking (`std::string_view`), `EmbeddingProvider` interface, optional chunk text storage in RAG engine, and a unified `RagPipeline` with `IngestDocument` and `RetrieveContext`. C API: `pomai_rag_pipeline_create`, `pomai_rag_ingest_document`, `pomai_rag_retrieve_context` (and buffer-based variant); Python: `ingest_document`, `retrieve_context`.
-- **Hardening** — Stress/soak, crash-replay, power-loss, SD-fault injection, and encryption overhead benchmarks are part of the repository test/bench matrix.
+- **Hardening** — Stress/soak, crash-replay, power-loss, SD-fault injection, endurance-aware write tracking, and encryption overhead benchmarks are part of the repository test/bench matrix.
 - **Hardware** — Optimized for **ARM64** (Raspberry Pi, Orange Pi, Jetson) and **x64** servers. Single-threaded design avoids NUMA and core-pinning complexity.
 
 ---
 
 ## Performance
 
-PomaiDB is engineered for high-efficiency ingestion and low-latency retrieval on edge hardware. Below are representative benchmarks.
+PomaiDB is engineered for predictable ingestion, retrieval, and maintenance on constrained edge hardware.  
+**Latest benchmark run:** via `./scripts/run_benchmarks_one_by_one.sh` (full suite, exit code `0`).
 
 **Run Device (Edge-class laptop):**
 - **Model:** HP ProBook 450 G5
@@ -74,16 +77,19 @@ PomaiDB is engineered for high-efficiency ingestion and low-latency retrieval on
 - **RAM:** 16GB
 - **Storage:** SATA SSD
 
-| Benchmark | Workload | Result |
+| Benchmark | Workload | Latest Result |
 | --- | --- | --- |
-| **Vector Ingestion** | Sequential Put (128-dim) | ~60,000 vectors/sec |
-| **Vertex Ingestion** | Add graph nodes | **~67,200 ops/sec** |
-| **Edge Ingestion** | Add random graph edges | **~70,500 ops/sec** |
-| **SearchGraphRAG** | Vector Search + 2-hop Graph | **~2.7 ms (avg)** |
-| **Hybrid RAG** | Lexical + Vector search | **~0.4 ms (avg)** |
-| **Recall@10** | ANN Accuracy (10K/128d) | 100% |
+| **Comprehensive Search** | 10K vecs / 1K queries / top-k=10 | Mean **18.55 ms**, P99 **28.52 ms**, QPS **53.89**, Recall@10 **100%** |
+| **Ingestion Throughput** | 10K vectors @ 128-dim | **31,004 vectors/sec** (~15.14 MB/s), avg **32.25 us/vector** |
+| **RAG Lexical** | Chunked retrieval pipeline | **0.068 ms** |
+| **RAG Hybrid** | Lexical + vector candidates | **0.064 ms** |
+| **CI Perf Gate** | 2K vecs / 300 queries (3 iters) | Ingest **56,847.3 qps**, Search p50 **2509.65 us**, p99 **3470.43 us** |
+| **CBRS (single)** | Routed query profile | Query **30.9 qps**, p99 **21820.6 us**, Recall@10 **100%** |
+| **Low-memory Edge Churn** | 5 cycles constrained run | Throughput **1844.43 vec/s**, Peak RSS **51.2 MiB**, PASS |
+| **Quantization** | Float/SQ8/FP16/1-bit comparison | Throughput: Float **56.37**, SQ8 **56.90**, FP16 **56.42**, 1-bit **49.41** |
+| **Mesh LOD** | 4,096 triangles / 5K volume ops | Auto-LOD **276.005 ms**, High-detail **1664.509 ms** (~6.0x faster auto path) |
 
-*Note: Benchmarks run with `FsyncPolicy::kNever` for maximum throughput. Performance on SD cards will vary based on write speed class.*
+*Note: Benchmarks are device/profile dependent. Throughput and latency vary by CPU class, storage medium, fsync policy, and memory limit profile.*
 
 ---
 
@@ -93,8 +99,12 @@ PomaiDB is engineered for high-efficiency ingestion and low-latency retrieval on
 
 Requires a C++20 compiler and CMake 3.20+.
 
+**Vulkan headers:** the Khronos bundle (Vulkan-Hpp + `vulkan/*.h`) is expected under **`third_party/vulkan/include/`** in the repo root (same tree as `simd/`, `pomaidb_hnsw/`). CMake prints `[pomai] Vulkan headers: …` at configure time. To use another path: `cmake -DPOMAI_VULKAN_HEADERS_DIR=/path/to/include`.
+
+**Examples:** see **`examples/README.md`** (C++, C ABI, Python, Go, JS/TS, RAG quickstart). C ABI structs match **`include/pomai/c_types.h`**.
+
 ```bash
-git clone --recursive https://github.com/YOUR_ORG/pomaidb.git
+git clone --recursive https://github.com/pomagrenate/pomaidb
 cd pomaidb
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
@@ -109,12 +119,12 @@ cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-Latest full local run in this repo state: **62/62 tests passed**.
+Latest full local run in this repo state: **67/67 tests passed**.
 
 **Smaller clone (embedded / CI):** Use a shallow clone and slim the palloc submodule to skip unneeded directories (saves ~6MB+ and reduces history size):
 
 ```bash
-git clone --depth 1 --recursive https://github.com/YOUR_ORG/pomaidb.git
+git clone --depth 1 --recursive https://github.com/pomagrenate/pomaidb
 cd pomaidb
 ./scripts/slim_palloc_submodule.sh
 ```
@@ -181,7 +191,7 @@ int main() {
     opt.path = "/tmp/rag_db";
     opt.dim = 4;
     opt.shard_count = 2;
-    std::unique_ptr<pomai::DB> db;
+    std::unique_ptr<pomai::DB> dhttps://github.com/YOUR_ORG/pomaidb.gitb;
     if (!pomai::DB::Open(opt, &db).ok()) return 1;
 
     pomai::MembraneSpec rag;
@@ -252,7 +262,7 @@ POMAI_BENCH_LOW_MEMORY=1 ./benchmark_a
 POMAI_BENCH_LOW_MEMORY=1 ./new_membrane_bench
 ```
 
-Latest local benchmark verification in this repo state: all benchmark executables above completed successfully (exit code 0).
+Latest local benchmark verification in this repo state: all executables from `run_benchmarks_one_by_one.sh` completed successfully (exit code `0`), including `comprehensive_bench`, `ingestion_bench`, `rag_bench`, `ci_perf_bench`, `bench_cbrs`, `benchmark_a`, and `quantization_bench`.
 
 **Python CIFAR-10 benchmark (end-to-end):** Create a venv, install from `requirements.txt`, build the C library, then run the benchmark (uses ctypes against `libpomai_c.so`; downloads real CIFAR-10 by default):
 

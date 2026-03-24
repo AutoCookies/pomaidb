@@ -3,11 +3,13 @@
 namespace pomai::core {
 
 void SemanticLifecycle::OnRead(VectorId id) {
+    if (max_entries_ == 0) return;
     EvictIfNeeded();
     table_[id].reads++;
 }
 
 void SemanticLifecycle::OnWrite(VectorId id) {
+    if (max_entries_ == 0) return;
     EvictIfNeeded();
     table_[id].writes++;
 }

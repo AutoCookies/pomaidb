@@ -85,15 +85,34 @@ def _register_api(lib):
         ]
 
     class PomaiQuery(ctypes.Structure):
+        # Must match include/pomai/c_types.h pomai_query_t (field order + padding).
         _fields_ = [
             ("struct_size", ctypes.c_uint32),
             ("vector", ctypes.POINTER(ctypes.c_float)),
             ("dim", ctypes.c_uint32),
             ("topk", ctypes.c_uint32),
             ("filter_expression", ctypes.c_char_p),
+            ("partition_device_id", ctypes.c_char_p),
+            ("partition_location_id", ctypes.c_char_p),
+            ("as_of_ts", ctypes.c_uint64),
+            ("as_of_lsn", ctypes.c_uint64),
+            ("aggregate_op", ctypes.c_uint32),
+            ("aggregate_field", ctypes.c_char_p),
+            ("aggregate_topk", ctypes.c_uint32),
+            ("mesh_detail_preference", ctypes.c_uint32),
             ("alpha", ctypes.c_float),
             ("deadline_ms", ctypes.c_uint32),
             ("flags", ctypes.c_uint32),
+        ]
+
+    class PomaiSemanticPointer(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("raw_data_ptr", ctypes.c_void_p),
+            ("dim", ctypes.c_uint32),
+            ("quant_min", ctypes.c_float),
+            ("quant_inv_scale", ctypes.c_float),
+            ("session_id", ctypes.c_uint64),
         ]
 
     class PomaiSearchResults(ctypes.Structure):
@@ -103,6 +122,12 @@ def _register_api(lib):
             ("ids", ctypes.POINTER(ctypes.c_uint64)),
             ("scores", ctypes.POINTER(ctypes.c_float)),
             ("shard_ids", ctypes.POINTER(ctypes.c_uint32)),
+            ("total_shards_count", ctypes.c_uint32),
+            ("pruned_shards_count", ctypes.c_uint32),
+            ("aggregate_value", ctypes.c_double),
+            ("aggregate_op", ctypes.c_uint32),
+            ("mesh_lod_level", ctypes.c_uint32),
+            ("zero_copy_pointers", ctypes.POINTER(PomaiSemanticPointer)),
         ]
 
     lib.pomai_options_init.argtypes = [ctypes.POINTER(PomaiOptions)]
@@ -224,6 +249,7 @@ def _register_api(lib):
     lib._pomai_options = PomaiOptions
     lib._pomai_upsert = PomaiUpsert
     lib._pomai_query = PomaiQuery
+    lib._pomai_semantic_pointer = PomaiSemanticPointer
     lib._pomai_search_results = PomaiSearchResults
     lib._pomai_rag_chunk_options = PomaiRagChunkOptions
     lib._pomai_rag_chunk = PomaiRagChunk
@@ -312,7 +338,15 @@ def search_batch(db, queries, topk=10):
         batch[i].dim = dim
         batch[i].topk = topk
         batch[i].filter_expression = None
-        batch[i].alpha = ctypes.c_float(0.0)
+        batch[i].partition_device_id = None
+        batch[i].partition_location_id = None
+        batch[i].as_of_ts = 0
+        batch[i].as_of_lsn = 0
+        batch[i].aggregate_op = 0
+        batch[i].aggregate_field = None
+        batch[i].aggregate_topk = 0
+        batch[i].mesh_detail_preference = 0
+        batch[i].alpha = 1.0
         batch[i].deadline_ms = 0
         batch[i].flags = 0
     out = ctypes.POINTER(_lib._pomai_search_results)()

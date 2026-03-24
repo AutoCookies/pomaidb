@@ -1,15 +1,17 @@
-// PomaiDB TypeScript FFI example (Node.js + ts-node).
-//
-// How to run:
-//   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-//   cmake --build build --target pomai_c
-//   npm install ffi-napi ref-napi ref-struct-di ts-node typescript
-//   POMAI_C_LIB=./build/libpomai_c.so npx ts-node --compiler-options '{"module":"commonjs"}' examples/ts_basic.ts
-
+/**
+ * PomaiDB TypeScript FFI example (Node.js + ts-node + ffi-napi).
+ * Struct layout must match include/pomai/c_types.h (including implicit padding).
+ *
+ *   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+ *   cmake --build build --target pomai_c
+ *   npm install ffi-napi ref-napi ref-struct-di ts-node typescript @types/node
+ *   POMAI_C_LIB=./build/libpomai_c.so npx ts-node --compilerOptions '{"module":"commonjs"}' examples/ts_basic.ts
+ */
 import ffi from "ffi-napi";
 import ref from "ref-napi";
 import StructDi from "ref-struct-di";
 import path from "node:path";
+import process from "node:process";
 
 const Struct = StructDi(ref);
 const voidPtr = ref.refType(ref.types.void);
@@ -18,6 +20,7 @@ const uint8Ptr = ref.refType(ref.types.uint8);
 
 const PomaiOptions = Struct({
   struct_size: ref.types.uint32,
+  _pad_align_path: ref.types.uint32,
   path: ref.types.CString,
   shards: ref.types.uint32,
   dim: ref.types.uint32,
@@ -25,6 +28,15 @@ const PomaiOptions = Struct({
   fsync_policy: ref.types.uint32,
   memory_budget_bytes: ref.types.uint64,
   deadline_ms: ref.types.uint32,
+  index_type: ref.types.uint8,
+  _pad_before_hnsw: ref.types.uint8,
+  _pad_before_hnsw2: ref.types.uint8,
+  _pad_before_hnsw3: ref.types.uint8,
+  hnsw_m: ref.types.uint32,
+  hnsw_ef_construction: ref.types.uint32,
+  hnsw_ef_search: ref.types.uint32,
+  adaptive_threshold: ref.types.uint32,
+  metric: ref.types.uint8,
 });
 
 const PomaiUpsert = Struct({
@@ -38,12 +50,31 @@ const PomaiUpsert = Struct({
 
 const PomaiQuery = Struct({
   struct_size: ref.types.uint32,
+  _pad_align_vector: ref.types.uint32,
   vector: floatPtr,
   dim: ref.types.uint32,
   topk: ref.types.uint32,
   filter_expression: ref.types.CString,
+  partition_device_id: ref.types.CString,
+  partition_location_id: ref.types.CString,
+  as_of_ts: ref.types.uint64,
+  as_of_lsn: ref.types.uint64,
+  aggregate_op: ref.types.uint32,
+  aggregate_field: ref.types.CString,
+  aggregate_topk: ref.types.uint32,
+  mesh_detail_preference: ref.types.uint32,
   alpha: ref.types.float,
   deadline_ms: ref.types.uint32,
+  flags: ref.types.uint32,
+});
+
+const PomaiSemanticPointer = Struct({
+  struct_size: ref.types.uint32,
+  raw_data_ptr: voidPtr,
+  dim: ref.types.uint32,
+  quant_min: ref.types.float,
+  quant_inv_scale: ref.types.float,
+  session_id: ref.types.uint64,
 });
 
 const PomaiSearchResults = Struct({
@@ -52,6 +83,12 @@ const PomaiSearchResults = Struct({
   ids: ref.refType(ref.types.uint64),
   scores: floatPtr,
   shard_ids: ref.refType(ref.types.uint32),
+  total_shards_count: ref.types.uint32,
+  pruned_shards_count: ref.types.uint32,
+  aggregate_value: ref.types.double,
+  aggregate_op: ref.types.uint32,
+  mesh_lod_level: ref.types.uint32,
+  zero_copy_pointers: ref.refType(PomaiSemanticPointer),
 });
 
 const libPath = process.env.POMAI_C_LIB ?? path.resolve("./build/libpomai_c.so");
@@ -67,15 +104,15 @@ const lib = ffi.Library(libPath, {
   pomai_status_free: ["void", [voidPtr]],
 });
 
-function checkStatus(status: any) {
+function checkStatus(status: unknown): void {
   if (!ref.isNull(status)) {
-    const msg = lib.pomai_status_message(status);
-    lib.pomai_status_free(status);
+    const msg = lib.pomai_status_message(status as ref.Pointer<void>);
+    lib.pomai_status_free(status as ref.Pointer<void>);
     throw new Error(msg);
   }
 }
 
-function makeVector(dim: number, seed: number) {
+function makeVector(dim: number, seed: number): { buf: Buffer; seed: number } {
   const buf = Buffer.alloc(dim * 4);
   const view = new Float32Array(buf.buffer, buf.byteOffset, dim);
   let next = seed;
@@ -93,9 +130,9 @@ const opts = new PomaiOptions();
 lib.pomai_options_init(opts.ref());
 opts.struct_size = PomaiOptions.size;
 opts.path = path.resolve("/tmp/pomai_example_ts");
-opts.shards = 4;
+opts.shards = 1;
 opts.dim = dim;
-opts.search_threads = 2;
+opts.search_threads = 0;
 
 const dbPtr = ref.alloc(voidPtr);
 checkStatus(lib.pomai_open(opts.ref(), dbPtr));
@@ -124,8 +161,17 @@ query.vector = vectors[0];
 query.dim = dim;
 query.topk = 5;
 query.filter_expression = ref.NULL;
+query.partition_device_id = ref.NULL;
+query.partition_location_id = ref.NULL;
+query.as_of_ts = 0;
+query.as_of_lsn = 0;
+query.aggregate_op = 0;
+query.aggregate_field = ref.NULL;
+query.aggregate_topk = 0;
+query.mesh_detail_preference = 0;
 query.alpha = 1.0;
 query.deadline_ms = 0;
+query.flags = 0;
 
 const resultsPtrPtr = ref.alloc(ref.refType(PomaiSearchResults));
 checkStatus(lib.pomai_search(db, query.ref(), resultsPtrPtr));

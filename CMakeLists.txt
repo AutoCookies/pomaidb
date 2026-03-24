@@ -46,6 +46,16 @@ endif()
 # =========================
 message(STATUS "[pomai] Native HNSW: enabled")
 
+# Khronos Vulkan-Headers + Vulkan-Hpp (vendored under third_party/vulkan/include).
+# Override with: cmake -DPOMAI_VULKAN_HEADERS_DIR=/path/to/include
+set(POMAI_VULKAN_HEADERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vulkan/include" CACHE PATH
+    "Directory containing vulkan/vulkan.h (parent of the vulkan/ header folder)")
+if(NOT EXISTS "${POMAI_VULKAN_HEADERS_DIR}/vulkan/vulkan.h")
+  message(FATAL_ERROR
+    "Vulkan headers not found at:\n  ${POMAI_VULKAN_HEADERS_DIR}/vulkan/vulkan.h\n"
+    "Place the Khronos bundle under third_party/vulkan/include/ or set POMAI_VULKAN_HEADERS_DIR.")
+endif()
+message(STATUS "[pomai] Vulkan headers: ${POMAI_VULKAN_HEADERS_DIR}")
 
 # =========================
 # Library: pomai
@@ -68,6 +78,8 @@ add_library(pomai STATIC
   src/core/simd/simd_dispatch.cc
   src/core/spatial/spatial_engine.cc
   src/core/mesh/mesh_engine.cc
+  src/core/mesh/mesh_lod_manager.cc
+  src/core/mesh/simplifier.cc
   src/core/sparse/sparse_engine.cc
   src/core/bitset/bitset_engine.cc
   src/core/ai/no_train_dispatch.cc
@@ -88,6 +100,11 @@ add_library(pomai STATIC
   src/core/storage/compaction_manager.cc
   src/core/storage/sync_provider.cc
   src/core/concurrency/scheduler.cc
+  src/compute/vulkan/loader/volk.c
+  src/compute/vulkan/vulkan_init.cc
+  src/compute/vulkan/vulkan_device_context.cc
+  src/compute/vulkan/vulkan_memory_bridge.cc
+  src/compute/vulkan/vulkan_staging_pool.cc
 
   src/core/quantization/scalar_quantizer.cc
   src/core/quantization/half_float_quantizer.cc
@@ -150,6 +167,8 @@ target_include_directories(pomai
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${POMAI_VULKAN_HEADERS_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/compute/vulkan/loader
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ai
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ai/cheesebrain_core
     ${CMAKE_CURRENT_SOURCE_DIR}/src/ai/tensor_core
@@ -158,6 +177,10 @@ target_include_directories(pomai
   SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
+
+if (WIN32)
+  target_compile_definitions(pomai PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
 
 # Vendored code: keep strict warnings for PomaiDB, but avoid breaking builds on
 # third_party sources when POMAI_STRICT is enabled.
@@ -174,6 +197,9 @@ endif()
 
 find_package(OpenSSL REQUIRED)
 target_link_libraries(pomai PRIVATE OpenSSL::Crypto)
+if (UNIX AND NOT APPLE)
+  target_link_libraries(pomai PRIVATE ${CMAKE_DL_LIBS})
+endif()
 
 if (MSVC)
   target_compile_options(pomai PRIVATE /W4 /permissive-)
@@ -421,6 +447,14 @@ if (POMAI_BUILD_TESTS)
   add_executable(edge_ai_core_enhancements_test tests/unit/edge_ai_core_enhancements_test.cc)
   pomai_setup_test(edge_ai_core_enhancements_test)
   pomai_add_labeled_test(edge_ai_core_enhancements_test "unit")
+
+  add_executable(mesh_lod_manager_test tests/unit/mesh_lod_manager_test.cc)
+  pomai_setup_test(mesh_lod_manager_test)
+  pomai_add_labeled_test(mesh_lod_manager_test "unit")
+
+  add_executable(vulkan_memory_bridge_test tests/unit/vulkan_memory_bridge_test.cc)
+  pomai_setup_test(vulkan_memory_bridge_test)
+  pomai_add_labeled_test(vulkan_memory_bridge_test "unit")
 
   add_executable(recall_test tests/recall/recall_test.cc tests/recall/recall_dataset.cc tests/common/bruteforce_oracle.cc)
   pomai_setup_test(recall_test)
@@ -711,6 +745,14 @@ target_include_directories(simd_new_membranes_bench PRIVATE ${CMAKE_CURRENT_SOUR
 add_executable(edge_ai_core_bench benchmarks/edge_ai_core_bench.cc)
 target_link_libraries(edge_ai_core_bench PRIVATE ${POMAI_EXE_DEPS})
 target_include_directories(edge_ai_core_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+  add_executable(mesh_lod_bench benchmarks/mesh_lod_bench.cc)
+  target_link_libraries(mesh_lod_bench PRIVATE ${POMAI_EXE_DEPS})
+  target_include_directories(mesh_lod_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+  add_executable(vulkan_transfer_bench benchmarks/vulkan_transfer_bench.cc)
+  target_link_libraries(vulkan_transfer_bench PRIVATE ${POMAI_EXE_DEPS})
+  target_include_directories(vulkan_transfer_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 # =========================
 # Tools

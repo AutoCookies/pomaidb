@@ -103,6 +103,7 @@ typedef struct {
     uint32_t aggregate_op;     // 0:none 1:sum 2:avg 3:min 4:max 5:count 6:topk
     const char* aggregate_field; // score|timestamp|lsn
     uint32_t aggregate_topk;
+    uint32_t mesh_detail_preference; // 0:auto-latency 1:high-detail
     float alpha;
     uint32_t deadline_ms;
     uint32_t flags;
@@ -127,6 +128,7 @@ typedef struct {
     uint32_t pruned_shards_count;
     double aggregate_value;
     uint32_t aggregate_op;
+    uint32_t mesh_lod_level; // reserved for mesh result paths
     pomai_semantic_pointer_t* zero_copy_pointers;
 } pomai_search_results_t;
 

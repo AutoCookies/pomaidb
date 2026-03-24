@@ -44,6 +44,12 @@ int main() {
         (void)db->Put(2, v2, m2);
     }
 
+    st = db->Freeze("__default__");
+    if (!st.ok()) {
+        std::cerr << "Freeze failed: " << st.message() << std::endl;
+        return 1;
+    }
+
     // 2. Hybrid Search (Vector + Lexical)
     std::cout << "\nTesting Hybrid Search (Query: 'garden')..." << std::endl;
     pomai::MultiModalQuery q1;
@@ -87,7 +93,11 @@ int main() {
         std::cout << " - ID: " << hit.id << std::endl;
     }
 
-    // No need for delete db; handled by unique_ptr
+    st = db->Close();
+    if (!st.ok()) {
+        std::cerr << "Close failed: " << st.message() << std::endl;
+        return 1;
+    }
     std::cout << "\nMulti-modal Verification Complete!" << std::endl;
     return 0;
 }

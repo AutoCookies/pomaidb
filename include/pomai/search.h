@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "options.h"
 #include "types.h"
 
 namespace pomai
@@ -27,6 +28,10 @@ namespace pomai
         kAuto = 0,
         kVectorFirst = 1,
         kGraphFirst = 2,
+    };
+
+    struct MeshQueryOptions {
+        MeshDetailPreference detail = MeshDetailPreference::kAutoLatencyFirst;
     };
 
 
@@ -125,6 +130,7 @@ namespace pomai
         // Optional bitset/sparse prefilter hints.
         uint64_t prefilter_bitset_id = 0;
         uint64_t prefilter_sparse_id = 0;
+        MeshDetailPreference mesh_detail_preference = MeshDetailPreference::kAutoLatencyFirst;
     };
 
 } // namespace pomai

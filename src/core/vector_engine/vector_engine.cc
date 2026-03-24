@@ -2,6 +2,7 @@
 
 #include <utility>
 
+#include "compute/vulkan/vulkan_device_context.h"
 #include "core/distance.h"
 #include "core/memory/pin_manager.h"
 #include "core/shard/runtime.h"
@@ -101,12 +102,25 @@ Status VectorEngine::OpenLocked() {
         return st;
     }
 
+    if (opt_.vulkan_enable_memory_bridge) {
+        auto vctx = std::make_unique<pomai::compute::vulkan::VulkanComputeContext>();
+        pomai::compute::vulkan::BridgeOptions bopt;
+        bopt.prefer_unified_memory = opt_.vulkan_prefer_unified_memory;
+        bopt.staging_pool_mb = opt_.vulkan_staging_pool_mb;
+        bopt.zero_copy_min_bytes = opt_.vulkan_zero_copy_min_bytes;
+        Status vv = pomai::compute::vulkan::VulkanComputeContext::Create(bopt, vctx.get());
+        if (vv.ok()) {
+            vulkan_ctx_ = std::move(vctx);
+        }
+    }
+
     opened_ = true;
     return Status::Ok();
 }
 
 Status VectorEngine::Close() {
     if (!opened_) return Status::Ok();
+    vulkan_ctx_.reset();
     runtime_.reset();
     opened_ = false;
     return Status::Ok();

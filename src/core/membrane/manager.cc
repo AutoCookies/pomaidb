@@ -1,6 +1,7 @@
 #include "core/membrane/manager.h"
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 #include <vector>
 
@@ -24,6 +25,23 @@
 
 namespace pomai::core
 {
+    namespace {
+    class MeshLodTask final : public DatabaseTask {
+    public:
+        explicit MeshLodTask(MembraneManager* owner) : owner_(owner) {}
+
+        Status Run() override {
+            if (!owner_) return Status::Ok();
+            owner_->RunMeshLodSlice();
+            return Status::Ok();
+        }
+
+        std::string Name() const override { return "MeshLodTask"; }
+
+    private:
+        MembraneManager* owner_;
+    };
+    } // namespace
 
     MembraneManager::MembraneManager(pomai::DBOptions base) : base_(std::move(base)) {
         orchestrator_ = std::make_unique<QueryOrchestrator>(this, base_.max_query_frontier);
@@ -33,6 +51,8 @@ namespace pomai::core
     Status MembraneManager::Open()
     {
         opened_ = true;
+        const auto interval_ms = base_.mesh_lod_build_interval_ms == 0 ? 50u : base_.mesh_lod_build_interval_ms;
+        scheduler_.RegisterPeriodic(std::make_unique<MeshLodTask>(this), std::chrono::milliseconds(interval_ms));
 
         // Ensure default membrane exists and is opened.
         pomai::MembraneSpec spec;
@@ -81,7 +101,7 @@ namespace pomai::core
             } else if (loaded_spec.kind == pomai::MembraneKind::kSpatial) {
                 state.spatial_engine = std::make_unique<SpatialEngine>(opt.path, base_.max_spatial_points);
             } else if (loaded_spec.kind == pomai::MembraneKind::kMesh) {
-                state.mesh_engine = std::make_unique<MeshEngine>(opt.path, base_.max_mesh_objects);
+                state.mesh_engine = std::make_unique<MeshEngine>(opt.path, base_.max_mesh_objects, base_);
             } else if (loaded_spec.kind == pomai::MembraneKind::kSparse) {
                 state.sparse_engine = std::make_unique<SparseEngine>(base_.max_sparse_entries);
             } else if (loaded_spec.kind == pomai::MembraneKind::kBitset) {
@@ -150,7 +170,7 @@ namespace pomai::core
                 } else if (mspec.kind == pomai::MembraneKind::kSpatial) {
                     state.spatial_engine = std::make_unique<SpatialEngine>(opt.path, base_.max_spatial_points);
                 } else if (mspec.kind == pomai::MembraneKind::kMesh) {
-                    state.mesh_engine = std::make_unique<MeshEngine>(opt.path, base_.max_mesh_objects);
+                    state.mesh_engine = std::make_unique<MeshEngine>(opt.path, base_.max_mesh_objects, base_);
                 } else if (mspec.kind == pomai::MembraneKind::kSparse) {
                     state.sparse_engine = std::make_unique<SparseEngine>(base_.max_sparse_entries);
                 } else if (mspec.kind == pomai::MembraneKind::kBitset) {
@@ -287,7 +307,7 @@ namespace pomai::core
         } else if (spec.kind == pomai::MembraneKind::kSpatial) {
             state.spatial_engine = std::make_unique<SpatialEngine>(opt.path, base_.max_spatial_points);
         } else if (spec.kind == pomai::MembraneKind::kMesh) {
-            state.mesh_engine = std::make_unique<MeshEngine>(opt.path, base_.max_mesh_objects);
+            state.mesh_engine = std::make_unique<MeshEngine>(opt.path, base_.max_mesh_objects, base_);
         } else if (spec.kind == pomai::MembraneKind::kSparse) {
             state.sparse_engine = std::make_unique<SparseEngine>(base_.max_sparse_entries);
         } else if (spec.kind == pomai::MembraneKind::kBitset) {
@@ -382,16 +402,19 @@ namespace pomai::core
 
     Status MembraneManager::Put(std::string_view membrane, VectorId id, std::span<const float> vec)
     {
+        PollMaintenance();
         return PutVector(membrane, id, vec);
     }
 
     Status MembraneManager::Put(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta)
     {
+        PollMaintenance();
         return PutVector(membrane, id, vec, meta);
     }
 
     Status MembraneManager::PutVector(std::string_view membrane, VectorId id, std::span<const float> vec)
     {
+        PollMaintenance();
         auto *state = GetMembraneOrNull(membrane);
         if (!state)
             return Status::NotFound("membrane not found");
@@ -415,6 +438,7 @@ namespace pomai::core
 
     Status MembraneManager::PutVector(std::string_view membrane, VectorId id, std::span<const float> vec, const Metadata& meta)
     {
+        PollMaintenance();
         auto *state = GetMembraneOrNull(membrane);
         if (!state)
             return Status::NotFound("membrane not found");
@@ -440,6 +464,7 @@ namespace pomai::core
 
     Status MembraneManager::PutChunk(std::string_view membrane, const pomai::RagChunk& chunk)
     {
+        PollMaintenance();
         auto *state = GetMembraneOrNull(membrane);
         if (!state)
             return Status::NotFound("membrane not found");
@@ -455,6 +480,7 @@ namespace pomai::core
                                      const std::vector<VectorId>& ids,
                                      const std::vector<std::span<const float>>& vectors)
     {
+        PollMaintenance();
         auto *state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
         if (state->spec.kind != pomai::MembraneKind::kVector)
@@ -712,31 +738,52 @@ namespace pomai::core
     }
 
     Status MembraneManager::MeshPut(std::string_view membrane, uint64_t mesh_id, std::span<const float> vertices_xyz) {
+        PollMaintenance();
         auto* state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
         if (!state->mesh_engine) return Status::InvalidArgument("MESH membrane required");
-        return state->mesh_engine->Put(mesh_id, vertices_xyz);
+        auto st = state->mesh_engine->Put(mesh_id, vertices_xyz);
+        if (!st.ok()) return st;
+        return state->mesh_engine->ProcessLodJobs(1);
     }
 
     Status MembraneManager::MeshRmsd(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, double* out) {
+        return MeshRmsd(membrane, mesh_a, mesh_b, MeshQueryOptions{}, out);
+    }
+
+    Status MembraneManager::MeshRmsd(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b,
+                                     const MeshQueryOptions& opts, double* out) {
+        PollMaintenance();
         auto* state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
         if (!state->mesh_engine) return Status::InvalidArgument("MESH membrane required");
-        return state->mesh_engine->Rmsd(mesh_a, mesh_b, out);
+        return state->mesh_engine->Rmsd(mesh_a, mesh_b, opts, out);
     }
 
     Status MembraneManager::MeshIntersect(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, bool* out) {
+        return MeshIntersect(membrane, mesh_a, mesh_b, MeshQueryOptions{}, out);
+    }
+
+    Status MembraneManager::MeshIntersect(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b,
+                                          const MeshQueryOptions& opts, bool* out) {
+        PollMaintenance();
         auto* state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
         if (!state->mesh_engine) return Status::InvalidArgument("MESH membrane required");
-        return state->mesh_engine->Intersect(mesh_a, mesh_b, out);
+        return state->mesh_engine->Intersect(mesh_a, mesh_b, opts, out);
     }
 
     Status MembraneManager::MeshVolume(std::string_view membrane, uint64_t mesh_id, double* out) {
+        return MeshVolume(membrane, mesh_id, MeshQueryOptions{}, out);
+    }
+
+    Status MembraneManager::MeshVolume(std::string_view membrane, uint64_t mesh_id,
+                                       const MeshQueryOptions& opts, double* out) {
+        PollMaintenance();
         auto* state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
         if (!state->mesh_engine) return Status::InvalidArgument("MESH membrane required");
-        return state->mesh_engine->Volume(mesh_id, out);
+        return state->mesh_engine->Volume(mesh_id, opts, out);
     }
 
     Status MembraneManager::SparsePut(std::string_view membrane, uint64_t id, const pomai::SparseEntry& entry) {
@@ -932,6 +979,14 @@ namespace pomai::core
         POMAI_LOG_WARN("Membrane '{}' memtable pressure ({} MB). Triggering Auto-Freeze.",
                        state->spec.name, used_mb);
         return state->vector_engine->Freeze();
+    }
+
+    void MembraneManager::PollMaintenance() { scheduler_.Poll(); }
+    void MembraneManager::RunMeshLodSlice() {
+        const std::size_t jobs = base_.mesh_lod_jobs_per_tick == 0 ? 1u : static_cast<std::size_t>(base_.mesh_lod_jobs_per_tick);
+        for (auto& kv : membranes_) {
+            if (kv.second.mesh_engine) (void)kv.second.mesh_engine->ProcessLodJobs(jobs);
+        }
     }
 
 } // namespace pomai::core

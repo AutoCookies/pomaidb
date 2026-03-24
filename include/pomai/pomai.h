@@ -147,6 +147,9 @@ namespace pomai
         virtual Status MeshRmsd(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, double* out) = 0;
         virtual Status MeshIntersect(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, bool* out) = 0;
         virtual Status MeshVolume(std::string_view membrane, uint64_t mesh_id, double* out) = 0;
+        virtual Status MeshRmsd(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, const MeshQueryOptions& opts, double* out) = 0;
+        virtual Status MeshIntersect(std::string_view membrane, uint64_t mesh_a, uint64_t mesh_b, const MeshQueryOptions& opts, bool* out) = 0;
+        virtual Status MeshVolume(std::string_view membrane, uint64_t mesh_id, const MeshQueryOptions& opts, double* out) = 0;
 
         // Sparse API
         virtual Status SparsePut(std::string_view membrane, uint64_t id, const SparseEntry& entry) = 0;
