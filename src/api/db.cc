@@ -112,6 +112,14 @@ namespace pomai
         {
             return mgr_.ListMembranes(out);
         }
+        Status UpdateMembraneRetention(std::string_view name, uint32_t ttl_sec, uint32_t retention_max_count, uint64_t retention_max_bytes) override
+        {
+            return mgr_.UpdateMembraneRetention(name, ttl_sec, retention_max_count, retention_max_bytes);
+        }
+        Status GetMembraneRetention(std::string_view name, uint32_t* ttl_sec, uint32_t* retention_max_count, uint64_t* retention_max_bytes) const override
+        {
+            return mgr_.GetMembraneRetention(name, ttl_sec, retention_max_count, retention_max_bytes);
+        }
 
         // ---- Membrane-scoped operations ----
         Status Put(std::string_view membrane, VectorId id, std::span<const float> vec) override
@@ -412,7 +420,9 @@ namespace pomai
         if (options.shard_count == 0)
             return Status::InvalidArgument("shard_count must be > 0");
         
-        auto impl = std::make_unique<DbImpl>(options);
+        DBOptions effective = options;
+        effective.ApplyEdgeProfile();
+        auto impl = std::make_unique<DbImpl>(std::move(effective));
         auto st = impl->Init();
         if (!st.ok()) {
              return st;

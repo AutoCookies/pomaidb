@@ -81,6 +81,8 @@ namespace pomai
         virtual Status OpenMembrane(std::string_view name) = 0;
         virtual Status CloseMembrane(std::string_view name) = 0;
         virtual Status ListMembranes(std::vector<std::string> *out) const = 0;
+        virtual Status UpdateMembraneRetention(std::string_view name, uint32_t ttl_sec, uint32_t retention_max_count, uint64_t retention_max_bytes) = 0;
+        virtual Status GetMembraneRetention(std::string_view name, uint32_t* ttl_sec, uint32_t* retention_max_count, uint64_t* retention_max_bytes) const = 0;
 
         virtual Status Put(std::string_view membrane, VectorId id,
                            std::span<const float> vec) = 0;

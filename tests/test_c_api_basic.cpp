@@ -1,8 +1,10 @@
 #include "tests/common/test_main.h"
 
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "pomai/c_api.h"
@@ -188,6 +190,45 @@ POMAI_TEST(CApiMetaMembraneCrud) {
     pomai_status_t* st = pomai_meta_get(fx.db(), "meta", "gid:7", &out_value, &out_len);
     POMAI_EXPECT_TRUE(st != nullptr);
     pomai_status_free(st);
+}
+
+POMAI_TEST(CApiMetaMembraneRetentionTtl) {
+    CApiFixture fx;
+    constexpr uint32_t kMetaKind = 12u; // MembraneKind::kMeta
+    CAPI_EXPECT_OK(pomai_create_membrane_kind_with_retention(
+        fx.db(), "meta_ttl", 1, 1, kMetaKind, 1, 0, 0));
+
+    CAPI_EXPECT_OK(pomai_meta_put(fx.db(), "meta_ttl", "gid:9", "{\"status\":\"hot\"}"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    char* out_value = nullptr;
+    size_t out_len = 0;
+    pomai_status_t* st = pomai_meta_get(fx.db(), "meta_ttl", "gid:9", &out_value, &out_len);
+    POMAI_EXPECT_TRUE(st != nullptr);
+    pomai_status_free(st);
+}
+
+POMAI_TEST(CApiUpdateMembraneRetention) {
+    CApiFixture fx;
+    constexpr uint32_t kMetaKind = 12u; // MembraneKind::kMeta
+    CAPI_EXPECT_OK(pomai_create_membrane_kind(fx.db(), "meta_upd", 1, 1, kMetaKind));
+    CAPI_EXPECT_OK(pomai_update_membrane_retention(fx.db(), "meta_upd", 1, 0, 0));
+    CAPI_EXPECT_OK(pomai_meta_put(fx.db(), "meta_upd", "gid:11", "{\"status\":\"warm\"}"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    char* out_value = nullptr;
+    size_t out_len = 0;
+    pomai_status_t* st = pomai_meta_get(fx.db(), "meta_upd", "gid:11", &out_value, &out_len);
+    POMAI_EXPECT_TRUE(st != nullptr);
+    pomai_status_free(st);
+
+    char* json = nullptr;
+    size_t json_len = 0;
+    CAPI_EXPECT_OK(pomai_get_membrane_retention_json(fx.db(), "meta_upd", &json, &json_len));
+    POMAI_EXPECT_TRUE(json != nullptr);
+    std::string s(json, json_len);
+    POMAI_EXPECT_TRUE(s.find("\"ttl_sec\":1") != std::string::npos);
+    pomai_free(json);
 }
 
 POMAI_TEST(CApiObjectLinkerAndGatewayLifecycle) {

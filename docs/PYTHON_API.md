@@ -19,33 +19,42 @@ PomaiDB is exposed to Python via the **C API** and **ctypes**. The official pack
 
 | Function        | Description |
 |----------------|-------------|
-| `open_db(path, dim, **opts)` | Open database at `path` with vector dimension `dim`. Options: `shards`, `search_threads`, `fsync`, `metric` ("ip" or "l2"), `hnsw_m`, `hnsw_ef_construction`, `hnsw_ef_search`, `adaptive_threshold`. Returns opaque db handle. |
+| `open_db(path, dim, **opts)` | Open database at `path` with vector dimension `dim`. Options: `shards`, `search_threads`, `fsync`, `metric` ("ip" or "l2"), `profile` (`edge-low-ram`, `edge-balanced`, `edge-throughput`, `user_defined`), `hnsw_m`, `hnsw_ef_construction`, `hnsw_ef_search`, `adaptive_threshold`, `gateway_rate_limit_per_sec`, `gateway_idempotency_ttl_sec`, `gateway_token_file`, `gateway_upstream_sync_enabled`, `gateway_upstream_sync_url`, `gateway_require_mtls_proxy_header`, `gateway_mtls_proxy_header`. Returns opaque db handle. |
+| `resolve_effective_options(path, dim, **opts)` | Return effective runtime options as JSON after profile application (preflight/deploy validation). |
 | `put_batch(db, ids, vectors)` | Insert vectors. `ids`: list of int; `vectors`: list of list of float (n × dim). |
 | `meta_put(db, membrane_name, gid, value)` | Store metadata payload by global id in a `kMeta` membrane. |
 | `meta_get(db, membrane_name, gid)` | Load metadata payload by global id from a `kMeta` membrane. |
 | `meta_delete(db, membrane_name, gid)` | Delete metadata payload by global id from a `kMeta` membrane. |
+| `create_membrane_kind(db, name, dim, shard_count, kind, ttl_sec=0, retention_max_count=0, retention_max_bytes=0)` | Create and open a membrane with optional retention policy (TTL/count/bytes). |
+| `update_membrane_retention(db, membrane_name, ttl_sec=0, retention_max_count=0, retention_max_bytes=0)` | Update retention policy for an existing `kMeta`/`kKeyValue` membrane. |
+| `get_membrane_retention(db, membrane_name)` | Read current retention policy for a membrane as a dict. |
 | `link_objects(db, gid, vector_id, graph_vertex_id, mesh_id)` | Register multi-modal GID link for vector/graph/mesh objects. |
 | `unlink_objects(db, gid)` | Remove a registered multi-modal GID link. |
-| `start_edge_gateway(db, http_port=8080, ingest_port=8090, auth_token=None)` | Start embedded HTTP + ingestion listeners (Phase 3). If `auth_token` is set, gateway requires `Authorization: Bearer <token>`. |
+| `start_edge_gateway(db, http_port=8080, ingest_port=8090, auth_token=None)` | Start embedded HTTP + ingestion listeners (Phase 3). If `auth_token` is set, gateway validates bearer token + scopes (from static token or rotating token file). |
 | `stop_edge_gateway(db)` | Stop embedded edge listeners. |
 | `search_zero_copy(db, query, topk=10)` | Run single query with zero-copy semantic pointers and return NumPy views/dequantized arrays. |
 | `release_zero_copy_session(session_id)` | Release pinned zero-copy session returned by search results. |
 
 Gateway endpoints/protocols:
-- HTTP: `GET /health`, `GET /metrics`, `POST /ingest/meta/<membrane>/<gid>`, `POST /ingest/vector/<membrane>/<id>`
+- HTTP: `GET /health`, `GET /healthz`, `GET /metrics`, `POST /ingest/meta/<membrane>/<gid>`, `POST /ingest/vector/<membrane>/<id>`
+- Versioned aliases are supported: `/v1/health`, `/v1/healthz`, `/v1/metrics`, `/v1/ingest/...`
 - HTTP responses are JSON (`{"status":"ok|error|duplicate","message":"..."}`) with proper status codes (`200/400/401/404/429`).
+- HTTP error schema includes machine-readable `code` (`auth_scope_denied`, `write_failed`, `invalid_path`, ...).
 - HTTP idempotency: send `X-Idempotency-Key: <key>` to make retries safe; repeated keys return `status=duplicate`.
 - Idempotency keys are persisted under DB path (`gateway/idempotency.log`) so duplicate suppression survives gateway restart.
 - Gateway writes operational audit lines to `gateway/audit.log` (`timestamp|event|detail`) for incident/debug workflows.
 - Idempotency log is periodically compacted to keep disk usage bounded.
 - Audit log also rotates (`audit.log` -> `audit.log.1`) to bound local disk growth.
 - `/metrics` exports gateway durability/ops counters including log compactions, log errors, and audit rotations.
+- Optional async upstream sync: configure `gateway_upstream_sync_enabled` + `gateway_upstream_sync_url` for edge->regional forwarding with checkpointed sequence progress.
+- Edge profile note: profile presets tune operational limits (memtable/fsync/gateway) but do **not** overwrite user-provided index params.
 - Ingest TCP (MQTT/WS-style line protocol):
   - no-auth: `MQTT|<membrane>|<id>|f1,f2,f3`
   - auth: `MQTT|<token>|<membrane>|<id>|f1,f2,f3`
   - optional idempotency + durability: `...|<idem_key>|D`
   - durable ack: `|D` => server flushes and replies only after flush
-  - replies: `ACK|ok`, `ACK|duplicate`, or `ERR|...`
+  - replies: `ACK|accepted|seq=<n>`, `ACK|durable_ack|seq=<n>`, `ACK|duplicate`, or `ERR|...`
+  - Retry semantics: duplicate idempotency key => `duplicate`; accepted write => `accepted`; durable flush success => `durable_ack`.
 | `freeze(db)`   | Flush memtable to segment and build index. Must be called before new data is visible to search. |
 | `search_batch(db, queries, topk=10)` | Batch search. `queries`: list of list of float (n_queries × dim). Returns list of `(ids, scores)` per query. |
 | `close(db)`    | Close the database. |
@@ -77,6 +86,9 @@ The shared library exposes:
 - `pomai_open(opts, &db)` — open DB; returns status (null = ok)
 - `pomai_put_batch(db, upserts, n)` — batch insert
 - `pomai_meta_put(db, membrane_name, gid, value)` / `pomai_meta_get(...)` / `pomai_meta_delete(...)` — metadata membrane CRUD by GID
+- `pomai_create_membrane_kind_with_retention(db, name, dim, shard_count, kind, ttl_sec, retention_max_count, retention_max_bytes)` — create typed membrane with lifecycle retention limits
+- `pomai_update_membrane_retention(db, membrane_name, ttl_sec, retention_max_count, retention_max_bytes)` — update retention policy without recreating membrane
+- `pomai_get_membrane_retention_json(db, membrane_name, &out_json, &out_len)` — read current retention policy (JSON)
 - `pomai_link_objects(db, gid, vector_id, graph_vertex_id, mesh_id)` / `pomai_unlink_objects(...)` — multi-modal linker APIs
 - `pomai_edge_gateway_start(db, http_port, ingest_port)` / `pomai_edge_gateway_start_secure(db, http_port, ingest_port, auth_token)` / `pomai_edge_gateway_stop(db)` — edge connectivity lifecycle
 - `pomai_freeze(db)` — flush and build index

@@ -193,13 +193,16 @@ def main():
         check_status(lib.pomai_edge_gateway_start(db, 18081, 18091))
         time.sleep(0.1)
         health_resp = send_http_raw(18081, b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        if "200 OK" not in health_resp or '"status":"ok"' not in health_resp:
+        if "200 OK" not in health_resp or '"status":"ok"' not in health_resp or '"code":"ok"' not in health_resp:
             raise RuntimeError("health endpoint failed")
+        healthz_resp = send_http_raw(18081, b"GET /v1/healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        if "200 OK" not in healthz_resp or '"grade":"' not in healthz_resp:
+            raise RuntimeError("healthz endpoint failed")
         metrics_resp = send_http_raw(18081, b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
         if "200 OK" not in metrics_resp or "http_requests_total" not in metrics_resp or "idempotency_compactions_total" not in metrics_resp:
             raise RuntimeError("metrics endpoint failed")
         ingest_resp = send_ingest_line(18091, "MQTT|v|123|1,2,3,4,5,6,7,8|idem-1|D")
-        if ("ACK|ok" not in ingest_resp) and ("ERR|" not in ingest_resp):
+        if ("ACK|accepted|seq=" not in ingest_resp) and ("ACK|durable_ack|seq=" not in ingest_resp) and ("ERR|" not in ingest_resp):
             raise RuntimeError("ingest protocol reply missing")
         check_status(lib.pomai_edge_gateway_stop(db))
         check_status(lib.pomai_edge_gateway_start_secure(db, 18083, 18093, b"demo-token"))
@@ -251,6 +254,18 @@ def main():
         raise RuntimeError("missing merged API: search_zero_copy")
     if not hasattr(pomaidb, "release_zero_copy_session"):
         raise RuntimeError("missing merged API: release_zero_copy_session")
+    resolved = pomaidb.resolve_effective_options(
+        "/tmp/pomai_profile_check",
+        8,
+        profile="edge-low-ram",
+        hnsw_m=55,
+        hnsw_ef_construction=333,
+        hnsw_ef_search=111,
+    )
+    if '"profile":"edge-low-ram"' not in resolved:
+        raise RuntimeError("effective options profile mismatch")
+    if '"hnsw_m":55' not in resolved:
+        raise RuntimeError("effective options must preserve user index params")
 
 
 if __name__ == '__main__':

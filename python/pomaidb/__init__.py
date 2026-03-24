@@ -7,14 +7,20 @@ and point to build/libpomai_c.so (Linux) or build/libpomai_c.dylib (macOS).
 """
 
 import ctypes
+import json
 import os
 from pathlib import Path
 
 __all__ = [
     "open_db", "close", "put_batch", "freeze", "search_batch",
+    "resolve_effective_options",
     "meta_put", "meta_get", "meta_delete",
+    "create_membrane_kind",
+    "update_membrane_retention",
+    "get_membrane_retention",
     "link_objects", "unlink_objects",
     "start_edge_gateway", "stop_edge_gateway",
+    "list_membranes", "compact_membrane",
     "search_zero_copy", "release_zero_copy_session",
     "create_rag_membrane", "put_chunk", "search_rag",
     "ingest_document", "retrieve_context",
@@ -76,6 +82,14 @@ def _register_api(lib):
             ("hnsw_ef_search", ctypes.c_uint32),
             ("adaptive_threshold", ctypes.c_uint32),
             ("metric", ctypes.c_uint8),
+            ("edge_profile", ctypes.c_uint8),
+            ("gateway_rate_limit_per_sec", ctypes.c_uint32),
+            ("gateway_idempotency_ttl_sec", ctypes.c_uint32),
+            ("gateway_token_file", ctypes.c_char_p),
+            ("gateway_upstream_sync_url", ctypes.c_char_p),
+            ("gateway_upstream_sync_enabled", ctypes.c_bool),
+            ("gateway_require_mtls_proxy_header", ctypes.c_bool),
+            ("gateway_mtls_proxy_header", ctypes.c_char_p),
         ]
 
     class PomaiUpsert(ctypes.Structure):
@@ -162,6 +176,11 @@ def _register_api(lib):
     lib.pomai_meta_get.restype = ctypes.c_void_p
     lib.pomai_meta_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
     lib.pomai_meta_delete.restype = ctypes.c_void_p
+    lib.pomai_create_membrane_kind_with_retention.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint64,
+    ]
+    lib.pomai_create_membrane_kind_with_retention.restype = ctypes.c_void_p
     lib.pomai_link_objects.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_uint64]
     lib.pomai_link_objects.restype = ctypes.c_void_p
     lib.pomai_unlink_objects.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -172,10 +191,32 @@ def _register_api(lib):
     lib.pomai_edge_gateway_start_secure.restype = ctypes.c_void_p
     lib.pomai_edge_gateway_stop.argtypes = [ctypes.c_void_p]
     lib.pomai_edge_gateway_stop.restype = ctypes.c_void_p
+    lib.pomai_list_membranes_json.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.pomai_list_membranes_json.restype = ctypes.c_void_p
+    lib.pomai_compact_membrane.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.pomai_compact_membrane.restype = ctypes.c_void_p
+    lib.pomai_update_membrane_retention.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint64
+    ]
+    lib.pomai_update_membrane_retention.restype = ctypes.c_void_p
+    lib.pomai_get_membrane_retention_json.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t)
+    ]
+    lib.pomai_get_membrane_retention_json.restype = ctypes.c_void_p
     lib.pomai_status_message.argtypes = [ctypes.c_void_p]
     lib.pomai_status_message.restype = ctypes.c_char_p
     lib.pomai_status_free.argtypes = [ctypes.c_void_p]
     lib.pomai_status_free.restype = None
+    lib.pomai_options_resolve_json.argtypes = [
+        ctypes.POINTER(PomaiOptions),
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.pomai_options_resolve_json.restype = ctypes.c_void_p
 
     # RAG types
     class PomaiRagChunkOptions(ctypes.Structure):
@@ -290,7 +331,7 @@ def _check(st):
         raise PomaiDBError(msg)
 
 
-def open_db(path, dim, *, shards=1, search_threads=0, fsync=False, metric="ip", **hnsw_kw):
+def open_db(path, dim, *, shards=1, search_threads=0, fsync=False, metric="ip", profile=None, **hnsw_kw):
     """Open a PomaiDB database at `path` with dimension `dim`. Returns an opaque db handle."""
     _ensure_lib()
     opts = _lib._pomai_options()
@@ -307,9 +348,82 @@ def open_db(path, dim, *, shards=1, search_threads=0, fsync=False, metric="ip", 
     opts.hnsw_ef_construction = hnsw_kw.get("hnsw_ef_construction", 200)
     opts.hnsw_ef_search = hnsw_kw.get("hnsw_ef_search", 64)
     opts.adaptive_threshold = hnsw_kw.get("adaptive_threshold", 0)
+    profile_map = {
+        None: 0,
+        "user_defined": 0,
+        "edge-low-ram": 1,
+        "edge-balanced": 2,
+        "edge-throughput": 3,
+    }
+    if profile not in profile_map:
+        raise ValueError("profile must be one of: edge-low-ram, edge-balanced, edge-throughput, user_defined")
+    opts.edge_profile = profile_map[profile]
+    if "gateway_rate_limit_per_sec" in hnsw_kw:
+        opts.gateway_rate_limit_per_sec = int(hnsw_kw.get("gateway_rate_limit_per_sec"))
+    if "gateway_idempotency_ttl_sec" in hnsw_kw:
+        opts.gateway_idempotency_ttl_sec = int(hnsw_kw.get("gateway_idempotency_ttl_sec"))
+    if "gateway_token_file" in hnsw_kw and hnsw_kw.get("gateway_token_file"):
+        opts.gateway_token_file = str(hnsw_kw.get("gateway_token_file")).encode("utf-8")
+    if "gateway_upstream_sync_url" in hnsw_kw and hnsw_kw.get("gateway_upstream_sync_url"):
+        opts.gateway_upstream_sync_url = str(hnsw_kw.get("gateway_upstream_sync_url")).encode("utf-8")
+    opts.gateway_upstream_sync_enabled = bool(hnsw_kw.get("gateway_upstream_sync_enabled", False))
+    opts.gateway_require_mtls_proxy_header = bool(hnsw_kw.get("gateway_require_mtls_proxy_header", False))
+    if "gateway_mtls_proxy_header" in hnsw_kw and hnsw_kw.get("gateway_mtls_proxy_header"):
+        opts.gateway_mtls_proxy_header = str(hnsw_kw.get("gateway_mtls_proxy_header")).encode("utf-8")
     db = ctypes.c_void_p()
     _check(_lib.pomai_open(ctypes.byref(opts), ctypes.byref(db)))
     return db
+
+
+def resolve_effective_options(path, dim, *, shards=1, search_threads=0, fsync=False, metric="ip", profile=None, **hnsw_kw):
+    """Return effective runtime options (JSON string) after profile application."""
+    _ensure_lib()
+    opts = _lib._pomai_options()
+    _lib.pomai_options_init(ctypes.byref(opts))
+    opts.struct_size = ctypes.sizeof(_lib._pomai_options())
+    opts.path = path.encode("utf-8")
+    opts.shards = shards
+    opts.dim = dim
+    opts.search_threads = search_threads
+    opts.fsync_policy = 1 if fsync else 0
+    opts.metric = 1 if metric == "ip" else 0
+    opts.index_type = 1
+    opts.hnsw_m = hnsw_kw.get("hnsw_m", 32)
+    opts.hnsw_ef_construction = hnsw_kw.get("hnsw_ef_construction", 200)
+    opts.hnsw_ef_search = hnsw_kw.get("hnsw_ef_search", 64)
+    opts.adaptive_threshold = hnsw_kw.get("adaptive_threshold", 0)
+    profile_map = {
+        None: 0,
+        "user_defined": 0,
+        "edge-low-ram": 1,
+        "edge-balanced": 2,
+        "edge-throughput": 3,
+    }
+    if profile not in profile_map:
+        raise ValueError("profile must be one of: edge-low-ram, edge-balanced, edge-throughput, user_defined")
+    opts.edge_profile = profile_map[profile]
+    if "gateway_rate_limit_per_sec" in hnsw_kw:
+        opts.gateway_rate_limit_per_sec = int(hnsw_kw.get("gateway_rate_limit_per_sec"))
+    if "gateway_idempotency_ttl_sec" in hnsw_kw:
+        opts.gateway_idempotency_ttl_sec = int(hnsw_kw.get("gateway_idempotency_ttl_sec"))
+    if "gateway_token_file" in hnsw_kw and hnsw_kw.get("gateway_token_file"):
+        opts.gateway_token_file = str(hnsw_kw.get("gateway_token_file")).encode("utf-8")
+    if "gateway_upstream_sync_url" in hnsw_kw and hnsw_kw.get("gateway_upstream_sync_url"):
+        opts.gateway_upstream_sync_url = str(hnsw_kw.get("gateway_upstream_sync_url")).encode("utf-8")
+    opts.gateway_upstream_sync_enabled = bool(hnsw_kw.get("gateway_upstream_sync_enabled", False))
+    opts.gateway_require_mtls_proxy_header = bool(hnsw_kw.get("gateway_require_mtls_proxy_header", False))
+    if "gateway_mtls_proxy_header" in hnsw_kw and hnsw_kw.get("gateway_mtls_proxy_header"):
+        opts.gateway_mtls_proxy_header = str(hnsw_kw.get("gateway_mtls_proxy_header")).encode("utf-8")
+    out = ctypes.c_char_p()
+    out_len = ctypes.c_size_t()
+    _check(_lib.pomai_options_resolve_json(ctypes.byref(opts), ctypes.byref(out), ctypes.byref(out_len)))
+    try:
+        if not out:
+            return "{}"
+        return ctypes.string_at(out, out_len.value).decode("utf-8", errors="replace")
+    finally:
+        if out:
+            _lib.pomai_free(out)
 
 
 def close(db):
@@ -372,6 +486,23 @@ def meta_delete(db, membrane_name, gid):
     _ensure_lib()
     _check(_lib.pomai_meta_delete(db, membrane_name.encode("utf-8"), gid.encode("utf-8")))
 
+def create_membrane_kind(
+    db, name, dim, shard_count, kind, *,
+    ttl_sec=0, retention_max_count=0, retention_max_bytes=0
+):
+    """Create and open a membrane with optional retention policy."""
+    _ensure_lib()
+    _check(_lib.pomai_create_membrane_kind_with_retention(
+        db,
+        str(name).encode("utf-8"),
+        int(dim),
+        int(shard_count),
+        int(kind),
+        int(ttl_sec),
+        int(retention_max_count),
+        int(retention_max_bytes),
+    ))
+
 
 def link_objects(db, gid, vector_id, graph_vertex_id, mesh_id):
     """Link vector/graph/mesh records under a single GID."""
@@ -400,6 +531,52 @@ def stop_edge_gateway(db):
     """Stop embedded HTTP + ingestion listeners."""
     _ensure_lib()
     _check(_lib.pomai_edge_gateway_stop(db))
+
+def list_membranes(db):
+    """Return membrane names as a Python list."""
+    _ensure_lib()
+    out = ctypes.c_char_p()
+    out_len = ctypes.c_size_t()
+    _check(_lib.pomai_list_membranes_json(db, ctypes.byref(out), ctypes.byref(out_len)))
+    try:
+        if not out:
+            return []
+        return json.loads(ctypes.string_at(out, out_len.value).decode("utf-8", errors="replace"))
+    finally:
+        if out:
+            _lib.pomai_free(out)
+
+def compact_membrane(db, membrane_name):
+    """Trigger manual compaction on a membrane."""
+    _ensure_lib()
+    _check(_lib.pomai_compact_membrane(db, membrane_name.encode("utf-8")))
+
+def update_membrane_retention(db, membrane_name, *, ttl_sec=0, retention_max_count=0, retention_max_bytes=0):
+    """Update retention policy for an existing membrane."""
+    _ensure_lib()
+    _check(_lib.pomai_update_membrane_retention(
+        db,
+        membrane_name.encode("utf-8"),
+        int(ttl_sec),
+        int(retention_max_count),
+        int(retention_max_bytes),
+    ))
+
+def get_membrane_retention(db, membrane_name):
+    """Return retention policy for an existing membrane as a dict."""
+    _ensure_lib()
+    out = ctypes.c_char_p()
+    out_len = ctypes.c_size_t()
+    _check(_lib.pomai_get_membrane_retention_json(
+        db, membrane_name.encode("utf-8"), ctypes.byref(out), ctypes.byref(out_len)
+    ))
+    try:
+        if not out:
+            return {}
+        return json.loads(ctypes.string_at(out, out_len.value).decode("utf-8", errors="replace"))
+    finally:
+        if out:
+            _lib.pomai_free(out)
 
 
 def search_batch(db, queries, topk=10):

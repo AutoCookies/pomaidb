@@ -65,6 +65,8 @@ namespace pomai::core
         Status DropMembrane(std::string_view name);
         Status OpenMembrane(std::string_view name);
         Status CloseMembrane(std::string_view name);
+        Status UpdateMembraneRetention(std::string_view name, uint32_t ttl_sec, uint32_t retention_max_count, uint64_t retention_max_bytes);
+        Status GetMembraneRetention(std::string_view name, uint32_t* ttl_sec, uint32_t* retention_max_count, uint64_t* retention_max_bytes) const;
 
         Status ListMembranes(std::vector<std::string> *out) const;
 

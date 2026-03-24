@@ -434,6 +434,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(low_ram_limits_test)
   pomai_add_labeled_test(low_ram_limits_test "unit")
 
+  add_executable(edge_profile_options_test tests/unit/edge_profile_options_test.cc)
+  pomai_setup_test(edge_profile_options_test)
+  pomai_add_labeled_test(edge_profile_options_test "unit")
+
   add_executable(new_membrane_typed_api_test tests/unit/new_membrane_typed_api_test.cc)
   pomai_setup_test(new_membrane_typed_api_test)
   pomai_add_labeled_test(new_membrane_typed_api_test "unit")

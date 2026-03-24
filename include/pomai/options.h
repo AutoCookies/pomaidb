@@ -59,6 +59,18 @@ namespace pomai
     /** When true, vectors are stored as SQ8 (int8) with per-vector min/max for ~4x memory reduction. */
     static constexpr bool kDefaultEnableQuantization = true;
 
+    enum class EdgeProfile : uint8_t
+    {
+        // Keep user-provided settings as-is.
+        kUserDefined = 0,
+        // Low memory footprint, safer for constrained edge nodes.
+        kLowRam = 1,
+        // Balanced durability and latency defaults.
+        kBalanced = 2,
+        // Higher throughput at the cost of stronger durability guarantees.
+        kThroughput = 3,
+    };
+
     struct IndexParams
     {
         IndexType type = IndexType::kIvfFlat;
@@ -164,6 +176,78 @@ namespace pomai
         bool vulkan_prefer_unified_memory = true;
         uint32_t vulkan_staging_pool_mb = 16;
         uint64_t vulkan_zero_copy_min_bytes = 4096;
+
+        // Optional deployment profile. Does not override index params; users keep full index freedom.
+        EdgeProfile edge_profile = EdgeProfile::kUserDefined;
+        // Gateway operational defaults.
+        uint32_t gateway_rate_limit_per_sec = 2000;
+        uint32_t gateway_idempotency_ttl_sec = 300;
+        // Optional rotating token file (line format: token|exp_unix|scope1,scope2).
+        std::string gateway_token_file;
+        // Optional upstream forwarding target for async edge->regional sync (http://host:port/path).
+        std::string gateway_upstream_sync_url;
+        bool gateway_upstream_sync_enabled = false;
+        // Optional mTLS check behind a TLS terminator (expects header presence/value).
+        bool gateway_require_mtls_proxy_header = false;
+        std::string gateway_mtls_proxy_header = "X-Client-Cert-Verified: 1";
+
+        void ApplyEdgeProfile()
+        {
+            switch (edge_profile)
+            {
+                case EdgeProfile::kLowRam:
+                    memtable_flush_threshold_mb = 16u;
+                    max_memtable_mb = 64u;
+                    auto_freeze_on_pressure = true;
+                    fsync = FsyncPolicy::kAlways;
+                    max_query_frontier = 512u;
+                    max_kv_entries = 5000u;
+                    max_text_docs = 10000u;
+                    max_blob_bytes_mb = 16u;
+                    max_spatial_points = 5000u;
+                    max_mesh_objects = 1000u;
+                    max_sparse_entries = 5000u;
+                    max_bitset_bytes_mb = 16u;
+                    gateway_rate_limit_per_sec = 500u;
+                    gateway_idempotency_ttl_sec = 120u;
+                    break;
+                case EdgeProfile::kBalanced:
+                    memtable_flush_threshold_mb = 64u;
+                    max_memtable_mb = 256u;
+                    auto_freeze_on_pressure = true;
+                    fsync = FsyncPolicy::kAlways;
+                    max_query_frontier = 2048u;
+                    max_kv_entries = 20000u;
+                    max_text_docs = 50000u;
+                    max_blob_bytes_mb = 64u;
+                    max_spatial_points = 20000u;
+                    max_mesh_objects = 4000u;
+                    max_sparse_entries = 20000u;
+                    max_bitset_bytes_mb = 64u;
+                    gateway_rate_limit_per_sec = 2000u;
+                    gateway_idempotency_ttl_sec = 300u;
+                    break;
+                case EdgeProfile::kThroughput:
+                    memtable_flush_threshold_mb = 128u;
+                    max_memtable_mb = 512u;
+                    auto_freeze_on_pressure = true;
+                    fsync = FsyncPolicy::kNever;
+                    max_query_frontier = 4096u;
+                    max_kv_entries = 50000u;
+                    max_text_docs = 100000u;
+                    max_blob_bytes_mb = 128u;
+                    max_spatial_points = 50000u;
+                    max_mesh_objects = 8000u;
+                    max_sparse_entries = 50000u;
+                    max_bitset_bytes_mb = 128u;
+                    gateway_rate_limit_per_sec = 5000u;
+                    gateway_idempotency_ttl_sec = 600u;
+                    break;
+                case EdgeProfile::kUserDefined:
+                default:
+                    break;
+            }
+        }
     };
 
     // One membrane = one logical collection.
@@ -176,6 +260,11 @@ namespace pomai
         IndexParams index_params;
         MembraneKind kind = MembraneKind::kVector;
         uint64_t sync_lsn = 0;
+        // Optional retention policy (primarily used by kMeta and kKeyValue membranes).
+        // 0 means disabled for each field.
+        uint32_t ttl_sec = 0;
+        uint32_t retention_max_count = 0;
+        uint64_t retention_max_bytes = 0;
     };
 
 } // namespace pomai

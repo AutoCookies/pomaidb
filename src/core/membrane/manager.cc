@@ -27,6 +27,16 @@
 namespace pomai::core
 {
     namespace {
+    KeyValueEngine::RetentionPolicy KvPolicyFromSpec(const pomai::MembraneSpec& spec) {
+        KeyValueEngine::RetentionPolicy p;
+        p.ttl_sec = spec.ttl_sec;
+        p.max_count = spec.retention_max_count;
+        p.max_bytes = spec.retention_max_bytes;
+        return p;
+    }
+    }
+
+    namespace {
     class MeshLodTask final : public DatabaseTask {
     public:
         explicit MeshLodTask(MembraneManager* owner) : owner_(owner) {}
@@ -95,9 +105,9 @@ namespace pomai::core
             } else if (loaded_spec.kind == pomai::MembraneKind::kTimeSeries) {
                 state.timeseries_engine = std::make_unique<TimeSeriesEngine>(opt.path, base_.max_lifecycle_entries);
             } else if (loaded_spec.kind == pomai::MembraneKind::kKeyValue) {
-                state.keyvalue_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries);
+                state.keyvalue_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries, KvPolicyFromSpec(loaded_spec));
             } else if (loaded_spec.kind == pomai::MembraneKind::kMeta) {
-                state.meta_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries);
+                state.meta_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries, KvPolicyFromSpec(loaded_spec));
             } else if (loaded_spec.kind == pomai::MembraneKind::kSketch) {
                 state.sketch_engine = std::make_unique<SketchEngine>(base_.max_sketch_entries);
             } else if (loaded_spec.kind == pomai::MembraneKind::kBlob) {
@@ -166,9 +176,9 @@ namespace pomai::core
                 } else if (mspec.kind == pomai::MembraneKind::kTimeSeries) {
                     state.timeseries_engine = std::make_unique<TimeSeriesEngine>(opt.path, base_.max_lifecycle_entries);
                 } else if (mspec.kind == pomai::MembraneKind::kKeyValue) {
-                    state.keyvalue_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries);
+                    state.keyvalue_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries, KvPolicyFromSpec(mspec));
                 } else if (mspec.kind == pomai::MembraneKind::kMeta) {
-                    state.meta_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries);
+                    state.meta_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries, KvPolicyFromSpec(mspec));
                 } else if (mspec.kind == pomai::MembraneKind::kSketch) {
                     state.sketch_engine = std::make_unique<SketchEngine>(base_.max_sketch_entries);
                 } else if (mspec.kind == pomai::MembraneKind::kBlob) {
@@ -309,9 +319,9 @@ namespace pomai::core
         } else if (spec.kind == pomai::MembraneKind::kTimeSeries) {
             state.timeseries_engine = std::make_unique<TimeSeriesEngine>(opt.path, base_.max_lifecycle_entries);
         } else if (spec.kind == pomai::MembraneKind::kKeyValue) {
-            state.keyvalue_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries);
+            state.keyvalue_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries, KvPolicyFromSpec(spec));
         } else if (spec.kind == pomai::MembraneKind::kMeta) {
-            state.meta_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries);
+            state.meta_engine = std::make_unique<KeyValueEngine>(opt.path, base_.max_kv_entries, KvPolicyFromSpec(spec));
         } else if (spec.kind == pomai::MembraneKind::kSketch) {
             state.sketch_engine = std::make_unique<SketchEngine>(base_.max_sketch_entries);
         } else if (spec.kind == pomai::MembraneKind::kBlob) {
@@ -401,6 +411,40 @@ namespace pomai::core
         } else if (state->spec.kind == pomai::MembraneKind::kMesh) {
             return state->mesh_engine->Close();
         }
+        return Status::Ok();
+    }
+
+    Status MembraneManager::UpdateMembraneRetention(std::string_view name, uint32_t ttl_sec,
+                                                    uint32_t retention_max_count, uint64_t retention_max_bytes) {
+        auto* state = GetMembraneOrNull(name);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->meta_engine && !state->keyvalue_engine) {
+            return Status::InvalidArgument("retention update currently supported for META/KEYVALUE membranes");
+        }
+        auto st = storage::Manifest::UpdateRetentionPolicy(base_.path, name, ttl_sec, retention_max_count, retention_max_bytes);
+        if (!st.ok()) return st;
+
+        state->spec.ttl_sec = ttl_sec;
+        state->spec.retention_max_count = retention_max_count;
+        state->spec.retention_max_bytes = retention_max_bytes;
+        KeyValueEngine::RetentionPolicy p{};
+        p.ttl_sec = ttl_sec;
+        p.max_count = retention_max_count;
+        p.max_bytes = retention_max_bytes;
+        if (state->meta_engine) return state->meta_engine->SetRetentionPolicy(p);
+        return state->keyvalue_engine->SetRetentionPolicy(p);
+    }
+
+    Status MembraneManager::GetMembraneRetention(std::string_view name, uint32_t* ttl_sec,
+                                                 uint32_t* retention_max_count, uint64_t* retention_max_bytes) const {
+        if (!ttl_sec || !retention_max_count || !retention_max_bytes) {
+            return Status::InvalidArgument("retention out args must be non-null");
+        }
+        const auto* state = GetMembraneOrNull(name);
+        if (!state) return Status::NotFound("membrane not found");
+        *ttl_sec = state->spec.ttl_sec;
+        *retention_max_count = state->spec.retention_max_count;
+        *retention_max_bytes = state->spec.retention_max_bytes;
         return Status::Ok();
     }
 
@@ -963,6 +1007,12 @@ namespace pomai::core
     {
         auto *state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
+        if (state->spec.kind == pomai::MembraneKind::kMeta && state->meta_engine) {
+            return state->meta_engine->Compact();
+        }
+        if (state->spec.kind == pomai::MembraneKind::kKeyValue && state->keyvalue_engine) {
+            return state->keyvalue_engine->Compact();
+        }
         if (state->spec.kind != pomai::MembraneKind::kVector)
             return Status::InvalidArgument("VECTOR membrane required for Compact");
         return state->vector_engine->Compact();

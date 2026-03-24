@@ -57,6 +57,14 @@ typedef struct {
     uint32_t hnsw_ef_search;
     uint32_t adaptive_threshold;
     uint8_t metric; // 0 = L2, 1 = IP
+    uint8_t edge_profile; // 0=user_defined, 1=low_ram, 2=balanced, 3=throughput
+    uint32_t gateway_rate_limit_per_sec;
+    uint32_t gateway_idempotency_ttl_sec;
+    const char* gateway_token_file;
+    const char* gateway_upstream_sync_url;
+    bool gateway_upstream_sync_enabled;
+    bool gateway_require_mtls_proxy_header;
+    const char* gateway_mtls_proxy_header;
 } pomai_options_t;
 
 typedef struct {

@@ -1,6 +1,9 @@
 #include "tests/common/test_main.h"
 #include "tests/common/test_tmpdir.h"
 
+#include <chrono>
+#include <thread>
+
 #include "pomai/pomai.h"
 
 namespace {
@@ -55,6 +58,36 @@ POMAI_TEST(NewMembrane_TypedApis_Basic) {
     std::vector<uint8_t> got;
     POMAI_EXPECT_OK(db->BlobGet("bl", 7, &got));
     POMAI_EXPECT_EQ(got.size(), 5u);
+    POMAI_EXPECT_OK(db->Close());
+}
+
+POMAI_TEST(NewMembrane_MetaRetention_TtlAndCount) {
+    auto path = pomai::test::TempDir("meta_retention");
+    DBOptions opt;
+    opt.path = path;
+    opt.dim = 4;
+    opt.shard_count = 1;
+    opt.max_kv_entries = 64;
+
+    std::unique_ptr<DB> db;
+    POMAI_EXPECT_OK(DB::Open(opt, &db));
+
+    MembraneSpec mt;
+    mt.name = "meta_ttl";
+    mt.kind = MembraneKind::kMeta;
+    mt.shard_count = 1;
+    mt.ttl_sec = 1;
+    POMAI_EXPECT_OK(db->CreateMembrane(mt));
+    POMAI_EXPECT_OK(db->OpenMembrane("meta_ttl"));
+
+    std::string out;
+    POMAI_EXPECT_OK(db->MetaPut("meta_ttl", "gid:1", "{\"v\":1}"));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    POMAI_EXPECT_TRUE(!db->MetaGet("meta_ttl", "gid:1", &out).ok());
+
+    POMAI_EXPECT_OK(db->MetaPut("meta_ttl", "gid:2", "{\"v\":2}"));
+    POMAI_EXPECT_OK(db->MetaGet("meta_ttl", "gid:2", &out));
+    POMAI_EXPECT_OK(db->Compact("meta_ttl"));
     POMAI_EXPECT_OK(db->Close());
 }
 

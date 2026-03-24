@@ -305,6 +305,9 @@ namespace pomai::storage
                    std::to_string(spec.index_params.hnsw_ef_construction) + " " +
                    std::to_string(spec.index_params.hnsw_ef_search) + "\n";
             out += "sync_lsn " + std::to_string(spec.sync_lsn) + "\n";
+            out += "ttl_sec " + std::to_string(spec.ttl_sec) + "\n";
+            out += "retention_max_count " + std::to_string(spec.retention_max_count) + "\n";
+            out += "retention_max_bytes " + std::to_string(spec.retention_max_bytes) + "\n";
             return AtomicWriteFile(MembraneManifestPath(root_path, spec.name), out);
         }
 
@@ -330,6 +333,9 @@ namespace pomai::storage
             spec->dim = 0;
             spec->metric = pomai::MetricType::kL2;
             spec->kind = pomai::MembraneKind::kVector;
+            spec->ttl_sec = 0;
+            spec->retention_max_count = 0;
+            spec->retention_max_bytes = 0;
 
             while (!sv.empty()) {
                 std::size_t eol = sv.find('\n');
@@ -378,6 +384,14 @@ namespace pomai::storage
                          try {
                             spec->sync_lsn = std::stoull(std::string(toks[1]));
                          } catch(...) {}
+                    }
+                } else if (toks[0] == "ttl_sec") {
+                    if (toks.size() > 1) (void)ParseU32(toks[1], &spec->ttl_sec);
+                } else if (toks[0] == "retention_max_count") {
+                    if (toks.size() > 1) (void)ParseU32(toks[1], &spec->retention_max_count);
+                } else if (toks[0] == "retention_max_bytes") {
+                    if (toks.size() > 1) {
+                        try { spec->retention_max_bytes = std::stoull(std::string(toks[1])); } catch(...) {}
                     }
                 }
             }
@@ -531,6 +545,18 @@ namespace pomai::storage
 
         if (spec.sync_lsn == lsn) return pomai::Status::Ok(); // Already there
         spec.sync_lsn = lsn;
+        return WriteMembraneManifest(root_path, spec);
+    }
+
+    pomai::Status Manifest::UpdateRetentionPolicy(std::string_view root_path, std::string_view name,
+                                                  uint32_t ttl_sec, uint32_t retention_max_count,
+                                                  uint64_t retention_max_bytes) {
+        pomai::MembraneSpec spec;
+        auto st = GetMembrane(root_path, name, &spec);
+        if (!st.ok()) return st;
+        spec.ttl_sec = ttl_sec;
+        spec.retention_max_count = retention_max_count;
+        spec.retention_max_bytes = retention_max_bytes;
         return WriteMembraneManifest(root_path, spec);
     }
 
