@@ -144,8 +144,10 @@ namespace pomai
 
         std::uint32_t dim() const noexcept { return dim_; }
 
-    private:
+        // Internal constructor used by Open(); must be public for std::make_unique.
         AgentMemory(AgentMemoryOptions opts, std::unique_ptr<Database> db);
+
+    private:
 
         Status EnsureOpenLocked() const;
 

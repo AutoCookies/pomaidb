@@ -186,7 +186,7 @@ Status PosixEnv::NewSequentialFile(const std::string& path,
                                    std::unique_ptr<SequentialFile>* result) {
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return detail::ErrnoStatus("open");
-  result->reset(new detail::PosixSequentialFile(fd));
+  *result = std::make_unique<detail::PosixSequentialFile>(fd);
   return Status::Ok();
 }
 
@@ -194,7 +194,7 @@ Status PosixEnv::NewRandomAccessFile(const std::string& path,
                                      std::unique_ptr<RandomAccessFile>* result) {
   int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return detail::ErrnoStatus("open");
-  result->reset(new detail::PosixRandomAccessFile(fd));
+  *result = std::make_unique<detail::PosixRandomAccessFile>(fd);
   return Status::Ok();
 }
 
@@ -202,7 +202,7 @@ Status PosixEnv::NewWritableFile(const std::string& path,
                                  std::unique_ptr<WritableFile>* result) {
   int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) return detail::ErrnoStatus("open");
-  result->reset(new detail::PosixWritableFile(fd, 0));
+  *result = std::make_unique<detail::PosixWritableFile>(fd, 0);
   return Status::Ok();
 }
 
@@ -216,7 +216,7 @@ Status PosixEnv::NewAppendableFile(const std::string& path,
     return detail::ErrnoStatus("fstat");
   }
   uint64_t start = static_cast<uint64_t>(st.st_size);
-  result->reset(new detail::PosixWritableFile(fd, start));
+  *result = std::make_unique<detail::PosixWritableFile>(fd, start);
   return Status::Ok();
 }
 
@@ -232,13 +232,13 @@ Status PosixEnv::NewFileMapping(const std::string& path,
   size_t size = static_cast<size_t>(st.st_size);
   if (size == 0) {
     ::close(fd);
-    result->reset(new detail::PosixFileMapping(nullptr, 0));
+    *result = std::make_unique<detail::PosixFileMapping>(nullptr, 0);
     return Status::Ok();
   }
   void* addr = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
   ::close(fd);
   if (addr == MAP_FAILED) return detail::ErrnoStatus("mmap");
-  result->reset(new detail::PosixFileMapping(addr, size));
+  *result = std::make_unique<detail::PosixFileMapping>(addr, size);
   return Status::Ok();
 }
 

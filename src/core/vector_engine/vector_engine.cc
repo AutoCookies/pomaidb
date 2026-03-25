@@ -71,8 +71,14 @@ Status VectorEngine::OpenLocked() {
     Status st = wal->Open();
     if (!st.ok()) return st;
 
+    // quantize_inmem_ only makes sense when the downstream segment/index
+    // is also quantized. Otherwise we would decode back to lossy floats
+    // and break exact float expectations (tests compare with EXPECT_EQ).
+    const bool quantize_inmem =
+        opt_.enable_quantization && (opt_.index_params.quant_type != pomai::QuantizationType::kNone);
+
     auto mem = std::make_unique<table::MemTable>(
-        opt_.dim, kArenaBlockBytes, nullptr, opt_.enable_quantization);
+        opt_.dim, kArenaBlockBytes, nullptr, quantize_inmem);
     st = wal->ReplayInto(*mem);
     if (!st.ok()) return st;
 
@@ -94,7 +100,7 @@ Status VectorEngine::OpenLocked() {
         opt_.endurance_aware_maintenance,
         opt_.write_budget_bytes_per_hour,
         opt_.endurance_compaction_bias,
-        opt_.enable_quantization,
+        quantize_inmem,
         opt_.write_coalesce_window_us,
         opt_.write_coalesce_batch_size);
 

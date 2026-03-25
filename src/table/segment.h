@@ -14,12 +14,13 @@
 #include "pomai/options.h"
 #include "pomai/quantization/scalar_quantizer.h"
 #include "pomai/quantization/half_float_quantizer.h"
+#include "core/quantization/pomai_pq.h"
 #include "core/storage/io_provider.h"
 #include "util/slice.h"
 
 // Forward declare in correct namespace
 namespace pomai::index { class HnswIndex; class IvfFlatIndex; }
-namespace pomai::core { class LexicalIndex; struct LexicalHit; class ProductQuantizer; }
+namespace pomai::core { class LexicalIndex; struct LexicalHit; }
 
 namespace pomai::table
 {

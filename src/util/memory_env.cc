@@ -149,7 +149,7 @@ Status InMemoryEnv::NewSequentialFile(const std::string& path,
   std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(path);
   if (it == files_.end()) return Status::NotFound("file does not exist");
-  result->reset(new InMemorySequentialFile(it->second));
+  *result = std::make_unique<InMemorySequentialFile>(it->second);
   return Status::Ok();
 }
 
@@ -158,19 +158,19 @@ Status InMemoryEnv::NewRandomAccessFile(const std::string& path,
   std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(path);
   if (it == files_.end()) return Status::NotFound("file does not exist");
-  result->reset(new InMemoryRandomAccessFile(it->second));
+  *result = std::make_unique<InMemoryRandomAccessFile>(it->second);
   return Status::Ok();
 }
 
 Status InMemoryEnv::NewWritableFile(const std::string& path,
                                     std::unique_ptr<WritableFile>* result) {
-  result->reset(new InMemoryWritableFile(path, &files_, &mu_, false));
+  *result = std::make_unique<InMemoryWritableFile>(path, &files_, &mu_, false);
   return Status::Ok();
 }
 
 Status InMemoryEnv::NewAppendableFile(const std::string& path,
                                      std::unique_ptr<WritableFile>* result) {
-  result->reset(new InMemoryWritableFile(path, &files_, &mu_, true));
+  *result = std::make_unique<InMemoryWritableFile>(path, &files_, &mu_, true);
   return Status::Ok();
 }
 
@@ -179,7 +179,7 @@ Status InMemoryEnv::NewFileMapping(const std::string& path,
   std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(path);
   if (it == files_.end()) return Status::NotFound("file does not exist");
-  result->reset(new InMemoryFileMapping(it->second));
+  *result = std::make_unique<InMemoryFileMapping>(it->second);
   return Status::Ok();
 }
 

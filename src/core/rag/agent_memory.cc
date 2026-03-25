@@ -208,8 +208,7 @@ Status AgentMemory::Open(const AgentMemoryOptions& options,
     if (!st.ok())
         return st;
 
-    auto ptr = std::unique_ptr<AgentMemory>(
-        new AgentMemory(options, std::move(db)));
+    auto ptr = std::make_unique<AgentMemory>(options, std::move(db));
 
     {
         std::lock_guard<std::mutex> lock(ptr->mu_);

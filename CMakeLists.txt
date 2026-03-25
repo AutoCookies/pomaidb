@@ -695,6 +695,16 @@ if (POMAI_BUILD_TESTS)
   pomai_add_labeled_test(basic_workload_tsan_test "tsan")
 
   add_subdirectory(tests/fuzz)
+
+  # Policy check: owned PomaiDB code must avoid raw malloc/new.
+  # This runs as a normal ctest so CI catches allocator regressions.
+  if (UNIX)
+    add_test(
+      NAME allocator_policy_test
+      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_malloc_new.sh" "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(allocator_policy_test PROPERTIES LABELS "unit;policy")
+  endif()
 endif()
 
 # =========================
