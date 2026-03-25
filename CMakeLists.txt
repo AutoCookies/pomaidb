@@ -57,11 +57,22 @@ if(NOT EXISTS "${POMAI_VULKAN_HEADERS_DIR}/vulkan/vulkan.h")
 endif()
 message(STATUS "[pomai] Vulkan headers: ${POMAI_VULKAN_HEADERS_DIR}")
 
+# Vendored palloc (AutoCookies fork): use explicit pa_* API only — do not export
+# malloc/free aliases from libpalloc (avoids clashes with libc and other deps).
+set(PA_OVERRIDE OFF CACHE BOOL "palloc: interpose libc malloc/free" FORCE)
+set(PA_BUILD_SHARED OFF CACHE BOOL "palloc: build shared library" FORCE)
+set(PA_BUILD_STATIC ON CACHE BOOL "palloc: build static library" FORCE)
+set(PA_BUILD_TESTS OFF CACHE BOOL "palloc: build palloc unit tests" FORCE)
+set(PA_BUILD_OBJECT OFF CACHE BOOL "palloc: build palloc-obj target" FORCE)
+add_subdirectory(third_party/palloc)
+
+find_package(Threads REQUIRED)
+
 # =========================
 # Library: pomai
 # =========================
 add_library(pomai STATIC
-  src/api/db.cc
+  src/db.cc
   src/database.cc
   src/core/rag/agent_memory.cc
   src/palloc_page_pool.cc
@@ -91,6 +102,7 @@ add_library(pomai STATIC
   src/core/shard/iterator.cc
   src/core/shard/manifest.cc
   src/core/membrane/manager.cc
+  src/core/membrane/membrane_record_iterator.cc
   src/table/memtable.cc
   src/storage/wal/wal.cc
   src/core/kernel/pods/vector_pod.cc
@@ -198,6 +210,8 @@ if (OpenMP_CXX_FOUND)
 endif()
 
 find_package(OpenSSL REQUIRED)
+# PUBLIC: static lib pomai leaves unresolved pa_* until consumers link palloc-static too.
+target_link_libraries(pomai PUBLIC palloc-static Threads::Threads)
 target_link_libraries(pomai PRIVATE OpenSSL::Crypto)
 if (UNIX AND NOT APPLE)
   target_link_libraries(pomai PRIVATE ${CMAKE_DL_LIBS})
@@ -239,6 +253,8 @@ set(POMAI_C_API_SOURCES
   src/capi/capi_status.cc
   src/capi/capi_db.cc
   src/capi/capi_scan.cc
+  src/capi/capi_membrane_scan.cc
+  src/capi/capi_membrane_capabilities.cc
   src/capi/capi_agent_memory.cc
 )
 
@@ -248,7 +264,9 @@ add_library(pomai_c_static STATIC ${POMAI_C_API_SOURCES})
 set_target_properties(pomai_c_static PROPERTIES OUTPUT_NAME pomai_c)
 
 target_link_libraries(pomai_c PRIVATE pomai)
-target_link_libraries(pomai_c_static PRIVATE pomai)
+# Static C API archive must re-export pomai usage requirements (e.g. palloc headers)
+# so targets that include C++ headers such as pomai/database.h can compile.
+target_link_libraries(pomai_c_static PUBLIC pomai)
 
 # Export C API symbols when building shared library on Windows.
 target_compile_definitions(pomai_c PRIVATE POMAI_C_BUILD_DLL)
@@ -441,6 +459,10 @@ if (POMAI_BUILD_TESTS)
   add_executable(new_membrane_typed_api_test tests/unit/new_membrane_typed_api_test.cc)
   pomai_setup_test(new_membrane_typed_api_test)
   pomai_add_labeled_test(new_membrane_typed_api_test "unit")
+
+  add_executable(membrane_capabilities_test tests/unit/membrane_capabilities_test.cc)
+  pomai_setup_test(membrane_capabilities_test)
+  pomai_add_labeled_test(membrane_capabilities_test "unit")
 
   add_executable(simd_new_membranes_test tests/unit/simd_new_membranes_test.cc)
   pomai_setup_test(simd_new_membranes_test)
@@ -770,6 +792,16 @@ target_include_directories(pomai_inspect PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# Long-running gateway for Docker / VM (HTTP + ingest TCP); library use stays embedded.
+add_executable(pomaidb_server tools/pomaidb_server.cc)
+target_link_libraries(pomaidb_server PRIVATE ${POMAI_EXE_DEPS})
+target_include_directories(pomaidb_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+if (MSVC)
+  target_compile_options(pomaidb_server PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(pomaidb_server PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 # =========================
 # C API Tests & Examples
 # =========================
@@ -809,4 +841,6 @@ install(FILES
   include/pomai/c_types.h
   include/pomai/c_version.h
   include/pomai/database.h
+  include/pomai/membrane_capabilities.h
+  include/pomai/membrane_iterator.h
   DESTINATION include/pomai)

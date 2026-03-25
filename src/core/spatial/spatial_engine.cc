@@ -91,5 +91,9 @@ Status SpatialEngine::Nearest(double lat, double lon, std::uint32_t topk, std::v
     return Status::Ok();
 }
 
+void SpatialEngine::ForEach(const std::function<void(std::uint64_t id, double lat, double lon)>& fn) const {
+    for (const auto& [id, pt] : points_) fn(id, pt.latitude, pt.longitude);
+}
+
 } // namespace pomai::core
 

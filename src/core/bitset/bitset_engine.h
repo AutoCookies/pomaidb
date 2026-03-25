@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
+#include <functional>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +20,7 @@ public:
     Status Xor(std::uint64_t a, std::uint64_t b, std::vector<std::uint8_t>* out) const;
     Status Hamming(std::uint64_t a, std::uint64_t b, double* out) const;
     Status Jaccard(std::uint64_t a, std::uint64_t b, double* out) const;
+    void ForEach(const std::function<void(std::uint64_t id, std::size_t nbytes)>& fn) const;
 
 private:
     Status BinaryOp(std::uint64_t a, std::uint64_t b, std::vector<std::uint8_t>* out, std::uint8_t op) const;

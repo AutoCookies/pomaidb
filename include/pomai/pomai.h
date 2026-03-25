@@ -10,6 +10,7 @@
 #include "search.h"
 #include "status.h"
 #include "types.h"
+#include "membrane_iterator.h"
 #include "snapshot.h"
 
 namespace pomai
@@ -181,6 +182,12 @@ namespace pomai
         // Iterator API: Full-scan access to all live vectors
         virtual Status NewIterator(std::string_view membrane,
                                   std::unique_ptr<class SnapshotIterator> *out) = 0;
+
+        /** Full-scan over a membrane for any MembraneKind (unified record shape; see membrane_iterator.h). */
+        virtual Status NewMembraneRecordIterator(std::string_view membrane,
+                                                  std::unique_ptr<MembraneRecordIterator>* out) = 0;
+        virtual Status NewMembraneRecordIterator(std::string_view membrane, const MembraneScanOptions& scan_opts,
+                                                  std::unique_ptr<MembraneRecordIterator>* out) = 0;
 
         // Snapshot API
         virtual Status GetSnapshot(std::string_view membrane, std::shared_ptr<Snapshot>* out) = 0;

@@ -56,9 +56,14 @@ private:
     void EnqueueSyncEvent(SyncEvent ev);
     void HttpLoop(uint16_t port);
     void IngestLoop(uint16_t port);
+    /// Single TCP port: HTTP (health, metrics, REST ingest) + line protocol (MQTT|… / WS|…).
+    void UnifiedGatewayLoop(uint16_t port);
+    void ServeHttpConnection(int client, const std::string& req);
+    void ServeIngestConnection(int client, const std::string& line);
 
     MembraneManager* manager_ = nullptr;
     std::atomic<bool> running_{false};
+    bool unified_mode_ = false;
     std::string auth_token_;
     std::string token_file_path_;
     std::atomic<int> http_fd_{-1};

@@ -43,5 +43,9 @@ Status SparseEngine::Jaccard(std::uint64_t a, std::uint64_t b, double* out) cons
     return Status::Ok();
 }
 
+void SparseEngine::ForEach(const std::function<void(std::uint64_t id, std::size_t nnz)>& fn) const {
+    for (const auto& [id, e] : sparse_) fn(id, e.indices.size());
+}
+
 } // namespace pomai::core
 

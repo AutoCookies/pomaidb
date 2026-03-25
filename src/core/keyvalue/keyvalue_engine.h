@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 
@@ -26,6 +27,9 @@ public:
     Status Delete(std::string_view key);
     Status Compact();
     Status SetRetentionPolicy(RetentionPolicy retention);
+
+    /** Stable order not guaranteed; snapshot of current map. */
+    void ForEach(const std::function<void(std::string_view key, std::string_view value)>& fn) const;
 
 private:
     struct Entry {

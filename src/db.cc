@@ -395,6 +395,14 @@ namespace pomai
             return mgr_.NewIterator(membrane, out);
         }
 
+        Status NewMembraneRecordIterator(std::string_view membrane, std::unique_ptr<MembraneRecordIterator>* out) override {
+            return mgr_.NewMembraneRecordIterator(membrane, out);
+        }
+        Status NewMembraneRecordIterator(std::string_view membrane, const MembraneScanOptions& scan_opts,
+                                         std::unique_ptr<MembraneRecordIterator>* out) override {
+            return mgr_.NewMembraneRecordIterator(membrane, scan_opts, out);
+        }
+
         Status GetSnapshot(std::string_view membrane, std::shared_ptr<Snapshot>* out) override
         {
             return mgr_.GetSnapshot(membrane, out);

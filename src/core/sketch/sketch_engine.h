@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -15,6 +18,7 @@ public:
     Status Estimate(std::string_view key, uint64_t* out) const;
     Status Seen(std::string_view key, bool* out) const;
     Status UniqueEstimate(uint64_t* out) const;
+    void ForEach(const std::function<void(std::string_view key, uint64_t count)>& fn) const;
 
 private:
     void EvictIfNeeded();

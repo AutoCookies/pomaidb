@@ -1,5 +1,7 @@
 ## PomaiDB on Edge Devices: Recommended Settings & Failure Semantics
 
+See also **[EDGE_RELEASE.md](EDGE_RELEASE.md)** for the membrane capability matrix, release SLOs, crash-test gate, and foreign-binding roadmap.
+
 PomaiDB is designed first for embedded / edge workloads: single-process, local storage, constrained memory, and frequent power loss. This guide summarizes **recommended configuration presets** and **what happens on failure** so you can reason about behavior on devices like Raspberry Pi, Jetson, or custom ARM boards.
 
 This document focuses on the **embedded `pomai::Database` API** (single-instance engine) and the **sharded `pomai::DB` API** where relevant.

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <string_view>
 #include <vector>
 
 namespace pomai::core {
@@ -168,6 +169,10 @@ void KeyValueEngine::EnforceRetention() {
     };
     while (retention_.max_count > 0 && kv_.size() > retention_.max_count) prune_oldest();
     while (retention_.max_bytes > 0 && ApproxBytesUsed() > retention_.max_bytes && !kv_.empty()) prune_oldest();
+}
+
+void KeyValueEngine::ForEach(const std::function<void(std::string_view key, std::string_view value)>& fn) const {
+    for (const auto& [k, e] : kv_) fn(k, e.value);
 }
 
 } // namespace pomai::core

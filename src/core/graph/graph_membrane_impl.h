@@ -1,9 +1,11 @@
 #pragma once
 
+#include <cstddef>
+#include <functional>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
-#include <mutex>
 
 #include "pomai/graph.h"
 #include "pomai/status.h"
@@ -83,9 +85,14 @@ public:
         return Status::Ok();
     }
 
+    void ForEachVertex(const std::function<void(pomai::VertexId id, std::size_t out_degree)>& fn) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [vid, neigh] : adj_lists_) fn(vid, neigh.size());
+    }
+
 private:
     std::unique_ptr<storage::Wal> wal_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     
     // Contiguous Adjacency Store (Simplified for now - using map to vectors but intended for mmap)
     // In a full implementation, this would be a single large buffer + offset index.

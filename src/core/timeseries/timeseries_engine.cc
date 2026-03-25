@@ -68,5 +68,13 @@ Status TimeSeriesEngine::Range(std::uint64_t series_id, std::uint64_t start_ts, 
     return Status::Ok();
 }
 
+void TimeSeriesEngine::ForEach(const std::function<void(std::uint64_t series_id, const pomai::TimeSeriesPoint&)>& fn) const {
+    for (const auto& [sid, pts] : data_) {
+        for (const auto& p : pts) {
+            fn(sid, p);
+        }
+    }
+}
+
 } // namespace pomai::core
 

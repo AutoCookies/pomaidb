@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,19 @@ namespace pomai::core
         Status Search(const pomai::RagQuery& query,
                       const pomai::RagSearchOptions& opts,
                       pomai::RagSearchResult* out) const;
+
+        void ForEachChunk(const std::function<void(pomai::ChunkId chunk_id,
+                                                   pomai::DocId doc_id,
+                                                   const std::string& text,
+                                                   std::size_t token_count,
+                                                   bool has_embedding)>& fn) const;
+
+        /** O(shards) lookup; for export iterators. */
+        bool TryGetChunkExport(pomai::ChunkId id,
+                               pomai::DocId* doc_id,
+                               std::string* text,
+                               std::size_t* token_count,
+                               bool* has_embedding) const;
 
         const pomai::MembraneSpec& spec() const { return spec_; }
 

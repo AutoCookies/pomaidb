@@ -10,6 +10,7 @@
 #include "pomai/search.h"
 #include "pomai/status.h"
 #include "pomai/iterator.h"
+#include "pomai/membrane_iterator.h"
 #include "pomai/metadata.h"
 #include "pomai/snapshot.h"
 #include "pomai/rag.h"
@@ -148,6 +149,10 @@ namespace pomai::core
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);
         Status NewIterator(std::string_view membrane, std::unique_ptr<pomai::SnapshotIterator> *out);
+        /** Full-scan rows for any membrane kind (see pomai/membrane_iterator.h). */
+        Status NewMembraneRecordIterator(std::string_view membrane, std::unique_ptr<pomai::MembraneRecordIterator> *out);
+        Status NewMembraneRecordIterator(std::string_view membrane, const pomai::MembraneScanOptions& scan_opts,
+                                         std::unique_ptr<pomai::MembraneRecordIterator>* out);
         Status GetSnapshot(std::string_view name, std::shared_ptr<pomai::Snapshot> *out);
         Status PushSync(std::string_view name, SyncReceiver* receiver);
         void AddPostPutHook(std::string_view membrane, std::shared_ptr<PostPutHook> hook);

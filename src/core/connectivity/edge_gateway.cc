@@ -19,6 +19,7 @@
 #include <set>
 
 #include "core/membrane/manager.h"
+#include "pomai/membrane_iterator.h"
 
 namespace pomai::core {
 
@@ -95,6 +96,65 @@ bool HttpPostJson(const std::string& host, uint16_t port, const std::string& pat
     const std::string resp(buf, static_cast<size_t>(n));
     return resp.find(" 200 ") != std::string::npos || resp.find(" 201 ") != std::string::npos || resp.find(" 202 ") != std::string::npos;
 }
+
+std::string JsonEscapeMembraneField(std::string_view s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (unsigned char uc : s) {
+        const char c = static_cast<char>(uc);
+        switch (c) {
+            case '"':
+                o += "\\\"";
+                break;
+            case '\\':
+                o += "\\\\";
+                break;
+            case '\n':
+                o += "\\n";
+                break;
+            case '\r':
+                break;
+            default:
+                if (uc < 0x20) {
+                    o += ' ';
+                } else {
+                    o += c;
+                }
+        }
+    }
+    return o;
+}
+
+static std::string HttpQueryParam(std::string_view query, std::string_view key) {
+    size_t pos = 0;
+    while (pos < query.size()) {
+        const size_t amp = query.find('&', pos);
+        const std::string_view part = (amp == std::string::npos) ? query.substr(pos) : query.substr(pos, amp - pos);
+        const size_t eq = part.find('=');
+        if (eq != std::string::npos) {
+            const std::string_view k = part.substr(0, eq);
+            if (k == key) return std::string(part.substr(eq + 1));
+        }
+        if (amp == std::string::npos) break;
+        pos = amp + 1;
+    }
+    return {};
+}
+
+bool LooksLikeHttpRequest(std::string_view s) {
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) {
+        ++i;
+    }
+    if (i + 4 > s.size()) return false;
+    const char* p = s.data() + i;
+    const size_t rem = s.size() - i;
+    auto has = [p, rem](const char* lit, size_t n) {
+        return rem >= n && std::memcmp(p, lit, n) == 0;
+    };
+    return has("GET ", 4) || has("POST ", 5) || has("HEAD ", 5) || has("PUT ", 4) || has("DELETE ", 7) ||
+           has("OPTIONS ", 8) || has("PATCH ", 6) || has("CONNECT ", 8) || has("TRACE ", 6);
+}
 } // namespace
 
 EdgeGateway::EdgeGateway(MembraneManager* manager) : manager_(manager) {}
@@ -127,8 +187,13 @@ Status EdgeGateway::Start(uint16_t http_port, uint16_t ingest_port, std::string 
         return seq_st;
     }
     ReloadTokensIfNeeded();
-    http_thread_ = std::thread([this, http_port]() { HttpLoop(http_port); });
-    ingest_thread_ = std::thread([this, ingest_port]() { IngestLoop(ingest_port); });
+    unified_mode_ = (http_port == ingest_port);
+    if (unified_mode_) {
+        http_thread_ = std::thread([this, http_port]() { UnifiedGatewayLoop(http_port); });
+    } else {
+        http_thread_ = std::thread([this, http_port]() { HttpLoop(http_port); });
+        ingest_thread_ = std::thread([this, ingest_port]() { IngestLoop(ingest_port); });
+    }
     if (opt.gateway_upstream_sync_enabled && !opt.gateway_upstream_sync_url.empty()) {
         sync_thread_ = std::thread([this]() { SyncLoop(); });
     }
@@ -148,7 +213,7 @@ Status EdgeGateway::Stop() {
         ::close(ifd);
     }
     if (http_thread_.joinable()) http_thread_.join();
-    if (ingest_thread_.joinable()) ingest_thread_.join();
+    if (!unified_mode_ && ingest_thread_.joinable()) ingest_thread_.join();
     sync_cv_.notify_all();
     if (sync_thread_.joinable()) sync_thread_.join();
     return Status::Ok();
@@ -466,6 +531,384 @@ void EdgeGateway::SyncLoop() {
     }
 }
 
+void EdgeGateway::UnifiedGatewayLoop(uint16_t port) {
+    const int server_fd = OpenListenSocket(port);
+    if (server_fd < 0) {
+        running_.store(false);
+        return;
+    }
+    http_fd_.store(server_fd);
+    ingest_fd_.store(-1);
+    while (running_.load()) {
+        int client = ::accept(server_fd, nullptr, nullptr);
+        if (client < 0) continue;
+        char peek[16];
+        const ssize_t pn = ::recv(client, peek, sizeof(peek), MSG_PEEK);
+        if (pn <= 0) {
+            ::close(client);
+            continue;
+        }
+        const bool peek_http = LooksLikeHttpRequest(std::string_view(peek, static_cast<size_t>(pn)));
+        if (!AllowRequest()) {
+            if (peek_http) {
+                const std::string too_many = JsonResponse(429, "Too Many Requests", "error", "rate_limited");
+                (void)::send(client, too_many.data(), too_many.size(), 0);
+                http_errors_total_.fetch_add(1);
+            } else {
+                static const std::string nack = "ERR|rate_limited\n";
+                (void)::send(client, nack.data(), nack.size(), 0);
+                ingest_errors_total_.fetch_add(1);
+            }
+            rate_limited_total_.fetch_add(1);
+            AppendAuditLog(peek_http ? "http_rate_limited" : "ingest_rate_limited", "request");
+            ::close(client);
+            continue;
+        }
+        char buf[8192];
+        const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) {
+            ::close(client);
+            continue;
+        }
+        buf[n] = '\0';
+        const std::string data(buf, static_cast<size_t>(n));
+        if (LooksLikeHttpRequest(data)) {
+            http_requests_total_.fetch_add(1);
+            ServeHttpConnection(client, data);
+        } else {
+            ingest_requests_total_.fetch_add(1);
+            ServeIngestConnection(client, data);
+        }
+    }
+    if (http_fd_.exchange(-1) >= 0) ::close(server_fd);
+}
+
+void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
+    std::string response = JsonResponse(200, "OK", "ok", "healthy");
+    const bool health = (req.rfind("GET /health ", 0) == 0) || (req.rfind("GET /v1/health ", 0) == 0);
+    const bool metrics = (req.rfind("GET /metrics ", 0) == 0) || (req.rfind("GET /v1/metrics ", 0) == 0);
+    const bool healthz = (req.rfind("GET /healthz ", 0) == 0) || (req.rfind("GET /v1/healthz ", 0) == 0);
+    if (health) {
+        (void)::send(client, response.data(), response.size(), 0);
+        ::close(client);
+        return;
+    }
+    if (healthz) {
+        const std::string body = HealthGradeJson();
+        const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+        const std::string full = head + body;
+        (void)::send(client, full.data(), full.size(), 0);
+        ::close(client);
+        return;
+    }
+    if (metrics) {
+        if (!IsAuthorizedForScope(req, "admin:ops")) {
+            response = JsonResponse(401, "Unauthorized", "error", "missing admin scope", "auth_scope_denied");
+            auth_denied_total_.fetch_add(1);
+            (void)::send(client, response.data(), response.size(), 0);
+            ::close(client);
+            return;
+        }
+        std::ostringstream oss;
+        oss << "http_requests_total " << http_requests_total_.load() << "\n";
+        oss << "http_errors_total " << http_errors_total_.load() << "\n";
+        oss << "ingest_requests_total " << ingest_requests_total_.load() << "\n";
+        oss << "ingest_errors_total " << ingest_errors_total_.load() << "\n";
+        oss << "ingest_duplicates_total " << ingest_duplicates_total_.load() << "\n";
+        oss << "rate_limited_total " << rate_limited_total_.load() << "\n";
+        oss << "idempotency_compactions_total " << idempotency_compactions_total_.load() << "\n";
+        oss << "idempotency_log_errors_total " << idempotency_log_errors_total_.load() << "\n";
+        oss << "audit_log_errors_total " << audit_log_errors_total_.load() << "\n";
+        oss << "audit_log_rotations_total " << audit_log_rotations_total_.load() << "\n";
+        oss << "auth_denied_total " << auth_denied_total_.load() << "\n";
+        oss << "mtls_denied_total " << mTLS_denied_total_.load() << "\n";
+        oss << "ingest_seq " << ingest_seq_.load() << "\n";
+        oss << "sync_attempts_total " << sync_attempts_total_.load() << "\n";
+        oss << "sync_success_total " << sync_success_total_.load() << "\n";
+        oss << "sync_fail_total " << sync_fail_total_.load() << "\n";
+        oss << "sync_backlog_drops_total " << sync_backlog_drops_total_.load() << "\n";
+        oss << "sync_checkpoint_seq " << sync_checkpoint_seq_.load() << "\n";
+        const std::string body = oss.str();
+        const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
+        const std::string full = head + body;
+        (void)::send(client, full.data(), full.size(), 0);
+        ::close(client);
+        return;
+    }
+    const bool membrane_records = (req.rfind("GET /v1/membrane/records", 0) == 0) || (req.rfind("GET /membrane/records", 0) == 0);
+    if (membrane_records) {
+        if (!IsAuthorizedForScope(req, "admin:ops")) {
+            response = JsonResponse(401, "Unauthorized", "error", "missing admin scope", "auth_scope_denied");
+            auth_denied_total_.fetch_add(1);
+            (void)::send(client, response.data(), response.size(), 0);
+            ::close(client);
+            return;
+        }
+        const auto line_end = req.find("\r\n");
+        const std::string req_line = (line_end == std::string::npos) ? req : req.substr(0, line_end);
+        const auto qm = req_line.find('?');
+        const std::string qs = (qm == std::string::npos) ? std::string() : req_line.substr(qm + 1);
+        const std::string membrane = HttpQueryParam(qs, "membrane");
+        if (membrane.empty()) {
+            response = JsonResponse(400, "Bad Request", "error", "membrane query parameter required", "bad_request");
+            (void)::send(client, response.data(), response.size(), 0);
+            ::close(client);
+            return;
+        }
+        std::string lim_s = HttpQueryParam(qs, "limit");
+        uint64_t limit = 10000;
+        if (!lim_s.empty()) {
+            limit = static_cast<uint64_t>(std::strtoull(lim_s.c_str(), nullptr, 10));
+        }
+        if (limit == 0) limit = 10000;
+        if (limit > 50000) limit = 50000;
+
+        pomai::MembraneScanOptions scan_opts;
+        scan_opts.max_records = limit;
+
+        std::unique_ptr<pomai::MembraneRecordIterator> mit;
+        const auto st = manager_->NewMembraneRecordIterator(membrane, scan_opts, &mit);
+        if (!st.ok()) {
+            const bool nf = (st.code() == pomai::ErrorCode::kNotFound);
+            response = JsonResponse(nf ? 404 : 400, nf ? "Not Found" : "Bad Request", "error", st.message(),
+                                    nf ? "not_found" : "scan_failed");
+            (void)::send(client, response.data(), response.size(), 0);
+            ::close(client);
+            return;
+        }
+
+        std::string body;
+        constexpr std::size_t kMaxExport = 64 * 1024 * 1024;
+        while (mit && mit->Valid()) {
+            if (body.size() > kMaxExport) break;
+            const auto& row = mit->Record();
+            std::ostringstream line;
+            line << "{\"kind\":" << static_cast<int>(row.kind) << ",\"id\":" << row.id << ",\"key\":\""
+                 << JsonEscapeMembraneField(row.key) << "\",\"value\":\"" << JsonEscapeMembraneField(row.value)
+                 << "\",\"vector_dim\":" << row.vector.size() << "}\n";
+            body += line.str();
+            if (!mit->ScanStatus().ok()) break;
+            mit->Next();
+        }
+        if (mit && !mit->ScanStatus().ok()) {
+            body += std::string("{\"error\":\"") + JsonEscapeMembraneField(mit->ScanStatus().message()) + "\"}\n";
+        }
+        if (mit && mit->Truncated()) {
+            body += "{\"truncated\":true}\n";
+        }
+
+        const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: " +
+                                 std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+        (void)::send(client, head.data(), head.size(), 0);
+        (void)::send(client, body.data(), body.size(), 0);
+        ::close(client);
+        return;
+    }
+    if (manager_->GetOptions().gateway_require_mtls_proxy_header &&
+        req.find(manager_->GetOptions().gateway_mtls_proxy_header) == std::string::npos) {
+        response = JsonResponse(401, "Unauthorized", "error", "mtls proxy header missing", "mtls_required");
+        mTLS_denied_total_.fetch_add(1);
+        (void)::send(client, response.data(), response.size(), 0);
+        ::close(client);
+        return;
+    }
+    if (!IsAuthorizedForScope(req, "ingest:write")) {
+        response = JsonResponse(401, "Unauthorized", "error", "missing ingest scope", "auth_scope_denied");
+        (void)::send(client, response.data(), response.size(), 0);
+        ::close(client);
+        http_errors_total_.fetch_add(1);
+        auth_denied_total_.fetch_add(1);
+        AppendAuditLog("http_unauthorized", "request");
+        return;
+    }
+    const auto key_pos = req.find("X-Idempotency-Key:");
+    std::string idempotency_key;
+    if (key_pos != std::string::npos) {
+        const auto eol = req.find("\r\n", key_pos);
+        if (eol != std::string::npos) {
+            idempotency_key = req.substr(key_pos + 18, eol - (key_pos + 18));
+            while (!idempotency_key.empty() && (idempotency_key.front() == ' ' || idempotency_key.front() == '\t')) {
+                idempotency_key.erase(idempotency_key.begin());
+            }
+        }
+    }
+    if (HasIdempotencyKey(idempotency_key)) {
+        response = JsonResponse(200, "OK", "duplicate", "idempotency_key_seen");
+        (void)::send(client, response.data(), response.size(), 0);
+        ::close(client);
+        ingest_duplicates_total_.fetch_add(1);
+        AppendAuditLog("http_duplicate", idempotency_key);
+        return;
+    }
+    const bool meta_ingest = (req.rfind("POST /ingest/meta/", 0) == 0) || (req.rfind("POST /v1/ingest/meta/", 0) == 0);
+    const bool vec_ingest = (req.rfind("POST /ingest/vector/", 0) == 0) || (req.rfind("POST /v1/ingest/vector/", 0) == 0);
+    if (meta_ingest) {
+        const auto sp1 = req.find(' ');
+        const auto sp2 = req.find(' ', sp1 + 1);
+        const std::string path = req.substr(sp1 + 1, sp2 - (sp1 + 1));
+        const auto body_pos = req.find("\r\n\r\n");
+        const std::string body = (body_pos == std::string::npos) ? std::string() : req.substr(body_pos + 4);
+        const std::string prefix = (path.rfind("/v1/ingest/meta/", 0) == 0) ? "/v1/ingest/meta/" : "/ingest/meta/";
+        const auto rem = path.substr(prefix.size());
+        const auto slash = rem.find('/');
+        if (slash != std::string::npos) {
+            const auto membrane = rem.substr(0, slash);
+            const auto gid = rem.substr(slash + 1);
+            const auto st = manager_->MetaPut(membrane, gid, body);
+            if (st.ok()) {
+                RememberIdempotencyKey(idempotency_key);
+                AppendAuditLog("http_meta_ok", std::string(membrane) + "/" + std::string(gid));
+                response = JsonResponse(200, "OK", "ok", "meta_ingested", "accepted");
+            } else {
+                AppendAuditLog("http_meta_err", st.message());
+                response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
+                http_errors_total_.fetch_add(1);
+            }
+        } else {
+            AppendAuditLog("http_meta_err", "invalid_meta_path");
+            response = JsonResponse(400, "Bad Request", "error", "invalid_meta_path", "invalid_path");
+            http_errors_total_.fetch_add(1);
+        }
+    } else if (vec_ingest) {
+        const auto sp1 = req.find(' ');
+        const auto sp2 = req.find(' ', sp1 + 1);
+        const std::string path = req.substr(sp1 + 1, sp2 - (sp1 + 1));
+        const auto body_pos = req.find("\r\n\r\n");
+        const std::string body = (body_pos == std::string::npos) ? std::string() : req.substr(body_pos + 4);
+        const std::string prefix = (path.rfind("/v1/ingest/vector/", 0) == 0) ? "/v1/ingest/vector/" : "/ingest/vector/";
+        const auto rem = path.substr(prefix.size());
+        const auto slash = rem.find('/');
+        if (slash != std::string::npos) {
+            const auto membrane = rem.substr(0, slash);
+            const auto id_s = rem.substr(slash + 1);
+            const uint64_t id = static_cast<uint64_t>(std::strtoull(id_s.c_str(), nullptr, 10));
+            std::vector<float> v;
+            std::istringstream viss(body);
+            std::string tok;
+            while (std::getline(viss, tok, ',')) {
+                v.push_back(static_cast<float>(std::strtod(tok.c_str(), nullptr)));
+            }
+            if (!v.empty()) {
+                const auto st = manager_->PutVector(membrane, id, v);
+                if (st.ok()) {
+                    RememberIdempotencyKey(idempotency_key);
+                    AppendAuditLog("http_vector_ok", std::string(membrane) + "/" + std::to_string(id));
+                    response = JsonResponse(200, "OK", "ok", "vector_ingested", "accepted");
+                } else {
+                    AppendAuditLog("http_vector_err", st.message());
+                    response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
+                    http_errors_total_.fetch_add(1);
+                }
+            } else {
+                AppendAuditLog("http_vector_err", "empty_vector");
+                response = JsonResponse(400, "Bad Request", "error", "empty_vector", "bad_vector");
+                http_errors_total_.fetch_add(1);
+            }
+        } else {
+            AppendAuditLog("http_vector_err", "invalid_vector_path");
+            response = JsonResponse(400, "Bad Request", "error", "invalid_vector_path", "invalid_path");
+            http_errors_total_.fetch_add(1);
+        }
+    } else {
+        AppendAuditLog("http_not_found", "endpoint");
+        response = JsonResponse(404, "Not Found", "error", "endpoint_not_found", "not_found");
+        http_errors_total_.fetch_add(1);
+    }
+    (void)::send(client, response.data(), response.size(), 0);
+    ::close(client);
+}
+
+void EdgeGateway::ServeIngestConnection(int client, const std::string& line) {
+    std::istringstream iss(line);
+    std::string proto;
+    if (!std::getline(iss, proto, '|')) {
+        ::close(client);
+        ingest_errors_total_.fetch_add(1);
+        return;
+    }
+    std::string token_or_membrane;
+    std::string membrane;
+    std::string id_s;
+    std::string vec_s;
+    if (!std::getline(iss, token_or_membrane, '|')) {
+        ::close(client);
+        return;
+    }
+    if (auth_token_.empty()) {
+        membrane = token_or_membrane;
+        if (!std::getline(iss, id_s, '|') || !std::getline(iss, vec_s, '|')) {
+            ::close(client);
+            ingest_errors_total_.fetch_add(1);
+            return;
+        }
+    } else {
+        if (token_or_membrane != auth_token_) {
+            ::close(client);
+            ingest_errors_total_.fetch_add(1);
+            return;
+        }
+        if (!std::getline(iss, membrane, '|') || !std::getline(iss, id_s, '|') || !std::getline(iss, vec_s, '|')) {
+            ::close(client);
+            ingest_errors_total_.fetch_add(1);
+            return;
+        }
+    }
+    if ((proto == "MQTT" || proto == "WS") && !membrane.empty() && !id_s.empty()) {
+        const uint64_t id = static_cast<uint64_t>(std::strtoull(id_s.c_str(), nullptr, 10));
+        std::vector<float> v;
+        std::istringstream viss(vec_s);
+        std::string tok;
+        while (std::getline(viss, tok, ',')) {
+            v.push_back(static_cast<float>(std::strtod(tok.c_str(), nullptr)));
+        }
+        if (!v.empty()) {
+            std::string idem_key;
+            std::string durability;
+            (void)std::getline(iss, idem_key, '|');
+            (void)std::getline(iss, durability, '|');
+            if (HasIdempotencyKey(idem_key)) {
+                const std::string reply = "ACK|duplicate\n";
+                ingest_duplicates_total_.fetch_add(1);
+                AppendAuditLog("ingest_duplicate", idem_key);
+                (void)::send(client, reply.data(), reply.size(), 0);
+                ::close(client);
+                return;
+            }
+            auto st = manager_->PutVector(membrane, id, v);
+            if (st.ok() && durability == "D") {
+                st = manager_->FlushAll();
+            }
+            uint64_t seq = 0;
+            if (st.ok()) {
+                seq = ingest_seq_.fetch_add(1) + 1;
+                (void)SaveSeqState();
+            }
+            const std::string reply = st.ok()
+                ? (durability == "D" ? "ACK|durable_ack|seq=" + std::to_string(seq) + "\n"
+                                     : "ACK|accepted|seq=" + std::to_string(seq) + "\n")
+                : "ERR|write_failed\n";
+            if (!st.ok()) {
+                ingest_errors_total_.fetch_add(1);
+                AppendAuditLog("ingest_err", st.message());
+            } else {
+                RememberIdempotencyKey(idem_key);
+                AppendAuditLog("ingest_ok", std::string(membrane) + "/" + std::to_string(id));
+                EnqueueSyncEvent(SyncEvent{seq, "vector_put", membrane, id});
+            }
+            (void)::send(client, reply.data(), reply.size(), 0);
+        } else {
+            const std::string reply = "ERR|bad_vector\n";
+            ingest_errors_total_.fetch_add(1);
+            (void)::send(client, reply.data(), reply.size(), 0);
+        }
+    } else {
+        const std::string reply = "ERR|bad_protocol\n";
+        ingest_errors_total_.fetch_add(1);
+        (void)::send(client, reply.data(), reply.size(), 0);
+    }
+    ::close(client);
+}
+
 void EdgeGateway::HttpLoop(uint16_t port) {
     const int server_fd = OpenListenSocket(port);
     if (server_fd < 0) {
@@ -486,179 +929,14 @@ void EdgeGateway::HttpLoop(uint16_t port) {
             AppendAuditLog("http_rate_limited", "request");
             continue;
         }
-        char buf[2048];
+        char buf[8192];
         const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
         if (n > 0) {
             buf[n] = '\0';
-            std::string req(buf, static_cast<size_t>(n));
-            std::string response = JsonResponse(200, "OK", "ok", "healthy");
-            const bool health = (req.rfind("GET /health ", 0) == 0) || (req.rfind("GET /v1/health ", 0) == 0);
-            const bool metrics = (req.rfind("GET /metrics ", 0) == 0) || (req.rfind("GET /v1/metrics ", 0) == 0);
-            const bool healthz = (req.rfind("GET /healthz ", 0) == 0) || (req.rfind("GET /v1/healthz ", 0) == 0);
-            if (health) {
-                (void)::send(client, response.data(), response.size(), 0);
-                ::close(client);
-                continue;
-            }
-            if (healthz) {
-                const std::string body = HealthGradeJson();
-                const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-                const std::string full = head + body;
-                (void)::send(client, full.data(), full.size(), 0);
-                ::close(client);
-                continue;
-            }
-            if (metrics) {
-                if (!IsAuthorizedForScope(req, "admin:ops")) {
-                    response = JsonResponse(401, "Unauthorized", "error", "missing admin scope", "auth_scope_denied");
-                    auth_denied_total_.fetch_add(1);
-                    (void)::send(client, response.data(), response.size(), 0);
-                    ::close(client);
-                    continue;
-                }
-                std::ostringstream oss;
-                oss << "http_requests_total " << http_requests_total_.load() << "\n";
-                oss << "http_errors_total " << http_errors_total_.load() << "\n";
-                oss << "ingest_requests_total " << ingest_requests_total_.load() << "\n";
-                oss << "ingest_errors_total " << ingest_errors_total_.load() << "\n";
-                oss << "ingest_duplicates_total " << ingest_duplicates_total_.load() << "\n";
-                oss << "rate_limited_total " << rate_limited_total_.load() << "\n";
-                oss << "idempotency_compactions_total " << idempotency_compactions_total_.load() << "\n";
-                oss << "idempotency_log_errors_total " << idempotency_log_errors_total_.load() << "\n";
-                oss << "audit_log_errors_total " << audit_log_errors_total_.load() << "\n";
-                oss << "audit_log_rotations_total " << audit_log_rotations_total_.load() << "\n";
-                oss << "auth_denied_total " << auth_denied_total_.load() << "\n";
-                oss << "mtls_denied_total " << mTLS_denied_total_.load() << "\n";
-                oss << "ingest_seq " << ingest_seq_.load() << "\n";
-                oss << "sync_attempts_total " << sync_attempts_total_.load() << "\n";
-                oss << "sync_success_total " << sync_success_total_.load() << "\n";
-                oss << "sync_fail_total " << sync_fail_total_.load() << "\n";
-                oss << "sync_backlog_drops_total " << sync_backlog_drops_total_.load() << "\n";
-                oss << "sync_checkpoint_seq " << sync_checkpoint_seq_.load() << "\n";
-                const std::string body = oss.str();
-                const std::string head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-                const std::string full = head + body;
-                (void)::send(client, full.data(), full.size(), 0);
-                ::close(client);
-                continue;
-            }
-            if (manager_->GetOptions().gateway_require_mtls_proxy_header &&
-                req.find(manager_->GetOptions().gateway_mtls_proxy_header) == std::string::npos) {
-                response = JsonResponse(401, "Unauthorized", "error", "mtls proxy header missing", "mtls_required");
-                mTLS_denied_total_.fetch_add(1);
-                (void)::send(client, response.data(), response.size(), 0);
-                ::close(client);
-                continue;
-            }
-            if (!IsAuthorizedForScope(req, "ingest:write")) {
-                response = JsonResponse(401, "Unauthorized", "error", "missing ingest scope", "auth_scope_denied");
-                (void)::send(client, response.data(), response.size(), 0);
-                ::close(client);
-                http_errors_total_.fetch_add(1);
-                auth_denied_total_.fetch_add(1);
-                AppendAuditLog("http_unauthorized", "request");
-                continue;
-            }
-            const auto key_pos = req.find("X-Idempotency-Key:");
-            std::string idempotency_key;
-            if (key_pos != std::string::npos) {
-                const auto eol = req.find("\r\n", key_pos);
-                if (eol != std::string::npos) {
-                    idempotency_key = req.substr(key_pos + 18, eol - (key_pos + 18));
-                    while (!idempotency_key.empty() && (idempotency_key.front() == ' ' || idempotency_key.front() == '\t')) {
-                        idempotency_key.erase(idempotency_key.begin());
-                    }
-                }
-            }
-            if (HasIdempotencyKey(idempotency_key)) {
-                response = JsonResponse(200, "OK", "duplicate", "idempotency_key_seen");
-                (void)::send(client, response.data(), response.size(), 0);
-                ::close(client);
-                ingest_duplicates_total_.fetch_add(1);
-                AppendAuditLog("http_duplicate", idempotency_key);
-                continue;
-            }
-            // Tiny endpoints:
-            // - GET /health
-            // - POST /ingest/meta/<membrane>/<gid> body=value
-            // - POST /ingest/vector/<membrane>/<id> body=f1,f2,f3
-            const bool meta_ingest = (req.rfind("POST /ingest/meta/", 0) == 0) || (req.rfind("POST /v1/ingest/meta/", 0) == 0);
-            const bool vec_ingest = (req.rfind("POST /ingest/vector/", 0) == 0) || (req.rfind("POST /v1/ingest/vector/", 0) == 0);
-            if (meta_ingest) {
-                const auto sp1 = req.find(' ');
-                const auto sp2 = req.find(' ', sp1 + 1);
-                const std::string path = req.substr(sp1 + 1, sp2 - (sp1 + 1));
-                const auto body_pos = req.find("\r\n\r\n");
-                const std::string body = (body_pos == std::string::npos) ? std::string() : req.substr(body_pos + 4);
-                const std::string prefix = (path.rfind("/v1/ingest/meta/", 0) == 0) ? "/v1/ingest/meta/" : "/ingest/meta/";
-                const auto rem = path.substr(prefix.size());
-                const auto slash = rem.find('/');
-                if (slash != std::string::npos) {
-                    const auto membrane = rem.substr(0, slash);
-                    const auto gid = rem.substr(slash + 1);
-                    const auto st = manager_->MetaPut(membrane, gid, body);
-                    if (st.ok()) {
-                        RememberIdempotencyKey(idempotency_key);
-                        AppendAuditLog("http_meta_ok", std::string(membrane) + "/" + std::string(gid));
-                        response = JsonResponse(200, "OK", "ok", "meta_ingested", "accepted");
-                    } else {
-                        AppendAuditLog("http_meta_err", st.message());
-                        response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                        http_errors_total_.fetch_add(1);
-                    }
-                } else {
-                    AppendAuditLog("http_meta_err", "invalid_meta_path");
-                    response = JsonResponse(400, "Bad Request", "error", "invalid_meta_path", "invalid_path");
-                    http_errors_total_.fetch_add(1);
-                }
-            } else if (vec_ingest) {
-                const auto sp1 = req.find(' ');
-                const auto sp2 = req.find(' ', sp1 + 1);
-                const std::string path = req.substr(sp1 + 1, sp2 - (sp1 + 1));
-                const auto body_pos = req.find("\r\n\r\n");
-                const std::string body = (body_pos == std::string::npos) ? std::string() : req.substr(body_pos + 4);
-                const std::string prefix = (path.rfind("/v1/ingest/vector/", 0) == 0) ? "/v1/ingest/vector/" : "/ingest/vector/";
-                const auto rem = path.substr(prefix.size());
-                const auto slash = rem.find('/');
-                if (slash != std::string::npos) {
-                    const auto membrane = rem.substr(0, slash);
-                    const auto id_s = rem.substr(slash + 1);
-                    const uint64_t id = static_cast<uint64_t>(std::strtoull(id_s.c_str(), nullptr, 10));
-                    std::vector<float> v;
-                    std::istringstream viss(body);
-                    std::string tok;
-                    while (std::getline(viss, tok, ',')) {
-                        v.push_back(static_cast<float>(std::strtod(tok.c_str(), nullptr)));
-                    }
-                    if (!v.empty()) {
-                        const auto st = manager_->PutVector(membrane, id, v);
-                        if (st.ok()) {
-                            RememberIdempotencyKey(idempotency_key);
-                            AppendAuditLog("http_vector_ok", std::string(membrane) + "/" + std::to_string(id));
-                            response = JsonResponse(200, "OK", "ok", "vector_ingested", "accepted");
-                        } else {
-                            AppendAuditLog("http_vector_err", st.message());
-                            response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                            http_errors_total_.fetch_add(1);
-                        }
-                    } else {
-                        AppendAuditLog("http_vector_err", "empty_vector");
-                        response = JsonResponse(400, "Bad Request", "error", "empty_vector", "bad_vector");
-                        http_errors_total_.fetch_add(1);
-                    }
-                } else {
-                    AppendAuditLog("http_vector_err", "invalid_vector_path");
-                    response = JsonResponse(400, "Bad Request", "error", "invalid_vector_path", "invalid_path");
-                    http_errors_total_.fetch_add(1);
-                }
-            } else {
-                AppendAuditLog("http_not_found", "endpoint");
-                response = JsonResponse(404, "Not Found", "error", "endpoint_not_found", "not_found");
-                http_errors_total_.fetch_add(1);
-            }
-            (void)::send(client, response.data(), response.size(), 0);
+            ServeHttpConnection(client, std::string(buf, static_cast<size_t>(n)));
+        } else {
+            ::close(client);
         }
-        ::close(client);
     }
     if (http_fd_.exchange(-1) >= 0) ::close(server_fd);
 }
@@ -687,103 +965,10 @@ void EdgeGateway::IngestLoop(uint16_t port) {
         const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
         if (n > 0) {
             buf[n] = '\0';
-            // Simple line protocol for MQTT/WebSocket gateway compatibility:
-            // No-auth: MQTT|<membrane>|<id>|f1,f2,f3
-            // Auth:    MQTT|<token>|<membrane>|<id>|f1,f2,f3
-            // Same shape for WS|...
-            std::string line(buf, static_cast<size_t>(n));
-            std::istringstream iss(line);
-            std::string proto;
-            if (!std::getline(iss, proto, '|')) {
-                ::close(client);
-                ingest_errors_total_.fetch_add(1);
-                continue;
-            }
-            std::string token_or_membrane;
-            std::string membrane;
-            std::string id_s;
-            std::string vec_s;
-            if (!std::getline(iss, token_or_membrane, '|')) {
-                ::close(client);
-                continue;
-            }
-            if (auth_token_.empty()) {
-                membrane = token_or_membrane;
-                if (!std::getline(iss, id_s, '|') || !std::getline(iss, vec_s, '|')) {
-                    ::close(client);
-                    ingest_errors_total_.fetch_add(1);
-                    continue;
-                }
-            } else {
-                if (token_or_membrane != auth_token_) {
-                    ::close(client);
-                    ingest_errors_total_.fetch_add(1);
-                    continue;
-                }
-                if (!std::getline(iss, membrane, '|') || !std::getline(iss, id_s, '|') || !std::getline(iss, vec_s, '|')) {
-                    ::close(client);
-                    ingest_errors_total_.fetch_add(1);
-                    continue;
-                }
-            }
-            if ((proto == "MQTT" || proto == "WS") && !membrane.empty() && !id_s.empty()) {
-                const uint64_t id = static_cast<uint64_t>(std::strtoull(id_s.c_str(), nullptr, 10));
-                std::vector<float> v;
-                std::istringstream viss(vec_s);
-                std::string tok;
-                while (std::getline(viss, tok, ',')) {
-                    v.push_back(static_cast<float>(std::strtod(tok.c_str(), nullptr)));
-                }
-                if (!v.empty()) {
-                    // Optional fields:
-                    // 5th token: idempotency key
-                    // 6th token: durability ("D")
-                    std::string idem_key;
-                    std::string durability;
-                    (void)std::getline(iss, idem_key, '|');
-                    (void)std::getline(iss, durability, '|');
-                    if (HasIdempotencyKey(idem_key)) {
-                        const std::string reply = "ACK|duplicate\n";
-                        ingest_duplicates_total_.fetch_add(1);
-                        AppendAuditLog("ingest_duplicate", idem_key);
-                        (void)::send(client, reply.data(), reply.size(), 0);
-                        ::close(client);
-                        continue;
-                    }
-                    auto st = manager_->PutVector(membrane, id, v);
-                    if (st.ok() && durability == "D") {
-                        st = manager_->FlushAll();
-                    }
-                    uint64_t seq = 0;
-                    if (st.ok()) {
-                        seq = ingest_seq_.fetch_add(1) + 1;
-                        (void)SaveSeqState();
-                    }
-                    const std::string reply = st.ok()
-                        ? (durability == "D" ? "ACK|durable_ack|seq=" + std::to_string(seq) + "\n"
-                                             : "ACK|accepted|seq=" + std::to_string(seq) + "\n")
-                        : "ERR|write_failed\n";
-                    if (!st.ok()) {
-                        ingest_errors_total_.fetch_add(1);
-                        AppendAuditLog("ingest_err", st.message());
-                    } else {
-                        RememberIdempotencyKey(idem_key);
-                        AppendAuditLog("ingest_ok", std::string(membrane) + "/" + std::to_string(id));
-                        EnqueueSyncEvent(SyncEvent{seq, "vector_put", membrane, id});
-                    }
-                    (void)::send(client, reply.data(), reply.size(), 0);
-                } else {
-                    const std::string reply = "ERR|bad_vector\n";
-                    ingest_errors_total_.fetch_add(1);
-                    (void)::send(client, reply.data(), reply.size(), 0);
-                }
-            } else {
-                const std::string reply = "ERR|bad_protocol\n";
-                ingest_errors_total_.fetch_add(1);
-                (void)::send(client, reply.data(), reply.size(), 0);
-            }
+            ServeIngestConnection(client, std::string(buf, static_cast<size_t>(n)));
+        } else {
+            ::close(client);
         }
-        ::close(client);
     }
     if (ingest_fd_.exchange(-1) >= 0) ::close(server_fd);
 }

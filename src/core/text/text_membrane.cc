@@ -2,6 +2,14 @@
 
 namespace pomai::core {
 
+Status TextMembrane::Get(VectorId id, std::string* out) const {
+    if (!out) return Status::InvalidArgument("text get out is null");
+    const auto it = docs_.find(id);
+    if (it == docs_.end()) return Status::NotFound("text doc not found");
+    *out = it->second;
+    return Status::Ok();
+}
+
 Status TextMembrane::Put(VectorId id, const std::string& text) {
     if (max_docs_ > 0 && docs_.size() >= max_docs_ && docs_.find(id) == docs_.end()) {
         // Strict memory cap for edge devices.
@@ -32,6 +40,10 @@ Status TextMembrane::Search(const std::string& query, uint32_t topk, std::vector
 void TextMembrane::Clear() {
     docs_.clear();
     index_.Clear();
+}
+
+void TextMembrane::ForEach(const std::function<void(VectorId id, std::string_view text)>& fn) const {
+    for (const auto& [id, t] : docs_) fn(id, t);
 }
 
 void TextMembrane::RebuildIndex() {

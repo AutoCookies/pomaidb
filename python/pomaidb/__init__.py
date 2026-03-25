@@ -24,8 +24,42 @@ __all__ = [
     "search_zero_copy", "release_zero_copy_session",
     "create_rag_membrane", "put_chunk", "search_rag",
     "ingest_document", "retrieve_context",
+    "membrane_kind_capabilities",
+    "MEMBRANE_KIND_VECTOR",
+    "MEMBRANE_KIND_RAG",
+    "MEMBRANE_KIND_GRAPH",
+    "MEMBRANE_KIND_TEXT",
+    "MEMBRANE_KIND_TIMESERIES",
+    "MEMBRANE_KIND_KEYVALUE",
+    "MEMBRANE_KIND_SKETCH",
+    "MEMBRANE_KIND_BLOB",
+    "MEMBRANE_KIND_SPATIAL",
+    "MEMBRANE_KIND_MESH",
+    "MEMBRANE_KIND_SPARSE",
+    "MEMBRANE_KIND_BITSET",
+    "MEMBRANE_KIND_META",
+    "MEMBRANE_STABILITY_STABLE",
+    "MEMBRANE_STABILITY_EXPERIMENTAL",
     "PomaiDBError",
 ]
+
+# Mirror include/pomai/c_types.h (pomai::MembraneKind).
+MEMBRANE_KIND_VECTOR = 0
+MEMBRANE_KIND_RAG = 1
+MEMBRANE_KIND_GRAPH = 2
+MEMBRANE_KIND_TEXT = 3
+MEMBRANE_KIND_TIMESERIES = 4
+MEMBRANE_KIND_KEYVALUE = 5
+MEMBRANE_KIND_SKETCH = 6
+MEMBRANE_KIND_BLOB = 7
+MEMBRANE_KIND_SPATIAL = 8
+MEMBRANE_KIND_MESH = 9
+MEMBRANE_KIND_SPARSE = 10
+MEMBRANE_KIND_BITSET = 11
+MEMBRANE_KIND_META = 12
+
+MEMBRANE_STABILITY_STABLE = 0
+MEMBRANE_STABILITY_EXPERIMENTAL = 1
 
 # Default library path when running from repo (build dir)
 def _find_lib():
@@ -148,6 +182,19 @@ def _register_api(lib):
             ("zero_copy_pointers", ctypes.POINTER(PomaiSemanticPointer)),
         ]
 
+    class PomaiMembraneCapabilities(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("kind", ctypes.c_uint8),
+            ("stability", ctypes.c_uint8),
+            ("reserved0", ctypes.c_uint8),
+            ("reserved1", ctypes.c_uint8),
+            ("read_path", ctypes.c_bool),
+            ("write_path", ctypes.c_bool),
+            ("unified_scan", ctypes.c_bool),
+            ("snapshot_isolated_scan", ctypes.c_bool),
+        ]
+
     lib.pomai_options_init.argtypes = [ctypes.POINTER(PomaiOptions)]
     lib.pomai_options_init.restype = None
     lib.pomai_open.argtypes = [ctypes.POINTER(PomaiOptions), ctypes.POINTER(ctypes.c_void_p)]
@@ -211,6 +258,10 @@ def _register_api(lib):
     lib.pomai_status_message.restype = ctypes.c_char_p
     lib.pomai_status_free.argtypes = [ctypes.c_void_p]
     lib.pomai_status_free.restype = None
+    lib.pomai_membrane_capabilities_init.argtypes = [ctypes.POINTER(PomaiMembraneCapabilities)]
+    lib.pomai_membrane_capabilities_init.restype = None
+    lib.pomai_membrane_kind_capabilities.argtypes = [ctypes.c_uint8, ctypes.POINTER(PomaiMembraneCapabilities)]
+    lib.pomai_membrane_kind_capabilities.restype = ctypes.c_void_p
     lib.pomai_options_resolve_json.argtypes = [
         ctypes.POINTER(PomaiOptions),
         ctypes.POINTER(ctypes.c_char_p),
@@ -321,6 +372,7 @@ def _register_api(lib):
     lib._pomai_rag_search_options = PomaiRagSearchOptions
     lib._pomai_rag_hit = PomaiRagHit
     lib._pomai_rag_search_result = PomaiRagSearchResult
+    lib._pomai_membrane_capabilities = PomaiMembraneCapabilities
 
 
 def _check(st):
@@ -734,6 +786,24 @@ def retrieve_context(db, membrane_name, query, top_k=5, *, embedding_dim=4):
         return out_buf.value[:out_len.value].decode("utf-8", errors="replace")
     finally:
         _lib.pomai_rag_pipeline_free(pipeline)
+
+
+def membrane_kind_capabilities(kind: int):
+    """Return capability flags for a membrane kind (0=vector … 12=meta). No DB handle required."""
+    _ensure_lib()
+    caps = _lib._pomai_membrane_capabilities()
+    _lib.pomai_membrane_capabilities_init(ctypes.byref(caps))
+    caps.struct_size = ctypes.sizeof(caps)
+    _check(_lib.pomai_membrane_kind_capabilities(int(kind) & 0xFF, ctypes.byref(caps)))
+    stab = "stable" if caps.stability == MEMBRANE_STABILITY_STABLE else "experimental"
+    return {
+        "kind": int(caps.kind),
+        "stability": stab,
+        "read_path": bool(caps.read_path),
+        "write_path": bool(caps.write_path),
+        "unified_scan": bool(caps.unified_scan),
+        "snapshot_isolated_scan": bool(caps.snapshot_isolated_scan),
+    }
 
 
 from .zero_copy import release_zero_copy_session, search_zero_copy

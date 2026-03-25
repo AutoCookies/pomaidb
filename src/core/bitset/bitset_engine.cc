@@ -53,5 +53,9 @@ Status BitsetEngine::Jaccard(std::uint64_t a, std::uint64_t b, double* out) cons
     return Status::Ok();
 }
 
+void BitsetEngine::ForEach(const std::function<void(std::uint64_t id, std::size_t nbytes)>& fn) const {
+    for (const auto& [id, b] : bitsets_) fn(id, b.size());
+}
+
 } // namespace pomai::core
 

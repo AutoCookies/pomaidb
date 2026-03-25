@@ -255,5 +255,9 @@ Status MeshEngine::Volume(std::uint64_t mesh_id, const MeshQueryOptions& opts, d
     return Status::Ok();
 }
 
+void MeshEngine::ForEach(const std::function<void(std::uint64_t id, std::size_t base_floats)>& fn) const {
+    for (const auto& [id, rec] : meshes_) fn(id, rec.base_xyz.size());
+}
+
 } // namespace pomai::core
 

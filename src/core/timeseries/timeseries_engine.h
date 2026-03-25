@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -17,6 +18,8 @@ public:
     Status Close();
     Status Put(std::uint64_t series_id, std::uint64_t ts, double value);
     Status Range(std::uint64_t series_id, std::uint64_t start_ts, std::uint64_t end_ts, std::vector<pomai::TimeSeriesPoint>* out) const;
+
+    void ForEach(const std::function<void(std::uint64_t series_id, const pomai::TimeSeriesPoint&)>& fn) const;
 
 private:
     std::string path_;

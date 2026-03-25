@@ -71,6 +71,40 @@ namespace pomai::core
         return Status::Ok();
     }
 
+    void RagEngine::ForEachChunk(const std::function<void(pomai::ChunkId,
+                                                          pomai::DocId,
+                                                          const std::string&,
+                                                          std::size_t,
+                                                          bool)>& fn) const
+    {
+        for (const auto& shard_ptr : shards_) {
+            if (!shard_ptr) continue;
+            for (const auto& [cid, rec] : shard_ptr->chunks) {
+                fn(cid, rec.doc_id, rec.chunk_text, rec.tokens.size(), rec.has_vector);
+            }
+        }
+    }
+
+    bool RagEngine::TryGetChunkExport(const pomai::ChunkId id,
+                                        pomai::DocId* doc_id,
+                                        std::string* text,
+                                        std::size_t* token_count,
+                                        bool* has_embedding) const
+    {
+        for (const auto& shard_ptr : shards_) {
+            if (!shard_ptr) continue;
+            const auto it = shard_ptr->chunks.find(id);
+            if (it == shard_ptr->chunks.end()) continue;
+            const RagRecord& rec = it->second;
+            if (doc_id) *doc_id = rec.doc_id;
+            if (text) *text = rec.chunk_text;
+            if (token_count) *token_count = rec.tokens.size();
+            if (has_embedding) *has_embedding = rec.has_vector;
+            return true;
+        }
+        return false;
+    }
+
     Status RagEngine::PutChunk(const pomai::RagChunk& chunk)
     {
         if (!opened_) return Status::InvalidArgument("rag_engine not opened");

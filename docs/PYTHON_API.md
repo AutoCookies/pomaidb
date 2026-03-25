@@ -21,6 +21,7 @@ PomaiDB is exposed to Python via the **C API** and **ctypes**. The official pack
 |----------------|-------------|
 | `open_db(path, dim, **opts)` | Open database at `path` with vector dimension `dim`. Options: `shards`, `search_threads`, `fsync`, `metric` ("ip" or "l2"), `profile` (`edge-low-ram`, `edge-balanced`, `edge-throughput`, `user_defined`), `hnsw_m`, `hnsw_ef_construction`, `hnsw_ef_search`, `adaptive_threshold`, `gateway_rate_limit_per_sec`, `gateway_idempotency_ttl_sec`, `gateway_token_file`, `gateway_upstream_sync_enabled`, `gateway_upstream_sync_url`, `gateway_require_mtls_proxy_header`, `gateway_mtls_proxy_header`. Returns opaque db handle. |
 | `resolve_effective_options(path, dim, **opts)` | Return effective runtime options as JSON after profile application (preflight/deploy validation). |
+| `membrane_kind_capabilities(kind)` | Return a dict of capability flags for a membrane kind (`MEMBRANE_KIND_*` constants); matches C API `pomai_membrane_kind_capabilities`. No database open required. |
 | `put_batch(db, ids, vectors)` | Insert vectors. `ids`: list of int; `vectors`: list of list of float (n × dim). |
 | `meta_put(db, membrane_name, gid, value)` | Store metadata payload by global id in a `kMeta` membrane. |
 | `meta_get(db, membrane_name, gid)` | Load metadata payload by global id from a `kMeta` membrane. |

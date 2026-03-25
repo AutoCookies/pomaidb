@@ -30,6 +30,10 @@ Status SketchEngine::UniqueEstimate(uint64_t* out) const {
     return Status::Ok();
 }
 
+void SketchEngine::ForEach(const std::function<void(std::string_view key, uint64_t count)>& fn) const {
+    for (const auto& [k, c] : counts_) fn(k, c);
+}
+
 void SketchEngine::EvictIfNeeded() {
     if (max_entries_ == 0) return;
     if (counts_.size() < max_entries_) return;

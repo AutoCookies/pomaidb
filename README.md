@@ -313,6 +313,16 @@ Override the default command to run another benchmark (e.g. `ingestion_bench`, `
 
 ---
 
+## Documentation
+
+- **Edge release criteria** (capabilities matrix, SLOs, crash gates, binding roadmap): [`docs/EDGE_RELEASE.md`](docs/EDGE_RELEASE.md)
+- **Edge deployment** (profiles, durability, memory): [`docs/EDGE_DEPLOYMENT.md`](docs/EDGE_DEPLOYMENT.md)
+- **Failure semantics** (WAL/manifest): [`docs/FAILURE_SEMANTICS.md`](docs/FAILURE_SEMANTICS.md)
+- **Python ctypes API**: [`docs/PYTHON_API.md`](docs/PYTHON_API.md)
+- **ABI versioning**: [`docs/VERSIONING.md`](docs/VERSIONING.md)
+
+---
+
 ## Discovery Tags
 
 **Keywords:** embedded vector database, single-threaded, C++20, append-only, log-structured, zero-copy, mmap, palloc, edge AI, IoT, Raspberry Pi, Orange Pi, Jetson, ARM64, SD card longevity, vector search, similarity search, RAG, semantic search, offline RAG, VFS, virtual file system.

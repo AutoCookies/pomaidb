@@ -91,5 +91,9 @@ Status BlobEngine::Delete(uint64_t id) {
     return Status::Ok();
 }
 
+void BlobEngine::ForEach(const std::function<void(uint64_t id, std::size_t nbytes)>& fn) const {
+    for (const auto& [id, data] : blobs_) fn(id, data.size());
+}
+
 } // namespace pomai::core
 

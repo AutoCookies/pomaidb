@@ -316,4 +316,52 @@ POMAI_TEST(CApiInvalidArgs) {
     pomai_status_free(st);
 }
 
+POMAI_TEST(CApiMembraneScanVector) {
+    CApiFixture fx;
+    const auto v = fx.Vec(3.0f);
+    pomai_upsert_t up{};
+    up.struct_size = sizeof(pomai_upsert_t);
+    up.id = 7;
+    up.vector = v.data();
+    up.dim = 8;
+    CAPI_EXPECT_OK(pomai_put(fx.db(), &up));
+
+    pomai_membrane_scan_options_t mopts{};
+    pomai_membrane_scan_options_init(&mopts);
+    mopts.max_records = 100;
+
+    pomai_membrane_iter_t* mit = nullptr;
+    CAPI_EXPECT_OK(pomai_membrane_scan(fx.db(), "__default__", &mopts, &mit));
+
+    bool saw7 = false;
+    while (pomai_membrane_iter_valid(mit)) {
+        pomai_membrane_record_view_t view{};
+        view.struct_size = sizeof(view);
+        CAPI_EXPECT_OK(pomai_membrane_iter_get_record(mit, &view));
+        POMAI_EXPECT_EQ(view.membrane_kind, 0u);
+        if (view.id == 7u) {
+            saw7 = true;
+            POMAI_EXPECT_EQ(view.vector_dim, 8u);
+        }
+        pomai_membrane_iter_next(mit);
+    }
+    POMAI_EXPECT_TRUE(saw7);
+    CAPI_EXPECT_OK(pomai_membrane_iter_status(mit));
+    pomai_membrane_iter_free(mit);
+}
+
+POMAI_TEST(CApiMembraneKindCapabilities) {
+    pomai_membrane_capabilities_t caps{};
+    pomai_membrane_capabilities_init(&caps);
+    caps.struct_size = sizeof(caps);
+    CAPI_EXPECT_OK(pomai_membrane_kind_capabilities(POMAI_MEMBRANE_KIND_VECTOR, &caps));
+    POMAI_EXPECT_EQ(static_cast<unsigned>(caps.kind), static_cast<unsigned>(POMAI_MEMBRANE_KIND_VECTOR));
+    POMAI_EXPECT_TRUE(caps.snapshot_isolated_scan);
+    CAPI_EXPECT_OK(pomai_membrane_kind_capabilities(POMAI_MEMBRANE_KIND_SPATIAL, &caps));
+    POMAI_EXPECT_EQ(caps.stability, POMAI_MEMBRANE_STABILITY_EXPERIMENTAL);
+    pomai_status_t* bad = pomai_membrane_kind_capabilities(200, &caps);
+    POMAI_EXPECT_TRUE(bad != nullptr);
+    pomai_status_free(bad);
+}
+
 }  // namespace

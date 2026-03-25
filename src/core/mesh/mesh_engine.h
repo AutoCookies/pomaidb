@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -30,6 +32,8 @@ public:
     void QueueLodBuild(std::uint64_t mesh_id);
     Status ProcessLodJobs(std::size_t max_jobs);
     std::size_t PendingLodJobs() const { return lod_queue_.size(); }
+
+    void ForEach(const std::function<void(std::uint64_t id, std::size_t base_floats)>& fn) const;
 
 private:
     struct MeshRecord {

@@ -15,7 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     git \
     g++-13 \
+    libssl-dev \
     ninja-build \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Use g++-13 as default for full C++20 (std::format, etc.)
@@ -30,16 +32,16 @@ COPY . .
 # Initialize palloc submodule (required for build)
 RUN git submodule update --init third_party/palloc
 
-# Build: Release, no tests, benchmarks enabled
+# Build: Release, no tests; server + benchmarks
 RUN mkdir -p build && cd build \
     && cmake -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CXX_COMPILER=g++ \
         -DPOMAI_BUILD_TESTS=OFF \
         -DPOMAI_BUILD_BENCH=ON \
-        -DPOMAI_USE_PALLOC=ON \
         .. \
     && ninja -j$(nproc) \
+        pomaidb_server \
         benchmark_a \
         ingestion_bench \
         comprehensive_bench \
@@ -54,12 +56,14 @@ RUN mkdir -p build && cd build \
 # Use ubuntu:24.04 (same as builder) for compatibility; -slim can be unavailable in some registries.
 FROM ubuntu:24.04 AS runtime
 
-# Minimal runtime: only libc and data dirs
+# Minimal runtime: libc + OpenSSL (pomai links libcrypto)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binaries from builder
+COPY --from=builder /src/build/pomaidb_server /usr/local/bin/
 COPY --from=builder /src/build/benchmark_a /usr/local/bin/
 COPY --from=builder /src/build/ingestion_bench /usr/local/bin/
 COPY --from=builder /src/build/comprehensive_bench /usr/local/bin/
@@ -73,6 +77,11 @@ RUN mkdir -p /data /bench && chmod 777 /data /bench
 
 WORKDIR /data
 
-# Default: run full multi-environment stress (IoT / Edge / Cloud)
-# Override with: docker run ... benchmark_a --list | or another binary
-CMD ["benchmark_a"]
+# Edge Gateway: HTTP (health, metrics, JSON ingest) + line ingest on one port (default 2406).
+EXPOSE 2406/tcp
+
+# Default: run network gateway (embedded use = link libpomai in your app instead).
+# Split mode: -e POMAID_HTTP_PORT=8080 -e POMAID_INGEST_PORT=2406
+ENV POMAID_DATA_PATH=/data/pomaidb
+ENV POMAID_PORT=2406
+CMD ["pomaidb_server"]
