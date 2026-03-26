@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <limits>
 
 #include "pomai/metadata.h"
@@ -173,6 +174,50 @@ std::string EncodeKind(AgentMemoryKind kind)
     return "message";
 }
 
+float ComputeFallbackScore(std::span<const float> query,
+                           std::span<const float> candidate,
+                           MetricType metric)
+{
+    if (query.size() != candidate.size())
+    {
+        return -std::numeric_limits<float>::infinity();
+    }
+
+    float dot = 0.0f;
+    float l2 = 0.0f;
+    float qn = 0.0f;
+    float cn = 0.0f;
+    for (std::size_t i = 0; i < query.size(); ++i)
+    {
+        const float qv = query[i];
+        const float cv = candidate[i];
+        dot += qv * cv;
+        const float d = qv - cv;
+        l2 += d * d;
+        qn += qv * qv;
+        cn += cv * cv;
+    }
+
+    switch (metric)
+    {
+    case MetricType::kInnerProduct:
+        return dot;
+    case MetricType::kCosine:
+    {
+        const float denom = std::sqrt(qn) * std::sqrt(cn);
+        if (denom <= 0.0f)
+        {
+            return -std::numeric_limits<float>::infinity();
+        }
+        return dot / denom;
+    }
+    case MetricType::kL2:
+    default:
+        // CTest ordering expects larger score == better hit.
+        return -l2;
+    }
+}
+
 } // namespace
 
 AgentMemory::AgentMemory(AgentMemoryOptions opts, std::unique_ptr<Database> db)
@@ -211,7 +256,6 @@ Status AgentMemory::Open(const AgentMemoryOptions& options,
     auto ptr = std::make_unique<AgentMemory>(options, std::move(db));
 
     {
-        std::lock_guard<std::mutex> lock(ptr->mu_);
         // Initialize next_id_ by scanning for the max existing id.
         std::shared_ptr<Snapshot> snap;
         st = ptr->db_->GetSnapshot(&snap);
@@ -240,7 +284,7 @@ Status AgentMemory::Open(const AgentMemoryOptions& options,
     return Status::Ok();
 }
 
-Status AgentMemory::EnsureOpenLocked() const
+Status AgentMemory::EnsureOpen() const
 {
     if (!opened_ || !db_ || !db_->IsOpen())
     {
@@ -280,8 +324,7 @@ bool AgentMemory::DecodeMetadata(const std::string& encoded,
 Status AgentMemory::AppendMessage(const AgentMemoryRecord& record,
                                   VectorId* out_id)
 {
-    std::unique_lock<std::mutex> lock(mu_);
-    auto st = EnsureOpenLocked();
+    auto st = EnsureOpen();
     if (!st.ok())
         return st;
     if (record.embedding.size() != dim_)
@@ -305,8 +348,6 @@ Status AgentMemory::AppendMessage(const AgentMemoryRecord& record,
         *out_id = id;
     }
 
-    lock.unlock();
-
     // Lazy per-agent pruning based on soft cap.
     if (options_.max_messages_per_agent > 0)
     {
@@ -325,8 +366,7 @@ Status AgentMemory::AppendMessage(const AgentMemoryRecord& record,
 Status AgentMemory::AppendBatch(const std::vector<AgentMemoryRecord>& records,
                                 std::vector<VectorId>* out_ids)
 {
-    std::unique_lock<std::mutex> lock(mu_);
-    auto st = EnsureOpenLocked();
+    auto st = EnsureOpen();
     if (!st.ok())
         return st;
     if (records.empty())
@@ -372,8 +412,6 @@ Status AgentMemory::AppendBatch(const std::vector<AgentMemoryRecord>& records,
 
     (void)db_->TryFreezeIfPressured();
 
-    lock.unlock();
-
     // Soft caps checked against the last record's agent / device totals.
     if (!records.empty() && options_.max_messages_per_agent > 0)
     {
@@ -396,8 +434,7 @@ Status AgentMemory::GetRecent(std::string_view agent_id,
 {
     if (!out)
         return Status::InvalidArgument("out is null");
-    std::lock_guard<std::mutex> lock(mu_);
-    auto st = EnsureOpenLocked();
+    auto st = EnsureOpen();
     if (!st.ok())
         return st;
 
@@ -465,7 +502,7 @@ Status AgentMemory::GetRecent(std::string_view agent_id,
     return Status::Ok();
 }
 
-Status AgentMemory::SearchAndFilterLocked(const AgentMemoryQuery& query,
+Status AgentMemory::SearchAndFilter(const AgentMemoryQuery& query,
                                           AgentMemorySearchResult* out)
 {
     if (!out)
@@ -488,6 +525,24 @@ Status AgentMemory::SearchAndFilterLocked(const AgentMemoryQuery& query,
                           internal_topk, &raw);
     if (!st.ok())
         return st;
+
+    if (raw.hits.empty())
+    {
+        // Fallback: ANN index may temporarily have no visible hits while writes
+        // are still resident in the active memtable. Probe known ids directly.
+        std::vector<float> probe_vec;
+        Metadata probe_meta;
+        for (VectorId id = 1; id < next_id_; ++id)
+        {
+            probe_vec.clear();
+            probe_meta = Metadata();
+            if (!db_->Get(id, &probe_vec, &probe_meta).ok())
+            {
+                continue;
+            }
+            raw.hits.push_back(SearchHit{id, 0.0f, {}});
+        }
+    }
 
     out->Clear();
     std::vector<float> tmp_vec;
@@ -525,12 +580,28 @@ Status AgentMemory::SearchAndFilterLocked(const AgentMemoryQuery& query,
         }
         AgentMemoryHit hit;
         hit.record = std::move(rec);
-        hit.score = h.score;
+        hit.score = (h.score != 0.0f)
+                        ? h.score
+                        : ComputeFallbackScore(
+                              std::span<const float>(query.embedding.data(), query.embedding.size()),
+                              std::span<const float>(tmp_vec.data(), tmp_vec.size()),
+                              options_.metric);
         out->hits.push_back(std::move(hit));
-        if (out->hits.size() >= query.topk)
-        {
-            break;
-        }
+    }
+
+    std::sort(out->hits.begin(), out->hits.end(),
+              [](const AgentMemoryHit& a, const AgentMemoryHit& b) {
+                  return a.score > b.score;
+              });
+
+    if (out->hits.size() > query.topk)
+    {
+        out->hits.resize(query.topk);
+    }
+
+    if (query.topk == 0)
+    {
+        out->hits.clear();
     }
 
     return Status::Ok();
@@ -539,19 +610,18 @@ Status AgentMemory::SearchAndFilterLocked(const AgentMemoryQuery& query,
 Status AgentMemory::SemanticSearch(const AgentMemoryQuery& query,
                                    AgentMemorySearchResult* out)
 {
-    std::lock_guard<std::mutex> lock(mu_);
-    auto st = EnsureOpenLocked();
+    auto st = EnsureOpen();
     if (!st.ok())
         return st;
-    return SearchAndFilterLocked(query, out);
+    return SearchAndFilter(query, out);
 }
 
-Status AgentMemory::CollectPruneEntriesLocked(
+Status AgentMemory::CollectPruneEntries(
     std::vector<PruneEntry>* out_entries) const
 {
     if (!out_entries)
         return Status::InvalidArgument("out_entries is null");
-    auto st = EnsureOpenLocked();
+    auto st = EnsureOpen();
     if (!st.ok())
         return st;
 
@@ -599,9 +669,8 @@ Status AgentMemory::PruneOld(std::string_view agent_id,
                              std::size_t keep_last_n,
                              std::int64_t min_ts_to_keep)
 {
-    std::lock_guard<std::mutex> lock(mu_);
     std::vector<PruneEntry> entries;
-    auto st = CollectPruneEntriesLocked(&entries);
+    auto st = CollectPruneEntries(&entries);
     if (!st.ok())
         return st;
 
@@ -648,9 +717,8 @@ Status AgentMemory::PruneOld(std::string_view agent_id,
 
 Status AgentMemory::PruneDeviceWide(std::size_t target_total_bytes)
 {
-    std::lock_guard<std::mutex> lock(mu_);
     std::vector<PruneEntry> entries;
-    auto st = CollectPruneEntriesLocked(&entries);
+    auto st = CollectPruneEntries(&entries);
     if (!st.ok())
         return st;
     if (entries.empty())
@@ -694,8 +762,7 @@ Status AgentMemory::PruneDeviceWide(std::size_t target_total_bytes)
 
 Status AgentMemory::FreezeIfNeeded()
 {
-    std::lock_guard<std::mutex> lock(mu_);
-    auto st = EnsureOpenLocked();
+    auto st = EnsureOpen();
     if (!st.ok())
         return st;
     return db_->TryFreezeIfPressured();

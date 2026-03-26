@@ -32,16 +32,7 @@ struct XxHash64ForVectorId {
   }
 };
 
-// Single-threaded: no concurrency, plain counter for consistency checks.
-class Seqlock {
- public:
-  void BeginWrite() noexcept { seq_ |= 1u; }
-  void EndWrite() noexcept { seq_ = (seq_ + 1u) & ~uint64_t(1); }
-  uint64_t BeginRead() const noexcept { return seq_ & ~uint64_t(1); }
-  bool EndRead(uint64_t s) const noexcept { return seq_ == s; }
- private:
-  uint64_t seq_{0};
-};
+// Single-threaded: no concurrency needed.
 
 class MemTable {
 public:
@@ -232,7 +223,6 @@ private:
     mutable std::unordered_map<pomai::VectorId, pomai::Metadata> metadata_;
     mutable std::multimap<uint64_t, pomai::VectorId> temporal_index_;
     mutable core::LexicalIndex lexical_index_;
-    Seqlock seqlock_;
 };
 
 } // namespace pomai::table

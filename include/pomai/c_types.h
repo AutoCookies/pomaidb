@@ -41,6 +41,23 @@ typedef enum {
     POMAI_FSYNC_POLICY_ALWAYS = 1,
 } pomai_fsync_policy_t;
 
+typedef uint64_t pomai_vertex_id_t;
+typedef uint32_t pomai_edge_type_t;
+typedef uint32_t pomai_tag_id_t;
+
+typedef struct {
+    pomai_vertex_id_t dst;
+    pomai_edge_type_t type;
+    uint32_t rank;
+} pomai_neighbor_t;
+
+typedef enum {
+    POMAI_EMBEDDED_PRESET_GENERIC = 0,
+    POMAI_EMBEDDED_PRESET_ESP32_S3 = 1,
+    POMAI_EMBEDDED_PRESET_ARM_CORTEX_M85 = 2,
+    POMAI_EMBEDDED_PRESET_RPI_ZERO_2W = 3,
+} pomai_embedded_preset_t;
+
 typedef struct {
     uint32_t struct_size;
     const char* path;
@@ -129,6 +146,16 @@ typedef struct {
 
 typedef struct {
     uint32_t struct_size;
+    const float* vector;
+    uint32_t dim;
+    uint32_t top_k;
+    uint32_t graph_hops;
+    const char* filter_expression;
+    uint32_t deadline_ms;
+} pomai_multi_modal_query_t;
+
+typedef struct {
+    uint32_t struct_size;
     size_t count;
     uint64_t* ids;
     float* scores;
@@ -139,6 +166,10 @@ typedef struct {
     uint32_t aggregate_op;
     uint32_t mesh_lod_level; // reserved for mesh result paths
     pomai_semantic_pointer_t* zero_copy_pointers;
+    
+    // Graph extension
+    pomai_neighbor_t* neighbors;
+    size_t neighbors_count;
 } pomai_search_results_t;
 
 POMAI_API pomai_status_t* pomai_search_batch(

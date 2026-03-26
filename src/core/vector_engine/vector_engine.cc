@@ -353,6 +353,22 @@ Status VectorEngine::Search(std::span<const float> query,
     return Status::Ok();
 }
 
+Status VectorEngine::Search(std::span<const float> query,
+                            std::uint32_t topk,
+                            const SearchOptions& opts,
+                            pomai::SearchHitSink& sink) {
+    auto st = EnsureOpen();
+    if (!st.ok()) return st;
+
+    if (static_cast<std::uint32_t>(query.size()) != opt_.dim) {
+        return Status::InvalidArgument("vector_engine dim mismatch");
+    }
+    if (topk == 0) return Status::Ok();
+
+    // Re-use core VectorRuntime internal search logic directly
+    return runtime_->Search(query, topk, opts, sink);
+}
+
 Status VectorEngine::SearchBatch(std::span<const float> queries,
                                  uint32_t num_queries,
                                  uint32_t topk,

@@ -81,6 +81,11 @@ public:
                   std::uint32_t topk,
                   const SearchOptions& opts,
                   pomai::SearchResult* out);
+    /** @brief Zero-copy search directly into a sink. skips SearchResult allocation/copy. */
+    Status Search(std::span<const float> query,
+                  std::uint32_t topk,
+                  const SearchOptions& opts,
+                  pomai::SearchHitSink& sink);
     Status SearchLexical(const std::string& query,
                         std::uint32_t topk,
                         std::vector<LexicalHit>* out);

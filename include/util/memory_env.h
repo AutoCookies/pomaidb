@@ -5,7 +5,6 @@
 
 #include "pomai/env.h"
 
-#include <mutex>
 #include <unordered_map>
 
 namespace pomai {
@@ -35,7 +34,6 @@ class InMemoryEnv : public Env {
 
  private:
   std::unordered_map<std::string, std::string> files_;
-  std::mutex mu_;
 };
 
 }  // namespace pomai

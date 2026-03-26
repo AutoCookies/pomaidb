@@ -32,17 +32,19 @@ namespace pomai::core {
                 break;
             }
             case 0x03: { // Search
-                // Payload is topk (4) + query (dim*4)
-                if (msg.payload.size() < 4) return;
-                uint32_t topk = *reinterpret_cast<const uint32_t*>(msg.payload.data());
-                std::span<const float> query(
-                    reinterpret_cast<const float*>(msg.payload.data() + 4),
-                    (msg.payload.size() - 4) / 4
-                );
+                struct P {
+                    uint32_t topk;
+                    const float* query_data;
+                    size_t query_size;
+                    const SearchOptions* opts;
+                };
+                if (msg.payload.size() < sizeof(P)) return;
+                const auto* p = reinterpret_cast<const P*>(msg.payload.data());
                 if (msg.result_ptr) {
                     auto* out = static_cast<SearchResult*>(msg.result_ptr);
                     std::vector<SearchHit> hits;
-                    auto st = runtime_->Search(query, topk, SearchOptions(), &hits);
+                    std::span<const float> query(p->query_data, p->query_size);
+                    auto st = runtime_->Search(query, p->topk, *p->opts, &hits);
                     if (st.ok()) {
                         out->hits = std::move(hits);
                         out->routed_shards_count = 1;

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <span>
 #include <string>
+#include <queue>
 #include <vector>
 
 #include "palloc_compat.h"
@@ -35,6 +36,7 @@ struct SearchResultsWrapper {
     std::vector<uint64_t> ids;
     std::vector<float> scores;
     std::vector<uint32_t> shard_ids;
+    std::vector<pomai_neighbor_t> neighbors;
 };
 
 constexpr uint32_t MinOptionsStructSize() {
@@ -142,6 +144,41 @@ pomai::Metadata ToMetadata(const pomai_upsert_t& item) {
     return m;
 }
 
+/**
+ * @brief Sink that collects hits directly for the C ABI, avoiding metadata overhead.
+ */
+class CApiHitSink final : public pomai::SearchHitSink {
+public:
+    explicit CApiHitSink(std::uint32_t k) : k_(k), heap_(pomai::WorseHit()) {}
+
+    void Push(pomai::VectorId id, float score) override {
+        if (k_ == 0) return;
+        pomai::SearchHit hit{id, score, {}};
+        if (heap_.size() < k_) {
+            heap_.push(hit);
+        } else if (pomai::IsBetterHit(hit, heap_.top())) {
+            heap_.pop();
+            heap_.push(hit);
+        }
+    }
+
+    void Finalize(std::vector<uint64_t>& ids, std::vector<float>& scores) {
+        size_t n = heap_.size();
+        ids.resize(n);
+        scores.resize(n);
+        for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
+            const auto& top = heap_.top();
+            ids[i] = top.id;
+            scores[i] = top.score;
+            heap_.pop();
+        }
+    }
+
+private:
+    std::uint32_t k_;
+    std::priority_queue<pomai::SearchHit, std::vector<pomai::SearchHit>, pomai::WorseHit> heap_;
+};
+
 }  // namespace
 
 struct pomai_rag_pipeline_t {
@@ -162,9 +199,7 @@ uint32_t pomai_abi_version(void) {
 }
 
 void pomai_options_init(pomai_options_t* opts) {
-    if (opts == nullptr) {
-        return;
-    }
+    if (opts == nullptr) return;
     opts->struct_size = static_cast<uint32_t>(sizeof(pomai_options_t));
     opts->path = nullptr;
     opts->shards = 4;
@@ -187,6 +222,26 @@ void pomai_options_init(pomai_options_t* opts) {
     opts->gateway_upstream_sync_enabled = false;
     opts->gateway_require_mtls_proxy_header = false;
     opts->gateway_mtls_proxy_header = nullptr;
+}
+
+void pomai_options_apply_preset(pomai_options_t* opts, pomai_embedded_preset_t preset) {
+    if (opts == nullptr) return;
+    pomai::DBOptions db_opts;
+    // Map C preset to C++ EdgeProfile
+    pomai::EdgeProfile profile = pomai::EdgeProfile::kUserDefined;
+    if (preset == POMAI_EMBEDDED_PRESET_ESP32_S3) profile = pomai::EdgeProfile::kLowRam;
+    else if (preset == POMAI_EMBEDDED_PRESET_ARM_CORTEX_M85) profile = pomai::EdgeProfile::kBalanced;
+    else if (preset == POMAI_EMBEDDED_PRESET_RPI_ZERO_2W) profile = pomai::EdgeProfile::kThroughput;
+    
+    db_opts.edge_profile = profile;
+    db_opts.ApplyEdgeProfile();
+    
+    // Copy resolved values back to C struct
+    opts->edge_profile = static_cast<uint8_t>(profile);
+    opts->shards = db_opts.shard_count;
+    opts->hnsw_m = db_opts.index_params.hnsw_m;
+    opts->hnsw_ef_construction = db_opts.index_params.hnsw_ef_construction;
+    opts->hnsw_ef_search = db_opts.index_params.hnsw_ef_search;
 }
 
 void pomai_scan_options_init(pomai_scan_options_t* opts) {
@@ -483,7 +538,6 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
         return MakeStatus(POMAI_STATUS_DEADLINE_EXCEEDED, "deadline exceeded before search");
     }
 
-    pomai::SearchResult res;
     pomai::SearchOptions opts;
     if (!ParseTenantFilter(query->filter_expression, &opts)) {
         return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "filter_expression must use tenant/device_id/location_id=<value>");
@@ -498,7 +552,8 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
         opts.zero_copy = true;
     }
 
-    auto st = db->db->Search(std::span<const float>(query->vector, query->dim), query->topk, opts, &res);
+    CApiHitSink sink(query->topk);
+    auto st = db->db->SearchVector(std::span<const float>(query->vector, query->dim), query->topk, opts, sink);
     if (!st.ok() && st.code() != pomai::ErrorCode::kPartial) {
         return ToCStatus(st);
     }
@@ -510,58 +565,27 @@ pomai_status_t* pomai_search(pomai_db_t* db, const pomai_query_t* query, pomai_s
     void* raw = palloc_malloc_aligned(sizeof(SearchResultsWrapper), alignof(SearchResultsWrapper));
     if (!raw) return MakeStatus(POMAI_STATUS_RESOURCE_EXHAUSTED, "search results allocation failed");
     auto* w = new (raw) SearchResultsWrapper();
-    w->ids.reserve(res.hits.size());
-    w->scores.reserve(res.hits.size());
-    w->shard_ids.reserve(res.hits.size());
-    for (const auto& hit : res.hits) {
-        w->ids.push_back(hit.id);
-        w->scores.push_back(hit.score);
-        w->shard_ids.push_back(UINT32_MAX);
-    }
+    
+    sink.Finalize(w->ids, w->scores);
+    w->shard_ids.assign(w->ids.size(), UINT32_MAX);
 
     w->pub.struct_size = static_cast<uint32_t>(sizeof(pomai_search_results_t));
     w->pub.count = w->ids.size();
     w->pub.ids = w->ids.data();
     w->pub.scores = w->scores.data();
     w->pub.shard_ids = w->shard_ids.data();
-    w->pub.total_shards_count = res.total_shards_count;
-    w->pub.pruned_shards_count = res.pruned_shards_count;
+    w->pub.total_shards_count = 1; // Single-threaded edge default
+    w->pub.pruned_shards_count = 0;
     w->pub.aggregate_value = 0.0;
     w->pub.aggregate_op = 0;
-    w->pub.mesh_lod_level = 0;
-    if (!res.aggregates.empty()) {
-        w->pub.aggregate_value = res.aggregates.front().value;
-        w->pub.aggregate_op = static_cast<uint32_t>(res.aggregates.front().op);
-    } else if (query->struct_size >= static_cast<uint32_t>(sizeof(pomai_query_t)) && query->aggregate_op != 0) {
-        w->pub.aggregate_value = ComputeAggregateValue(query->aggregate_op, res.hits);
+    if (query->struct_size >= static_cast<uint32_t>(sizeof(pomai_query_t)) && query->aggregate_op != 0) {
         w->pub.aggregate_op = query->aggregate_op;
     }
-    if (opts.zero_copy && !res.zero_copy_pointers.empty()) {
-        size_t n = res.zero_copy_pointers.size();
-        w->pub.zero_copy_pointers = static_cast<pomai_semantic_pointer_t*>(
-            palloc_malloc_aligned(n * sizeof(pomai_semantic_pointer_t), alignof(pomai_semantic_pointer_t)));
-        if (w->pub.zero_copy_pointers) {
-            for (size_t i = 0; i < n; ++i) {
-                w->pub.zero_copy_pointers[i].struct_size = sizeof(pomai_semantic_pointer_t);
-                w->pub.zero_copy_pointers[i].raw_data_ptr = res.zero_copy_pointers[i].raw_data_ptr;
-                w->pub.zero_copy_pointers[i].dim = res.zero_copy_pointers[i].dim;
-                w->pub.zero_copy_pointers[i].quant_min = res.zero_copy_pointers[i].quant_min;
-                w->pub.zero_copy_pointers[i].quant_inv_scale = res.zero_copy_pointers[i].quant_inv_scale;
-                w->pub.zero_copy_pointers[i].session_id = res.zero_copy_pointers[i].session_id;
-            }
-        } else {
-            w->pub.zero_copy_pointers = nullptr;
-        }
-    } else {
-        w->pub.zero_copy_pointers = nullptr;
-    }
+    w->pub.zero_copy_pointers = nullptr;
     *out = &w->pub;
 
     if (st.code() == pomai::ErrorCode::kPartial) {
         return MakeStatus(POMAI_STATUS_PARTIAL_FAILURE, st.message());
-    }
-    if (!res.errors.empty()) {
-        return MakeStatus(POMAI_STATUS_PARTIAL_FAILURE, "partial shard failures");
     }
     return nullptr;
 }
@@ -683,6 +707,95 @@ void pomai_search_results_free(pomai_search_results_t* results) {
     auto* w = reinterpret_cast<SearchResultsWrapper*>(results);
     w->~SearchResultsWrapper();
     palloc_free(w);
+}
+
+pomai_status_t* pomai_graph_add_vertex(pomai_db_t* db, pomai_vertex_id_t id, pomai_tag_id_t tag, const uint8_t* metadata, size_t metadata_len) {
+    if (!db || !db->db) return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "db is null");
+    pomai::Metadata meta(metadata ? std::string(reinterpret_cast<const char*>(metadata), metadata_len) : "");
+    return ToCStatus(db->db->AddVertex(id, tag, meta));
+}
+
+pomai_status_t* pomai_graph_add_edge(pomai_db_t* db, pomai_vertex_id_t src, pomai_vertex_id_t dst, pomai_edge_type_t type, uint32_t rank, const uint8_t* metadata, size_t metadata_len) {
+    if (!db || !db->db) return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "db is null");
+    pomai::Metadata meta(metadata ? std::string(reinterpret_cast<const char*>(metadata), metadata_len) : "");
+    return ToCStatus(db->db->AddEdge(src, dst, static_cast<pomai::EdgeType>(type), rank, meta));
+}
+
+pomai_status_t* pomai_graph_get_neighbors(pomai_db_t* db, pomai_vertex_id_t src, pomai_neighbor_t** out_neighbors, size_t* out_count) {
+    if (!db || !db->db || !out_neighbors || !out_count) return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "invalid args");
+    std::vector<pomai::Neighbor> neighbors;
+    auto st = db->db->GetNeighbors(src, &neighbors);
+    if (!st.ok()) return ToCStatus(st);
+    
+    if (neighbors.empty()) {
+        *out_neighbors = nullptr;
+        *out_count = 0;
+        return nullptr;
+    }
+    
+    pomai_neighbor_t* arr = static_cast<pomai_neighbor_t*>(palloc_malloc_aligned(neighbors.size() * sizeof(pomai_neighbor_t), alignof(pomai_neighbor_t)));
+    if (!arr) return MakeStatus(POMAI_STATUS_RESOURCE_EXHAUSTED, "allocation failed");
+    
+    for (size_t i = 0; i < neighbors.size(); ++i) {
+        arr[i].dst = neighbors[i].id;
+        arr[i].type = static_cast<pomai_edge_type_t>(neighbors[i].type);
+        arr[i].rank = neighbors[i].rank;
+    }
+    *out_neighbors = arr;
+    *out_count = neighbors.size();
+    return nullptr;
+}
+
+void pomai_graph_neighbors_free(pomai_neighbor_t* neighbors) {
+    if (neighbors) palloc_free(neighbors);
+}
+
+pomai_status_t* pomai_search_multi_modal(pomai_db_t* db, const pomai_multi_modal_query_t* query, pomai_search_results_t** out) {
+    if (!db || !db->db || !query || !out) return MakeStatus(POMAI_STATUS_INVALID_ARGUMENT, "invalid args");
+    
+    pomai::MultiModalQuery mm_query;
+    if (query->vector && query->dim > 0) {
+        mm_query.vector.assign(query->vector, query->vector + query->dim);
+    }
+    mm_query.top_k = query->top_k;
+    mm_query.graph_hops = query->graph_hops;
+    
+    pomai::SearchResult res;
+    auto st = db->db->SearchMultiModal(mm_query, &res);
+    if (!st.ok()) return ToCStatus(st);
+    
+    void* raw = palloc_malloc_aligned(sizeof(SearchResultsWrapper), alignof(SearchResultsWrapper));
+    if (!raw) return MakeStatus(POMAI_STATUS_RESOURCE_EXHAUSTED, "allocation failed");
+    auto* w = new (raw) SearchResultsWrapper();
+    
+    w->ids.reserve(res.hits.size());
+    w->scores.reserve(res.hits.size());
+    for (const auto& hit : res.hits) {
+        w->ids.push_back(hit.id);
+        w->scores.push_back(hit.score);
+    }
+    
+    w->pub.struct_size = sizeof(pomai_search_results_t);
+    w->pub.count = w->ids.size();
+    w->pub.ids = w->ids.data();
+    w->pub.scores = w->scores.data();
+    
+    // Fill neighbors if present (GraphRAG results often use neighbors_count)
+    if (!res.neighbors.empty()) {
+        w->neighbors.reserve(res.neighbors.size());
+        for (const auto& n : res.neighbors) {
+            pomai_neighbor_t nb;
+            nb.dst = n.id;
+            nb.type = static_cast<pomai_edge_type_t>(n.type);
+            nb.rank = n.rank;
+            w->neighbors.push_back(nb);
+        }
+        w->pub.neighbors = w->neighbors.data();
+        w->pub.neighbors_count = w->neighbors.size();
+    }
+    
+    *out = &w->pub;
+    return nullptr;
 }
 
 pomai_status_t* pomai_create_membrane_kind(pomai_db_t* db, const char* name, uint32_t dim, uint32_t shard_count, uint32_t kind) {

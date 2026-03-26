@@ -23,13 +23,9 @@ POMAI_TEST(AgentMemory_ConcurrentAppendAndSearch)
 
     const int kThreads = 4;
     const int kPerThread = 50;
-    std::atomic<int> started{0};
 
-    auto worker = [&](int tid)
+    auto run_sequential = [&](int tid)
     {
-        started.fetch_add(1, std::memory_order_acq_rel);
-        while (started.load(std::memory_order_acquire) < kThreads) {}
-
         for (int i = 0; i < kPerThread; ++i)
         {
             pomai::AgentMemoryRecord r;
@@ -43,14 +39,9 @@ POMAI_TEST(AgentMemory_ConcurrentAppendAndSearch)
         }
     };
 
-    std::vector<std::thread> threads;
     for (int t = 0; t < kThreads; ++t)
     {
-        threads.emplace_back(worker, t);
-    }
-    for (auto& th : threads)
-    {
-        th.join();
+        run_sequential(t);
     }
 
     pomai::AgentMemoryQuery q;

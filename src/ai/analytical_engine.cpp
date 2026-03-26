@@ -2,6 +2,7 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
+#include <mutex>
 
 namespace pomai::core {
 

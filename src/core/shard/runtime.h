@@ -142,6 +142,9 @@ namespace pomai::core
         std::shared_ptr<VectorSnapshot> GetSnapshot() {
              return current_snapshot_;
         }
+        std::shared_ptr<table::MemTable> GetActiveMemTable() {
+             return mem_;
+        }
 
         pomai::Status GetSemanticPointer(std::shared_ptr<VectorSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out);
 
@@ -152,6 +155,11 @@ namespace pomai::core
                              std::uint32_t topk,
                              const SearchOptions& opts,
                              std::vector<pomai::SearchHit> *out); // Overload
+        /** @brief Zero-copy search directly into a sink. skips intermediate vector. */
+        pomai::Status Search(std::span<const float> query,
+                             std::uint32_t topk,
+                             const SearchOptions& opts,
+                             SearchHitSink& sink);
 
         pomai::Status SearchLexical(const std::string& query,
                                    std::uint32_t topk,
@@ -208,7 +216,7 @@ namespace pomai::core
                                           const pomai::SearchOptions& opts,
                                           SearchMergePolicy& merge_policy,
                                           bool use_visibility,
-                                          std::vector<pomai::SearchHit>* out,
+                                          pomai::SearchHitSink& sink,
                                           bool use_pool);
 
                                           

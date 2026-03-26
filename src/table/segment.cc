@@ -602,7 +602,6 @@ namespace pomai::table
     }
 
     void SegmentReader::EnsureLexicalIndexBuilt() const {
-        std::lock_guard<std::mutex> lock(lexical_init_mutex_);
         if (lexical_index_) return;
         
         lexical_index_ = std::make_unique<core::LexicalIndex>();

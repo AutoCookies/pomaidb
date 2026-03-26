@@ -106,9 +106,7 @@ pomai::Status MemTable::Put(pomai::VectorId id, pomai::VectorView vec,
         std::memcpy(dst, vec.data, vec.size_bytes());
     }
 
-    seqlock_.BeginWrite();
     map_.Put(id, dst);
-    seqlock_.EndWrite();
 
     // Temporal Index Management
     auto it_old = metadata_.find(id);
@@ -162,10 +160,8 @@ pomai::Status MemTable::PutBatch(const std::vector<pomai::VectorId>& ids,
         ptrs.push_back(dst);
     }
 
-    seqlock_.BeginWrite();
     for (std::size_t i = 0; i < ids.size(); ++i)
         map_.Put(ids[i], ptrs[i]);
-    seqlock_.EndWrite();
 
     return pomai::Status::Ok();
 }
@@ -174,9 +170,7 @@ pomai::Status MemTable::PutBatch(const std::vector<pomai::VectorId>& ids,
 // Delete (tombstone)
 // ------------------------------------------------
 pomai::Status MemTable::Delete(pomai::VectorId id) {
-    seqlock_.BeginWrite();
     map_.Put(id, nullptr); // nullptr = tombstone
-    seqlock_.EndWrite();
 
     auto it = metadata_.find(id);
     if (it != metadata_.end()) {
@@ -211,14 +205,8 @@ pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec,
                             pomai::Metadata* out_meta) const {
     if (!out_vec) return Status::InvalidArgument("out_vec is null");
 
-    // Seqlock read: retry if write is in progress.
-    float* ptr = nullptr;
-    uint64_t seq;
-    do {
-        seq = seqlock_.BeginRead();
-        auto* v = map_.Find(id);
-        ptr = v ? *v : nullptr;
-    } while (!seqlock_.EndRead(seq));
+    auto* v = map_.Find(id);
+    const float* ptr = v ? *v : nullptr;
 
     if (ptr == nullptr) {
         *out_vec = nullptr;
@@ -237,9 +225,7 @@ pomai::Status MemTable::Get(pomai::VectorId id, const float** out_vec,
 // Clear
 // ------------------------------------------------
 void MemTable::Clear() {
-    seqlock_.BeginWrite();
     map_.Clear();
-    seqlock_.EndWrite();
 
     metadata_.clear();
     temporal_index_.clear();
@@ -253,14 +239,9 @@ void MemTable::Clear() {
 MemTable::Cursor MemTable::CreateCursor() const {
     std::vector<Cursor::Entry> snap;
     // Snapshot the table under a seqlock read.
-    uint64_t seq;
-    do {
-        seq = seqlock_.BeginRead();
-        snap.clear();
-        map_.ForEach([&](const pomai::VectorId& id, float* const& ptr) {
-            snap.push_back({id, ptr});
-        });
-    } while (!seqlock_.EndRead(seq));
+    map_.ForEach([&](const pomai::VectorId& id, float* const& ptr) {
+        snap.push_back({id, ptr});
+    });
 
     return Cursor(this, std::move(snap), quantize_inmem_);
 }

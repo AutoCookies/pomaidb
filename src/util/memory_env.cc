@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <mutex>
 #include <unordered_map>
 
 namespace pomai {
@@ -84,11 +83,9 @@ class InMemoryRandomAccessFile : public RandomAccessFile {
 // -----------------------------------------------------------------------------
 class InMemoryWritableFile : public WritableFile {
  public:
-  InMemoryWritableFile(std::string path, FileMap* files, std::mutex* mu,
-                       bool append)
-      : path_(std::move(path)), files_(files), mu_(mu), append_(append) {
+  InMemoryWritableFile(std::string path, FileMap* files, bool append)
+      : path_(std::move(path)), files_(files), append_(append) {
     if (append_) {
-      std::lock_guard<std::mutex> lock(*mu_);
       auto it = files_->find(path_);
       if (it != files_->end()) content_ = it->second;
     }
@@ -109,7 +106,6 @@ class InMemoryWritableFile : public WritableFile {
   Status Close() override {
     if (closed_) return Status::Ok();
     closed_ = true;
-    std::lock_guard<std::mutex> lock(*mu_);
     (*files_)[path_] = std::move(content_);
     return Status::Ok();
   }
@@ -117,7 +113,6 @@ class InMemoryWritableFile : public WritableFile {
  private:
   std::string path_;
   FileMap* files_ = nullptr;
-  std::mutex* mu_ = nullptr;
   bool append_ = false;
   bool closed_ = false;
   std::string content_;
@@ -146,7 +141,6 @@ class InMemoryFileMapping : public FileMapping {
 // -----------------------------------------------------------------------------
 Status InMemoryEnv::NewSequentialFile(const std::string& path,
                                      std::unique_ptr<SequentialFile>* result) {
-  std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(path);
   if (it == files_.end()) return Status::NotFound("file does not exist");
   *result = std::make_unique<InMemorySequentialFile>(it->second);
@@ -155,7 +149,6 @@ Status InMemoryEnv::NewSequentialFile(const std::string& path,
 
 Status InMemoryEnv::NewRandomAccessFile(const std::string& path,
                                         std::unique_ptr<RandomAccessFile>* result) {
-  std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(path);
   if (it == files_.end()) return Status::NotFound("file does not exist");
   *result = std::make_unique<InMemoryRandomAccessFile>(it->second);
@@ -164,19 +157,18 @@ Status InMemoryEnv::NewRandomAccessFile(const std::string& path,
 
 Status InMemoryEnv::NewWritableFile(const std::string& path,
                                     std::unique_ptr<WritableFile>* result) {
-  *result = std::make_unique<InMemoryWritableFile>(path, &files_, &mu_, false);
+  *result = std::make_unique<InMemoryWritableFile>(path, &files_, false);
   return Status::Ok();
 }
 
 Status InMemoryEnv::NewAppendableFile(const std::string& path,
                                      std::unique_ptr<WritableFile>* result) {
-  *result = std::make_unique<InMemoryWritableFile>(path, &files_, &mu_, true);
+  *result = std::make_unique<InMemoryWritableFile>(path, &files_, true);
   return Status::Ok();
 }
 
 Status InMemoryEnv::NewFileMapping(const std::string& path,
                                    std::unique_ptr<FileMapping>* result) {
-  std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(path);
   if (it == files_.end()) return Status::NotFound("file does not exist");
   *result = std::make_unique<InMemoryFileMapping>(it->second);
@@ -184,13 +176,11 @@ Status InMemoryEnv::NewFileMapping(const std::string& path,
 }
 
 Status InMemoryEnv::FileExists(const std::string& path) {
-  std::lock_guard<std::mutex> lock(mu_);
   return files_.count(path) ? Status::Ok() : Status::NotFound("file does not exist");
 }
 
 Status InMemoryEnv::GetFileSize(const std::string& path, uint64_t* size) {
   if (!size) return Status::InvalidArgument("size is null");
-  std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(path);
   if (it == files_.end()) return Status::NotFound("file does not exist");
   *size = static_cast<uint64_t>(it->second.size());
@@ -198,13 +188,11 @@ Status InMemoryEnv::GetFileSize(const std::string& path, uint64_t* size) {
 }
 
 Status InMemoryEnv::DeleteFile(const std::string& path) {
-  std::lock_guard<std::mutex> lock(mu_);
   files_.erase(path);
   return Status::Ok();
 }
 
 Status InMemoryEnv::RenameFile(const std::string& src, const std::string& dst) {
-  std::lock_guard<std::mutex> lock(mu_);
   auto it = files_.find(src);
   if (it == files_.end()) return Status::NotFound("file does not exist");
   std::string content = std::move(it->second);

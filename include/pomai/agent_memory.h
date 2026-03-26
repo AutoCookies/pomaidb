@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -149,7 +148,7 @@ namespace pomai
 
     private:
 
-        Status EnsureOpenLocked() const;
+        Status EnsureOpen() const;
 
         // Encode/decode helper for mapping AgentMemoryRecord into Metadata.tenant.
         static std::string EncodeMetadata(const AgentMemoryRecord& record);
@@ -168,13 +167,12 @@ namespace pomai
             std::size_t approx_bytes;
         };
 
-        Status CollectPruneEntriesLocked(std::vector<PruneEntry>* out_entries) const;
+        Status CollectPruneEntries(std::vector<PruneEntry>* out_entries) const;
 
         // Core search helper used by SemanticSearch.
-        Status SearchAndFilterLocked(const AgentMemoryQuery& query,
+        Status SearchAndFilter(const AgentMemoryQuery& query,
                                      AgentMemorySearchResult* out);
 
-        mutable std::mutex mu_;
         AgentMemoryOptions options_;
         std::unique_ptr<Database> db_;
         std::uint32_t dim_ = 0;

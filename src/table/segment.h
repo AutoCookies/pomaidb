@@ -238,7 +238,6 @@ namespace pomai::table
         
         // V7: Lexical Index support
         mutable std::unique_ptr<core::LexicalIndex> lexical_index_;
-        mutable std::mutex lexical_init_mutex_;
         
         // Internal helpers
         void GetMetadata(uint32_t index, pomai::Metadata* out) const;

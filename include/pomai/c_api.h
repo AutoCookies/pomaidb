@@ -19,6 +19,8 @@ POMAI_API void pomai_membrane_capabilities_init(pomai_membrane_capabilities_t* c
 POMAI_API pomai_status_t* pomai_membrane_kind_capabilities(uint8_t kind, pomai_membrane_capabilities_t* out_caps);
 // Resolve effective runtime options after applying edge profile.
 POMAI_API pomai_status_t* pomai_options_resolve_json(const pomai_options_t* opts, char** out_json, size_t* out_len);
+/** Apply a hardware-specific configuration preset to the options. */
+POMAI_API void pomai_options_apply_preset(pomai_options_t* opts, pomai_embedded_preset_t preset);
 
 // Database Management
 POMAI_API pomai_status_t* pomai_open(const pomai_options_t* opts, pomai_db_t** out_db);
@@ -65,6 +67,15 @@ POMAI_API pomai_status_t* pomai_get_membrane_retention_json(
     pomai_db_t* db, const char* membrane_name, char** out_json, size_t* out_len);
 POMAI_API pomai_status_t* pomai_sketch_add(pomai_db_t* db, const char* membrane_name, const char* key, uint64_t increment);
 POMAI_API pomai_status_t* pomai_blob_put(pomai_db_t* db, const char* membrane_name, uint64_t blob_id, const uint8_t* data, size_t len);
+
+// Graph operations
+POMAI_API pomai_status_t* pomai_graph_add_vertex(pomai_db_t* db, pomai_vertex_id_t id, pomai_tag_id_t tag, const uint8_t* metadata, size_t metadata_len);
+POMAI_API pomai_status_t* pomai_graph_add_edge(pomai_db_t* db, pomai_vertex_id_t src, pomai_vertex_id_t dst, pomai_edge_type_t type, uint32_t rank, const uint8_t* metadata, size_t metadata_len);
+POMAI_API pomai_status_t* pomai_graph_get_neighbors(pomai_db_t* db, pomai_vertex_id_t src, pomai_neighbor_t** out_neighbors, size_t* out_count);
+POMAI_API void pomai_graph_neighbors_free(pomai_neighbor_t* neighbors);
+
+// Multi-modal search
+POMAI_API pomai_status_t* pomai_search_multi_modal(pomai_db_t* db, const pomai_multi_modal_query_t* query, pomai_search_results_t** out);
 
 // RAG membrane and search
 POMAI_API pomai_status_t* pomai_create_rag_membrane(pomai_db_t* db, const char* name, uint32_t dim, uint32_t shard_count);

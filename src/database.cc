@@ -173,12 +173,15 @@ Status StorageEngine::Delete(VectorId id) {
 }
 
 Status StorageEngine::Search(std::string_view membrane, std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult* out) {
-    (void)opts; // Default options for now
-    std::vector<uint8_t> payload(4 + query.size_bytes());
-    std::memcpy(payload.data(), &topk, 4);
-    std::memcpy(payload.data() + 4, query.data(), query.size_bytes());
+    struct P {
+        uint32_t topk;
+        const float* query_data;
+        size_t query_size;
+        const SearchOptions* opts;
+    } p = {topk, query.data(), query.size(), &opts};
 
-    core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kSearch, payload);
+    core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kSearch, 
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&p), sizeof(P)));
     msg.membrane_id = membrane;
     msg.result_ptr = out;
     kernel_.Enqueue(std::move(msg));
@@ -239,6 +242,9 @@ Status StorageEngine::GetNeighbors(std::string_view /*membrane*/, VertexId src, 
 std::optional<core::LinkedObject> StorageEngine::ResolveLinkedByVectorId(uint64_t /*vector_id*/) const {
     return std::nullopt;
 }
+
+
+// (Method removed to avoid duplication and signature mismatch)
 
 Status StorageEngine::GetNeighbors(VertexId src, std::vector<pomai::Neighbor>* out) {
     core::Message msg = core::Message::Create(core::PodId::kGraph, core::Op::kGetNeighbors, 

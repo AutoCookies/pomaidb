@@ -29,6 +29,10 @@ int OpenListenSocket(uint16_t port) {
     if (fd < 0) return -1;
     int on = 1;
     (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    // Set non-blocking
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -230,7 +234,8 @@ EdgeGateway::~EdgeGateway() { (void)Stop(); }
 
 Status EdgeGateway::Start(uint16_t http_port, uint16_t ingest_port, std::string auth_token) {
     if (!manager_) return Status::InvalidArgument("manager is null");
-    if (running_.exchange(true)) return Status::AlreadyExists("edge gateway already running");
+    if (running_) return Status::AlreadyExists("edge gateway already running");
+    running_ = true;
     auth_token_ = std::move(auth_token);
     const auto& opt = manager_->GetOptions();
     token_file_path_ = opt.gateway_token_file;
@@ -246,44 +251,37 @@ Status EdgeGateway::Start(uint16_t http_port, uint16_t ingest_port, std::string 
     sync_checkpoint_path_ = manager_->GetOptions().path + "/gateway/sync.checkpoint";
     const auto load_st = LoadIdempotencyLog();
     if (!load_st.ok()) {
-        running_.store(false);
+        running_ = false;
         return load_st;
     }
     const auto seq_st = LoadSeqState();
     if (!seq_st.ok()) {
-        running_.store(false);
+        running_ = false;
         return seq_st;
     }
     ReloadTokensIfNeeded();
     unified_mode_ = (http_port == ingest_port);
     if (unified_mode_) {
-        http_thread_ = std::thread([this, http_port]() { UnifiedGatewayLoop(http_port); });
+        http_fd_ = OpenListenSocket(http_port);
+        ingest_fd_ = -1;
     } else {
-        http_thread_ = std::thread([this, http_port]() { HttpLoop(http_port); });
-        ingest_thread_ = std::thread([this, ingest_port]() { IngestLoop(ingest_port); });
-    }
-    if (opt.gateway_upstream_sync_enabled && !opt.gateway_upstream_sync_url.empty()) {
-        sync_thread_ = std::thread([this]() { SyncLoop(); });
+        http_fd_ = OpenListenSocket(http_port);
+        ingest_fd_ = OpenListenSocket(ingest_port);
     }
     return Status::Ok();
 }
 
 Status EdgeGateway::Stop() {
-    if (!running_.exchange(false)) return Status::Ok();
-    const int hfd = http_fd_.exchange(-1);
-    if (hfd >= 0) {
-        ::shutdown(hfd, SHUT_RDWR);
-        ::close(hfd);
+    if (!running_) return Status::Ok();
+    running_ = false;
+    if (http_fd_ >= 0) {
+        ::close(http_fd_);
+        http_fd_ = -1;
     }
-    const int ifd = ingest_fd_.exchange(-1);
-    if (ifd >= 0) {
-        ::shutdown(ifd, SHUT_RDWR);
-        ::close(ifd);
+    if (ingest_fd_ >= 0) {
+        ::close(ingest_fd_);
+        ingest_fd_ = -1;
     }
-    if (http_thread_.joinable()) http_thread_.join();
-    if (!unified_mode_ && ingest_thread_.joinable()) ingest_thread_.join();
-    sync_cv_.notify_all();
-    if (sync_thread_.joinable()) sync_thread_.join();
     return Status::Ok();
 }
 
@@ -325,13 +323,11 @@ void EdgeGateway::ReloadTokensIfNeeded() {
         }
         if (!token.empty()) tmp[token] = std::move(rec);
     }
-    std::lock_guard<std::mutex> lock(token_mu_);
     token_store_ = std::move(tmp);
 }
 
 bool EdgeGateway::TokenAllowsScope(const std::string& token, std::string_view scope) const {
     if (!auth_token_.empty() && token == auth_token_) return true;
-    std::lock_guard<std::mutex> lock(token_mu_);
     const auto it = token_store_.find(token);
     if (it == token_store_.end()) return false;
     const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
@@ -353,19 +349,18 @@ bool EdgeGateway::IsAuthorizedForScope(const std::string& request, std::string_v
 
 bool EdgeGateway::AllowRequest() {
     const uint64_t now_sec = static_cast<uint64_t>(std::time(nullptr));
-    uint64_t prev = rate_window_sec_.load();
-    if (prev != now_sec) {
-        rate_window_sec_.store(now_sec);
-        rate_window_count_.store(0);
+    if (rate_window_sec_ != now_sec) {
+        rate_window_sec_ = now_sec;
+        rate_window_count_ = 0;
     }
-    const uint32_t c = rate_window_count_.fetch_add(1) + 1;
+    const uint32_t c = ++rate_window_count_;
     return c <= rate_limit_per_sec_;
 }
 
 bool EdgeGateway::HasIdempotencyKey(const std::string& key) {
     if (key.empty()) return false;
     const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
-    std::lock_guard<std::mutex> lock(idem_mu_);
+    (void)0; // idem_mu_ removed
     for (auto it = seen_idempotency_keys_.begin(); it != seen_idempotency_keys_.end();) {
         if (it->second <= now) {
             it = seen_idempotency_keys_.erase(it);
@@ -381,7 +376,7 @@ void EdgeGateway::RememberIdempotencyKey(const std::string& key) {
     const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
     bool inserted = false;
     {
-        std::lock_guard<std::mutex> lock(idem_mu_);
+        (void)0; // idem_mu_ removed
         const auto it = seen_idempotency_keys_.find(key);
         if (it == seen_idempotency_keys_.end()) {
             inserted = true;
@@ -405,13 +400,13 @@ Status EdgeGateway::LoadIdempotencyLog() {
     if (!in.good()) return Status::Ok();
     const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
     std::string line;
-    std::lock_guard<std::mutex> lock(idem_mu_);
+    (void)0; // idem_mu_ removed
     while (std::getline(in, line)) {
         // Keep only sane keys to tolerate partial/corrupt lines.
         if (!line.empty() && line.size() <= 256 && line.find('\n') == std::string::npos && line.find('\r') == std::string::npos) {
             seen_idempotency_keys_[line] = now + idempotency_ttl_sec_;
         } else if (!line.empty()) {
-            idempotency_log_errors_total_.fetch_add(1);
+            idempotency_log_errors_total_++;
         }
     }
     return Status::Ok();
@@ -421,7 +416,7 @@ void EdgeGateway::AppendIdempotencyLog(const std::string& key) {
     if (idempotency_log_path_.empty()) return;
     std::ofstream out(idempotency_log_path_, std::ios::app);
     if (!out.good()) {
-        idempotency_log_errors_total_.fetch_add(1);
+        idempotency_log_errors_total_++;
         return;
     }
     out << key << "\n";
@@ -437,7 +432,7 @@ Status EdgeGateway::CompactIdempotencyLogIfNeeded() {
     if (!out.good()) return Status::IOError("failed to compact idempotency log");
     const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
     {
-        std::lock_guard<std::mutex> lock(idem_mu_);
+        (void)0; // idem_mu_ removed
         for (auto it = seen_idempotency_keys_.begin(); it != seen_idempotency_keys_.end();) {
             if (it->second <= now) {
                 it = seen_idempotency_keys_.erase(it);
@@ -452,10 +447,10 @@ Status EdgeGateway::CompactIdempotencyLogIfNeeded() {
     std::error_code ec;
     std::filesystem::rename(tmp_path, idempotency_log_path_, ec);
     if (ec) {
-        idempotency_log_errors_total_.fetch_add(1);
+        idempotency_log_errors_total_++;
         return Status::IOError("failed to rotate idempotency log");
     }
-    idempotency_compactions_total_.fetch_add(1);
+    idempotency_compactions_total_++;
     return Status::Ok();
 }
 
@@ -471,10 +466,10 @@ Status EdgeGateway::RotateAuditLogIfNeeded() {
     }
     fs::rename(p, rotated, ec);
     if (ec) {
-        audit_log_errors_total_.fetch_add(1);
+        audit_log_errors_total_++;
         return Status::IOError("failed to rotate audit log");
     }
-    audit_log_rotations_total_.fetch_add(1);
+    audit_log_rotations_total_++;
     return Status::Ok();
 }
 
@@ -482,7 +477,7 @@ void EdgeGateway::AppendAuditLog(std::string_view event, std::string_view detail
     if (audit_log_path_.empty()) return;
     std::ofstream out(audit_log_path_, std::ios::app);
     if (!out.good()) {
-        audit_log_errors_total_.fetch_add(1);
+        audit_log_errors_total_++;
         return;
     }
     const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
@@ -498,14 +493,14 @@ Status EdgeGateway::LoadSeqState() {
     if (!in.good()) return Status::Ok();
     uint64_t v = 0;
     in >> v;
-    ingest_seq_.store(v);
+    ingest_seq_ = v;
     return Status::Ok();
 }
 
 Status EdgeGateway::SaveSeqState() {
     std::ofstream out(seq_state_path_, std::ios::trunc);
     if (!out.good()) return Status::IOError("failed to save seq state");
-    out << ingest_seq_.load();
+    out << ingest_seq_;
     out.flush();
     return Status::Ok();
 }
@@ -524,143 +519,167 @@ std::string EdgeGateway::JsonResponse(int code, std::string_view reason, std::st
 std::string EdgeGateway::HealthGradeJson() const {
     std::string grade = "healthy";
     std::string reason = "ok";
-    if (audit_log_errors_total_.load() > 0 || idempotency_log_errors_total_.load() > 0) {
+    if (audit_log_errors_total_ > 0 || idempotency_log_errors_total_ > 0) {
         grade = "degraded";
         reason = "log_io_errors";
     }
-    if (http_errors_total_.load() + ingest_errors_total_.load() > (http_requests_total_.load() + ingest_requests_total_.load()) / 2 + 10) {
+    if (http_errors_total_ + ingest_errors_total_ > (http_requests_total_ + ingest_requests_total_) / 2 + 10) {
         grade = "unhealthy";
         reason = "high_error_ratio";
     }
-    if (sync_fail_total_.load() > sync_success_total_.load() + 10) {
+    if (sync_fail_total_ > sync_success_total_ + 10) {
         grade = "degraded";
         reason = "upstream_sync_failures";
     }
     std::size_t sync_depth = 0;
     {
-        std::lock_guard<std::mutex> lock(sync_mu_);
+        (void)0; // sync_mu_ removed
         sync_depth = sync_queue_.size();
     }
     std::ostringstream body;
-    body << "{\"grade\":\"" << grade << "\",\"reason\":\"" << reason << "\",\"ingest_seq\":" << ingest_seq_.load()
-         << ",\"sync_checkpoint_seq\":" << sync_checkpoint_seq_.load() << ",\"sync_queue_depth\":" << sync_depth
-         << ",\"sync_backlog_drops_total\":" << sync_backlog_drops_total_.load() << "}";
+    body << "{\"grade\":\"" << grade << "\",\"reason\":\"" << reason << "\",\"ingest_seq\":" << ingest_seq_
+         << ",\"sync_checkpoint_seq\":" << sync_checkpoint_seq_ << ",\"sync_queue_depth\":" << sync_depth
+         << ",\"sync_backlog_drops_total\":" << sync_backlog_drops_total_ << "}";
     return body.str();
 }
 
 void EdgeGateway::EnqueueSyncEvent(SyncEvent ev) {
     if (!manager_->GetOptions().gateway_upstream_sync_enabled || manager_->GetOptions().gateway_upstream_sync_url.empty()) return;
-    std::lock_guard<std::mutex> lock(sync_mu_);
+    (void)0; // sync_mu_ removed
     if (sync_queue_.size() >= sync_max_queue_) {
         sync_queue_.pop_front();
-        sync_backlog_drops_total_.fetch_add(1);
+        sync_backlog_drops_total_++;
     }
     sync_queue_.push_back(std::move(ev));
-    sync_cv_.notify_one();
 }
 
-void EdgeGateway::SyncLoop() {
-    std::ifstream in(sync_checkpoint_path_);
-    if (in.good()) {
-        uint64_t ck = 0;
-        in >> ck;
-        sync_checkpoint_seq_.store(ck);
+void EdgeGateway::Tick() {
+    if (!running_) return;
+    ProcessHttp();
+    ProcessIngest();
+    ProcessSync();
+}
+
+void EdgeGateway::ProcessHttp() {
+    if (http_fd_ < 0) return;
+    // Handle multiple accepts to avoid backlog
+    for (int i = 0; i < 16; ++i) {
+        int client = ::accept(http_fd_, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            continue;
+        }
+        // Set client non-blocking
+        int flags = ::fcntl(client, F_GETFL, 0);
+        ::fcntl(client, F_SETFL, flags | O_NONBLOCK);
+        
+        ProcessAcceptedClient(client);
     }
+}
+
+void EdgeGateway::ProcessIngest() {
+    if (ingest_fd_ < 0 || unified_mode_) return;
+    for (int i = 0; i < 16; ++i) {
+        int client = ::accept(ingest_fd_, nullptr, nullptr);
+        if (client < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            continue;
+        }
+        int flags = ::fcntl(client, F_GETFL, 0);
+        ::fcntl(client, F_SETFL, flags | O_NONBLOCK);
+        
+        ProcessAcceptedClient(client);
+    }
+}
+
+void EdgeGateway::ProcessAcceptedClient(int client) {
+    char peek[16];
+    const ssize_t pn = ::recv(client, peek, sizeof(peek), MSG_PEEK);
+    if (pn <= 0) {
+        if (pn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return; // No data yet
+        ::close(client);
+        return;
+    }
+    const bool peek_http = LooksLikeHttpRequest(std::string_view(peek, static_cast<size_t>(pn)));
+    if (!AllowRequest()) {
+        if (peek_http) {
+            const std::string too_many = JsonResponse(429, "Too Many Requests", "error", "rate_limited");
+            (void)::send(client, too_many.data(), too_many.size(), 0);
+            http_errors_total_++;
+        } else {
+            static const std::string nack = "ERR|rate_limited\n";
+            (void)::send(client, nack.data(), nack.size(), 0);
+            ingest_errors_total_++;
+        }
+        rate_limited_total_++;
+        AppendAuditLog(peek_http ? "http_rate_limited" : "ingest_rate_limited", "request");
+        ::close(client);
+        return;
+    }
+
+    char buf[16384];
+    const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) {
+        ::close(client);
+        return;
+    }
+    buf[n] = '\0';
+    const std::string data(buf, static_cast<size_t>(n));
+    if (LooksLikeHttpRequest(data)) {
+        http_requests_total_++;
+        ServeHttpConnection(client, data);
+    } else {
+        ingest_requests_total_++;
+        ServeIngestConnection(client, data);
+    }
+}
+
+void EdgeGateway::ProcessSync() {
+    if (!manager_->GetOptions().gateway_upstream_sync_enabled || manager_->GetOptions().gateway_upstream_sync_url.empty()) return;
+    if (sync_queue_.empty()) return;
+
+    const uint64_t now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                     std::chrono::system_clock::now().time_since_epoch())
+                                                     .count());
+    if (now_ms < last_sync_attempt_unix_ms_ + sync_retry_ms_) return;
+
     std::string host, path;
     uint16_t port = 80;
     if (!ParseHttpUrl(manager_->GetOptions().gateway_upstream_sync_url, &host, &port, &path)) {
         AppendAuditLog("sync_disabled", "invalid_upstream_url");
         return;
     }
-    while (running_.load()) {
-        SyncEvent ev;
-        {
-            std::unique_lock<std::mutex> lock(sync_mu_);
-            sync_cv_.wait_for(lock, std::chrono::milliseconds(500), [this]() { return !sync_queue_.empty() || !running_.load(); });
-            if (!running_.load()) break;
-            if (sync_queue_.empty()) continue;
-            ev = sync_queue_.front();
+
+    SyncEvent& ev = sync_queue_.front();
+    if (ev.seq <= sync_checkpoint_seq_) {
+        sync_queue_.pop_front();
+        return;
+    }
+
+    std::ostringstream body;
+    body << "{\"seq\":" << ev.seq << ",\"type\":\"" << JsonEscapeMembraneField(ev.type) << "\",\"membrane\":\""
+         << JsonEscapeMembraneField(ev.membrane) << "\",\"id\":" << ev.id << ",\"id2\":" << ev.id2 << ",\"u32_a\":" << ev.u32_a
+         << ",\"u32_b\":" << ev.u32_b << ",\"aux_k\":\"" << JsonEscapeMembraneField(ev.aux_k) << "\",\"aux_v\":\""
+         << JsonEscapeMembraneField(ev.aux_v) << "\"}";
+
+    sync_attempts_total_++;
+    last_sync_attempt_unix_ms_ = now_ms;
+    
+    const bool ok = HttpPostJson(host, port, path, body.str());
+    if (ok) {
+        sync_success_total_++;
+        sync_checkpoint_seq_ = ev.seq;
+        std::ofstream out(sync_checkpoint_path_, std::ios::trunc);
+        if (out.good()) {
+            out << ev.seq;
+            out.flush();
         }
-        if (ev.seq <= sync_checkpoint_seq_.load()) {
-            std::lock_guard<std::mutex> lock(sync_mu_);
-            if (!sync_queue_.empty() && sync_queue_.front().seq == ev.seq) sync_queue_.pop_front();
-            continue;
-        }
-        std::ostringstream body;
-        body << "{\"seq\":" << ev.seq << ",\"type\":\"" << JsonEscapeMembraneField(ev.type) << "\",\"membrane\":\""
-             << JsonEscapeMembraneField(ev.membrane) << "\",\"id\":" << ev.id << ",\"id2\":" << ev.id2 << ",\"u32_a\":" << ev.u32_a
-             << ",\"u32_b\":" << ev.u32_b << ",\"aux_k\":\"" << JsonEscapeMembraneField(ev.aux_k) << "\",\"aux_v\":\""
-             << JsonEscapeMembraneField(ev.aux_v) << "\"}";
-        sync_attempts_total_.fetch_add(1);
-        const bool ok = HttpPostJson(host, port, path, body.str());
-        if (ok) {
-            sync_success_total_.fetch_add(1);
-            sync_checkpoint_seq_.store(ev.seq);
-            std::ofstream out(sync_checkpoint_path_, std::ios::trunc);
-            if (out.good()) {
-                out << ev.seq;
-                out.flush();
-            }
-            std::lock_guard<std::mutex> lock(sync_mu_);
-            if (!sync_queue_.empty() && sync_queue_.front().seq == ev.seq) sync_queue_.pop_front();
-        } else {
-            sync_fail_total_.fetch_add(1);
-            std::this_thread::sleep_for(std::chrono::milliseconds(sync_retry_ms_));
-        }
+        sync_queue_.pop_front();
+    } else {
+        sync_fail_total_++;
     }
 }
 
-void EdgeGateway::UnifiedGatewayLoop(uint16_t port) {
-    const int server_fd = OpenListenSocket(port);
-    if (server_fd < 0) {
-        running_.store(false);
-        return;
-    }
-    http_fd_.store(server_fd);
-    ingest_fd_.store(-1);
-    while (running_.load()) {
-        int client = ::accept(server_fd, nullptr, nullptr);
-        if (client < 0) continue;
-        char peek[16];
-        const ssize_t pn = ::recv(client, peek, sizeof(peek), MSG_PEEK);
-        if (pn <= 0) {
-            ::close(client);
-            continue;
-        }
-        const bool peek_http = LooksLikeHttpRequest(std::string_view(peek, static_cast<size_t>(pn)));
-        if (!AllowRequest()) {
-            if (peek_http) {
-                const std::string too_many = JsonResponse(429, "Too Many Requests", "error", "rate_limited");
-                (void)::send(client, too_many.data(), too_many.size(), 0);
-                http_errors_total_.fetch_add(1);
-            } else {
-                static const std::string nack = "ERR|rate_limited\n";
-                (void)::send(client, nack.data(), nack.size(), 0);
-                ingest_errors_total_.fetch_add(1);
-            }
-            rate_limited_total_.fetch_add(1);
-            AppendAuditLog(peek_http ? "http_rate_limited" : "ingest_rate_limited", "request");
-            ::close(client);
-            continue;
-        }
-        char buf[8192];
-        const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) {
-            ::close(client);
-            continue;
-        }
-        buf[n] = '\0';
-        const std::string data(buf, static_cast<size_t>(n));
-        if (LooksLikeHttpRequest(data)) {
-            http_requests_total_.fetch_add(1);
-            ServeHttpConnection(client, data);
-        } else {
-            ingest_requests_total_.fetch_add(1);
-            ServeIngestConnection(client, data);
-        }
-    }
-    if (http_fd_.exchange(-1) >= 0) ::close(server_fd);
-}
 
 void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
     std::string response = JsonResponse(200, "OK", "ok", "healthy");
@@ -683,32 +702,32 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
     if (metrics) {
         if (!IsAuthorizedForScope(req, "admin:ops")) {
             response = JsonResponse(401, "Unauthorized", "error", "missing admin scope", "auth_scope_denied");
-            auth_denied_total_.fetch_add(1);
+            auth_denied_total_++;
             (void)::send(client, response.data(), response.size(), 0);
             ::close(client);
             return;
         }
         std::ostringstream oss;
-        oss << "http_requests_total " << http_requests_total_.load() << "\n";
-        oss << "http_errors_total " << http_errors_total_.load() << "\n";
-        oss << "ingest_requests_total " << ingest_requests_total_.load() << "\n";
-        oss << "ingest_errors_total " << ingest_errors_total_.load() << "\n";
-        oss << "ingest_duplicates_total " << ingest_duplicates_total_.load() << "\n";
-        oss << "rate_limited_total " << rate_limited_total_.load() << "\n";
-        oss << "idempotency_compactions_total " << idempotency_compactions_total_.load() << "\n";
-        oss << "idempotency_log_errors_total " << idempotency_log_errors_total_.load() << "\n";
-        oss << "audit_log_errors_total " << audit_log_errors_total_.load() << "\n";
-        oss << "audit_log_rotations_total " << audit_log_rotations_total_.load() << "\n";
-        oss << "auth_denied_total " << auth_denied_total_.load() << "\n";
-        oss << "mtls_denied_total " << mTLS_denied_total_.load() << "\n";
-        oss << "ingest_seq " << ingest_seq_.load() << "\n";
-        oss << "sync_attempts_total " << sync_attempts_total_.load() << "\n";
-        oss << "sync_success_total " << sync_success_total_.load() << "\n";
-        oss << "sync_fail_total " << sync_fail_total_.load() << "\n";
-        oss << "sync_backlog_drops_total " << sync_backlog_drops_total_.load() << "\n";
-        oss << "sync_checkpoint_seq " << sync_checkpoint_seq_.load() << "\n";
+        oss << "http_requests_total " << http_requests_total_ << "\n";
+        oss << "http_errors_total " << http_errors_total_ << "\n";
+        oss << "ingest_requests_total " << ingest_requests_total_ << "\n";
+        oss << "ingest_errors_total " << ingest_errors_total_ << "\n";
+        oss << "ingest_duplicates_total " << ingest_duplicates_total_ << "\n";
+        oss << "rate_limited_total " << rate_limited_total_ << "\n";
+        oss << "idempotency_compactions_total " << idempotency_compactions_total_ << "\n";
+        oss << "idempotency_log_errors_total " << idempotency_log_errors_total_ << "\n";
+        oss << "audit_log_errors_total " << audit_log_errors_total_ << "\n";
+        oss << "audit_log_rotations_total " << audit_log_rotations_total_ << "\n";
+        oss << "auth_denied_total " << auth_denied_total_ << "\n";
+        oss << "mtls_denied_total " << mTLS_denied_total_ << "\n";
+        oss << "ingest_seq " << ingest_seq_ << "\n";
+        oss << "sync_attempts_total " << sync_attempts_total_ << "\n";
+        oss << "sync_success_total " << sync_success_total_ << "\n";
+        oss << "sync_fail_total " << sync_fail_total_ << "\n";
+        oss << "sync_backlog_drops_total " << sync_backlog_drops_total_ << "\n";
+        oss << "sync_checkpoint_seq " << sync_checkpoint_seq_ << "\n";
         {
-            std::lock_guard<std::mutex> lock(sync_mu_);
+            (void)0; // sync_mu_ removed
             oss << "sync_queue_depth " << sync_queue_.size() << "\n";
         }
         const std::string body = oss.str();
@@ -722,7 +741,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
     if (membrane_records) {
         if (!IsAuthorizedForScope(req, "admin:ops")) {
             response = JsonResponse(401, "Unauthorized", "error", "missing admin scope", "auth_scope_denied");
-            auth_denied_total_.fetch_add(1);
+            auth_denied_total_++;
             (void)::send(client, response.data(), response.size(), 0);
             ::close(client);
             return;
@@ -790,7 +809,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
     if (manager_->GetOptions().gateway_require_mtls_proxy_header &&
         req.find(manager_->GetOptions().gateway_mtls_proxy_header) == std::string::npos) {
         response = JsonResponse(401, "Unauthorized", "error", "mtls proxy header missing", "mtls_required");
-        mTLS_denied_total_.fetch_add(1);
+        mTLS_denied_total_++;
         (void)::send(client, response.data(), response.size(), 0);
         ::close(client);
         return;
@@ -799,8 +818,8 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         response = JsonResponse(401, "Unauthorized", "error", "missing ingest scope", "auth_scope_denied");
         (void)::send(client, response.data(), response.size(), 0);
         ::close(client);
-        http_errors_total_.fetch_add(1);
-        auth_denied_total_.fetch_add(1);
+        http_errors_total_++;
+        auth_denied_total_++;
         AppendAuditLog("http_unauthorized", "request");
         return;
     }
@@ -821,7 +840,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         response = JsonResponse(200, "OK", "duplicate", "idempotency_key_seen");
         (void)::send(client, response.data(), response.size(), 0);
         ::close(client);
-        ingest_duplicates_total_.fetch_add(1);
+        ingest_duplicates_total_++;
         AppendAuditLog("http_duplicate", idempotency_key);
         return;
     }
@@ -857,7 +876,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (st.ok()) {
                 RememberIdempotencyKey(idempotency_key);
                 AppendAuditLog("http_meta_ok", std::string(membrane) + "/" + std::string(gid));
-                const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                const uint64_t seq = ingest_seq_++ + 1;
                 (void)SaveSeqState();
                 {
                     SyncEvent sev;
@@ -873,12 +892,12 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             } else {
                 AppendAuditLog("http_meta_err", st.message());
                 response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             }
         } else {
             AppendAuditLog("http_meta_err", "invalid_meta_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_meta_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         }
     } else if (vec_ingest) {
         const auto sp1 = req.find(' ');
@@ -904,7 +923,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
                 if (st.ok()) {
                     RememberIdempotencyKey(idempotency_key);
                     AppendAuditLog("http_vector_ok", std::string(membrane) + "/" + std::to_string(id));
-                    const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                    const uint64_t seq = ingest_seq_++ + 1;
                     (void)SaveSeqState();
                     {
                         SyncEvent sev;
@@ -920,17 +939,17 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
                 } else {
                     AppendAuditLog("http_vector_err", st.message());
                     response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                    http_errors_total_.fetch_add(1);
+                    http_errors_total_++;
                 }
             } else {
                 AppendAuditLog("http_vector_err", "empty_vector");
                 response = JsonResponse(400, "Bad Request", "error", "empty_vector", "bad_vector");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             }
         } else {
             AppendAuditLog("http_vector_err", "invalid_vector_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_vector_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         }
     } else if (graph_vertex_ingest) {
         const auto sp1 = req.find(' ');
@@ -946,7 +965,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 3) {
             AppendAuditLog("http_graph_vertex_err", "invalid_graph_vertex_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_graph_vertex_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const pomai::VertexId vid = static_cast<pomai::VertexId>(std::strtoull(std::string(parts[1]).c_str(), nullptr, 10));
@@ -956,7 +975,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (st.ok()) {
                 RememberIdempotencyKey(idempotency_key);
                 AppendAuditLog("http_graph_vertex_ok", membrane + "/" + std::to_string(vid));
-                const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                const uint64_t seq = ingest_seq_++ + 1;
                 (void)SaveSeqState();
                 {
                     SyncEvent sev;
@@ -972,7 +991,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             } else {
                 AppendAuditLog("http_graph_vertex_err", st.message());
                 response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             }
         }
     } else if (graph_edge_ingest) {
@@ -986,7 +1005,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 5) {
             AppendAuditLog("http_graph_edge_err", "invalid_graph_edge_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_graph_edge_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const pomai::VertexId src = static_cast<pomai::VertexId>(std::strtoull(std::string(parts[1]).c_str(), nullptr, 10));
@@ -998,7 +1017,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (st.ok()) {
                 RememberIdempotencyKey(idempotency_key);
                 AppendAuditLog("http_graph_edge_ok", membrane + "/" + std::to_string(src) + "->" + std::to_string(dst));
-                const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                const uint64_t seq = ingest_seq_++ + 1;
                 (void)SaveSeqState();
                 {
                     SyncEvent sev;
@@ -1016,7 +1035,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             } else {
                 AppendAuditLog("http_graph_edge_err", st.message());
                 response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             }
         }
     } else if (mesh_ingest) {
@@ -1032,7 +1051,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 2) {
             AppendAuditLog("http_mesh_err", "invalid_mesh_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_mesh_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const uint64_t mesh_id = static_cast<uint64_t>(std::strtoull(std::string(parts[1]).c_str(), nullptr, 10));
@@ -1040,13 +1059,13 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (!ParseCsvFloats(body, &xyz)) {
                 AppendAuditLog("http_mesh_err", "invalid_mesh_xyz");
                 response = JsonResponse(400, "Bad Request", "error", "invalid_mesh_xyz", "bad_vector");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             } else {
                 const auto st = manager_->MeshPut(membrane, mesh_id, xyz);
                 if (st.ok()) {
                     RememberIdempotencyKey(idempotency_key);
                     AppendAuditLog("http_mesh_ok", membrane + "/" + std::to_string(mesh_id));
-                    const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                    const uint64_t seq = ingest_seq_++ + 1;
                     (void)SaveSeqState();
                     {
                         SyncEvent sev;
@@ -1062,7 +1081,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
                 } else {
                     AppendAuditLog("http_mesh_err", st.message());
                     response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                    http_errors_total_.fetch_add(1);
+                    http_errors_total_++;
                 }
             }
         }
@@ -1079,7 +1098,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 3) {
             AppendAuditLog("http_audio_err", "invalid_audio_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_audio_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const uint64_t clip_id = static_cast<uint64_t>(std::strtoull(std::string(parts[1]).c_str(), nullptr, 10));
@@ -1088,13 +1107,13 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (!ParseCsvFloats(body, &embedding)) {
                 AppendAuditLog("http_audio_err", "invalid_audio_embedding");
                 response = JsonResponse(400, "Bad Request", "error", "invalid_audio_embedding", "bad_vector");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             } else {
                 const auto st = manager_->AudioPut(membrane, clip_id, ts_ms, embedding);
                 if (st.ok()) {
                     RememberIdempotencyKey(idempotency_key);
                     AppendAuditLog("http_audio_ok", membrane + "/" + std::to_string(clip_id));
-                    const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                    const uint64_t seq = ingest_seq_++ + 1;
                     (void)SaveSeqState();
                     {
                         SyncEvent sev;
@@ -1111,7 +1130,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
                 } else {
                     AppendAuditLog("http_audio_err", st.message());
                     response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                    http_errors_total_.fetch_add(1);
+                    http_errors_total_++;
                 }
             }
         }
@@ -1128,7 +1147,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 3) {
             AppendAuditLog("http_ts_err", "invalid_timeseries_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_timeseries_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const uint64_t series_id = static_cast<uint64_t>(std::strtoull(std::string(parts[1]).c_str(), nullptr, 10));
@@ -1138,13 +1157,13 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (endp == body.c_str()) {
                 AppendAuditLog("http_ts_err", "invalid_timeseries_value");
                 response = JsonResponse(400, "Bad Request", "error", "invalid_timeseries_value", "bad_value");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             } else {
                 const auto st = manager_->TsPut(membrane, series_id, ts_ms, val);
                 if (st.ok()) {
                     RememberIdempotencyKey(idempotency_key);
                     AppendAuditLog("http_ts_ok", membrane + "/" + std::to_string(series_id));
-                    const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                    const uint64_t seq = ingest_seq_++ + 1;
                     (void)SaveSeqState();
                     {
                         SyncEvent sev;
@@ -1161,7 +1180,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
                 } else {
                     AppendAuditLog("http_ts_err", st.message());
                     response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                    http_errors_total_.fetch_add(1);
+                    http_errors_total_++;
                 }
             }
         }
@@ -1178,7 +1197,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 2) {
             AppendAuditLog("http_kv_err", "invalid_keyvalue_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_keyvalue_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const std::string_view key_sv = parts[1];
@@ -1187,7 +1206,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (st.ok()) {
                 RememberIdempotencyKey(idempotency_key);
                 AppendAuditLog("http_kv_ok", membrane + "/" + key);
-                const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                const uint64_t seq = ingest_seq_++ + 1;
                 (void)SaveSeqState();
                 {
                     SyncEvent sev;
@@ -1204,7 +1223,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             } else {
                 AppendAuditLog("http_kv_err", st.message());
                 response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             }
         }
     } else if (document_ingest) {
@@ -1220,7 +1239,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 2) {
             AppendAuditLog("http_doc_err", "invalid_document_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_document_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const uint64_t doc_id = static_cast<uint64_t>(std::strtoull(std::string(parts[1]).c_str(), nullptr, 10));
@@ -1228,7 +1247,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (st.ok()) {
                 RememberIdempotencyKey(idempotency_key);
                 AppendAuditLog("http_doc_ok", membrane + "/" + std::to_string(doc_id));
-                const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                const uint64_t seq = ingest_seq_++ + 1;
                 (void)SaveSeqState();
                 {
                     SyncEvent sev;
@@ -1244,7 +1263,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             } else {
                 AppendAuditLog("http_doc_err", st.message());
                 response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             }
         }
     } else if (rag_chunk_ingest) {
@@ -1261,7 +1280,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
         if (parts.size() != 3) {
             AppendAuditLog("http_rag_err", "invalid_rag_path");
             response = JsonResponse(400, "Bad Request", "error", "invalid_rag_path", "invalid_path");
-            http_errors_total_.fetch_add(1);
+            http_errors_total_++;
         } else {
             const std::string membrane(parts[0]);
             const pomai::ChunkId chunk_id = static_cast<pomai::ChunkId>(std::strtoull(std::string(parts[1]).c_str(), nullptr, 10));
@@ -1270,7 +1289,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
             if (!ParseCsvUint32(body, &tokens)) {
                 AppendAuditLog("http_rag_err", "invalid_rag_tokens");
                 response = JsonResponse(400, "Bad Request", "error", "invalid_rag_tokens", "bad_tokens");
-                http_errors_total_.fetch_add(1);
+                http_errors_total_++;
             } else {
                 pomai::RagChunk chunk{};
                 chunk.chunk_id = chunk_id;
@@ -1283,7 +1302,7 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
                 if (st.ok()) {
                     RememberIdempotencyKey(idempotency_key);
                     AppendAuditLog("http_rag_ok", membrane + "/" + std::to_string(chunk_id));
-                    const uint64_t seq = ingest_seq_.fetch_add(1) + 1;
+                    const uint64_t seq = ingest_seq_++ + 1;
                     (void)SaveSeqState();
                     {
                         SyncEvent sev;
@@ -1300,14 +1319,14 @@ void EdgeGateway::ServeHttpConnection(int client, const std::string& req) {
                 } else {
                     AppendAuditLog("http_rag_err", st.message());
                     response = JsonResponse(400, "Bad Request", "error", st.message(), "write_failed");
-                    http_errors_total_.fetch_add(1);
+                    http_errors_total_++;
                 }
             }
         }
     } else {
         AppendAuditLog("http_not_found", "endpoint");
         response = JsonResponse(404, "Not Found", "error", "endpoint_not_found", "not_found");
-        http_errors_total_.fetch_add(1);
+        http_errors_total_++;
     }
     (void)::send(client, response.data(), response.size(), 0);
     ::close(client);
@@ -1318,7 +1337,7 @@ void EdgeGateway::ServeIngestConnection(int client, const std::string& line) {
     std::string proto;
     if (!std::getline(iss, proto, '|')) {
         ::close(client);
-        ingest_errors_total_.fetch_add(1);
+        ingest_errors_total_++;
         return;
     }
     std::string token_or_membrane;
@@ -1333,18 +1352,18 @@ void EdgeGateway::ServeIngestConnection(int client, const std::string& line) {
         membrane = token_or_membrane;
         if (!std::getline(iss, id_s, '|') || !std::getline(iss, vec_s, '|')) {
             ::close(client);
-            ingest_errors_total_.fetch_add(1);
+            ingest_errors_total_++;
             return;
         }
     } else {
         if (token_or_membrane != auth_token_) {
             ::close(client);
-            ingest_errors_total_.fetch_add(1);
+            ingest_errors_total_++;
             return;
         }
         if (!std::getline(iss, membrane, '|') || !std::getline(iss, id_s, '|') || !std::getline(iss, vec_s, '|')) {
             ::close(client);
-            ingest_errors_total_.fetch_add(1);
+            ingest_errors_total_++;
             return;
         }
     }
@@ -1363,7 +1382,7 @@ void EdgeGateway::ServeIngestConnection(int client, const std::string& line) {
             (void)std::getline(iss, durability, '|');
             if (HasIdempotencyKey(idem_key)) {
                 const std::string reply = "ACK|duplicate\n";
-                ingest_duplicates_total_.fetch_add(1);
+                ingest_duplicates_total_++;
                 AppendAuditLog("ingest_duplicate", idem_key);
                 (void)::send(client, reply.data(), reply.size(), 0);
                 ::close(client);
@@ -1375,7 +1394,7 @@ void EdgeGateway::ServeIngestConnection(int client, const std::string& line) {
             }
             uint64_t seq = 0;
             if (st.ok()) {
-                seq = ingest_seq_.fetch_add(1) + 1;
+                seq = ingest_seq_++ + 1;
                 (void)SaveSeqState();
             }
             const std::string reply = st.ok()
@@ -1383,7 +1402,7 @@ void EdgeGateway::ServeIngestConnection(int client, const std::string& line) {
                                      : "ACK|accepted|seq=" + std::to_string(seq) + "\n")
                 : "ERR|write_failed\n";
             if (!st.ok()) {
-                ingest_errors_total_.fetch_add(1);
+                ingest_errors_total_++;
                 AppendAuditLog("ingest_err", st.message());
             } else {
                 RememberIdempotencyKey(idem_key);
@@ -1401,79 +1420,16 @@ void EdgeGateway::ServeIngestConnection(int client, const std::string& line) {
             (void)::send(client, reply.data(), reply.size(), 0);
         } else {
             const std::string reply = "ERR|bad_vector\n";
-            ingest_errors_total_.fetch_add(1);
+            ingest_errors_total_++;
             (void)::send(client, reply.data(), reply.size(), 0);
         }
     } else {
         const std::string reply = "ERR|bad_protocol\n";
-        ingest_errors_total_.fetch_add(1);
+        ingest_errors_total_++;
         (void)::send(client, reply.data(), reply.size(), 0);
     }
     ::close(client);
 }
 
-void EdgeGateway::HttpLoop(uint16_t port) {
-    const int server_fd = OpenListenSocket(port);
-    if (server_fd < 0) {
-        running_.store(false);
-        return;
-    }
-    http_fd_.store(server_fd);
-    while (running_.load()) {
-        int client = ::accept(server_fd, nullptr, nullptr);
-        if (client < 0) continue;
-        http_requests_total_.fetch_add(1);
-        if (!AllowRequest()) {
-            const std::string too_many = JsonResponse(429, "Too Many Requests", "error", "rate_limited");
-            (void)::send(client, too_many.data(), too_many.size(), 0);
-            ::close(client);
-            http_errors_total_.fetch_add(1);
-            rate_limited_total_.fetch_add(1);
-            AppendAuditLog("http_rate_limited", "request");
-            continue;
-        }
-        char buf[8192];
-        const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-            buf[n] = '\0';
-            ServeHttpConnection(client, std::string(buf, static_cast<size_t>(n)));
-        } else {
-            ::close(client);
-        }
-    }
-    if (http_fd_.exchange(-1) >= 0) ::close(server_fd);
-}
-
-void EdgeGateway::IngestLoop(uint16_t port) {
-    const int server_fd = OpenListenSocket(port);
-    if (server_fd < 0) {
-        running_.store(false);
-        return;
-    }
-    ingest_fd_.store(server_fd);
-    while (running_.load()) {
-        int client = ::accept(server_fd, nullptr, nullptr);
-        if (client < 0) continue;
-        ingest_requests_total_.fetch_add(1);
-        if (!AllowRequest()) {
-            static const std::string nack = "ERR|rate_limited\n";
-            (void)::send(client, nack.data(), nack.size(), 0);
-            ::close(client);
-            ingest_errors_total_.fetch_add(1);
-            rate_limited_total_.fetch_add(1);
-            AppendAuditLog("ingest_rate_limited", "request");
-            continue;
-        }
-        char buf[4096];
-        const ssize_t n = ::recv(client, buf, sizeof(buf) - 1, 0);
-        if (n > 0) {
-            buf[n] = '\0';
-            ServeIngestConnection(client, std::string(buf, static_cast<size_t>(n)));
-        } else {
-            ::close(client);
-        }
-    }
-    if (ingest_fd_.exchange(-1) >= 0) ::close(server_fd);
-}
 
 } // namespace pomai::core

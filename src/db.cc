@@ -186,6 +186,10 @@ namespace pomai
         {
             return mgr_.SearchVector(core::MembraneManager::kDefaultMembrane, query, topk, opts, out);
         }
+        Status SearchVector(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchHitSink& sink) override
+        {
+            return mgr_.SearchVector(core::MembraneManager::kDefaultMembrane, query, topk, opts, sink);
+        }
 
         Status SearchRag(const RagQuery& query, const RagSearchOptions& opts, RagSearchResult *out) override
         {
@@ -232,6 +236,11 @@ namespace pomai
                             uint32_t topk, const SearchOptions& opts, SearchResult *out) override
         {
             return mgr_.SearchVector(membrane, query, topk, opts, out);
+        }
+        Status SearchVector(std::string_view membrane, std::span<const float> query,
+                            uint32_t topk, const SearchOptions& opts, SearchHitSink& sink) override
+        {
+            return mgr_.SearchVector(membrane, query, topk, opts, sink);
         }
 
         Status SearchRag(std::string_view membrane, const RagQuery& query,
@@ -304,6 +313,21 @@ namespace pomai
         Status BlobDelete(std::string_view membrane, uint64_t blob_id) override {
             return mgr_.BlobDelete(membrane, blob_id);
         }
+        
+        // ---- Graph API ----
+        Status AddVertex(VertexId id, TagId tag, const Metadata& meta) override {
+            return mgr_.AddVertex(core::MembraneManager::kDefaultMembrane, id, tag, meta);
+        }
+        Status AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta) override {
+            return mgr_.AddEdge(core::MembraneManager::kDefaultMembrane, src, dst, type, rank, meta);
+        }
+        Status GetNeighbors(VertexId src, std::vector<Neighbor>* out) override {
+            return mgr_.GetNeighbors(core::MembraneManager::kDefaultMembrane, src, out);
+        }
+        Status GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out) override {
+            return mgr_.GetNeighbors(core::MembraneManager::kDefaultMembrane, src, type, out);
+        }
+
         Status SpatialPut(std::string_view membrane, uint64_t entity_id, double latitude, double longitude) override {
             return mgr_.SpatialPut(membrane, entity_id, latitude, longitude);
         }

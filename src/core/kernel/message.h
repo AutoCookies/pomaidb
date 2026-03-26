@@ -45,6 +45,12 @@ namespace pomai::core {
         constexpr uint32_t kGetNeighborsWithType = 0x13;
     }
 
+    struct TraceMetadata {
+        uint64_t start_time_ns = 0;
+        uint32_t hop_count = 0;
+        bool enabled = false;
+    };
+
     /**
      * Internal Pomegranate Message.
      * Lightweight and zero-copy where possible (payload is often a view).
@@ -63,6 +69,9 @@ namespace pomai::core {
 
         // Optional LSN or Sequence for crash-recovery tracking
         uint64_t lsn = 0;
+
+        // Tracing for Bigtech-scale observability
+        TraceMetadata trace;
 
         // Factory helpers
         static Message Create(PodId to, uint32_t op, std::span<const uint8_t> pay = {}) {

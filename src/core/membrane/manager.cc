@@ -699,6 +699,18 @@ namespace pomai::core
         return st;
     }
 
+    Status MembraneManager::SearchVector(std::string_view membrane, std::span<const float> query,
+                                         std::uint32_t topk, const SearchOptions& opts, pomai::SearchHitSink& sink)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state)
+            return Status::NotFound("membrane not found");
+        if (state->vector_engine) {
+            return state->vector_engine->Search(query, topk, opts, sink);
+        }
+        return Status::NotSupported("membrane kind does not support vector search");
+    }
+
     Status MembraneManager::SearchLexical(std::string_view membrane, const std::string& query, uint32_t topk, std::vector<LexicalHit>* out) {
         auto *state = GetMembraneOrNull(membrane);
         if (!state) return Status::NotFound("membrane not found");
@@ -1159,7 +1171,10 @@ namespace pomai::core
         return state->vector_engine->Freeze();
     }
 
-    void MembraneManager::PollMaintenance() { scheduler_.Poll(); }
+    void MembraneManager::PollMaintenance() { 
+        scheduler_.Poll(); 
+        if (edge_gateway_) edge_gateway_->Tick();
+    }
     void MembraneManager::RunMeshLodSlice() {
         const std::size_t jobs = base_.mesh_lod_jobs_per_tick == 0 ? 1u : static_cast<std::size_t>(base_.mesh_lod_jobs_per_tick);
         for (auto& kv : membranes_) {

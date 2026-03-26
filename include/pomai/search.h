@@ -5,6 +5,7 @@
 
 #include "options.h"
 #include "types.h"
+#include "graph.h"
 
 namespace pomai
 {
@@ -42,6 +43,35 @@ namespace pomai
         std::vector<uint64_t> related_ids; // K-hop neighbors
     };
 
+    /**
+     * @brief Interface for collecting search results without intermediate allocations.
+     * Concrete implementations can write to std::vector, a pre-allocated pool, or directly to a C-buffer.
+     */
+    class SearchHitSink {
+    public:
+        virtual ~SearchHitSink() = default;
+        /** Collect one search hit. Implementation may decide to keep or discard based on top-K or filters. */
+        virtual void Push(VectorId id, float score) = 0;
+    };
+
+    /** @brief Priority queue comparator for min-heap (lowest score at top). */
+    struct WorseHit {
+        bool operator()(const SearchHit& a, const SearchHit& b) const {
+            if (a.score != b.score) {
+                return a.score > b.score;
+            }
+            return a.id > b.id;
+        }
+    };
+
+    /** @brief Check if 'a' is a better hit than 'b' (higher score, then lower ID). */
+    inline bool IsBetterHit(const SearchHit& a, const SearchHit& b) {
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        return a.id < b.id;
+    }
+
     struct AggregateResult {
         AggregateOp op = AggregateOp::kNone;
         std::string field;
@@ -77,11 +107,14 @@ namespace pomai
 
         std::vector<SemanticPointer> zero_copy_pointers;
         uint64_t zero_copy_session_id = 0;
+        
+        std::vector<Neighbor> neighbors;
 
         void Clear() {
             hits.clear();
             aggregates.clear();
             errors.clear();
+            neighbors.clear();
             routed_shards_count = 0;
             total_shards_count = 0;
             pruned_shards_count = 0;

@@ -67,6 +67,9 @@ namespace pomai
                                     SearchResult *out) = 0;
         virtual Status SearchVector(std::span<const float> query, uint32_t topk,
                                     const SearchOptions& opts, SearchResult *out) = 0;
+        /** @brief Zero-copy search vector directly into a sink. skips SearchResult allocation/copy. */
+        virtual Status SearchVector(std::span<const float> query, uint32_t topk,
+                                    const SearchOptions& opts, SearchHitSink& sink) = 0;
         
         // Batch Search (runs concurrently across multiple queries)
         virtual Status SearchBatch(std::span<const float> queries, uint32_t num_queries, 
@@ -111,6 +114,9 @@ namespace pomai
                                     uint32_t topk, SearchResult *out) = 0;
         virtual Status SearchVector(std::string_view membrane, std::span<const float> query,
                                     uint32_t topk, const SearchOptions& opts, SearchResult *out) = 0;
+        /** @brief Zero-copy membrane search vector directly into a sink. */
+        virtual Status SearchVector(std::string_view membrane, std::span<const float> query,
+                                    uint32_t topk, const SearchOptions& opts, SearchHitSink& sink) = 0;
         virtual Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, 
                                    uint32_t topk, std::vector<SearchResult>* out) = 0;
         virtual Status SearchBatch(std::string_view membrane, std::span<const float> queries, uint32_t num_queries, 
@@ -141,6 +147,12 @@ namespace pomai
         virtual Status SketchEstimate(std::string_view membrane, std::string_view key, uint64_t* out) = 0;
         virtual Status SketchSeen(std::string_view membrane, std::string_view key, bool* out) = 0;
         virtual Status SketchUniqueEstimate(std::string_view membrane, uint64_t* out) = 0;
+
+        // Graph API
+        virtual Status AddVertex(VertexId id, TagId tag, const Metadata& meta) = 0;
+        virtual Status AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta) = 0;
+        virtual Status GetNeighbors(VertexId src, std::vector<Neighbor>* out) = 0;
+        virtual Status GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out) = 0;
 
         // Blob API
         virtual Status BlobPut(std::string_view membrane, uint64_t blob_id, std::span<const uint8_t> data) = 0;

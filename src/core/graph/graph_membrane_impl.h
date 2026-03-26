@@ -2,8 +2,6 @@
 
 #include <cstddef>
 #include <functional>
-#include <mutex>
-#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -28,7 +26,6 @@ public:
         if (!st.ok()) return st;
 
         // 2. Update RAM index (structural only)
-        std::lock_guard<std::mutex> lock(mutex_);
         if (adj_lists_.find(id) == adj_lists_.end()) {
             adj_lists_[id] = {};
         }
@@ -42,7 +39,6 @@ public:
         if (!st.ok()) return st;
 
         // 2. Update RAM index (structural only)
-        std::lock_guard<std::mutex> lock(mutex_);
         // Add to contiguous store
         Neighbor n{dst, type, rank};
         auto& list = adj_lists_[src];
@@ -51,7 +47,6 @@ public:
     }
 
     Status GetNeighbors(VertexId src, std::vector<Neighbor>* out) override {
-        std::lock_guard<std::mutex> lock(mutex_);
         auto it = adj_lists_.find(src);
         if (it != adj_lists_.end()) {
             *out = it->second;
@@ -60,7 +55,6 @@ public:
     }
 
     Status GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out) override {
-        std::lock_guard<std::mutex> lock(mutex_);
         auto it = adj_lists_.find(src);
         if (it != adj_lists_.end()) {
             for (const auto& n : it->second) {
@@ -86,14 +80,11 @@ public:
     }
 
     void ForEachVertex(const std::function<void(pomai::VertexId id, std::size_t out_degree)>& fn) const {
-        std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [vid, neigh] : adj_lists_) fn(vid, neigh.size());
     }
 
 private:
     std::unique_ptr<storage::Wal> wal_;
-    mutable std::mutex mutex_;
-    
     // Contiguous Adjacency Store (Simplified for now - using map to vectors but intended for mmap)
     // In a full implementation, this would be a single large buffer + offset index.
     std::unordered_map<VertexId, std::vector<Neighbor>> adj_lists_;
