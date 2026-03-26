@@ -89,3 +89,21 @@ Priority reflects typical embedded stacks: **memory-safe systems languages first
 - [EDGE_DEPLOYMENT.md](EDGE_DEPLOYMENT.md) — profiles, fsync, memory limits.
 - [FAILURE_SEMANTICS.md](FAILURE_SEMANTICS.md) — WAL/manifest behavior.
 - [VERSIONING.md](VERSIONING.md) — ABI struct `struct_size` pattern.
+- [COMPAT_MATRIX.md](COMPAT_MATRIX.md) — OS/CPU/GPU compatibility summary.
+
+---
+
+## 5. Release artifact policy (operational)
+
+Each tagged release (`v*`) publishes:
+- `pomaidb-<os>-<arch>.tar.gz`
+- `<asset>.sha256`
+- `<asset>.sig` and `<asset>.pem` (keyless cosign signature/cert)
+
+Bundle contents should include:
+- `pomaidb_server`
+- `pomaictl`
+- `include/pomai/*`
+- available runtime/static libraries for the target platform
+
+CI (`run-all-tests`) additionally uploads a `ci-fast` Linux artifact for quick download and validation after every push/PR.

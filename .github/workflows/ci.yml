@@ -36,3 +36,25 @@ jobs:
         env:
           POMAI_SKIP_VULKAN_TESTS: 1
         run: ctest --test-dir build -L bench --output-on-failure -C Release --timeout 600
+
+      - name: Package ci-fast artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/include/pomai dist/lib
+          cp build/pomaidb_server dist/ || true
+          cp tools/pomaictl.py dist/pomaictl || true
+          cp -r include/pomai/* dist/include/pomai/
+          cp build/libpomai.a dist/lib/ || true
+          cp build/libpomai_c.so dist/lib/ || true
+          cp LICENSE dist/ || true
+          tar -czf pomaidb-ci-fast-linux-x64.tar.gz -C dist .
+          sha256sum pomaidb-ci-fast-linux-x64.tar.gz > pomaidb-ci-fast-linux-x64.tar.gz.sha256
+
+      - name: Upload ci-fast artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pomaidb-ci-fast-linux-x64
+          path: |
+            pomaidb-ci-fast-linux-x64.tar.gz
+            pomaidb-ci-fast-linux-x64.tar.gz.sha256
