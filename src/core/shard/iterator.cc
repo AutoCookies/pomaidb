@@ -5,12 +5,14 @@
 
 namespace pomai::core
 {
-    VectorIterator::VectorIterator(std::shared_ptr<VectorSnapshot> snapshot)
+    VectorIterator::VectorIterator(std::shared_ptr<VectorSnapshot> snapshot, uint32_t ttl_sec, std::uint64_t now_sec)
         : snapshot_(std::move(snapshot)),
           source_(Source::FROZEN_MEM),
           source_idx_(0),
           entry_idx_(0),
-          current_id_(0)
+          current_id_(0),
+          ttl_sec_(ttl_sec),
+          now_sec_(now_sec)
     {
         // Initialize: position at first valid entry
         AdvanceToNextLive();
@@ -80,14 +82,17 @@ namespace pomai::core
             
             // Check if entry is valid (not seen, not tombstone)
             if (found) {
-                if (seen_.count(current_id_) == 0 && !current_vec_.empty()) {
-                    // Found valid live entry (not a duplicate, not a tombstone)
-                    return;
-                } else {
-                    // Skip duplicate or tombstone
-                    entry_idx_++;
-                    continue;
+                if (seen_.count(current_id_) == 0) {
+                    if (!current_vec_.empty()) {
+                        // Found valid live entry (not a duplicate)
+                        return;
+                    }
+                    // Treat tombstone/expired as "seen" so older versions won't resurface.
+                    seen_.insert(current_id_);
                 }
+                // Skip duplicate or tombstone/expired.
+                entry_idx_++;
+                continue;
             }
         }
     }
@@ -112,11 +117,16 @@ namespace pomai::core
             // MemTable doesn't have indexed access, so we use IterateWithStatus
             size_t current_entry = 0;
             bool found = false;
-            mem->IterateWithStatus([&](VectorId id, std::span<const float> vec, bool is_deleted) {
+            mem->IterateWithMetadata([&](VectorId id, std::span<const float> vec, bool is_deleted, const pomai::Metadata* meta_ptr) {
                 if (current_entry == entry_idx_) {
                     current_id_ = id;
                     if (!is_deleted) {
-                        current_vec_.assign(vec.begin(), vec.end());
+                        const bool expired = (meta_ptr != nullptr) && IsExpired(*meta_ptr);
+                        if (!expired) {
+                            current_vec_.assign(vec.begin(), vec.end());
+                        } else {
+                            current_vec_.clear(); // Expired as tombstone
+                        }
                     } else {
                         current_vec_.clear(); // Tombstone: clear vector
                     }
@@ -143,13 +153,17 @@ namespace pomai::core
             VectorId id;
             std::span<const float> vec;
             bool is_deleted;
+            pomai::Metadata meta{};
             
-            auto st = seg->ReadAt(static_cast<uint32_t>(entry_idx_), &id, &vec, &is_deleted);
+            auto st = seg->ReadAt(static_cast<uint32_t>(entry_idx_), &id, &vec, &is_deleted, &meta);
             
             if (st.ok()) {
                 current_id_ = id;
                 if (!is_deleted) {
-                    if (seg->GetQuantType() != pomai::QuantizationType::kNone) {
+                    const bool expired = IsExpired(meta);
+                    if (expired) {
+                        current_vec_.clear(); // Expired as tombstone
+                    } else if (seg->GetQuantType() != pomai::QuantizationType::kNone) {
                         std::vector<float> decoded;
                         seg->FindAndDecode(id, nullptr, &decoded, nullptr);
                         current_vec_.assign(decoded.begin(), decoded.end());

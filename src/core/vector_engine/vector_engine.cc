@@ -23,8 +23,17 @@ constexpr std::size_t kWalSegmentBytes = 64u << 20; // 64 MiB
 VectorEngine::VectorEngine(pomai::DBOptions opt,
                            pomai::MembraneKind kind,
                            pomai::MetricType metric,
+                           uint32_t ttl_sec,
+                           uint32_t retention_max_count,
+                           uint64_t retention_max_bytes,
                            uint64_t sync_lsn)
-    : opt_(std::move(opt)), kind_(kind), metric_(metric), sync_lsn_(sync_lsn) {}
+    : opt_(std::move(opt)),
+      kind_(kind),
+      metric_(metric),
+      ttl_sec_(ttl_sec),
+      retention_max_count_(retention_max_count),
+      retention_max_bytes_(retention_max_bytes),
+      sync_lsn_(sync_lsn) {}
 
 VectorEngine::~VectorEngine() = default;
 
@@ -71,8 +80,14 @@ Status VectorEngine::OpenLocked() {
     Status st = wal->Open();
     if (!st.ok()) return st;
 
+    // quantize_inmem_ only makes sense when the downstream segment/index
+    // is also quantized. Otherwise we would decode back to lossy floats
+    // and break exact float expectations (tests compare with EXPECT_EQ).
+    const bool quantize_inmem =
+        opt_.enable_quantization && (opt_.index_params.quant_type != pomai::QuantizationType::kNone);
+
     auto mem = std::make_unique<table::MemTable>(
-        opt_.dim, kArenaBlockBytes, nullptr, opt_.enable_quantization);
+        opt_.dim, kArenaBlockBytes, nullptr, quantize_inmem);
     st = wal->ReplayInto(*mem);
     if (!st.ok()) return st;
 
@@ -94,9 +109,12 @@ Status VectorEngine::OpenLocked() {
         opt_.endurance_aware_maintenance,
         opt_.write_budget_bytes_per_hour,
         opt_.endurance_compaction_bias,
-        opt_.enable_quantization,
+        quantize_inmem,
         opt_.write_coalesce_window_us,
-        opt_.write_coalesce_batch_size);
+        opt_.write_coalesce_batch_size,
+        ttl_sec_,
+        retention_max_count_,
+        retention_max_bytes_);
 
     runtime_ = std::move(rt);
     st = runtime_->Start();

@@ -60,6 +60,11 @@ namespace pomai::core
                 entries += n;
             }
         };
+
+        bool VectorMetaExpired(std::uint32_t ttl_sec, std::uint64_t now_sec, const pomai::Metadata& m) {
+            return ttl_sec > 0 && m.timestamp > 0 && now_sec >= m.timestamp &&
+                   (now_sec - m.timestamp) >= static_cast<std::uint64_t>(ttl_sec);
+        }
     } // anonymous namespace
 
     struct VisibilityEntry {
@@ -241,7 +246,10 @@ namespace pomai::core
                                float endurance_compaction_bias,
                                bool quantize_inmem,
                                uint32_t write_coalesce_window_us,
-                               uint32_t write_coalesce_batch_size)
+                               uint32_t write_coalesce_batch_size,
+                               uint32_t ttl_sec,
+                               uint32_t retention_max_count,
+                               uint64_t retention_max_bytes)
         : runtime_id_(runtime_id),
           data_dir_(std::move(data_dir)),
           dim_(dim),
@@ -255,6 +263,9 @@ namespace pomai::core
           write_budget_bytes_per_hour_(write_budget_bytes_per_hour),
           endurance_compaction_bias_(endurance_compaction_bias),
           quantize_inmem_(quantize_inmem),
+          ttl_sec_(ttl_sec),
+          retention_max_count_(retention_max_count),
+          retention_max_bytes_(retention_max_bytes),
           coalesce_window_us_(write_coalesce_window_us),
           coalesce_batch_size_(write_coalesce_batch_size)
     {
@@ -578,6 +589,12 @@ namespace pomai::core
             return Status::NotFound("tombstone");
         }
         if (lookup.state == LookupState::kFound) {
+            const std::uint64_t now_sec = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            if (VectorMetaExpired(ttl_sec_, now_sec, lookup.meta)) {
+                return Status::NotFound("vector expired");
+            }
             out->assign(lookup.vec.begin(), lookup.vec.end());
             if (out_meta) {
                 *out_meta = lookup.meta;
@@ -587,14 +604,18 @@ namespace pomai::core
         return Status::NotFound("vector not found");
     }
 
-    // ... Exists ...
-
     pomai::Status VectorRuntime::GetFromSnapshot(std::shared_ptr<VectorSnapshot> snap, pomai::VectorId id, std::vector<float> *out, pomai::Metadata* out_meta) {
         const auto lookup = LookupById(nullptr, snap, id, dim_);
         if (lookup.state == LookupState::kTombstone) {
             return Status::NotFound("tombstone");
         }
         if (lookup.state == LookupState::kFound) {
+            const std::uint64_t now_sec = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+            if (VectorMetaExpired(ttl_sec_, now_sec, lookup.meta)) {
+                return Status::NotFound("vector expired");
+            }
             out->assign(lookup.vec.begin(), lookup.vec.end());
             if (out_meta) {
                 *out_meta = lookup.meta;
@@ -613,7 +634,14 @@ namespace pomai::core
         if (!snap) return Status::Aborted("shard not ready");
 
         const auto lookup = LookupById(active, snap, id, dim_);
-        *exists = (lookup.state == LookupState::kFound);
+        if (lookup.state != LookupState::kFound) {
+            *exists = false;
+            return Status::Ok();
+        }
+        const std::uint64_t now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        *exists = !VectorMetaExpired(ttl_sec_, now_sec, lookup.meta);
         return Status::Ok();
     }
 
@@ -621,7 +649,13 @@ namespace pomai::core
 
     std::pair<pomai::Status, bool> VectorRuntime::ExistsInSnapshot(std::shared_ptr<VectorSnapshot> snap, pomai::VectorId id) {
         const auto lookup = LookupById(nullptr, snap, id, dim_);
-        return {Status::Ok(), lookup.state == LookupState::kFound};
+        if (lookup.state != LookupState::kFound) {
+            return {Status::Ok(), false};
+        }
+        const std::uint64_t now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        return {Status::Ok(), !VectorMetaExpired(ttl_sec_, now_sec, lookup.meta)};
     }
 
     pomai::Status VectorRuntime::GetSemanticPointer(std::shared_ptr<VectorSnapshot> snap, pomai::VectorId id, pomai::SemanticPointer* out) {
@@ -684,7 +718,10 @@ namespace pomai::core
 
     pomai::Status VectorRuntime::NewIterator(std::shared_ptr<VectorSnapshot> snap, std::unique_ptr<pomai::SnapshotIterator>* out)
     {
-        *out = std::make_unique<VectorIterator>(std::move(snap));
+        const auto now_tp = std::chrono::system_clock::now();
+        const std::uint64_t now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(now_tp.time_since_epoch()).count());
+        *out = std::make_unique<VectorIterator>(std::move(snap), ttl_sec_, now_sec);
         return pomai::Status::Ok();
     }
 
@@ -961,7 +998,10 @@ namespace pomai::core
             snapshot = base;
         }
         
-        auto shard_iter = std::make_unique<VectorIterator>(snapshot);
+        const auto now_tp = std::chrono::system_clock::now();
+        const std::uint64_t now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(now_tp.time_since_epoch()).count());
+        auto shard_iter = std::make_unique<VectorIterator>(snapshot, ttl_sec_, now_sec);
         IteratorReply reply;
         reply.st = pomai::Status::Ok();
         reply.iterator = std::move(shard_iter);
@@ -1012,6 +1052,9 @@ namespace pomai::core
 
         if (background_job_->type == BackgroundJob::Type::kFreeze) {
             auto& state = std::get<BackgroundJob::FreezeState>(background_job_->state);
+            const auto now_tp = std::chrono::system_clock::now();
+            const std::uint64_t now_sec = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(now_tp.time_since_epoch()).count());
             for (;;) {
                 if (!bg_budget.HasBudget()) {
                     break;
@@ -1050,14 +1093,18 @@ namespace pomai::core
                     }
 
                     pomai::Metadata meta_copy = entry.meta ? *entry.meta : pomai::Metadata();
-                    auto st = state.builder->Add(entry.id, pomai::VectorView(entry.vec), entry.is_deleted, meta_copy);
+                    const bool expired = (!entry.is_deleted && ttl_sec_ > 0 && meta_copy.timestamp > 0 &&
+                                           now_sec >= meta_copy.timestamp &&
+                                           (now_sec - meta_copy.timestamp) >= static_cast<std::uint64_t>(ttl_sec_));
+                    const bool is_deleted_effective = entry.is_deleted || expired;
+                    auto st = state.builder->Add(entry.id, pomai::VectorView(entry.vec), is_deleted_effective, meta_copy);
                     if (!st.ok()) {
                         complete_job(pomai::Status::Internal(std::string("Freeze: SegmentBuilder::Add failed: ") + st.message()));
                         return;
                     }
 
                     // Feed Streaming IVF for continuous SOM updates
-                    if (!entry.is_deleted) {
+                    if (!is_deleted_effective) {
                          st = ivf_->Put(entry.id, std::span<const float>(entry.vec));
                          if (!st.ok()) {
                              complete_job(pomai::Status::Internal(std::string("Freeze: IVF::Put failed: ") + st.message()));
@@ -1164,6 +1211,9 @@ namespace pomai::core
         }
 
         auto& state = std::get<BackgroundJob::CompactState>(background_job_->state);
+        const auto compact_now_tp = std::chrono::system_clock::now();
+        const std::uint64_t compact_now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(compact_now_tp.time_since_epoch()).count());
         for (;;) {
             if (!bg_budget.HasBudget()) {
                 break;
@@ -1198,33 +1248,37 @@ namespace pomai::core
                             pomai::Metadata meta;
                             auto res = state.input_segments[top.seg_idx]->FindAndDecode(top.id, &vec_mapped, &vec_decoded, &meta);
                             if (res == table::SegmentReader::FindResult::kFound) {
-                                if (state.input_segments[top.seg_idx]->GetQuantType() != pomai::QuantizationType::kNone) {
-                                    state.compact_buffers.push_back(std::move(vec_decoded));
-                                    vec_mapped = std::span<const float>(state.compact_buffers.back());
-                                }
-                                if (!state.builder) {
-                                    auto sys_now = std::chrono::system_clock::now().time_since_epoch().count();
-                                    state.filename = "seg_" + std::to_string(sys_now) + "_compacted_" +
-                                                     std::to_string(state.segment_part) + ".dat";
-                                    state.filepath = (fs::path(data_dir_) / state.filename).string();
-                                    state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_, index_params_, metric_);
-                                }
-                                auto st = state.builder->Add(top.id, pomai::VectorView(vec_mapped), false, meta);
-                                if (!st.ok()) {
-                                    complete_job(pomai::Status::Internal(std::string("Compact: SegmentBuilder::Add failed: ") + st.message()));
-                                    return;
-                                }
+                                if (VectorMetaExpired(ttl_sec_, compact_now_sec, meta)) {
+                                    state.tombstones_purged++;
+                                } else {
+                                    if (state.input_segments[top.seg_idx]->GetQuantType() != pomai::QuantizationType::kNone) {
+                                        state.compact_buffers.push_back(std::move(vec_decoded));
+                                        vec_mapped = std::span<const float>(state.compact_buffers.back());
+                                    }
+                                    if (!state.builder) {
+                                        auto sys_now = std::chrono::system_clock::now().time_since_epoch().count();
+                                        state.filename = "seg_" + std::to_string(sys_now) + "_compacted_" +
+                                                         std::to_string(state.segment_part) + ".dat";
+                                        state.filepath = (fs::path(data_dir_) / state.filename).string();
+                                        state.builder = std::make_unique<table::SegmentBuilder>(state.filepath, dim_, index_params_, metric_);
+                                    }
+                                    auto st = state.builder->Add(top.id, pomai::VectorView(vec_mapped), false, meta);
+                                    if (!st.ok()) {
+                                        complete_job(pomai::Status::Internal(std::string("Compact: SegmentBuilder::Add failed: ") + st.message()));
+                                        return;
+                                    }
 
-                                // Feed downstream Streaming IVF
-                                st = ivf_->Put(top.id, vec_mapped);
-                                if (!st.ok()) {
-                                     complete_job(pomai::Status::Internal(std::string("Compact: IVF::Put failed: ") + st.message()));
-                                     return;
-                                }
-                                state.live_entries_kept++;
-                                if (state.builder->Count() >= kMaxSegmentEntries) {
-                                    state.phase = BackgroundJob::Phase::kFinalizeSegment;
-                                    break;
+                                    // Feed downstream Streaming IVF
+                                    st = ivf_->Put(top.id, vec_mapped);
+                                    if (!st.ok()) {
+                                         complete_job(pomai::Status::Internal(std::string("Compact: IVF::Put failed: ") + st.message()));
+                                         return;
+                                    }
+                                    state.live_entries_kept++;
+                                    if (state.builder->Count() >= kMaxSegmentEntries) {
+                                        state.phase = BackgroundJob::Phase::kFinalizeSegment;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -1335,10 +1389,16 @@ namespace pomai::core
         if (!snap) return pomai::Status::Aborted("shard not ready");
         auto active = mem_;
 
-        // Visibility is needed if we have updates across layers or multiple segments
-        bool use_visibility = (active != nullptr && active->GetCount() > 0) || 
-                              (!snap->frozen_memtables.empty()) || 
-                              (snap->segments.size() > 1);
+        // Visibility is needed if we have updates across layers or multiple segments, or TTL so fast paths
+        // still consult the newest-wins map (expired rows treated as tombstones).
+        bool use_visibility = (active != nullptr && active->GetCount() > 0) ||
+                              (!snap->frozen_memtables.empty()) ||
+                              (snap->segments.size() > 1) ||
+                              (ttl_sec_ > 0);
+
+        const std::uint64_t batch_now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
 
         SearchMergePolicy shared_policy;
         if (use_visibility) {
@@ -1352,20 +1412,29 @@ namespace pomai::core
             // Build the "Newest Wins" map ONCE for the whole batch
             if (active) {
                 const void* src = active.get();
-                active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                    shared_policy.RecordIfUnresolved(id, is_deleted, src);
+                active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                    const pomai::Metadata default_meta;
+                    const pomai::Metadata& m = meta ? *meta : default_meta;
+                    const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, batch_now_sec, m);
+                    shared_policy.RecordIfUnresolved(id, eff_del, src);
                 });
             }
             for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
                 const void* src = it->get();
-                (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                    shared_policy.RecordIfUnresolved(id, is_deleted, src);
+                (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                    const pomai::Metadata default_meta;
+                    const pomai::Metadata& m = meta ? *meta : default_meta;
+                    const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, batch_now_sec, m);
+                    shared_policy.RecordIfUnresolved(id, eff_del, src);
                 });
             }
             for (const auto& seg : snap->segments) {
                 const void* src = seg.get();
-                seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                    shared_policy.RecordIfUnresolved(id, is_deleted, src);
+                seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                    const pomai::Metadata default_meta;
+                    const pomai::Metadata& m = meta ? *meta : default_meta;
+                    const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, batch_now_sec, m);
+                    shared_policy.RecordIfUnresolved(id, eff_del, src);
                 });
             }
         }
@@ -1409,23 +1478,36 @@ namespace pomai::core
         for (const auto& seg : snap->segments) reserve_hint += seg->Count();
         merge_policy.Reserve(reserve_hint);
 
+        const std::uint64_t lexical_now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
         // Build the "Newest Wins" map
         if (active) {
             const void* src = active.get();
-            active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                merge_policy.RecordIfUnresolved(id, is_deleted, src);
+            active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                const pomai::Metadata default_meta;
+                const pomai::Metadata& m = meta ? *meta : default_meta;
+                const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, lexical_now_sec, m);
+                merge_policy.RecordIfUnresolved(id, eff_del, src);
             });
         }
         for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
             const void* src = it->get();
-            (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                merge_policy.RecordIfUnresolved(id, is_deleted, src);
+            (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                const pomai::Metadata default_meta;
+                const pomai::Metadata& m = meta ? *meta : default_meta;
+                const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, lexical_now_sec, m);
+                merge_policy.RecordIfUnresolved(id, eff_del, src);
             });
         }
         for (const auto& seg : snap->segments) {
             const void* src = seg.get();
-            seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                merge_policy.RecordIfUnresolved(id, is_deleted, src);
+            seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                const pomai::Metadata default_meta;
+                const pomai::Metadata& m = meta ? *meta : default_meta;
+                const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, lexical_now_sec, m);
+                merge_policy.RecordIfUnresolved(id, eff_del, src);
             });
         }
 
@@ -1492,21 +1574,42 @@ namespace pomai::core
         out->clear();
         out->reserve(topk);
 
+        const std::uint64_t search_now_sec = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
         if (use_visibility && merge_policy.Empty()) {
             // For single-query search, we only build the map for memtables.
-            // Segment-level visibility is handled on-the-fly or via pre-built batch policy.
-            merge_policy.Reserve(64); 
+            // When TTL is enabled, include on-disk segments so visibility matches batch Search.
+            merge_policy.Reserve(64);
             if (active) {
                 const void* src = active.get();
-                active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                    merge_policy.RecordIfUnresolved(id, is_deleted, src);
+                active->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                    const pomai::Metadata default_meta;
+                    const pomai::Metadata& m = meta ? *meta : default_meta;
+                    const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, search_now_sec, m);
+                    merge_policy.RecordIfUnresolved(id, eff_del, src);
                 });
             }
             for (auto it = snap->frozen_memtables.rbegin(); it != snap->frozen_memtables.rend(); ++it) {
                 const void* src = it->get();
-                (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata*) {
-                    merge_policy.RecordIfUnresolved(id, is_deleted, src);
+                (*it)->IterateWithMetadata([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                    const pomai::Metadata default_meta;
+                    const pomai::Metadata& m = meta ? *meta : default_meta;
+                    const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, search_now_sec, m);
+                    merge_policy.RecordIfUnresolved(id, eff_del, src);
                 });
+            }
+            if (ttl_sec_ > 0) {
+                for (const auto& seg : snap->segments) {
+                    const void* src = seg.get();
+                    seg->ForEach([&](VectorId id, std::span<const float>, bool is_deleted, const pomai::Metadata* meta) {
+                        const pomai::Metadata default_meta;
+                        const pomai::Metadata& m = meta ? *meta : default_meta;
+                        const bool eff_del = is_deleted || VectorMetaExpired(ttl_sec_, search_now_sec, m);
+                        merge_policy.RecordIfUnresolved(id, eff_del, src);
+                    });
+                }
             }
         }
 
@@ -1551,7 +1654,8 @@ namespace pomai::core
                     Metadata meta_obj;
                     auto st = mem->Get(id, &vec_ptr, &meta_obj);
                     if (!st.ok()) continue;
-                    
+                    if (VectorMetaExpired(ttl_sec_, search_now_sec, meta_obj)) continue;
+
                     ++local_scanned;
                     if (use_visibility) {
                         const auto* entry = merge_policy.Find(id);
@@ -1574,6 +1678,7 @@ namespace pomai::core
                     }
                     const pomai::Metadata default_meta;
                     const pomai::Metadata& m = meta ? *meta : default_meta;
+                    if (VectorMetaExpired(ttl_sec_, search_now_sec, m)) return;
                     if (!core::FilterEvaluator::Matches(m, opts)) return;
                     
                     float score = (this->metric_ == pomai::MetricType::kInnerProduct || this->metric_ == pomai::MetricType::kCosine)

@@ -31,6 +31,9 @@ public:
     explicit VectorEngine(pomai::DBOptions opt,
                           pomai::MembraneKind kind,
                           pomai::MetricType metric,
+                          uint32_t ttl_sec = 0,
+                          uint32_t retention_max_count = 0,
+                          uint64_t retention_max_bytes = 0,
                           uint64_t sync_lsn = 0);
     ~VectorEngine();
 
@@ -110,6 +113,9 @@ private:
     pomai::DBOptions opt_;
     pomai::MembraneKind kind_;
     pomai::MetricType metric_;
+    uint32_t ttl_sec_{0};
+    uint32_t retention_max_count_{0};
+    uint64_t retention_max_bytes_{0};
     bool opened_{false};
     uint64_t sync_lsn_{0};
 

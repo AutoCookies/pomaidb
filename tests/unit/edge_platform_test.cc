@@ -1,7 +1,11 @@
 #include "tests/common/test_main.h"
 #include "tests/common/test_tmpdir.h"
 #include "pomai/database.h"
+#include "pomai/graph.h"
 #include "pomai/hooks.h"
+#include "pomai/options.h"
+#include "pomai/pomai.h"
+#include "core/membrane/manager.h"
 #include "core/storage/sync_provider.h"
 #include "core/concurrency/scheduler.h"
 #include <filesystem>
@@ -120,6 +124,46 @@ POMAI_TEST(Edge_PushSync) {
     
     (void)db.Close();
     std::filesystem::remove_all(dir);
+}
+
+POMAI_TEST(Edge_GatewaySyncReplay) {
+    DBOptions opt;
+    opt.path = pomai::test::TempDir("edge_sync_replay");
+    opt.dim = 4;
+    opt.shard_count = 1;
+    opt.fsync = FsyncPolicy::kNever;
+    core::MembraneManager mgr(opt);
+    POMAI_EXPECT_OK(mgr.Open());
+
+    MembraneSpec gspec;
+    gspec.name = "gx";
+    gspec.kind = MembraneKind::kGraph;
+    gspec.dim = 4;
+    gspec.shard_count = 1;
+    POMAI_EXPECT_OK(mgr.CreateMembrane(gspec));
+    POMAI_EXPECT_OK(mgr.OpenMembrane("gx"));
+    POMAI_EXPECT_OK(mgr.ReplayGatewaySyncEvent(1, "graph_vertex_put", "gx", 42, 0, 7, 0, "", ""));
+    POMAI_EXPECT_OK(mgr.ReplayGatewaySyncEvent(2, "graph_vertex_put", "gx", 43, 0, 7, 0, "", ""));
+    POMAI_EXPECT_OK(mgr.ReplayGatewaySyncEvent(3, "graph_edge_put", "gx", 42, 43, 0, 0, "", ""));
+    std::vector<Neighbor> nbr;
+    POMAI_EXPECT_OK(mgr.GetNeighbors("gx", 42, &nbr));
+    POMAI_EXPECT_TRUE(!nbr.empty());
+
+    MembraneSpec tspec;
+    tspec.name = "tsm";
+    tspec.kind = MembraneKind::kTimeSeries;
+    tspec.dim = 4;
+    tspec.shard_count = 1;
+    POMAI_EXPECT_OK(mgr.CreateMembrane(tspec));
+    POMAI_EXPECT_OK(mgr.OpenMembrane("tsm"));
+    const uint64_t ts_ms = 1700000000000ULL;
+    POMAI_EXPECT_OK(mgr.ReplayGatewaySyncEvent(4, "timeseries_put", "tsm", 99, ts_ms, 0, 0, "", "12.5"));
+    std::vector<TimeSeriesPoint> pts;
+    POMAI_EXPECT_OK(mgr.TsRange("tsm", 99, 0, 2000000000000ULL, &pts));
+    POMAI_EXPECT_TRUE(!pts.empty());
+    POMAI_EXPECT_EQ(pts[0].value, 12.5);
+
+    std::filesystem::remove_all(opt.path);
 }
 
 } // namespace pomai

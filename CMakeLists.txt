@@ -11,6 +11,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(POMAI_BUILD_TESTS "Build tests" ON)
 option(POMAI_BUILD_BENCH "Build benchmarks" OFF)
+option(POMAI_REGISTER_BENCH_CTEST "Register benchmark executables as CTest (ctest -L bench)" ON)
 
 # Prefer integer (SQ8/FP16) distance paths where data is quantized; reduces float use on embedded.
 option(POMAI_PREFER_INTEGER_MATH "Prefer integer/SQ8/FP16 paths for distance (embedded)" ON)
@@ -695,6 +696,16 @@ if (POMAI_BUILD_TESTS)
   pomai_add_labeled_test(basic_workload_tsan_test "tsan")
 
   add_subdirectory(tests/fuzz)
+
+  # Policy check: owned PomaiDB code must avoid raw malloc/new.
+  # This runs as a normal ctest so CI catches allocator regressions.
+  if (UNIX)
+    add_test(
+      NAME allocator_policy_test
+      COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_no_malloc_new.sh" "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    set_tests_properties(allocator_policy_test PROPERTIES LABELS "unit;policy")
+  endif()
 endif()
 
 # =========================
@@ -777,13 +788,68 @@ add_executable(edge_ai_core_bench benchmarks/edge_ai_core_bench.cc)
 target_link_libraries(edge_ai_core_bench PRIVATE ${POMAI_EXE_DEPS})
 target_include_directories(edge_ai_core_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-  add_executable(mesh_lod_bench benchmarks/mesh_lod_bench.cc)
-  target_link_libraries(mesh_lod_bench PRIVATE ${POMAI_EXE_DEPS})
-  target_include_directories(mesh_lod_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_executable(mesh_lod_bench benchmarks/mesh_lod_bench.cc)
+target_link_libraries(mesh_lod_bench PRIVATE ${POMAI_EXE_DEPS})
+target_include_directories(mesh_lod_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-  add_executable(vulkan_transfer_bench benchmarks/vulkan_transfer_bench.cc)
-  target_link_libraries(vulkan_transfer_bench PRIVATE ${POMAI_EXE_DEPS})
-  target_include_directories(vulkan_transfer_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(vulkan_transfer_bench benchmarks/vulkan_transfer_bench.cc)
+target_link_libraries(vulkan_transfer_bench PRIVATE ${POMAI_EXE_DEPS})
+target_include_directories(vulkan_transfer_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# Bounded benchmark smoke tests (avoid ctest default 1500s timeout on heavy workloads).
+if (POMAI_REGISTER_BENCH_CTEST)
+  set(POMAI_BENCH_TIMEOUT_LONG 600)
+  set(POMAI_BENCH_TIMEOUT_MED 300)
+  set(POMAI_BENCH_TIMEOUT_SHORT 180)
+
+  add_test(NAME bench_comprehensive COMMAND $<TARGET_FILE:comprehensive_bench> --dataset small)
+  set_tests_properties(bench_comprehensive PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_LONG})
+
+  add_test(NAME bench_ingestion COMMAND $<TARGET_FILE:ingestion_bench> 10000 128)
+  set_tests_properties(bench_ingestion PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_MED})
+
+  add_test(NAME bench_rag COMMAND $<TARGET_FILE:rag_bench> 100 64 32)
+  set_tests_properties(bench_rag PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_MED})
+
+  add_test(NAME bench_ci_perf COMMAND $<TARGET_FILE:ci_perf_bench>)
+  set_tests_properties(bench_ci_perf PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_graph COMMAND $<TARGET_FILE:graph_bench> 2000 1000 4000)
+  set_tests_properties(bench_graph PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_MED})
+
+  add_test(NAME bench_quantization COMMAND $<TARGET_FILE:quantization_bench>)
+  set_tests_properties(bench_quantization PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_cbrs_smoke COMMAND $<TARGET_FILE:bench_cbrs> --n 8000 --queries 400 --topk 10)
+  set_tests_properties(bench_cbrs_smoke PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_LONG})
+
+  add_test(NAME bench_benchmark_a COMMAND ${CMAKE_COMMAND} -E env POMAI_BENCH_LOW_MEMORY=1 $<TARGET_FILE:benchmark_a>)
+  set_tests_properties(bench_benchmark_a PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_LONG})
+
+  add_test(NAME bench_encryption_perf COMMAND $<TARGET_FILE:encryption_perf_bench>)
+  set_tests_properties(bench_encryption_perf PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_hybrid_orchestrator COMMAND $<TARGET_FILE:hybrid_orchestrator_bench>)
+  set_tests_properties(bench_hybrid_orchestrator PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_low_ram_profile COMMAND $<TARGET_FILE:low_ram_profile_bench>)
+  set_tests_properties(bench_low_ram_profile PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_new_membrane COMMAND $<TARGET_FILE:new_membrane_bench>)
+  set_tests_properties(bench_new_membrane PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_simd_new_membranes COMMAND $<TARGET_FILE:simd_new_membranes_bench>)
+  set_tests_properties(bench_simd_new_membranes PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_edge_ai_core COMMAND $<TARGET_FILE:edge_ai_core_bench>)
+  set_tests_properties(bench_edge_ai_core PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_mesh_lod COMMAND $<TARGET_FILE:mesh_lod_bench>)
+  set_tests_properties(bench_mesh_lod PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_vulkan_transfer COMMAND $<TARGET_FILE:vulkan_transfer_bench>)
+  set_tests_properties(bench_vulkan_transfer PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+endif()
 
 # =========================
 # Tools

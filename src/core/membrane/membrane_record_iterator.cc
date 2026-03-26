@@ -73,6 +73,17 @@ static uint64_t EffectiveMaxRecords(const MembraneScanOptions& o) {
     return o.max_records == 0 ? UINT64_MAX : o.max_records;
 }
 
+// Timeseries samples use the same epoch units as HTTP ingest path segments (typically ms since epoch).
+static bool TimeSeriesSampleExpired(uint32_t ttl_sec, uint64_t sample_ts) {
+    if (ttl_sec == 0 || sample_ts == 0) return false;
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    const uint64_t now_u = static_cast<uint64_t>(now_ms >= 0 ? now_ms : 0);
+    const uint64_t ttl_ms = static_cast<uint64_t>(ttl_sec) * 1000u;
+    return now_u >= sample_ts && (now_u - sample_ts) >= ttl_ms;
+}
+
 class VectorMembraneScanIterator final : public MembraneRecordIterator {
     std::unique_ptr<pomai::SnapshotIterator> it_;
     MembraneScanOptions opts_;
@@ -466,8 +477,10 @@ Status MembraneManager::NewMembraneRecordIterator(std::string_view membrane, con
         if (!state->timeseries_engine) return Status::InvalidArgument("timeseries engine missing");
         std::vector<MembraneRecord> rows;
         bool truncated = false;
+        const uint32_t ts_ttl = state->spec.ttl_sec;
         state->timeseries_engine->ForEach([&](std::uint64_t sid, const pomai::TimeSeriesPoint& p) {
             if (ScanDeadlineExceeded(t0, scan_opts.deadline_ms)) return;
+            if (TimeSeriesSampleExpired(ts_ttl, p.timestamp)) return;
             if (scan_opts.max_records > 0 && rows.size() >= cap) {
                 truncated = true;
                 return;

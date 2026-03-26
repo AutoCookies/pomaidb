@@ -1,7 +1,9 @@
 #include "core/membrane/manager.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <chrono>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -33,6 +35,36 @@ namespace pomai::core
         p.max_count = spec.retention_max_count;
         p.max_bytes = spec.retention_max_bytes;
         return p;
+    }
+
+    bool ParseCsvFloatsReplay(std::string_view s, std::vector<float>* out) {
+        out->clear();
+        while (!s.empty()) {
+            std::size_t comma = s.find(',');
+            std::string_view tok = (comma == std::string_view::npos) ? s : s.substr(0, comma);
+            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.remove_prefix(1);
+            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.remove_suffix(1);
+            if (tok.empty()) return false;
+            out->push_back(static_cast<float>(std::strtod(std::string(tok).c_str(), nullptr)));
+            if (comma == std::string_view::npos) break;
+            s.remove_prefix(comma + 1);
+        }
+        return !out->empty();
+    }
+
+    bool ParseCsvUint32Replay(std::string_view s, std::vector<uint32_t>* out) {
+        out->clear();
+        while (!s.empty()) {
+            std::size_t comma = s.find(',');
+            std::string_view tok = (comma == std::string_view::npos) ? s : s.substr(0, comma);
+            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.remove_prefix(1);
+            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.remove_suffix(1);
+            if (tok.empty()) return false;
+            out->push_back(static_cast<uint32_t>(std::strtoul(std::string(tok).c_str(), nullptr, 10)));
+            if (comma == std::string_view::npos) break;
+            s.remove_prefix(comma + 1);
+        }
+        return !out->empty();
     }
     }
 
@@ -91,7 +123,9 @@ namespace pomai::core
             MembraneState state;
             state.spec = loaded_spec;
             if (loaded_spec.kind == pomai::MembraneKind::kVector) {
-                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind, loaded_spec.metric, loaded_spec.sync_lsn);
+                state.vector_engine = std::make_unique<VectorEngine>(opt, loaded_spec.kind, loaded_spec.metric, loaded_spec.ttl_sec,
+                                                                     loaded_spec.retention_max_count, loaded_spec.retention_max_bytes,
+                                                                     loaded_spec.sync_lsn);
             } else if (loaded_spec.kind == pomai::MembraneKind::kRag) {
                 state.rag_engine = std::make_unique<RagEngine>(opt, loaded_spec);
             } else if (loaded_spec.kind == pomai::MembraneKind::kGraph) {
@@ -168,7 +202,9 @@ namespace pomai::core
                 MembraneState state;
                 state.spec = mspec;
                 if (mspec.kind == pomai::MembraneKind::kVector) {
-                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind, mspec.metric, mspec.sync_lsn);
+                    state.vector_engine = std::make_unique<VectorEngine>(opt, mspec.kind, mspec.metric, mspec.ttl_sec,
+                                                                         mspec.retention_max_count, mspec.retention_max_bytes,
+                                                                         mspec.sync_lsn);
                 } else if (mspec.kind == pomai::MembraneKind::kRag) {
                     state.rag_engine = std::make_unique<RagEngine>(opt, mspec);
                 } else if (mspec.kind == pomai::MembraneKind::kGraph) {
@@ -326,7 +362,8 @@ namespace pomai::core
         MembraneState state;
         state.spec = spec;
         if (spec.kind == pomai::MembraneKind::kVector) {
-            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind, spec.metric, spec.sync_lsn);
+            state.vector_engine = std::make_unique<VectorEngine>(opt, spec.kind, spec.metric, spec.ttl_sec, spec.retention_max_count,
+                                                                 spec.retention_max_bytes, spec.sync_lsn);
         } else if (spec.kind == pomai::MembraneKind::kRag) {
             state.rag_engine = std::make_unique<RagEngine>(opt, spec);
         } else if (spec.kind == pomai::MembraneKind::kGraph) {
@@ -1222,6 +1259,55 @@ namespace pomai::core
         if (!state) return Status::NotFound("membrane not found");
         if (!state->document_engine) return Status::InvalidArgument("DOCUMENT membrane required");
         return state->document_engine->Search(query, topk, out);
+    }
+
+    Status MembraneManager::ReplayGatewaySyncEvent(uint64_t seq, std::string_view type, std::string_view membrane,
+                                                   uint64_t id, uint64_t id2, uint32_t u32_a, uint32_t u32_b,
+                                                   std::string_view aux_k, std::string_view aux_v) {
+        (void)seq;
+        const std::string t(type);
+        if (t == "meta_put") return MetaPut(membrane, aux_k, aux_v);
+        if (t == "kv_put") return KvPut(membrane, aux_k, aux_v);
+        if (t == "document_put") return DocumentPut(membrane, id, aux_v);
+        if (t == "graph_vertex_put")
+            return AddVertex(membrane, static_cast<pomai::VertexId>(id), static_cast<pomai::TagId>(u32_a), pomai::Metadata{});
+        if (t == "graph_edge_put")
+            return AddEdge(membrane, static_cast<pomai::VertexId>(id), static_cast<pomai::VertexId>(id2),
+                           static_cast<pomai::EdgeType>(u32_a), u32_b, pomai::Metadata{});
+        if (t == "timeseries_put") {
+            char* endp = nullptr;
+            const std::string vs(aux_v);
+            const double v = std::strtod(vs.c_str(), &endp);
+            if (endp == vs.c_str()) return Status::InvalidArgument("timeseries replay: bad value");
+            return TsPut(membrane, id, id2, v);
+        }
+        if (t == "vector_put") {
+            std::vector<float> v;
+            if (!ParseCsvFloatsReplay(aux_v, &v)) return Status::InvalidArgument("vector replay: empty vector");
+            return PutVector(membrane, id, v);
+        }
+        if (t == "mesh_put") {
+            std::vector<float> xyz;
+            if (!ParseCsvFloatsReplay(aux_v, &xyz)) return Status::InvalidArgument("mesh replay: bad vertices");
+            return MeshPut(membrane, id, xyz);
+        }
+        if (t == "audio_put") {
+            std::vector<float> emb;
+            if (!ParseCsvFloatsReplay(aux_v, &emb)) return Status::InvalidArgument("audio replay: bad embedding");
+            return AudioPut(membrane, id, id2, emb);
+        }
+        if (t == "rag_chunk_put") {
+            std::vector<uint32_t> tokens;
+            if (!ParseCsvUint32Replay(aux_v, &tokens)) return Status::InvalidArgument("rag replay: bad tokens");
+            pomai::RagChunk ch;
+            ch.chunk_id = static_cast<pomai::ChunkId>(id);
+            ch.doc_id = static_cast<pomai::DocId>(id2);
+            ch.tokens = std::move(tokens);
+            ch.chunk_text = {};
+            ch.meta = pomai::Metadata{};
+            return PutChunk(membrane, ch);
+        }
+        return Status::InvalidArgument(std::string("replay: unknown type ") + t);
     }
 
 } // namespace pomai::core

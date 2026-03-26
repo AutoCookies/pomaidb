@@ -1,5 +1,7 @@
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "compute/vulkan/vulkan_device_context.h"
@@ -7,6 +9,12 @@
 #include "compute/vulkan/vulkan_staging_pool.h"
 
 namespace {
+
+bool SkipVulkanBench() {
+    const char* s = std::getenv("POMAI_SKIP_VULKAN_TESTS");
+    return s != nullptr && s[0] != '\0' && std::strcmp(s, "0") != 0;
+}
+
 
 std::vector<std::byte> Payload(std::size_t n) {
     std::vector<std::byte> v(n);
@@ -19,6 +27,10 @@ std::vector<std::byte> Payload(std::size_t n) {
 }  // namespace
 
 int main() {
+    if (SkipVulkanBench()) {
+        std::fprintf(stderr, "Vulkan transfer bench skipped (POMAI_SKIP_VULKAN_TESTS)\n");
+        return 0;
+    }
     pomai::compute::vulkan::BridgeOptions bopt;
     bopt.prefer_unified_memory = true;
     bopt.zero_copy_min_bytes = 1u << 20;

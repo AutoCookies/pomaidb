@@ -4,6 +4,7 @@
 #include <vector>
 #include "pomai/iterator.h"
 #include "pomai/types.h"
+#include "pomai/metadata.h"
 #include "core/shard/snapshot.h"
 
 namespace pomai::core
@@ -16,7 +17,7 @@ namespace pomai::core
     class VectorIterator : public SnapshotIterator
     {
     public:
-        explicit VectorIterator(std::shared_ptr<VectorSnapshot> snapshot);
+        explicit VectorIterator(std::shared_ptr<VectorSnapshot> snapshot, uint32_t ttl_sec, std::uint64_t now_sec);
 
         bool Next() override;
         VectorId id() const override;
@@ -39,6 +40,16 @@ namespace pomai::core
 
         // Deduplication: track seen IDs to skip old versions
         std::unordered_set<VectorId> seen_;
+
+        uint32_t ttl_sec_{0};
+        std::uint64_t now_sec_{0};
+
+        bool IsExpired(const pomai::Metadata& meta) const {
+            if (ttl_sec_ == 0) return false;
+            if (meta.timestamp == 0) return false;
+            if (now_sec_ < meta.timestamp) return false;
+            return (now_sec_ - meta.timestamp) >= static_cast<std::uint64_t>(ttl_sec_);
+        }
 
         // Internal helpers
         void AdvanceToNextLive();  // Advance to next valid (unseen, non-tombstone) entry

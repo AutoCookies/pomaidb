@@ -179,6 +179,11 @@ namespace pomai::core
                                          std::unique_ptr<pomai::MembraneRecordIterator>* out);
         Status GetSnapshot(std::string_view name, std::shared_ptr<pomai::Snapshot> *out);
         Status PushSync(std::string_view name, SyncReceiver* receiver);
+
+        /// Re-applies one gateway sync record (same field layout as EdgeGateway upstream JSON: id, id2, u32_a, u32_b, aux_k, aux_v).
+        Status ReplayGatewaySyncEvent(uint64_t seq, std::string_view type, std::string_view membrane, uint64_t id,
+                                      uint64_t id2, uint32_t u32_a, uint32_t u32_b, std::string_view aux_k,
+                                      std::string_view aux_v);
         void AddPostPutHook(std::string_view membrane, std::shared_ptr<PostPutHook> hook);
         Status NewIterator(std::string_view membrane, const std::shared_ptr<pomai::Snapshot>& snap, std::unique_ptr<pomai::SnapshotIterator> *out);
 

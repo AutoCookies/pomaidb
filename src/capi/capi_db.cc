@@ -986,10 +986,10 @@ pomai_status_t* pomai_rag_pipeline_create(pomai_db_t* db, const char* membrane_n
         opts.max_chunks_per_batch = chunk_options->max_chunks_per_batch > 0 ? chunk_options->max_chunks_per_batch : 32u;
         opts.overlap_bytes = chunk_options->overlap_bytes;
     }
-    auto* wrap = new pomai_rag_pipeline_t();
+    auto wrap = std::make_unique<pomai_rag_pipeline_t>();
     wrap->mock_embed = std::make_unique<pomai::MockEmbeddingProvider>(embedding_dim);
     wrap->pipeline = std::make_unique<pomai::RagPipeline>(db->db.get(), membrane_name, embedding_dim, wrap->mock_embed.get(), opts);
-    *out_pipeline = wrap;
+    *out_pipeline = wrap.release();
     return nullptr;
 }
 

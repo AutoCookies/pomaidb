@@ -1,0 +1,35 @@
+
+This GDB supports auto-downloading debuginfo from the following URLs:
+  <https://debuginfod.ubuntu.com>
+Enable debuginfod for this session? (y or [n]) [answered N; input not from terminal]
+Debuginfod has been disabled.
+To make this setting permanent, add 'set debuginfod enabled off' to .gdbinit.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7ffff71cd6c0 (LWP 44427)]
+[Thread 0x7ffff71cd6c0 (LWP 44427) exited]
+
+Thread 1 "python3" received signal SIGINT, Interrupt.
+futex_wait (private=0, expected=2, futex_word=0xd0ea20) at ../sysdeps/nptl/futex-internal.h:146
+#0  futex_wait (private=0, expected=2, futex_word=0xd0ea20) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0xd0ea20, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007ffff7ca0101 in lll_mutex_lock_optimized (mutex=0xd0ea20) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=0xd0ea20) at ./nptl/pthread_mutex_lock.c:93
+#4  0x00007ffff669563a in pomai::AgentMemory::PruneOld(std::basic_string_view<char, std::char_traits<char> >, unsigned long, long) () from /home/autocookie/pomaieco/pomaidb/build/libpomai_c.so
+#5  0x00007ffff66a163e in pomai::AgentMemory::AppendMessage(pomai::AgentMemoryRecord const&, unsigned long*) () from /home/autocookie/pomaieco/pomaidb/build/libpomai_c.so
+#6  0x00007ffff6675f90 in pomai_agent_memory_append () from /home/autocookie/pomaieco/pomaidb/build/libpomai_c.so
+#7  0x00007ffff7bc4b16 in ?? () from /lib/x86_64-linux-gnu/libffi.so.8
+#8  0x00007ffff7bc13ef in ?? () from /lib/x86_64-linux-gnu/libffi.so.8
+#9  0x00007ffff7bc40be in ffi_call () from /lib/x86_64-linux-gnu/libffi.so.8
+#10 0x00007ffff7beb11c in ?? () from /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
+#11 0x00007ffff7be62af in ?? () from /usr/lib/python3.12/lib-dynload/_ctypes.cpython-312-x86_64-linux-gnu.so
+#12 0x0000000000548f75 in _PyObject_MakeTpCall ()
+#13 0x00000000005d6f09 in _PyEval_EvalFrameDefault ()
+#14 0x00000000005d543b in PyEval_EvalCode ()
+#15 0x00000000006084b3 in PyRun_StringFlags ()
+#16 0x00000000006b3d0e in PyRun_SimpleStringFlags ()
+#17 0x00000000006bc9d1 in Py_RunMain ()
+#18 0x00000000006bc3ed in Py_BytesMain ()
+#19 0x00007ffff7c2a1ca in __libc_start_call_main (main=main@entry=0x518930, argc=argc@entry=3, argv=argv@entry=0x7fffffffd818) at ../sysdeps/nptl/libc_start_call_main.h:58
+#20 0x00007ffff7c2a28b in __libc_start_main_impl (main=0x518930, argc=3, argv=0x7fffffffd818, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7fffffffd808) at ../csu/libc-start.c:360
+#21 0x00000000006576c5 in _start ()

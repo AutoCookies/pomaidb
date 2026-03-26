@@ -111,7 +111,10 @@ namespace pomai::core
                      float endurance_compaction_bias = 1.0f,
                      bool quantize_inmem = false,
                      uint32_t write_coalesce_window_us = 0,
-                     uint32_t write_coalesce_batch_size = 256);
+                     uint32_t write_coalesce_batch_size = 256,
+                     uint32_t ttl_sec = 0,
+                     uint32_t retention_max_count = 0,
+                     uint64_t retention_max_bytes = 0);
                      
         ~VectorRuntime();
 
@@ -264,6 +267,9 @@ namespace pomai::core
         std::uint64_t write_budget_bytes_per_hour_{0};
         float endurance_compaction_bias_{1.0f};
         bool quantize_inmem_{false};
+        uint32_t ttl_sec_{0};
+        uint32_t retention_max_count_{0};
+        uint64_t retention_max_bytes_{0};
 
         // WAL group-commit coalescing (Task 3)
         struct CoalesceEntry {

@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <random>
 #include <vector>
@@ -31,9 +32,17 @@ int main(int argc, char** argv)
     std::uint32_t tokens_per_chunk = 64;
     std::uint32_t dim = 32;
 
-    if (argc > 1) num_chunks = static_cast<std::uint32_t>(std::atoi(argv[1]));
-    if (argc > 2) tokens_per_chunk = static_cast<std::uint32_t>(std::atoi(argv[2]));
-    if (argc > 3) dim = static_cast<std::uint32_t>(std::atoi(argv[3]));
+    auto parse_pos_u32 = [](const char* s, std::uint32_t fallback) -> std::uint32_t {
+        if (!s || !*s) return fallback;
+        char* end = nullptr;
+        unsigned long v = std::strtoul(s, &end, 10);
+        if (end == s || *end != '\0') return fallback;
+        return static_cast<std::uint32_t>(v);
+    };
+
+    if (argc > 1) num_chunks = parse_pos_u32(argv[1], num_chunks);
+    if (argc > 2) tokens_per_chunk = parse_pos_u32(argv[2], tokens_per_chunk);
+    if (argc > 3) dim = parse_pos_u32(argv[3], dim);
 
     printf("=============================================================\n");
     printf("                      RAG Benchmark\n");

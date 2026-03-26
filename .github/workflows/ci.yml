@@ -22,5 +22,9 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      # GitHub-hosted runners typically have no usable Vulkan ICD/GPU; GPU tests would flake or fail.
+      # Set POMAI_SKIP_VULKAN_TESTS=0 locally or install mesa-vulkan-drivers (Lavapipe) to exercise Vulkan.
       - name: CTest
+        env:
+          POMAI_SKIP_VULKAN_TESTS: 1
         run: ctest --test-dir build --output-on-failure -C Release --timeout 120

@@ -20,6 +20,11 @@ __all__ = [
     "get_membrane_retention",
     "link_objects", "unlink_objects",
     "start_edge_gateway", "stop_edge_gateway",
+
+    "delete", "exists", "get",
+    "ts_put", "kv_put", "kv_get", "kv_delete", "sketch_add", "blob_put",
+    "agent_memory_open", "agent_memory_close", "agent_memory_append", "agent_memory_append_batch",
+    "agent_memory_get_recent", "agent_memory_search", "agent_memory_prune_old", "agent_memory_prune_device", "agent_memory_freeze_if_needed",
     "list_membranes", "compact_membrane",
     "search_zero_copy", "release_zero_copy_session",
     "create_rag_membrane", "put_chunk", "search_rag",
@@ -195,6 +200,67 @@ def _register_api(lib):
             ("snapshot_isolated_scan", ctypes.c_bool),
         ]
 
+    class PomaiRecord(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("id", ctypes.c_uint64),
+            ("dim", ctypes.c_uint32),
+            ("vector", ctypes.POINTER(ctypes.c_float)),
+            ("metadata", ctypes.POINTER(ctypes.c_uint8)),
+            ("metadata_len", ctypes.c_uint32),
+            ("is_deleted", ctypes.c_bool),
+        ]
+
+    class PomaiAgentMemoryOptions(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("path", ctypes.c_char_p),
+            ("dim", ctypes.c_uint32),
+            ("metric", ctypes.c_uint8),
+            ("max_messages_per_agent", ctypes.c_uint32),
+            ("max_device_bytes", ctypes.c_uint64),
+        ]
+
+    class PomaiAgentMemoryRecord(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("agent_id", ctypes.c_char_p),
+            ("session_id", ctypes.c_char_p),
+            ("kind", ctypes.c_char_p),
+            ("logical_ts", ctypes.c_int64),
+            ("text", ctypes.c_char_p),
+            ("embedding", ctypes.POINTER(ctypes.c_float)),
+            ("dim", ctypes.c_uint32),
+        ]
+
+    class PomaiAgentMemoryQuery(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("agent_id", ctypes.c_char_p),
+            ("session_id", ctypes.c_char_p),
+            ("kind", ctypes.c_char_p),
+            ("min_ts", ctypes.c_int64),
+            ("max_ts", ctypes.c_int64),
+            ("embedding", ctypes.POINTER(ctypes.c_float)),
+            ("dim", ctypes.c_uint32),
+            ("topk", ctypes.c_uint32),
+        ]
+
+    class PomaiAgentMemoryResultSet(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("count", ctypes.c_size_t),
+            ("records", ctypes.POINTER(PomaiAgentMemoryRecord)),
+        ]
+
+    class PomaiAgentMemorySearchResult(ctypes.Structure):
+        _fields_ = [
+            ("struct_size", ctypes.c_uint32),
+            ("count", ctypes.c_size_t),
+            ("records", ctypes.POINTER(PomaiAgentMemoryRecord)),
+            ("scores", ctypes.POINTER(ctypes.c_float)),
+        ]
+
     lib.pomai_options_init.argtypes = [ctypes.POINTER(PomaiOptions)]
     lib.pomai_options_init.restype = None
     lib.pomai_open.argtypes = [ctypes.POINTER(PomaiOptions), ctypes.POINTER(ctypes.c_void_p)]
@@ -361,6 +427,58 @@ def _register_api(lib):
     lib.pomai_free.argtypes = [ctypes.c_void_p]
     lib.pomai_free.restype = None
 
+
+    # Vector basic ops
+    lib.pomai_exists.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_bool)]
+    lib.pomai_exists.restype = ctypes.c_void_p
+    lib.pomai_get.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.POINTER(PomaiRecord))]
+    lib.pomai_get.restype = ctypes.c_void_p
+    lib.pomai_delete.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    lib.pomai_delete.restype = ctypes.c_void_p
+    lib.pomai_record_free.argtypes = [ctypes.POINTER(PomaiRecord)]
+    lib.pomai_record_free.restype = None
+
+    # Typed Membranes
+    lib.pomai_ts_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_double]
+    lib.pomai_ts_put.restype = ctypes.c_void_p
+    lib.pomai_kv_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+    lib.pomai_kv_put.restype = ctypes.c_void_p
+    lib.pomai_kv_get.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.pomai_kv_get.restype = ctypes.c_void_p
+    lib.pomai_kv_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+    lib.pomai_kv_delete.restype = ctypes.c_void_p
+    lib.pomai_sketch_add.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint64]
+    lib.pomai_sketch_add.restype = ctypes.c_void_p
+    lib.pomai_blob_put.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+    lib.pomai_blob_put.restype = ctypes.c_void_p
+
+    # AgentMemory
+    lib.pomai_agent_memory_open.argtypes = [ctypes.POINTER(PomaiAgentMemoryOptions), ctypes.POINTER(ctypes.c_void_p)]
+    lib.pomai_agent_memory_open.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_close.argtypes = [ctypes.c_void_p]
+    lib.pomai_agent_memory_close.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_append.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiAgentMemoryRecord), ctypes.POINTER(ctypes.c_uint64)]
+    lib.pomai_agent_memory_append.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_append_batch.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiAgentMemoryRecord), ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64)]
+    lib.pomai_agent_memory_append_batch.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_get_recent.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.POINTER(PomaiAgentMemoryResultSet))]
+    lib.pomai_agent_memory_get_recent.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_result_set_free.argtypes = [ctypes.POINTER(PomaiAgentMemoryResultSet)]
+    lib.pomai_agent_memory_result_set_free.restype = None
+    lib.pomai_agent_memory_search.argtypes = [ctypes.c_void_p, ctypes.POINTER(PomaiAgentMemoryQuery), ctypes.POINTER(ctypes.POINTER(PomaiAgentMemorySearchResult))]
+    lib.pomai_agent_memory_search.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_search_result_free.argtypes = [ctypes.POINTER(PomaiAgentMemorySearchResult)]
+    lib.pomai_agent_memory_search_result_free.restype = None
+    lib.pomai_agent_memory_prune_old.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int64]
+    lib.pomai_agent_memory_prune_old.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_prune_device.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    lib.pomai_agent_memory_prune_device.restype = ctypes.c_void_p
+    lib.pomai_agent_memory_freeze_if_needed.argtypes = [ctypes.c_void_p]
+    lib.pomai_agent_memory_freeze_if_needed.restype = ctypes.c_void_p
+
     lib._pomai_options = PomaiOptions
     lib._pomai_upsert = PomaiUpsert
     lib._pomai_query = PomaiQuery
@@ -373,6 +491,13 @@ def _register_api(lib):
     lib._pomai_rag_hit = PomaiRagHit
     lib._pomai_rag_search_result = PomaiRagSearchResult
     lib._pomai_membrane_capabilities = PomaiMembraneCapabilities
+
+    lib._pomai_record = PomaiRecord
+    lib._pomai_agent_memory_options = PomaiAgentMemoryOptions
+    lib._pomai_agent_memory_record = PomaiAgentMemoryRecord
+    lib._pomai_agent_memory_query = PomaiAgentMemoryQuery
+    lib._pomai_agent_memory_result_set = PomaiAgentMemoryResultSet
+    lib._pomai_agent_memory_search_result = PomaiAgentMemorySearchResult
 
 
 def _check(st):
@@ -804,6 +929,252 @@ def membrane_kind_capabilities(kind: int):
         "unified_scan": bool(caps.unified_scan),
         "snapshot_isolated_scan": bool(caps.snapshot_isolated_scan),
     }
+
+
+
+def delete(db, id: int):
+    """Delete a vector by global ID from the index."""
+    _ensure_lib()
+    _check(_lib.pomai_delete(db, int(id)))
+
+def exists(db, id: int) -> bool:
+    """Check if a vector with this global ID exists."""
+    _ensure_lib()
+    out = ctypes.c_bool()
+    _check(_lib.pomai_exists(db, int(id), ctypes.byref(out)))
+    return out.value
+
+def get(db, id: int) -> dict:
+    """Get a vector record by global ID."""
+    _ensure_lib()
+    out = ctypes.POINTER(_lib._pomai_record)()
+    _check(_lib.pomai_get(db, int(id), ctypes.byref(out)))
+    try:
+        if not out:
+            return None
+        rec = out.contents
+        vec = [rec.vector[i] for i in range(rec.dim)] if rec.vector and rec.dim > 0 else []
+        meta = None
+        if rec.metadata and rec.metadata_len > 0:
+            meta = bytes(rec.metadata[:rec.metadata_len])
+        return {
+            "id": int(rec.id),
+            "dim": int(rec.dim),
+            "vector": vec,
+            "metadata": meta,
+            "is_deleted": bool(rec.is_deleted)
+        }
+    finally:
+        if out:
+            _lib.pomai_record_free(out)
+
+def ts_put(db, membrane_name: str, series_id: int, ts: int, value: float):
+    """Put a timeseries data point."""
+    _ensure_lib()
+    _check(_lib.pomai_ts_put(db, membrane_name.encode("utf-8"), int(series_id), int(ts), float(value)))
+
+def kv_put(db, membrane_name: str, key: str, value: str):
+    """Store a KV pair."""
+    _ensure_lib()
+    _check(_lib.pomai_kv_put(db, membrane_name.encode("utf-8"), key.encode("utf-8"), value.encode("utf-8")))
+
+def kv_get(db, membrane_name: str, key: str) -> str:
+    """Get a KV pair's value."""
+    _ensure_lib()
+    out_val = ctypes.c_char_p()
+    out_len = ctypes.c_size_t()
+    _check(_lib.pomai_kv_get(db, membrane_name.encode("utf-8"), key.encode("utf-8"), ctypes.byref(out_val), ctypes.byref(out_len)))
+    try:
+        if not out_val:
+            return ""
+        return ctypes.string_at(out_val, out_len.value).decode("utf-8", errors="replace")
+    finally:
+        if out_val:
+            _lib.pomai_free(out_val)
+
+def kv_delete(db, membrane_name: str, key: str):
+    """Delete a KV pair."""
+    _ensure_lib()
+    _check(_lib.pomai_kv_delete(db, membrane_name.encode("utf-8"), key.encode("utf-8")))
+
+def sketch_add(db, membrane_name: str, key: str, increment: int):
+    """Add value to a sketch/counter."""
+    _ensure_lib()
+    _check(_lib.pomai_sketch_add(db, membrane_name.encode("utf-8"), key.encode("utf-8"), int(increment)))
+
+def blob_put(db, membrane_name: str, blob_id: int, data: bytes):
+    """Put a binary blob."""
+    _ensure_lib()
+    buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+    _check(_lib.pomai_blob_put(db, membrane_name.encode("utf-8"), int(blob_id), buf, len(data)))
+
+# AgentMemory
+def agent_memory_open(path: str, dim: int, metric: str = "l2", max_messages_per_agent: int = 1000, max_device_bytes: int = 0):
+    """Open or create an AgentMemory backend."""
+    _ensure_lib()
+    opts = _lib._pomai_agent_memory_options()
+    opts.struct_size = ctypes.sizeof(_lib._pomai_agent_memory_options())
+    opts.path = str(path).encode("utf-8")
+    opts.dim = dim
+    metric_map = {"l2": 0, "ip": 1, "cosine": 2}
+    opts.metric = metric_map.get(str(metric).lower(), 0)
+    opts.max_messages_per_agent = max_messages_per_agent
+    opts.max_device_bytes = max_device_bytes
+    out_mem = ctypes.c_void_p()
+    _check(_lib.pomai_agent_memory_open(ctypes.byref(opts), ctypes.byref(out_mem)))
+    return out_mem
+
+def agent_memory_close(mem):
+    """Close an AgentMemory backend."""
+    if _lib is None: return
+    _check(_lib.pomai_agent_memory_close(mem))
+
+def _make_agent_record(r_dict):
+    r = _lib._pomai_agent_memory_record()
+    r.struct_size = ctypes.sizeof(_lib._pomai_agent_memory_record())
+    # Keep refs to prevent gc
+    refs = []
+    
+    a_id = str(r_dict.get("agent_id", "")).encode("utf-8")
+    refs.append(a_id)
+    r.agent_id = a_id
+    
+    if r_dict.get("session_id"):
+        s_id = str(r_dict.get("session_id")).encode("utf-8")
+        refs.append(s_id)
+        r.session_id = s_id
+    else:
+        r.session_id = None
+        
+    if r_dict.get("kind"):
+        k = str(r_dict.get("kind")).encode("utf-8")
+        refs.append(k)
+        r.kind = k
+    else:
+        r.kind = None
+        
+    r.logical_ts = int(r_dict.get("logical_ts", 0))
+    
+    if r_dict.get("text"):
+        t = str(r_dict.get("text")).encode("utf-8")
+        refs.append(t)
+        r.text = t
+    else:
+        r.text = None
+        
+    vec = r_dict.get("embedding")
+    if vec and len(vec) > 0:
+        cv = (ctypes.c_float * len(vec))(*vec)
+        refs.append(cv)
+        r.embedding = cv
+        r.dim = len(vec)
+    else:
+        r.embedding = None
+        r.dim = 0
+    return r, refs
+
+def agent_memory_append(mem, agent_id: str, session_id: str, kind: str, logical_ts: int, text: str, embedding=None) -> int:
+    """Append a single agent memory record."""
+    _ensure_lib()
+    r, _refs = _make_agent_record({
+        "agent_id": agent_id, "session_id": session_id, "kind": kind,
+        "logical_ts": logical_ts, "text": text, "embedding": embedding
+    })
+    out_id = ctypes.c_uint64()
+    _check(_lib.pomai_agent_memory_append(mem, ctypes.byref(r), ctypes.byref(out_id)))
+    return out_id.value
+
+def agent_memory_append_batch(mem, records: list) -> list:
+    """Append multiple records: each is a dict."""
+    _ensure_lib()
+    n = len(records)
+    if n == 0: return []
+    arr = (_lib._pomai_agent_memory_record * n)()
+    # Keep refs to allocated struct content
+    _refs = []
+    for i, r_dict in enumerate(records):
+        r, rfs = _make_agent_record(r_dict)
+        _refs.extend(rfs)
+        arr[i] = r
+    out_ids = (ctypes.c_uint64 * n)()
+    _check(_lib.pomai_agent_memory_append_batch(mem, ctypes.cast(arr, ctypes.POINTER(_lib._pomai_agent_memory_record)), n, out_ids))
+    return [out_ids[i] for i in range(n)]
+
+def _parse_agent_records(records_ptr, count):
+    res = []
+    for i in range(count):
+        r = records_ptr[i]
+        vec = [r.embedding[j] for j in range(r.dim)] if r.embedding and r.dim > 0 else []
+        res.append({
+            "agent_id": r.agent_id.decode("utf-8", errors="replace") if r.agent_id else "",
+            "session_id": r.session_id.decode("utf-8", errors="replace") if r.session_id else "",
+            "kind": r.kind.decode("utf-8", errors="replace") if r.kind else "",
+            "logical_ts": int(r.logical_ts),
+            "text": r.text.decode("utf-8", errors="replace") if r.text else "",
+            "embedding": vec
+        })
+    return res
+
+def agent_memory_get_recent(mem, agent_id: str, session_id: str = None, limit: int = 10) -> list:
+    """Fetch recent agent memory points."""
+    _ensure_lib()
+    a_id = agent_id.encode("utf-8") if agent_id else None
+    s_id = session_id.encode("utf-8") if session_id else None
+    out = ctypes.POINTER(_lib._pomai_agent_memory_result_set)()
+    _check(_lib.pomai_agent_memory_get_recent(mem, a_id, s_id, int(limit), ctypes.byref(out)))
+    try:
+        if not out: return []
+        return _parse_agent_records(out.contents.records, out.contents.count)
+    finally:
+        if out: _lib.pomai_agent_memory_result_set_free(out)
+
+def agent_memory_search(mem, agent_id: str, session_id: str = None, kind: str = None, min_ts: int = 0, max_ts: int = 0, embedding=None, topk: int = 10) -> list:
+    """Semantic search memory."""
+    _ensure_lib()
+    q = _lib._pomai_agent_memory_query()
+    q.struct_size = ctypes.sizeof(_lib._pomai_agent_memory_query())
+    q.agent_id = agent_id.encode("utf-8") if agent_id else None
+    q.session_id = session_id.encode("utf-8") if session_id else None
+    q.kind = kind.encode("utf-8") if kind else None
+    q.min_ts = int(min_ts)
+    q.max_ts = int(max_ts)
+    q.topk = int(topk)
+    if embedding and len(embedding) > 0:
+        q.embedding = (ctypes.c_float * len(embedding))(*embedding)
+        q.dim = len(embedding)
+    else:
+        q.embedding = None
+        q.dim = 0
+    
+    out = ctypes.POINTER(_lib._pomai_agent_memory_search_result)()
+    _check(_lib.pomai_agent_memory_search(mem, ctypes.byref(q), ctypes.byref(out)))
+    try:
+        if not out: return []
+        count = out.contents.count
+        records = _parse_agent_records(out.contents.records, count)
+        res = []
+        for i in range(count):
+            entry = records[i]
+            entry["score"] = float(out.contents.scores[i]) if out.contents.scores else 0.0
+            res.append(entry)
+        return res
+    finally:
+        if out: _lib.pomai_agent_memory_search_result_free(out)
+
+def agent_memory_prune_old(mem, agent_id: str, keep_last_n: int, min_ts_to_keep: int):
+    """Prune old memory records for an agent."""
+    _ensure_lib()
+    _check(_lib.pomai_agent_memory_prune_old(mem, agent_id.encode("utf-8") if agent_id else None, int(keep_last_n), int(min_ts_to_keep)))
+
+def agent_memory_prune_device(mem, target_total_bytes: int):
+    """Prune global device wide records."""
+    _ensure_lib()
+    _check(_lib.pomai_agent_memory_prune_device(mem, int(target_total_bytes)))
+
+def agent_memory_freeze_if_needed(mem):
+    """Flush memory indexes to disk if pending."""
+    _ensure_lib()
+    _check(_lib.pomai_agent_memory_freeze_if_needed(mem))
 
 
 from .zero_copy import release_zero_copy_session, search_zero_copy

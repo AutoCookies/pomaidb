@@ -35,6 +35,9 @@ PomaiDB is exposed to Python via the **C API** and **ctypes**. The official pack
 | `stop_edge_gateway(db)` | Stop embedded edge listeners. |
 | `search_zero_copy(db, query, topk=10)` | Run single query with zero-copy semantic pointers and return NumPy views/dequantized arrays. |
 | `release_zero_copy_session(session_id)` | Release pinned zero-copy session returned by search results. |
+| `delete(db, int)` | Delete a vector from the index by global ID. |
+| `exists(db, int)` | Return a boolean indicating if a vector with the global ID exists. |
+| `get(db, int)` | Return the `id`, `dim`, `vector`, `metadata`, and `is_deleted` values for a given global ID. |
 
 Gateway endpoints/protocols:
 - HTTP: `GET /health`, `GET /healthz`, `GET /metrics`, `POST /ingest/meta/<membrane>/<gid>`, `POST /ingest/vector/<membrane>/<id>`
@@ -63,6 +66,23 @@ Gateway endpoints/protocols:
 | `create_rag_membrane(db, name, dim, shard_count=1)` | Create and open a RAG membrane for chunk storage and hybrid search. |
 | `put_chunk(db, membrane_name, chunk_id, doc_id, token_ids, vector=None)` | Insert a chunk: token IDs (required) and optional embedding vector. |
 | `search_rag(db, membrane_name, token_ids=None, vector=None, topk=10, ...)` | RAG search by token overlap and/or vector. Returns list of `(chunk_id, doc_id, score, token_matches)`. |
+| **Typed Membranes (Other)** | |
+| `ts_put(db, membrane_name, series_id, ts, value)` | Put a timeseries data point. |
+| `kv_put(db, membrane_name, key, value)` | Store a KV pair in KEYVALUE membrane. |
+| `kv_get(db, membrane_name, key)` | Get the string value for a given key. |
+| `kv_delete(db, membrane_name, key)` | Delete a KV pair from a KEYVALUE membrane. |
+| `sketch_add(db, membrane_name, key, increment)` | Add value to a SKETCH membrane counter. |
+| `blob_put(db, membrane_name, blob_id, data)` | Store a binary blob (`bytes`) in a BLOB membrane. |
+| **Agent Memory** | |
+| `agent_memory_open(path, dim, metric="l2", max_messages_per_agent, max_device_bytes)` | Open or create an AgentMemory backend at the given path. |
+| `agent_memory_close(mem)` | Close an AgentMemory backend. |
+| `agent_memory_append(mem, agent_id, session_id, kind, logical_ts, text, embedding=None)` | Append a single agent memory record. |
+| `agent_memory_append_batch(mem, records)` | Append multiple agent memory records as a list of dicts. |
+| `agent_memory_get_recent(mem, agent_id, session_id=None, limit=10)` | Fetch recent agent memory records. |
+| `agent_memory_search(mem, agent_id, session_id=None, kind=None, min_ts=0, max_ts=0, embedding=None, topk=10)` | Semantic search over AgentMemory. |
+| `agent_memory_prune_old(mem, agent_id, keep_last_n, min_ts_to_keep)` | Prune old records for an agent. |
+| `agent_memory_prune_device(mem, target_total_bytes)` | Prune global device wide records. |
+| `agent_memory_freeze_if_needed(mem)` | Flush memory indexes to disk if pending. |
 
 Exceptions: `pomaidb.PomaiDBError` on any failing call.
 

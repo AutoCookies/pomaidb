@@ -13,7 +13,9 @@ using namespace std::chrono;
 int main(int argc, char** argv) {
     bool use_batch = false;
     uint32_t batch_size = 1000;
-    uint32_t num_vectors = 1000000;
+    // Default kept modest so an accidental bare run finishes in reasonable time.
+    // Use e.g. `./ingestion_bench 1000000 128` for throughput sweeps.
+    uint32_t num_vectors = 10000;
     uint32_t dim = 128;
     
     // Simple arg parsing

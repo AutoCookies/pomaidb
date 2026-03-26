@@ -1,6 +1,7 @@
 #include "pomai/database.h"
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <random>
 #include <vector>
@@ -16,9 +17,16 @@ int main(int argc, char** argv) {
     uint32_t dim = 128;
     uint32_t k_hops = 2;
 
-    if (argc > 1) num_vectors = std::atoi(argv[1]);
-    if (argc > 2) num_vertices = std::atoi(argv[2]);
-    if (argc > 3) num_edges = std::atoi(argv[3]);
+    auto parse_pos_u32 = [](const char* s, uint32_t fallback) -> uint32_t {
+        if (!s || !*s) return fallback;
+        char* end = nullptr;
+        unsigned long v = std::strtoul(s, &end, 10);
+        if (end == s || *end != '\0') return fallback;
+        return static_cast<uint32_t>(v);
+    };
+    if (argc > 1) num_vectors = parse_pos_u32(argv[1], num_vectors);
+    if (argc > 2) num_vertices = parse_pos_u32(argv[2], num_vertices);
+    if (argc > 3) num_edges = parse_pos_u32(argv[3], num_edges);
 
     printf("=============================================================\n");
     printf("                 PomaiDB GraphRAG Benchmark\n");

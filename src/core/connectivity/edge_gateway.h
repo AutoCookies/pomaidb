@@ -34,6 +34,11 @@ private:
         std::string type;
         std::string membrane;
         uint64_t id = 0;
+        uint64_t id2 = 0;
+        uint32_t u32_a = 0;
+        uint32_t u32_b = 0;
+        std::string aux_k;
+        std::string aux_v;
     };
 
     bool IsAuthorized(const std::string& request) const;
@@ -104,7 +109,7 @@ private:
     std::atomic<uint64_t> sync_backlog_drops_total_{0};
     uint64_t sync_retry_ms_ = 1000;
     uint64_t sync_max_queue_ = 10000;
-    std::mutex sync_mu_;
+    mutable std::mutex sync_mu_;
     std::condition_variable sync_cv_;
     std::deque<SyncEvent> sync_queue_;
     std::string sync_checkpoint_path_;

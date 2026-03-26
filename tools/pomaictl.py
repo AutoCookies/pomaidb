@@ -21,6 +21,17 @@ def http_get(url: str, token: str | None = None) -> str:
         return resp.read().decode("utf-8", errors="replace")
 
 
+def http_post(url: str, body: str = "", token: str | None = None, *, idempotency: str | None = None) -> str:
+    data = body.encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    if idempotency:
+        req.add_header("Idempotency-Key", idempotency)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
 def cmd_preflight(args) -> int:
     txt = pomaidb.resolve_effective_options(
         args.path,
@@ -104,6 +115,8 @@ def cmd_gateway(args) -> int:
         "sync_attempts_total",
         "sync_success_total",
         "sync_fail_total",
+        "sync_queue_depth",
+        "sync_backlog_drops_total",
     )
     for ln in metrics.splitlines():
         parts = ln.split()
@@ -111,6 +124,19 @@ def cmd_gateway(args) -> int:
             out["metrics_sample"][parts[0]] = parts[1]
     print(json.dumps(out))
     return 0
+
+def cmd_ingest_http(args) -> int:
+    """POST raw body to a gateway ingest path (e.g. /v1/ingest/vector/default/1)."""
+    url = f"http://{args.host}:{args.port}{args.path}"
+    body = ""
+    if args.body_file:
+        body = Path(args.body_file).read_text(encoding="utf-8")
+    elif args.body is not None:
+        body = args.body
+    out = http_post(url, body, args.token, idempotency=args.idempotency)
+    print(out)
+    return 0
+
 
 def cmd_verify(args) -> int:
     db_path = Path(args.path)
@@ -179,6 +205,16 @@ def main() -> int:
         c.add_argument("--port", type=int, default=8080)
         c.add_argument("--token", default=None)
         c.set_defaults(func=fn)
+
+    ing = sub.add_parser("ingest-http", help="POST to /v1/ingest/... (body from --body or --body-file)")
+    ing.add_argument("--host", default="127.0.0.1")
+    ing.add_argument("--port", type=int, default=8080)
+    ing.add_argument("--token", default=None)
+    ing.add_argument("--path", required=True, help="e.g. /v1/ingest/graph/vertex/default/10/1")
+    ing.add_argument("--body", default=None, help="Request body (e.g. CSV floats)")
+    ing.add_argument("--body-file", default=None, help="Read body from file")
+    ing.add_argument("--idempotency", default=None, help="Idempotency-Key header value")
+    ing.set_defaults(func=cmd_ingest_http)
 
     g = sub.add_parser("gateway")
     g.add_argument("--host", default="127.0.0.1")
