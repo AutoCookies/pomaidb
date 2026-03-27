@@ -22,6 +22,15 @@ enum class ModelType {
  */
 class AIEngine {
 public:
+    enum class RuntimeState {
+        kUninitialized,
+        kLoaded,
+        kReady,
+        kRunning,
+        kCompleted,
+        kError,
+    };
+
     struct InferenceSummary {
         float score = 0.0f;              // 0..1 normalized confidence/severity
         bool action_required = false;    // deterministic rule trigger
@@ -60,6 +69,10 @@ public:
      * Caller provides compact numeric features extracted from domain payload.
      */
     Status InferNoTrain(MembraneKind kind, std::span<const float> features, InferenceSummary* out) const;
+
+    /** Runtime diagnostics for production control planes. */
+    RuntimeState State() const;
+    Status LastStatus() const;
 
 private:
     struct Impl;

@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <span>
+#include "pomai/status.h"
 
 namespace pomai::core {
 
@@ -37,12 +38,41 @@ namespace pomai::core {
         constexpr uint32_t kNewIterator      = 0x0B;
         constexpr uint32_t kSearchLexical    = 0x0C;
         constexpr uint32_t kPutBatch         = 0x0D;
+        constexpr uint32_t kPutWithMeta      = 0x0E;
+        constexpr uint32_t kGetWithMeta      = 0x0F;
 
         // Graph Opcodes (0x10 - 0x1F)
         constexpr uint32_t kAddVertex           = 0x10;
         constexpr uint32_t kAddEdge             = 0x11;
         constexpr uint32_t kGetNeighbors       = 0x12;
         constexpr uint32_t kGetNeighborsWithType = 0x13;
+    }
+
+    inline bool IsKnownOpcode(uint32_t opcode) {
+        switch (opcode) {
+            case Op::kPut:
+            case Op::kGet:
+            case Op::kSearch:
+            case Op::kDelete:
+            case Op::kFlush:
+            case Op::kFreeze:
+            case Op::kSync:
+            case Op::kSearchMultiModal:
+            case Op::kExists:
+            case Op::kGetSnapshot:
+            case Op::kNewIterator:
+            case Op::kSearchLexical:
+            case Op::kPutBatch:
+            case Op::kPutWithMeta:
+            case Op::kGetWithMeta:
+            case Op::kAddVertex:
+            case Op::kAddEdge:
+            case Op::kGetNeighbors:
+            case Op::kGetNeighborsWithType:
+                return true;
+            default:
+                return false;
+        }
     }
 
     struct TraceMetadata {
@@ -56,9 +86,9 @@ namespace pomai::core {
      * Lightweight and zero-copy where possible (payload is often a view).
      */
     struct Message {
-        PodId sender;
-        PodId target;
-        uint32_t opcode;
+        PodId sender = PodId::kKernel;
+        PodId target = PodId::kKernel;
+        uint32_t opcode = 0;
         std::string_view membrane_id;
         
         // Payload can be raw bytes (span) or a small string
@@ -66,6 +96,8 @@ namespace pomai::core {
         
         // Synchronous result pointer (for single-threaded direct response)
         void* result_ptr = nullptr;
+        // Optional explicit status channel for safe error propagation.
+        Status* status_ptr = nullptr;
 
         // Optional LSN or Sequence for crash-recovery tracking
         uint64_t lsn = 0;

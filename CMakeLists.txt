@@ -432,6 +432,10 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(edge_platform_test)
   pomai_add_labeled_test(edge_platform_test "unit")
 
+  add_executable(kernel_hardening_test tests/unit/kernel_hardening_test.cc)
+  pomai_setup_test(kernel_hardening_test)
+  pomai_add_labeled_test(kernel_hardening_test "unit")
+
   add_executable(graph_rag_test tests/unit/graph_rag_test.cc)
   pomai_setup_test(graph_rag_test)
   pomai_add_labeled_test(graph_rag_test "unit")
@@ -475,6 +479,7 @@ if (POMAI_BUILD_TESTS)
   add_executable(no_train_dispatch_test tests/unit/no_train_dispatch_test.cc)
   pomai_setup_test(no_train_dispatch_test)
   pomai_add_labeled_test(no_train_dispatch_test "unit")
+
 
   add_executable(edge_ai_core_enhancements_test tests/unit/edge_ai_core_enhancements_test.cc)
   pomai_setup_test(edge_ai_core_enhancements_test)
@@ -796,6 +801,10 @@ add_executable(vulkan_transfer_bench benchmarks/vulkan_transfer_bench.cc)
 target_link_libraries(vulkan_transfer_bench PRIVATE ${POMAI_EXE_DEPS})
 target_include_directories(vulkan_transfer_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+add_executable(kernel_dispatch_bench benchmarks/kernel_dispatch_bench.cc)
+target_link_libraries(kernel_dispatch_bench PRIVATE ${POMAI_EXE_DEPS})
+target_include_directories(kernel_dispatch_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # Bounded benchmark smoke tests (avoid ctest default 1500s timeout on heavy workloads).
 if (POMAI_REGISTER_BENCH_CTEST)
   set(POMAI_BENCH_TIMEOUT_LONG 600)
@@ -849,6 +858,9 @@ if (POMAI_REGISTER_BENCH_CTEST)
 
   add_test(NAME bench_vulkan_transfer COMMAND $<TARGET_FILE:vulkan_transfer_bench>)
   set_tests_properties(bench_vulkan_transfer PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
+
+  add_test(NAME bench_kernel_dispatch COMMAND $<TARGET_FILE:kernel_dispatch_bench> 100000)
+  set_tests_properties(bench_kernel_dispatch PROPERTIES LABELS "bench" TIMEOUT ${POMAI_BENCH_TIMEOUT_SHORT})
 endif()
 
 # =========================

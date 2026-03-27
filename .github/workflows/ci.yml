@@ -37,6 +37,11 @@ jobs:
           POMAI_SKIP_VULKAN_TESTS: 1
         run: ctest --test-dir build -L bench --output-on-failure -C Release --timeout 600
 
+      - name: Perf Regression Gate
+        env:
+          POMAI_PERF_MAX_REGRESSION_PCT: 15
+        run: ./tools/perf_gate.sh --build-dir=build --dataset=small
+
       - name: Package ci-fast artifact
         shell: bash
         run: |
