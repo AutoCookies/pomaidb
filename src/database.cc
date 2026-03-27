@@ -24,6 +24,10 @@
 #include <memory>
 
 namespace pomai {
+namespace {
+constexpr uint32_t kKernelHotPathMaxMsgs = 8;
+constexpr uint32_t kKernelHotPathMaxMs = 2;
+}
 
 Status StorageEngine::Open(const EmbeddedOptions& options) {
     auto env = options.env ? options.env : Env::Default();
@@ -59,14 +63,20 @@ Status StorageEngine::Open(const EmbeddedOptions& options) {
 }
 
 Status StorageEngine::SearchMultiModal(std::string_view membrane, const MultiModalQuery& query, SearchResult* out) {
+    Status st = Status::Ok();
+    struct ResultEnvelope {
+        SearchResult* out;
+        Status* st;
+    } env{out, &st};
     const MultiModalQuery* q_ptr = &query;
     core::Message msg = core::Message::Create(core::PodId::kQuery, core::Op::kSearchMultiModal, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&q_ptr), sizeof(void*)));
     msg.membrane_id = membrane;
-    msg.result_ptr = out;
+    msg.result_ptr = &env;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 void StorageEngine::Close() {
@@ -77,8 +87,9 @@ Status StorageEngine::Flush() {
     Status st = Status::Ok();
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kFlush);
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
     return st;
 }
 
@@ -86,8 +97,9 @@ Status StorageEngine::Freeze() {
     Status st = Status::Ok();
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kFreeze);
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
     return st;
 }
 
@@ -100,11 +112,12 @@ Status StorageEngine::Append(VectorId id, std::span<const float> vec, const Meta
         const Metadata* meta;
     } p = {id, vec.data(), vec.size(), &meta};
 
-    core::Message msg = core::Message::Create(core::PodId::kIndex, 0x0F /* kPutWithMeta */, 
+    core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kPutWithMeta, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&p), sizeof(P)));
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
 
     if (st.ok()) {
         for (auto& h : hooks_) h->OnPostPut(id, vec, meta);
@@ -126,8 +139,9 @@ Status StorageEngine::AppendBatch(const std::vector<VectorId>& ids, const std::v
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kPutBatch, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload)));
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
 
     if (st.ok()) {
         for (size_t i = 0; i < ids.size(); ++i) {
@@ -145,21 +159,24 @@ Status StorageEngine::Get(VectorId id, std::vector<float>* out, Metadata* meta) 
         Metadata* out_meta;
     } p = {id, out, meta};
 
-    core::Message msg = core::Message::Create(core::PodId::kIndex, 0x10 /* kGetWithMeta */, 
+    core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kGetWithMeta, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&p), sizeof(P)));
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
     return st;
 }
 
 Status StorageEngine::Exists(VectorId id, bool* exists) {
+    Status st = Status::Ok();
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kExists, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&id), sizeof(id)));
     msg.result_ptr = exists;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 Status StorageEngine::Delete(VectorId id) {
@@ -167,40 +184,52 @@ Status StorageEngine::Delete(VectorId id) {
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kDelete, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&id), sizeof(id)));
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
     return st;
 }
 
 Status StorageEngine::Search(std::string_view membrane, std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult* out) {
+    Status st = Status::Ok();
     struct P {
         uint32_t topk;
         const float* query_data;
         size_t query_size;
         const SearchOptions* opts;
     } p = {topk, query.data(), query.size(), &opts};
+    struct SearchResultEnvelope {
+        SearchResult* out;
+        Status* st;
+    } env{out, &st};
 
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kSearch, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&p), sizeof(P)));
     msg.membrane_id = membrane;
-    msg.result_ptr = out;
+    msg.result_ptr = &env;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 Status StorageEngine::SearchLexical(std::string_view membrane, const std::string& query, uint32_t topk, std::vector<core::LexicalHit>* out) {
-    // Op::kSearchLexical = 0x0C
-    std::vector<uint8_t> payload(4 + query.size());
-    std::memcpy(payload.data(), &topk, 4);
-    std::memcpy(payload.data() + 4, query.data(), query.size());
+    Status st = Status::Ok();
+    struct P {
+        uint32_t topk;
+        const std::string* query;
+        std::vector<core::LexicalHit>* out;
+        Status* st;
+    } p = {topk, &query, out, &st};
 
-    core::Message msg = core::Message::Create(core::PodId::kIndex, 0x0C /* kSearchLexical */, payload);
+    core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kSearchLexical,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&p), sizeof(P)));
     msg.membrane_id = membrane;
-    msg.result_ptr = out;
+    msg.result_ptr = nullptr;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 Status StorageEngine::Search(std::span<const float> query, uint32_t topk, const SearchOptions& opts, SearchResult* out) {
@@ -214,8 +243,9 @@ Status StorageEngine::AddVertex(VertexId id, TagId tag, const Metadata& meta) {
     core::Message msg = core::Message::Create(core::PodId::kGraph, core::Op::kAddVertex, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload)));
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
     return st;
 }
 
@@ -226,8 +256,9 @@ Status StorageEngine::AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_
     core::Message msg = core::Message::Create(core::PodId::kGraph, core::Op::kAddEdge, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload)));
     msg.result_ptr = &st;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
     return st;
 }
 
@@ -247,48 +278,58 @@ std::optional<core::LinkedObject> StorageEngine::ResolveLinkedByVectorId(uint64_
 // (Method removed to avoid duplication and signature mismatch)
 
 Status StorageEngine::GetNeighbors(VertexId src, std::vector<pomai::Neighbor>* out) {
+    Status st = Status::Ok();
     core::Message msg = core::Message::Create(core::PodId::kGraph, core::Op::kGetNeighbors, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&src), sizeof(src)));
     msg.result_ptr = out;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 Status StorageEngine::GetNeighbors(VertexId src, EdgeType type, std::vector<pomai::Neighbor>* out) {
+    Status st = Status::Ok();
     struct { VertexId src; EdgeType type; } payload = {src, type};
     core::Message msg = core::Message::Create(core::PodId::kGraph, core::Op::kGetNeighborsWithType, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload)));
     msg.result_ptr = out;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 Status StorageEngine::GetSnapshot(std::shared_ptr<Snapshot>* out) {
+    Status st = Status::Ok();
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kGetSnapshot);
     msg.result_ptr = out;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 Status StorageEngine::NewIterator(const std::shared_ptr<Snapshot>& snap, std::unique_ptr<SnapshotIterator>* out) {
+    Status st = Status::Ok();
     const std::shared_ptr<Snapshot>* s_ptr = &snap;
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kNewIterator, 
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&s_ptr), sizeof(void*)));
     msg.result_ptr = out;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 Status StorageEngine::PushSync(core::SyncReceiver* receiver) {
+    Status st = Status::Ok();
     core::Message msg = core::Message::Create(core::PodId::kIndex, core::Op::kSync);
     msg.result_ptr = receiver;
+    msg.status_ptr = &st;
     kernel_.Enqueue(std::move(msg));
-    kernel_.ProcessAll();
-    return Status::Ok();
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
 }
 
 std::size_t StorageEngine::GetMemTableBytesUsed() const {

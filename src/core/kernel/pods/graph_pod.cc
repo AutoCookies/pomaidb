@@ -2,6 +2,11 @@
 #include <cstring>
 
 namespace pomai::core {
+    namespace {
+    void SetStatus(Status* out, const Status& st) {
+        if (out) *out = st;
+    }
+    }
 
     struct AddVertexPayload {
         VertexId id;
@@ -18,23 +23,32 @@ namespace pomai::core {
 
     void GraphPod::Handle(Message&& msg) {
         switch (msg.opcode) {
-            case 0x10: { // AddVertex
-                if (msg.payload.size() < sizeof(AddVertexPayload)) return;
+            case Op::kAddVertex: {
+                if (msg.payload.size() < sizeof(AddVertexPayload)) {
+                    SetStatus(msg.status_ptr, Status::InvalidArgument("graph add-vertex payload too small"));
+                    return;
+                }
                 const auto* p = reinterpret_cast<const AddVertexPayload*>(msg.payload.data());
                 // Metadata is empty for now or extracted from tail
                 auto st = runtime_->AddVertex(p->id, p->tag, Metadata());
-                if (msg.result_ptr) *static_cast<Status*>(msg.result_ptr) = st;
+                SetStatus(msg.status_ptr, st);
                 break;
             }
-            case 0x11: { // AddEdge
-                if (msg.payload.size() < sizeof(AddEdgePayload)) return;
+            case Op::kAddEdge: {
+                if (msg.payload.size() < sizeof(AddEdgePayload)) {
+                    SetStatus(msg.status_ptr, Status::InvalidArgument("graph add-edge payload too small"));
+                    return;
+                }
                 const auto* p = reinterpret_cast<const AddEdgePayload*>(msg.payload.data());
                 auto st = runtime_->AddEdge(p->src, p->dst, p->type, p->rank, Metadata());
-                if (msg.result_ptr) *static_cast<Status*>(msg.result_ptr) = st;
+                SetStatus(msg.status_ptr, st);
                 break;
             }
-            case 0x12: { // GetNeighbors
-                if (msg.payload.size() < sizeof(VertexId)) return;
+            case Op::kGetNeighbors: {
+                if (msg.payload.size() < sizeof(VertexId)) {
+                    SetStatus(msg.status_ptr, Status::InvalidArgument("graph get-neighbors payload too small"));
+                    return;
+                }
                 VertexId src = *reinterpret_cast<const VertexId*>(msg.payload.data());
                 if (msg.result_ptr) {
                     auto* out = static_cast<std::vector<Neighbor>*>(msg.result_ptr);
@@ -42,9 +56,12 @@ namespace pomai::core {
                 }
                 break;
             }
-            case 0x13: { // GetNeighborsWithType
+            case Op::kGetNeighborsWithType: {
                 struct P { VertexId src; EdgeType type; };
-                if (msg.payload.size() < sizeof(P)) return;
+                if (msg.payload.size() < sizeof(P)) {
+                    SetStatus(msg.status_ptr, Status::InvalidArgument("graph get-neighbors-type payload too small"));
+                    return;
+                }
                 const auto* p = reinterpret_cast<const P*>(msg.payload.data());
                 if (msg.result_ptr) {
                     auto* out = static_cast<std::vector<Neighbor>*>(msg.result_ptr);
@@ -53,6 +70,7 @@ namespace pomai::core {
                 break;
             }
             default:
+                SetStatus(msg.status_ptr, Status::InvalidArgument("graph pod unsupported opcode"));
                 break;
         }
     }

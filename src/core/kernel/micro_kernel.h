@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -96,15 +97,25 @@ namespace pomai::core {
             
             Message msg = std::move(*msg_opt);
             auto it = pods_.find(msg.target);
-            if (it != pods_.end()) {
-                metrics::MetricsRegistry::Instance().Increment("kernel_messages_dispatched");
-                
-                // Tracing for observability
-                if (msg.trace.enabled) {
-                    msg.trace.hop_count++;
-                }
-
+            if (it == pods_.end()) {
+                metrics::MetricsRegistry::Instance().Increment("kernel_dispatch_target_not_found");
+                SetStatusIfPresent(msg.status_ptr, Status::NotFound("kernel target pod not found"));
+                return true;
+            }
+            if (!IsKnownOpcode(msg.opcode)) {
+                metrics::MetricsRegistry::Instance().Increment("kernel_dispatch_bad_opcode");
+                SetStatusIfPresent(msg.status_ptr, Status::InvalidArgument("kernel opcode unknown"));
+                return true;
+            }
+            metrics::MetricsRegistry::Instance().Increment("kernel_messages_dispatched");
+            if (msg.trace.enabled) {
+                msg.trace.hop_count++;
+            }
+            try {
                 it->second->Handle(std::move(msg));
+            } catch (...) {
+                metrics::MetricsRegistry::Instance().Increment("kernel_dispatch_exceptions");
+                SetStatusIfPresent(msg.status_ptr, Status::Internal("kernel pod handler exception"));
             }
             
             return true;
@@ -113,6 +124,21 @@ namespace pomai::core {
         /** Drain the entire queue. */
         void ProcessAll() {
             while (DispatchOne());
+        }
+
+        /** Drain queue with message/time budget to bound tail latency. */
+        uint32_t ProcessBudget(uint32_t max_msgs, uint32_t max_ms) {
+            if (max_msgs == 0) max_msgs = 1;
+            if (max_ms == 0) max_ms = 1;
+            const auto start = std::chrono::steady_clock::now();
+            const auto deadline = start + std::chrono::milliseconds(max_ms);
+            uint32_t processed = 0;
+            while (processed < max_msgs) {
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                if (!DispatchOne()) break;
+                ++processed;
+            }
+            return processed;
         }
 
         /** Shutdown all pods. */
@@ -131,6 +157,10 @@ namespace pomai::core {
         }
 
     private:
+        static void SetStatusIfPresent(Status* status_ptr, const Status& st) {
+            if (!status_ptr) return;
+            *status_ptr = st;
+        }
         std::unordered_map<PodId, std::unique_ptr<Pod>> pods_;
         util::StaticRingBuffer<Message, 1024> queue_;
     };

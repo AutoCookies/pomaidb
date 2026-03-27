@@ -3,6 +3,7 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <filesystem>
 
 // GGUF (cheesebrain) headers
 #include "ai/cheesebrain_core/cheese-context.h"
@@ -29,6 +30,8 @@ namespace pomai::core {
 
 struct AIEngine::Impl {
     ModelType type;
+    RuntimeState state = RuntimeState::kUninitialized;
+    mutable Status last_status = Status::Ok();
     
     // GGUF state
     std::unique_ptr<cheese_context> gguf_ctx;
@@ -39,32 +42,68 @@ struct AIEngine::Impl {
 
     // Analytical Backend
     std::unique_ptr<AnalyticalEngine> analytical_engine;
+    std::string text_result;
 
     Impl() : type(ModelType::kGGUF) {}
+
+    void Reset() {
+        gguf_ctx.reset();
+        tflite_interpreter.reset();
+        tflite_model.reset();
+        analytical_engine.reset();
+        text_result.clear();
+        state = RuntimeState::kUninitialized;
+        last_status = Status::Ok();
+    }
 };
 
 AIEngine::AIEngine() : impl_(std::make_unique<Impl>()) {}
 AIEngine::~AIEngine() = default;
 
 Status AIEngine::LoadModel(const std::string& path, ModelType type) {
+    impl_->Reset();
     impl_->type = type;
+    impl_->state = RuntimeState::kLoaded;
+
+    if (type == ModelType::kAnalytical) {
+        impl_->analytical_engine = std::make_unique<AnalyticalEngine>();
+        impl_->state = RuntimeState::kReady;
+        impl_->last_status = Status::Ok();
+        return Status::Ok();
+    }
+
+    if (path.empty()) {
+        impl_->state = RuntimeState::kError;
+        impl_->last_status = Status::InvalidArgument("model path is empty");
+        return impl_->last_status;
+    }
+    if (!std::filesystem::exists(path)) {
+        impl_->state = RuntimeState::kError;
+        impl_->last_status = Status::NotFound("model file not found");
+        return impl_->last_status;
+    }
 
     if (type == ModelType::kGGUF) {
         try {
-            // Simplified GGUF loading using cheesebrain's loader.
-            // In a real implementation, we'd pass palloc hints here.
+            // Keep path validation strict; mark GGUF as explicit not-supported
+            // until streaming context wiring is fully enabled.
             cheese_model_params mparams = cheese_model_default_params();
             (void)mparams;
-            // impl_->gguf_ctx = ...
-            return Status::Ok();
+            impl_->state = RuntimeState::kError;
+            impl_->last_status = Status::NotSupported("GGUF runtime wiring is not enabled yet");
+            return impl_->last_status;
         } catch (const std::exception& e) {
-            return Status::IoError(e.what());
+            impl_->state = RuntimeState::kError;
+            impl_->last_status = Status::IoError(e.what());
+            return impl_->last_status;
         }
     } else {
         // TFLite loading
         impl_->tflite_model = tflite::FlatBufferModel::BuildFromFile(path.c_str());
         if (!impl_->tflite_model) {
-            return Status::IoError("Failed to load TFLite model from " + path);
+            impl_->state = RuntimeState::kError;
+            impl_->last_status = Status::IoError("Failed to load TFLite model from " + path);
+            return impl_->last_status;
         }
 
         tflite::MutableOpResolver resolver;
@@ -77,52 +116,108 @@ Status AIEngine::LoadModel(const std::string& path, ModelType type) {
         
         tflite::InterpreterBuilder builder(*impl_->tflite_model, resolver);
         if (builder(&impl_->tflite_interpreter) != kTfLiteOk) {
-            return Status::Internal("Failed to build TFLite interpreter");
+            impl_->state = RuntimeState::kError;
+            impl_->last_status = Status::Internal("Failed to build TFLite interpreter");
+            return impl_->last_status;
         }
 
         if (impl_->tflite_interpreter->AllocateTensors() != kTfLiteOk) {
-            return Status::Internal("Failed to allocate TFLite tensors");
+            impl_->state = RuntimeState::kError;
+            impl_->last_status = Status::Internal("Failed to allocate TFLite tensors");
+            return impl_->last_status;
         }
+        impl_->state = RuntimeState::kReady;
+        impl_->last_status = Status::Ok();
         return Status::Ok();
     }
 }
 
 bool AIEngine::StepInference(float* progress) {
-    if (impl_->type == ModelType::kTensor && impl_->tflite_interpreter) {
-        // TFLite standard Invoke is not natively sliceable without custom kernels,
-        // but for PomaiDB we'll wrap it or use a sub-graph approach if needed.
-        if (impl_->tflite_interpreter->Invoke() == kTfLiteOk) {
-            if (progress) *progress = 1.0f;
-            return true;
-        }
+    if (progress) *progress = 0.0f;
+    if (impl_->state != RuntimeState::kReady && impl_->state != RuntimeState::kRunning) {
+        impl_->last_status = Status(ErrorCode::kFailedPrecondition, "model is not ready");
         return false;
     }
-    
-    // TODO: Implement GGUF sliceable stepping (token by token)
-    return true; 
+    impl_->state = RuntimeState::kRunning;
+
+    if (impl_->type == ModelType::kTensor && impl_->tflite_interpreter) {
+        if (impl_->tflite_interpreter->Invoke() == kTfLiteOk) {
+            if (progress) *progress = 1.0f;
+            impl_->state = RuntimeState::kCompleted;
+            impl_->last_status = Status::Ok();
+            return true;
+        }
+        impl_->state = RuntimeState::kError;
+        impl_->last_status = Status::Internal("TFLite invoke failed");
+        return false;
+    }
+
+    if (impl_->type == ModelType::kAnalytical && impl_->analytical_engine) {
+        if (progress) *progress = 1.0f;
+        impl_->state = RuntimeState::kCompleted;
+        impl_->last_status = Status::Ok();
+        return true;
+    }
+
+    impl_->state = RuntimeState::kError;
+    impl_->last_status = Status::NotSupported("backend does not support step inference");
+    return false;
 }
 
 void AIEngine::SetInput(std::span<const float> data) {
-    if (impl_->type == ModelType::kTensor && impl_->tflite_interpreter) {
-        float* input = impl_->tflite_interpreter->typed_input_tensor<float>(0);
-        if (input) {
-            std::copy(data.begin(), data.end(), input);
-        }
+    if (impl_->type != ModelType::kTensor || !impl_->tflite_interpreter) {
+        impl_->last_status = Status(ErrorCode::kFailedPrecondition, "tensor backend is not ready");
+        return;
     }
+    const TfLiteTensor* tensor = impl_->tflite_interpreter->input_tensor(0);
+    if (!tensor) {
+        impl_->last_status = Status::Internal("missing input tensor");
+        return;
+    }
+    const size_t expected = tensor->bytes / sizeof(float);
+    if (expected == 0 || data.size() != expected) {
+        impl_->last_status = Status::InvalidArgument("input size mismatch");
+        return;
+    }
+    float* input = impl_->tflite_interpreter->typed_input_tensor<float>(0);
+    if (!input) {
+        impl_->last_status = Status::Internal("input tensor type is not float");
+        return;
+    }
+    std::copy(data.begin(), data.end(), input);
+    impl_->last_status = Status::Ok();
 }
 
 std::span<const float> AIEngine::GetOutput(int index) const {
+    if (index < 0) {
+        impl_->last_status = Status::InvalidArgument("output index must be non-negative");
+        return {};
+    }
     if (impl_->type == ModelType::kTensor && impl_->tflite_interpreter) {
+        if (static_cast<size_t>(index) >= impl_->tflite_interpreter->outputs().size()) {
+            impl_->last_status = Status::InvalidArgument("output index out of range");
+            return {};
+        }
+        const TfLiteTensor* out_tensor = impl_->tflite_interpreter->output_tensor(index);
+        if (!out_tensor) {
+            impl_->last_status = Status::Internal("missing output tensor");
+            return {};
+        }
         const float* output = impl_->tflite_interpreter->typed_output_tensor<float>(index);
-        size_t size = impl_->tflite_interpreter->output_tensor(index)->bytes / sizeof(float);
+        if (!output) {
+            impl_->last_status = Status::Internal("output tensor type is not float");
+            return {};
+        }
+        size_t size = out_tensor->bytes / sizeof(float);
+        impl_->last_status = Status::Ok();
         return {output, size};
     }
+    impl_->last_status = Status(ErrorCode::kFailedPrecondition, "tensor backend is not ready");
     return {};
 }
 
 std::string AIEngine::GetTextResult() const {
-    // Return placeholder for now.
-    return "AI generation result placeholder";
+    return impl_->text_result;
 }
 
 Status AIEngine::InferNoTrain(MembraneKind kind, std::span<const float> features, InferenceSummary* out) const {
@@ -134,7 +229,12 @@ Status AIEngine::InferNoTrain(MembraneKind kind, std::span<const float> features
     out->action_required = summary.action_required;
     out->label = summary.label;
     out->explanation = summary.explanation;
+    impl_->last_status = Status::Ok();
     return Status::Ok();
 }
+
+AIEngine::RuntimeState AIEngine::State() const { return impl_->state; }
+
+Status AIEngine::LastStatus() const { return impl_->last_status; }
 
 } // namespace pomai::core
