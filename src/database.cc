@@ -262,6 +262,29 @@ Status StorageEngine::AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_
     return st;
 }
 
+Status StorageEngine::DeleteVertex(VertexId id) {
+    Status st = Status::Ok();
+    core::Message msg = core::Message::Create(core::PodId::kGraph, core::Op::kDeleteVertex,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&id), sizeof(id)));
+    msg.result_ptr = nullptr;
+    msg.status_ptr = &st;
+    kernel_.Enqueue(std::move(msg));
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
+}
+
+Status StorageEngine::DeleteEdge(VertexId src, VertexId dst, EdgeType type) {
+    Status st = Status::Ok();
+    struct { VertexId src; VertexId dst; EdgeType type; } payload = {src, dst, type};
+    core::Message msg = core::Message::Create(core::PodId::kGraph, core::Op::kDeleteEdge,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&payload), sizeof(payload)));
+    msg.result_ptr = nullptr;
+    msg.status_ptr = &st;
+    kernel_.Enqueue(std::move(msg));
+    (void)kernel_.ProcessBudget(kKernelHotPathMaxMsgs, kKernelHotPathMaxMs);
+    return st;
+}
+
 Status StorageEngine::GetNeighbors(std::string_view /*membrane*/, VertexId src, std::vector<pomai::Neighbor>* out) {
     return GetNeighbors(src, out);
 }
@@ -569,6 +592,20 @@ Status Database::AddVertex(VertexId id, TagId tag, const Metadata& meta) {
 Status Database::AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta) {
     if (!opened_) return Status::InvalidArgument("closed");
     auto st = storage_engine_->AddEdge(src, dst, type, rank, meta);
+    impl_->scheduler.Poll();
+    return st;
+}
+
+Status Database::DeleteVertex(VertexId id) {
+    if (!opened_) return Status::InvalidArgument("closed");
+    auto st = storage_engine_->DeleteVertex(id);
+    impl_->scheduler.Poll();
+    return st;
+}
+
+Status Database::DeleteEdge(VertexId src, VertexId dst, EdgeType type) {
+    if (!opened_) return Status::InvalidArgument("closed");
+    auto st = storage_engine_->DeleteEdge(src, dst, type);
     impl_->scheduler.Poll();
     return st;
 }

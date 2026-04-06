@@ -19,8 +19,7 @@ namespace pomai::core {
         std::string Name() const override { return "GraphService"; }
 
         MemoryQuota GetQuota() const override {
-            // TODO: Implement actual accounting in GraphMembraneImpl
-            return {0, 0};
+            return {runtime_->MemoryBytesUsed(), 0};
         }
 
         void OnStart() override { (void)runtime_->WarmUp(); }

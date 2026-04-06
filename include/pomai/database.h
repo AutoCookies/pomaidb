@@ -187,6 +187,8 @@ public:
     /** Graph Operations */
     Status AddVertex(VertexId id, TagId tag, const Metadata& meta);
     Status AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta);
+    Status DeleteVertex(VertexId id);
+    Status DeleteEdge(VertexId src, VertexId dst, EdgeType type);
     Status GetNeighbors(VertexId src, std::vector<Neighbor>* out);
     Status GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out);
 

@@ -73,6 +73,8 @@ POMAI_API pomai_status_t* pomai_graph_add_vertex(pomai_db_t* db, pomai_vertex_id
 POMAI_API pomai_status_t* pomai_graph_add_edge(pomai_db_t* db, pomai_vertex_id_t src, pomai_vertex_id_t dst, pomai_edge_type_t type, uint32_t rank, const uint8_t* metadata, size_t metadata_len);
 POMAI_API pomai_status_t* pomai_graph_get_neighbors(pomai_db_t* db, pomai_vertex_id_t src, pomai_neighbor_t** out_neighbors, size_t* out_count);
 POMAI_API void pomai_graph_neighbors_free(pomai_neighbor_t* neighbors);
+POMAI_API pomai_status_t* pomai_graph_delete_vertex(pomai_db_t* db, pomai_vertex_id_t id);
+POMAI_API pomai_status_t* pomai_graph_delete_edge(pomai_db_t* db, pomai_vertex_id_t src, pomai_vertex_id_t dst, pomai_edge_type_t type);
 
 // Multi-modal search
 POMAI_API pomai_status_t* pomai_search_multi_modal(pomai_db_t* db, const pomai_multi_modal_query_t* query, pomai_search_results_t** out);

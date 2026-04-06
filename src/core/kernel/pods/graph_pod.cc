@@ -69,6 +69,25 @@ namespace pomai::core {
                 }
                 break;
             }
+            case Op::kDeleteVertex: {
+                if (msg.payload.size() < sizeof(VertexId)) {
+                    SetStatus(msg.status_ptr, Status::InvalidArgument("graph delete-vertex payload too small"));
+                    return;
+                }
+                VertexId id = *reinterpret_cast<const VertexId*>(msg.payload.data());
+                SetStatus(msg.status_ptr, runtime_->DeleteVertex(id));
+                break;
+            }
+            case Op::kDeleteEdge: {
+                struct P { VertexId src; VertexId dst; EdgeType type; };
+                if (msg.payload.size() < sizeof(P)) {
+                    SetStatus(msg.status_ptr, Status::InvalidArgument("graph delete-edge payload too small"));
+                    return;
+                }
+                const auto* p = reinterpret_cast<const P*>(msg.payload.data());
+                SetStatus(msg.status_ptr, runtime_->DeleteEdge(p->src, p->dst, p->type));
+                break;
+            }
             default:
                 SetStatus(msg.status_ptr, Status::InvalidArgument("graph pod unsupported opcode"));
                 break;

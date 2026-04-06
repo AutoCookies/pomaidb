@@ -97,4 +97,38 @@ POMAI_TEST(Embedded_Error_FlushNotOpened) {
     POMAI_EXPECT_TRUE(st.code() == pomai::ErrorCode::kInvalidArgument);
 }
 
+// Graph error paths
+
+POMAI_TEST(Graph_Error_AddVertexNotOpened) {
+    pomai::Database db;
+    pomai::Status st = db.AddVertex(1, 0, pomai::Metadata{});
+    POMAI_EXPECT_TRUE(!st.ok());
+    POMAI_EXPECT_TRUE(st.code() == pomai::ErrorCode::kInvalidArgument);
+}
+
+POMAI_TEST(Graph_Error_DeleteVertexNotOpened) {
+    pomai::Database db;
+    pomai::Status st = db.DeleteVertex(1);
+    POMAI_EXPECT_TRUE(!st.ok());
+    POMAI_EXPECT_TRUE(st.code() == pomai::ErrorCode::kInvalidArgument);
+}
+
+POMAI_TEST(Graph_Error_DeleteEdgeNotOpened) {
+    pomai::Database db;
+    pomai::Status st = db.DeleteEdge(1, 2, 1);
+    POMAI_EXPECT_TRUE(!st.ok());
+    POMAI_EXPECT_TRUE(st.code() == pomai::ErrorCode::kInvalidArgument);
+}
+
+// Deleting a vertex that was never added must succeed (idempotent, set semantics).
+POMAI_TEST(Graph_DeleteVertexNeverAdded_IsIdempotent) {
+    pomai::EmbeddedOptions opt;
+    opt.path = pomai::test::TempDir("graph_err_del_never");
+    opt.dim = 4;
+    pomai::Database db;
+    POMAI_EXPECT_OK(db.Open(opt));
+    POMAI_EXPECT_OK(db.DeleteVertex(9999));
+    POMAI_EXPECT_OK(db.Close());
+}
+
 } // namespace

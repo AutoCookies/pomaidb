@@ -271,6 +271,11 @@ namespace pomai::core
                 if (!st.ok())
                     return st;
             }
+            if (kv.second.graph_engine) {
+                auto st = kv.second.graph_engine->Flush();
+                if (!st.ok())
+                    return st;
+            }
         }
         return Status::Ok();
     }
@@ -310,6 +315,10 @@ namespace pomai::core
             }
             if (kv.second.document_engine) {
                 (void)kv.second.document_engine->Close();
+            }
+            if (kv.second.graph_engine) {
+                // Flush WAL to disk before teardown; ignore error (other engines already closing).
+                (void)kv.second.graph_engine->Flush();
             }
         }
         membranes_.clear();
@@ -453,7 +462,11 @@ namespace pomai::core
         } else if (state->spec.kind == pomai::MembraneKind::kMesh) {
             return state->mesh_engine->Open();
         }
-        // Graph/Text membrane currently initialize on create/restore.
+        // For graph membranes, replay the WAL to rebuild the adjacency lists.
+        if (state->spec.kind == pomai::MembraneKind::kGraph && state->graph_engine) {
+            return state->graph_engine->WarmUp();
+        }
+        // Text and other membranes initialize on create/restore.
         return Status::Ok();
     }
 
@@ -1058,6 +1071,22 @@ namespace pomai::core
         if (!state) return Status::NotFound("membrane not found");
         if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
         return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->AddEdge(src, dst, type, rank, meta);
+    }
+
+    Status MembraneManager::DeleteVertex(std::string_view membrane, VertexId id)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->DeleteVertex(id);
+    }
+
+    Status MembraneManager::DeleteEdge(std::string_view membrane, VertexId src, VertexId dst, EdgeType type)
+    {
+        auto *state = GetMembraneOrNull(membrane);
+        if (!state) return Status::NotFound("membrane not found");
+        if (!state->graph_engine) return Status::InvalidArgument("Graph membrane required");
+        return static_cast<pomai::GraphMembrane*>(state->graph_engine.get())->DeleteEdge(src, dst, type);
     }
 
     Status MembraneManager::GetNeighbors(std::string_view membrane, VertexId src, std::vector<pomai::Neighbor>* out) {

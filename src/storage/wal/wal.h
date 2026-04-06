@@ -19,6 +19,11 @@ namespace pomai::table
     class MemTable;
 }
 
+namespace pomai::core
+{
+    class GraphMembraneImpl;
+}
+
 namespace pomai::storage
 {
 
@@ -54,6 +59,7 @@ namespace pomai::storage
 
         pomai::Status Flush();
         pomai::Status ReplayInto(pomai::table::MemTable &mem);
+        pomai::Status ReplayGraphInto(pomai::core::GraphMembraneImpl* graph);
         
         // Closes current log, deletes all WAL files, and resets state.
         // Used after successful MemTable flush to segments.

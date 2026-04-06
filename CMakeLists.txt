@@ -440,6 +440,14 @@ if (POMAI_BUILD_TESTS)
   pomai_setup_test(graph_rag_test)
   pomai_add_labeled_test(graph_rag_test "unit")
 
+  add_executable(graph_persistence_test tests/unit/graph_persistence_test.cc)
+  pomai_setup_test(graph_persistence_test)
+  pomai_add_labeled_test(graph_persistence_test "unit")
+
+  add_executable(graph_memory_accounting_test tests/unit/graph_memory_accounting_test.cc)
+  pomai_setup_test(graph_memory_accounting_test)
+  pomai_add_labeled_test(graph_memory_accounting_test "unit")
+
   add_executable(rag_chunking_test tests/unit/rag_chunking_test.cc)
   pomai_setup_test(rag_chunking_test)
   pomai_add_labeled_test(rag_chunking_test "unit")

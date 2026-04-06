@@ -321,6 +321,12 @@ namespace pomai
         Status AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta) override {
             return mgr_.AddEdge(core::MembraneManager::kDefaultMembrane, src, dst, type, rank, meta);
         }
+        Status DeleteVertex(VertexId id) override {
+            return mgr_.DeleteVertex(core::MembraneManager::kDefaultMembrane, id);
+        }
+        Status DeleteEdge(VertexId src, VertexId dst, EdgeType type) override {
+            return mgr_.DeleteEdge(core::MembraneManager::kDefaultMembrane, src, dst, type);
+        }
         Status GetNeighbors(VertexId src, std::vector<Neighbor>* out) override {
             return mgr_.GetNeighbors(core::MembraneManager::kDefaultMembrane, src, out);
         }

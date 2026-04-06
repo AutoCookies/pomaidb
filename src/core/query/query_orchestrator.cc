@@ -1,6 +1,7 @@
 #include "core/query/query_orchestrator.h"
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "core/query/heuristic_engine.h"
@@ -102,7 +103,7 @@ Status QueryOrchestrator::Execute(std::string_view default_membrane, const pomai
             hit.related_ids.push_back(linked->mesh_id);
         }
         std::vector<VertexId> frontier{hit.id};
-        std::vector<VertexId> seen{hit.id};
+        std::unordered_set<VertexId> seen{hit.id};
         for (uint32_t hop = 0; hop < query.graph_hops; ++hop) {
             std::vector<VertexId> next;
             for (auto vid : frontier) {
@@ -112,12 +113,8 @@ Status QueryOrchestrator::Execute(std::string_view default_membrane, const pomai
                               : engine_->GetNeighbors(graph_mem, vid, &neighbors);
                 if (!st.ok()) continue;
                 for (const auto& n : neighbors) {
-                    bool exists = false;
-                    for (auto s : seen) {
-                        if (s == n.id) { exists = true; break; }
-                    }
-                    if (!exists) {
-                        seen.push_back(n.id);
+                    if (!seen.count(n.id)) {
+                        seen.insert(n.id);
                         next.push_back(n.id);
                         hit.related_ids.push_back(n.id);
                     }

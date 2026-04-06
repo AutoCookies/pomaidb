@@ -6,6 +6,7 @@
 
 #include "palloc_compat.h"
 #include "core/security/aes_gcm.h"
+#include "core/graph/graph_membrane_impl.h"
 #include "table/memtable.h"
 #include "util/crc32c.h"
 
@@ -642,6 +643,15 @@ namespace pomai::storage {
                     if (!st.ok())
                         return st;
                 }
+                else if (rp->op == static_cast<std::uint8_t>(Op::kRawKV) ||
+                         rp->op == static_cast<std::uint8_t>(Op::kBatchStart) ||
+                         rp->op == static_cast<std::uint8_t>(Op::kBatchEnd))
+                {
+                    // Non-vector records (graph raw KV, batch markers): skip gracefully.
+                    off = body_end;
+                    if (rp->seq > seq_) seq_ = rp->seq;
+                    continue;
+                }
                 else
                 {
                     return pomai::Status::Corruption("wal unknown op");
@@ -649,6 +659,117 @@ namespace pomai::storage {
 
                 if (rp->seq > seq_)
                     seq_ = rp->seq;
+                off = body_end;
+            }
+        }
+        return pomai::Status::Ok();
+    }
+
+    pomai::Status Wal::ReplayGraphInto(pomai::core::GraphMembraneImpl* graph)
+    {
+        if (!graph) return pomai::Status::InvalidArgument("graph is null");
+        for (std::uint64_t g = 0; env_->FileExists(SegmentPath(g)).ok(); ++g)
+        {
+            std::unique_ptr<pomai::RandomAccessFile> raf;
+            pomai::Status st = env_->NewRandomAccessFile(SegmentPath(g), &raf);
+            if (!st.ok() || !raf)
+                return st.ok() ? pomai::Status::IOError("NewRandomAccessFile returned null") : st;
+
+            std::uint64_t file_size = 0;
+            st = env_->GetFileSize(SegmentPath(g), &file_size);
+            if (!st.ok())
+                return pomai::Status::IoError("wal GetFileSize failed");
+
+            std::uint64_t off = 0;
+            if (file_size >= sizeof(WalFileHeader))
+            {
+                WalFileHeader hdr{};
+                pomai::Slice hdr_slice;
+                st = raf->Read(0, sizeof(hdr), &hdr_slice);
+                if (!st.ok()) return st;
+                if (hdr_slice.size() != sizeof(hdr))
+                    return pomai::Status::Corruption("wal short file header");
+                std::memcpy(&hdr, hdr_slice.data(), sizeof(hdr));
+                if (std::memcmp(hdr.magic, kWalMagic, sizeof(hdr.magic)) == 0)
+                {
+                    if (hdr.version != kWalVersion)
+                        return pomai::Status::Aborted("wal version mismatch");
+                    off = sizeof(WalFileHeader);
+                }
+            }
+
+            while (off + sizeof(FrameHeader) <= file_size)
+            {
+                FrameHeader fh{};
+                pomai::Slice fh_slice;
+                st = raf->Read(off, sizeof(fh), &fh_slice);
+                if (!st.ok()) return st;
+                if (fh_slice.size() != sizeof(fh)) break;
+                std::memcpy(&fh, fh_slice.data(), sizeof(fh));
+
+                const std::uint64_t body_off = off + sizeof(FrameHeader);
+                const std::uint64_t body_end = body_off + fh.len;
+                if (body_end > file_size) break;
+
+                std::vector<std::uint8_t> body(fh.len);
+                pomai::Slice body_slice;
+                st = raf->Read(body_off, fh.len, &body_slice);
+                if (!st.ok()) return st;
+                if (body_slice.size() != fh.len) break;
+                std::memcpy(body.data(), body_slice.data(), body_slice.size());
+
+                if (fh.len < sizeof(RecordPrefix) + sizeof(std::uint32_t))
+                {
+                    off = body_end;
+                    continue;
+                }
+
+                std::uint32_t stored_crc = 0;
+                std::memcpy(&stored_crc, body.data() + (fh.len - sizeof(std::uint32_t)), sizeof(stored_crc));
+                const std::uint32_t calc_crc = pomai::util::Crc32c(body.data(), fh.len - sizeof(std::uint32_t));
+                if (stored_crc != calc_crc)
+                    return pomai::Status::Corruption("wal crc mismatch");
+
+                std::vector<std::uint8_t> plain;
+                const std::uint8_t* payload_ptr = body.data();
+                std::size_t payload_len = fh.len - sizeof(std::uint32_t);
+                if (encryption_enabled_) {
+                    if (payload_len < 12 + 16) { off = body_end; continue; }
+                    std::array<std::uint8_t, 12> nonce{};
+                    std::array<std::uint8_t, 16> tag{};
+                    std::memcpy(nonce.data(), payload_ptr, nonce.size());
+                    const std::size_t cipher_len = payload_len - nonce.size() - tag.size();
+                    std::vector<std::uint8_t> cipher(cipher_len);
+                    std::memcpy(cipher.data(), payload_ptr + nonce.size(), cipher_len);
+                    std::memcpy(tag.data(), payload_ptr + nonce.size() + cipher_len, tag.size());
+                    auto dst = pomai::core::AesGcm::Decrypt(encryption_key_, nonce, cipher, tag, &plain);
+                    if (!dst.ok()) return dst;
+                    payload_ptr = plain.data();
+                    payload_len = plain.size();
+                }
+
+                if (payload_len < sizeof(RecordPrefix)) { off = body_end; continue; }
+                const auto* rp = reinterpret_cast<const RecordPrefix*>(payload_ptr);
+
+                if (rp->op == static_cast<std::uint8_t>(Op::kRawKV))
+                {
+                    // Layout after RecordPrefix: klen(4) | vlen(4) | key[klen] | value[vlen]
+                    const std::size_t min_size = sizeof(RecordPrefix) + 4 + 4;
+                    if (payload_len >= min_size)
+                    {
+                        std::uint32_t klen = 0, vlen = 0;
+                        std::memcpy(&klen, payload_ptr + sizeof(RecordPrefix), 4);
+                        std::memcpy(&vlen, payload_ptr + sizeof(RecordPrefix) + 4, 4);
+                        if (payload_len >= min_size + klen)
+                        {
+                            pomai::Slice key(reinterpret_cast<const char*>(payload_ptr + min_size), klen);
+                            graph->ReplayEntry(key);
+                        }
+                    }
+                }
+                // All other ops (kPut, kPutMeta, kDel, kBatchStart, kBatchEnd) are not graph records; skip.
+
+                if (rp->seq > seq_) seq_ = rp->seq;
                 off = body_end;
             }
         }

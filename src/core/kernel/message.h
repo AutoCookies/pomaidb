@@ -46,6 +46,8 @@ namespace pomai::core {
         constexpr uint32_t kAddEdge             = 0x11;
         constexpr uint32_t kGetNeighbors       = 0x12;
         constexpr uint32_t kGetNeighborsWithType = 0x13;
+        constexpr uint32_t kDeleteVertex        = 0x14;
+        constexpr uint32_t kDeleteEdge          = 0x15;
     }
 
     inline bool IsKnownOpcode(uint32_t opcode) {
@@ -69,6 +71,8 @@ namespace pomai::core {
             case Op::kAddEdge:
             case Op::kGetNeighbors:
             case Op::kGetNeighborsWithType:
+            case Op::kDeleteVertex:
+            case Op::kDeleteEdge:
                 return true;
             default:
                 return false;

@@ -32,12 +32,22 @@ public:
     virtual Status AddVertex(VertexId id, TagId tag, const Metadata& meta) = 0;
     virtual Status AddEdge(VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta) = 0;
 
+    /** Deletion */
+    virtual Status DeleteVertex(VertexId id) = 0;
+    virtual Status DeleteEdge(VertexId src, VertexId dst, EdgeType type) = 0;
+
     /** Query */
     virtual Status GetNeighbors(VertexId src, std::vector<Neighbor>* out) = 0;
     virtual Status GetNeighbors(VertexId src, EdgeType type, std::vector<Neighbor>* out) = 0;
-    
+
     /** Maintenance */
     virtual Status Flush() = 0;
+
+    /**
+     * Called during database open to replay persisted state (e.g. WAL).
+     * Default is a no-op; implementations that have durable storage override this.
+     */
+    virtual Status WarmUp() { return Status::Ok(); }
 };
 
 } // namespace pomai

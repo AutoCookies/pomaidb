@@ -171,6 +171,8 @@ namespace pomai::core
         // Graph Operations
         Status AddVertex(std::string_view membrane, VertexId id, TagId tag, const Metadata& meta);
         Status AddEdge(std::string_view membrane, VertexId src, VertexId dst, EdgeType type, uint32_t rank, const Metadata& meta);
+        Status DeleteVertex(std::string_view membrane, VertexId id);
+        Status DeleteEdge(std::string_view membrane, VertexId src, VertexId dst, EdgeType type);
 
         Status Freeze(std::string_view membrane);
         Status Compact(std::string_view membrane);
